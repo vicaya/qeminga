@@ -375,16 +375,20 @@ Channel EOF or HUP closes both channel handles, discards any partial frame, and 
 ```
 qeminga/
 ├── Cargo.toml
+├── Cargo.lock               # committed; release and CI builds use --locked
 ├── docs/
 │   └── design.md          ← this file
 └── src/
     ├── main.rs            # entry point: parse config, drop caps, start async runtime
-    ├── config.rs          # configuration struct (channel path, log level, rate limits)
-    ├── channel.rs         # open + read/write virtio-serial fd
+    ├── config.rs          # configuration schema, channel, recovery marker, and limits
+    ├── channel.rs         # open, read/write, EOF/HUP recovery for virtio-serial fd
     ├── framing.rs         # newline-delimited frame decoder/encoder; 0xFF sentinel handling
+    ├── audit.rs           # structured sink and byte-bounded freeze-safe ring
     ├── proto.rs           # JSON-RPC types (Request, Response, Error)
     ├── dispatch.rs        # static allowlist match + rate limiter
     ├── state.rs           # FreezeState enum + Mutex-guarded singleton
+    ├── watchdog.rs        # cancellable async timer and blocking thaw handoff
+    ├── seccomp.rs         # target-specific seccomp policy construction
     ├── handlers/
     │   ├── mod.rs
     │   ├── ping.rs
@@ -407,7 +411,7 @@ qeminga/
 
 | Crate | Version | Purpose |
 |---|---|---|
-| `tokio` | 1.x | Async runtime — **multi-threaded** (`tokio::main` with `flavor = "multi_thread"`, min 2 worker threads). `FIFREEZE` and `FITRIM` are blocking syscalls that can stall for seconds; running them on `spawn_blocking` keeps the reactor alive for `guest-ping` and `guest-fsfreeze-thaw` during a long freeze. |
+| `tokio` | 1.x | Async runtime — **multi-threaded** (`tokio::main` with `flavor = "multi_thread"`, min 2 worker threads). It hosts the cancellable watchdog and keeps the reactor alive while `FIFREEZE`, `FITHAW`, and `FITRIM` run on `spawn_blocking`. |
 | `serde` / `serde_json` | 1.x | JSON serialisation |
 | `nix` | 0.27.x | Safe-ish wrappers for Linux syscalls and ioctls |
 | `caps` | 0.5.x | Linux capability dropping |
@@ -415,7 +419,7 @@ qeminga/
 | `tracing-subscriber` | 0.3.x | Log formatting (JSON output) |
 | `thiserror` | 1.x | Error type derivation |
 | `governor` | 0.6.x | Token-bucket rate limiter |
-| `seccompiler` | 0.4.x | Seccomp BPF filter (optional feature) |
+| `seccompiler` | 0.4.x | Target-specific seccomp BPF filter (optional feature) |
 
 ---
 
@@ -438,9 +442,10 @@ qeminga reads a TOML configuration file (default: `/etc/qeminga/config.toml`):
 
 ```toml
 [agent]
+config_version          = 1        # config schema; not the guest-info agent version
 channel_path            = "/dev/virtio-ports/org.qemu.guest_agent.0"
 log_level               = "info"   # trace | debug | info | warn | error
-version                 = "1.0.0"
+state_path              = "/run/qeminga/frozen"
 fsfreeze_idle_timeout_secs = 30    # auto-thaw if no guest-fsfreeze-status heartbeat received
 fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriving
 
@@ -457,6 +462,8 @@ fstrim      = true    # opt-out: discard unused blocks
 seccomp     = true    # no effect if binary not compiled with --features seccomp
 ```
 
+`config_version` versions the configuration schema. The agent version returned by `guest-info` is build metadata and cannot be supplied by a runtime configuration file. `state_path` must be on an unfreezable runtime filesystem; startup rejects a path that is eligible for the freeze plan.
+
 ### 8.3 Device Node Permissions
 
 The virtio-serial channel is a **single-open device**: only one process can hold it at a time. This is the primary OS-level isolation between the agent and any other local process. The following udev rule must be installed (e.g. `/etc/udev/rules.d/99-qeminga.rules`):
@@ -468,11 +475,26 @@ SUBSYSTEM=="virtio-ports", ATTR{name}=="org.qemu.guest_agent.0", \
 
 Without this rule, any process running as the same user as the agent (or root) can open the channel and send commands directly to QEMU.
 
+### 8.4 Packaging and Service Conflict
+
+qeminga and `qemu-guest-agent` must never run together: both contend for the single-open channel and can race responses even if both start successfully. A distribution package declares a package conflict where supported, and the qeminga system unit uses `Conflicts=qemu-guest-agent.service`. Installation stops and disables the upstream service before enabling qeminga; a migration does not share or multiplex the existing channel.
+
+### 8.5 Supported Platform Matrix
+
+| Dimension | Supported baseline |
+|---|---|
+| Operating system | Linux only |
+| Architectures | `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, each with its own seccomp profile and CI coverage |
+| Kernel | Linux 5.4 or newer with seccomp-BPF and the requested filesystem ioctls available |
+| Execution context | A systemd-managed VM in the initial user namespace; unprivileged containers are unsupported for freeze/trim |
+| Freeze coverage | ext4 and XFS are required interoperability targets; other local filesystems are eligible only when their `FIFREEZE` behavior is tested |
+| Excluded mounts | Pseudo and network filesystems; duplicate bind mounts are de-duplicated by filesystem identity |
+
 ---
 
 ## 9. Audit Log Format
 
-Every received command is logged as a structured JSON line to `stderr`, captured by the service manager (e.g., `systemd`):
+Outside a freeze window, every received command is written as a structured JSON line to `stderr`, captured by the service manager (e.g., `systemd`):
 
 ```json
 {
@@ -488,13 +510,17 @@ Every received command is logged as a structured JSON line to `stderr`, captured
 
 Denied commands use `"disposition": "denied"` and include `"reason"`.
 
+The `id` field preserves the protocol's signed 64-bit integer; `42` is only an illustrative value. For a method longer than 64 UTF-8 bytes, the record uses `method_prefix`, `method_len_bytes`, and `method_digest` instead of the raw `method`.
+
 ### 9.1 Logging During Freeze — Hazard and Mitigation
 
-**G7 (log every command) and G2 (fsfreeze) are in direct conflict.** After `FIFREEZE`, writes to a frozen superblock block indefinitely in `D` state:
+**G7 (auditability) and G2 (fsfreeze) are in direct conflict.** After `FIFREEZE`, writes to a frozen superblock block indefinitely in `D` state:
 
 - journald captures `stderr` → writes to `/var/log/journal` (on a frozen filesystem) → journald blocks → its socket buffer fills → the agent's next `tracing` write blocks → the agent can no longer read from the virtio channel → `guest-fsfreeze-thaw` is never received → the guest is permanently frozen. The watchdog task is in the same process and shares the same blocked write path.
 
-**Mitigation:** the agent uses a **fixed-capacity in-memory ring buffer** (512 log entries, ~64 KiB) as the tracing subscriber. Log entries are written to this buffer synchronously (no I/O). A separate background task flushes the ring buffer to `stderr` only when `FreezeState == Thawed`. While frozen, log entries accumulate in memory; if the ring overflows, oldest entries are discarded (a counter is incremented). This preserves the invariant that the main task never blocks on a log write.
+**Mitigation:** entering `Freezing` synchronously swaps the normal sink for a **64 KiB byte-bounded in-memory ring buffer** before the recovery marker is written. Log records are written to this buffer without I/O; the bounded method projection in §5.2 prevents one field from defeating the byte limit. No descriptor that might reach a frozen filesystem is written until the state is `Thawed`.
+
+While frozen, records accumulate in the ring. On overflow, the oldest records are discarded and a loss counter is retained. The thaw transition explicitly triggers a flush to the normal sink, beginning with the loss count if nonzero; a background flusher may continue draining only while `Thawed`. Recovery-marker startup follows the same rule and delays normal log and pid-file creation until thaw. Reads from the already-open virtio channel remain safe, which is why the frozen-safe command set can still receive a thaw request.
 
 ---
 
@@ -506,6 +532,9 @@ Denied commands use `"disposition": "denied"` and include `"reason"`.
 | D2 | `guest-fstrim` is **included**: enabled by default; can be disabled via `[features] fstrim = false` in `config.toml`. |
 | D3 | The threat model for the configuration file is **out of scope**: if the host can overwrite `/etc/qeminga/config.toml` it can replace the agent binary entirely. OS-level file permissions are the appropriate control. |
 | D4 | A freeze watchdog is **required** and is fully specified in §4.4. The idle timeout defaults to 30 seconds and the hard cap to 300 seconds; both are configurable in `config.toml`. |
+| D5 | A pre-freeze recovery marker is mandatory. It is created before any `FIFREEZE`, retained through failures, and forces a conservative frozen-only recovery mode after an unexpected process exit. |
+| D6 | qeminga supports Linux 5.4+ on x86-64 and arm64 in the initial user namespace. Seccomp policies and CI are architecture-specific. |
+| D7 | `CAP_DAC_READ_SEARCH` is retained with `CAP_SYS_ADMIN` and `CAP_SYS_BOOT` so a protected local mountpoint cannot silently make the entire snapshot path fail. |
 
 ---
 
@@ -515,13 +544,19 @@ Denied commands use `"disposition": "denied"` and include `"reason"`.
 |---|---|
 | AC1 | `guest-exec` and all other denied commands return `{"error": {"class": "CommandNotFound", ...}}`. |
 | AC2 | `guest-fsfreeze-freeze` followed by `guest-fsfreeze-thaw` succeeds on a real Linux ext4 or xfs filesystem. |
-| AC3 | The daemon starts with only `CAP_SYS_ADMIN` and `CAP_SYS_BOOT` in its effective set. |
+| AC3 | After the UID transition, the effective and permitted sets contain exactly `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`; no other capability can be regained from the bounding set. |
 | AC4 | An oversized (> 64 KiB) frame is rejected, the decoder re-syncs to the next newline, and the subsequent valid command is handled correctly (no permanent desync). |
 | AC5 | A flood of 1000 `guest-ping` requests within one second is rate-limited; the daemon continues serving subsequent valid requests. |
-| AC6 | `cargo audit` reports zero known vulnerabilities in the dependency tree. |
+| AC6 | `Cargo.lock` is committed; `cargo audit` and `cargo deny` report zero policy violations in CI and `cargo audit` also runs on a schedule. |
 | AC7 | `cargo clippy -- -D warnings` produces zero warnings. |
 | AC8 | All unit tests pass under `cargo test`. |
-| AC9 | While `Frozen`, every command outside the frozen-safe set is rejected with `FrozenGuest` error without touching a filesystem; `guest-fsfreeze-thaw` is accepted regardless of rate-limiter state. |
-| AC10 | Freeze → `SIGKILL` the agent → restart: the agent detects the prior frozen state on startup, refuses non-thaw commands, and a subsequent `guest-fsfreeze-thaw` successfully thaws the filesystems. |
+| AC9 | While `Frozen`, every command outside the frozen-safe set is rejected with `GenericError` without touching a filesystem; `guest-fsfreeze-thaw` is accepted regardless of rate-limiter state. |
+| AC10 | Freeze → `SIGKILL` the agent → restart: the pre-freeze marker puts the agent in recovery mode, it refuses non-thaw commands, and a subsequent `guest-fsfreeze-thaw` successfully drains and thaws the filesystems. |
 | AC11 | Freeze watchdog: if `guest-fsfreeze-status` heartbeats stop for `fsfreeze_idle_timeout_secs`, the filesystems are automatically thawed; if heartbeats continue past `fsfreeze_max_timeout_secs`, the filesystems are thawed regardless. |
 | AC12 | `guest-shutdown` does not emit a JSON-RPC success response on the channel; the VM exits cleanly.
+| AC13 | Under sustained logging volume with a filled journald pipe, a freeze/thaw cycle completes without a write to a frozen filesystem; any ring overflow is reported after thaw. |
+| AC14 | The frame decoder survives a `cargo fuzz` corpus for at least one hour with no panic, hang, or unbounded allocation, including oversized-frame discard and resynchronisation cases. |
+| AC15 | With seccomp **installed**, the full allowed-command matrix passes on x86-64 and arm64 in CI, including after every dependency update. |
+| AC16 | Against real libvirt, `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh domshutdown --mode agent` succeed. |
+| AC17 | Freeze succeeds with tmpfs and bind mounts present and can open a mode-0700 local mountpoint; unsupported or duplicate mounts do not turn the operation into a hard failure. |
+| AC18 | Channel EOF/reopen during a freeze preserves the recovery marker and frozen state; after reconnection, a thaw request completes successfully. |

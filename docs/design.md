@@ -20,11 +20,11 @@ The upstream QEMU Guest Agent (`qemu-ga`) is a C daemon that runs inside a virtu
 | G1 | Support graceful reboot and power-off initiated by the hypervisor. |
 | G2 | Support filesystem freeze/thaw (`guest-fsfreeze-freeze` / `guest-fsfreeze-thaw`) so hypervisor-initiated snapshots are crash-consistent. |
 | G3 | Report guest information (OS version, file-system state, agent version) so the hypervisor can make informed decisions. |
-| G4 | Support guest-initiated network interface enumeration (read-only, used during cloud-init / IP reporting). |
+| G4 | Support host-requested, read-only network interface enumeration (used during cloud-init / IP reporting). |
 | G5 | Refuse **all** commands that execute arbitrary code, write arbitrary files, or modify guest users/passwords. |
 | G6 | Operate with the minimum OS privileges required (non-root where possible, capability-dropped where root is unavoidable). |
 | G7 | Be auditable: command disposition is recorded. During a filesystem-freeze window, records are deferred in a bounded in-memory buffer and may be dropped on overflow; the loss is reported after thaw. |
-| G8 | Written in safe Rust; `unsafe` blocks are forbidden except in a single, explicitly reviewed FFI shim for `ioctl`-level freeze operations. |
+| G8 | Written in safe Rust; `unsafe` blocks are forbidden except in a single, explicitly reviewed kernel module for syscall-level operations. |
 
 ### 1.2 Non-Goals
 
@@ -77,7 +77,7 @@ The hypervisor is treated as **untrusted input**. Every byte arriving from the v
 | Hypervisor sends a valid but disallowed command | ✅ Yes |
 | Hypervisor replays or floods commands | ✅ Yes |
 | Hypervisor sends a valid allowed command at the wrong lifecycle phase | ✅ Yes |
-| Local guest process injects into the virtio channel | ❌ Out of scope (single-open device; access controlled by udev rule `0600 root:qeminga` — §8 documents the required rule) |
+| Local guest process injects into the virtio channel | ❌ Out of scope (single-open device; access controlled by the `0600 qeminga:qeminga` udev rule in §8) |
 | Physical memory access by the hypervisor | ❌ Out of scope (hardware / trusted-execution domain) |
 
 ### 2.3 Denied Command Categories
@@ -187,7 +187,7 @@ stateDiagram-v2
 
     Thawed --> Freezing : guest-fsfreeze-freeze received
     Freezing --> Frozen : eligible filesystems processed without hard error
-    Freezing --> Thawed : hard error; auto-rollback completes
+    Freezing --> Thawed : hard error, auto-rollback completes
 
     Frozen --> Thawing : guest-fsfreeze-thaw received
     Frozen --> Thawing : watchdog deadline reached
@@ -195,7 +195,6 @@ stateDiagram-v2
     Thawing --> Thawed : FITHAW drain completes; recovery marker removed
     Thawing --> Frozen : unrecoverable thaw failure; retain recovery marker
 
-    Frozen --> Frozen : guest-fsfreeze-freeze received; return existing count
 ```
 
 Before a freeze, qeminga builds a mount plan from `/proc/self/mountinfo`. It selects only local, device-backed, freezable filesystems; excludes pseudo and network mounts; and de-duplicates bind mounts by filesystem identity. `guest-fsfreeze-freeze-list` is intersected with this plan. This avoids attempting to freeze mounts that can hang or are never expected to implement `FIFREEZE`.
@@ -283,6 +282,7 @@ match req.method.as_str() {
     "guest-fsfreeze-thaw"     => handlers::fsfreeze_thaw(req),
     "guest-fstrim"            => handlers::fstrim(req),
     "guest-shutdown"          => handlers::shutdown(req),
+    "guest-suspend-ram" if config.suspend_ram_enabled() => handlers::suspend_ram(req),
     _                         => Err(Error::CommandNotFound(req.method)),
 }
 ```
@@ -397,6 +397,7 @@ qeminga/
     │   ├── interfaces.rs  # guest-network-get-interfaces
     │   ├── fsinfo.rs
     │   ├── fsfreeze.rs    # freeze, freeze-list, thaw, status, fstrim
+    │   ├── suspend.rs     # opt-in guest-suspend-ram
     │   └── shutdown.rs
     └── kernel/
         ├── mod.rs         # safe wrappers, re-exports
@@ -453,6 +454,7 @@ fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriv
 ping_sync_per_min          = 120
 get_commands_per_min       = 30
 fsfreeze_freeze_per_min    = 10
+fstrim_per_min             = 5
 shutdown_per_min           = 2
 
 [features]
@@ -553,7 +555,7 @@ While frozen, records accumulate in the ring. On overflow, the oldest records ar
 | AC9 | While `Frozen`, every command outside the frozen-safe set is rejected with `GenericError` without touching a filesystem; `guest-fsfreeze-thaw` is accepted regardless of rate-limiter state. |
 | AC10 | Freeze → `SIGKILL` the agent → restart: the pre-freeze marker puts the agent in recovery mode, it refuses non-thaw commands, and a subsequent `guest-fsfreeze-thaw` successfully drains and thaws the filesystems. |
 | AC11 | Freeze watchdog: if `guest-fsfreeze-status` heartbeats stop for `fsfreeze_idle_timeout_secs`, the filesystems are automatically thawed; if heartbeats continue past `fsfreeze_max_timeout_secs`, the filesystems are thawed regardless. |
-| AC12 | `guest-shutdown` does not emit a JSON-RPC success response on the channel; the VM exits cleanly.
+| AC12 | `guest-shutdown` does not emit a JSON-RPC success response on the channel; the VM exits cleanly. |
 | AC13 | Under sustained logging volume with a filled journald pipe, a freeze/thaw cycle completes without a write to a frozen filesystem; any ring overflow is reported after thaw. |
 | AC14 | The frame decoder survives a `cargo fuzz` corpus for at least one hour with no panic, hang, or unbounded allocation, including oversized-frame discard and resynchronisation cases. |
 | AC15 | With seccomp **installed**, the full allowed-command matrix passes on x86-64 and arm64 in CI, including after every dependency update. |

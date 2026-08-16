@@ -23,7 +23,7 @@ The upstream QEMU Guest Agent (`qemu-ga`) is a C daemon that runs inside a virtu
 | G4 | Support guest-initiated network interface enumeration (read-only, used during cloud-init / IP reporting). |
 | G5 | Refuse **all** commands that execute arbitrary code, write arbitrary files, or modify guest users/passwords. |
 | G6 | Operate with the minimum OS privileges required (non-root where possible, capability-dropped where root is unavoidable). |
-| G7 | Be auditable: every command received and its disposition (accepted / denied) is logged. |
+| G7 | Be auditable: command disposition is recorded. During a filesystem-freeze window, records are deferred in a bounded in-memory buffer and may be dropped on overflow; the loss is reported after thaw. |
 | G8 | Written in safe Rust; `unsafe` blocks are forbidden except in a single, explicitly reviewed FFI shim for `ioctl`-level freeze operations. |
 
 ### 1.2 Non-Goals
@@ -91,8 +91,11 @@ The following upstream `qemu-ga` command families are **explicitly denied** by d
 | User management | `guest-set-user-password` | Credential manipulation |
 | SSH key injection | `guest-ssh-add-authorized-keys`, `guest-ssh-remove-authorized-keys`, `guest-ssh-get-authorized-keys` | Persistent backdoor creation |
 | Time synchronization | `guest-set-time` | Can disrupt security protocols (TLS, Kerberos) |
-| Timezone mutation | `guest-set-timezone` does not exist in upstream `qemu-ga`; no action needed |  |
-| Read-only info commands denied in this release | `guest-get-users`, `guest-get-host-name`, `guest-get-time`, `guest-get-timezone`, `guest-get-devices`, `guest-get-disks`, `guest-get-memory-blocks`, `guest-get-memory-block-info` | Not required for snapshot or lifecycle operations; each expands the read surface exposed to the host |
+| CPU and memory mutation | `guest-set-vcpus`, `guest-set-memory-blocks` | Host-driven changes to the running guest's CPU or memory topology |
+| Disk and hybrid suspend | `guest-suspend-disk`, `guest-suspend-hybrid` | Can leave the guest unavailable or alter its persisted power state |
+| Read-only information commands denied in this release | `guest-get-users`, `guest-get-host-name`, `guest-get-time`, `guest-get-timezone`, `guest-get-devices`, `guest-get-disks`, `guest-get-diskstats`, `guest-get-cpustats`, `guest-get-load`, `guest-get-vcpus`, `guest-get-memory-blocks`, `guest-get-memory-block-info`, `guest-network-get-route` | Not required for snapshot or lifecycle operations; each expands the read surface exposed to the host, including the guest routing topology |
+
+`guest-set-timezone` is not an upstream `qemu-ga` command and therefore needs no deny rule.
 
 ---
 
@@ -110,11 +113,11 @@ Only the commands in the following table are implemented. All other commands rec
 | `guest-network-get-interfaces` | host → guest | Returns interface names, hardware addresses, and unicast IP addresses (read-only); loopback and link-local addresses are filtered out to limit host visibility into overlay and management networks |
 | `guest-get-fsinfo` | host → guest | Returns mounted filesystem metadata (name, type, mountpoint, total/free bytes) |
 | `guest-fsfreeze-status` | host → guest | Returns `"thawed"` or `"frozen"` |
-| `guest-fsfreeze-freeze` | host → guest | Calls `FIFREEZE` on all mounted filesystems; returns count of frozen FSes |
-| `guest-fsfreeze-freeze-list` | host → guest | As above but for a specified list of mountpoints |
-| `guest-fsfreeze-thaw` | host → guest | Calls `FITHAW` on all frozen filesystems; returns count of thawed FSes |
+| `guest-fsfreeze-freeze` | host → guest | Calls `FIFREEZE` only on discovered freezable local filesystem superblocks; pseudo, network, and duplicate bind mounts are excluded; returns count of frozen FSes |
+| `guest-fsfreeze-freeze-list` | host → guest | As above, restricted to a specified subset of discovered freezable local mountpoints |
+| `guest-fsfreeze-thaw` | host → guest | Drains `FITHAW` calls on all discovered freezable local filesystems; returns count of thawed FSes |
 | `guest-fstrim` | host → guest | Calls `FITRIM` ioctl to discard unused blocks (storage efficiency) |
-| `guest-shutdown` | host → guest | Initiates a clean shutdown. Accepts optional `mode` ∈ `{"halt", "poweroff", "reboot"}` (default `"poweroff"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. |
+| `guest-shutdown` | host → guest | Initiates a clean shutdown. Accepts optional `mode` ∈ `{"halt", "powerdown", "reboot"}` (default `"powerdown"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. |
 | `guest-suspend-ram` | host → guest | Suspends guest to RAM (S3) — **opt-in, disabled by default** via `[features] suspend_ram = false` in `config.toml` |
 
 ---
@@ -179,25 +182,32 @@ fsfreeze operations must be serialised. qeminga tracks freeze state explicitly:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Thawed : startup
+    [*] --> Thawed : no recovery marker
+    [*] --> Frozen : recovery marker present
 
     Thawed --> Freezing : guest-fsfreeze-freeze received
-    Freezing --> Frozen : all FIFREEZE ioctls return 0 or EOPNOTSUPP or EBUSY
-    Freezing --> Thawed : hard ioctl error other than EOPNOTSUPP or EBUSY (auto-rollback FITHAW all frozen)
+    Freezing --> Frozen : eligible filesystems processed without hard error
+    Freezing --> Thawed : hard error; auto-rollback completes
 
     Frozen --> Thawing : guest-fsfreeze-thaw received
     Frozen --> Thawing : watchdog deadline reached
-    Thawing --> Thawed : all FITHAW ioctls complete
-    Thawing --> Frozen : partial FITHAW failure (log alert; continue retrying)
+    Thawed --> Thawing : guest-fsfreeze-thaw recovery drain
+    Thawing --> Thawed : FITHAW drain completes; recovery marker removed
+    Thawing --> Frozen : unrecoverable thaw failure; retain recovery marker
 
-    Frozen --> Frozen : guest-fsfreeze-freeze received (idempotent; returns frozen count)
-    Thawed --> Thawed : guest-fsfreeze-thaw received (idempotent; returns 0)
+    Frozen --> Frozen : guest-fsfreeze-freeze received; return existing count
 ```
+
+Before a freeze, qeminga builds a mount plan from `/proc/self/mountinfo`. It selects only local, device-backed, freezable filesystems; excludes pseudo and network mounts; and de-duplicates bind mounts by filesystem identity. `guest-fsfreeze-freeze-list` is intersected with this plan. This avoids attempting to freeze mounts that can hang or are never expected to implement `FIFREEZE`.
+
+Mount order is load-bearing: the freeze plan is traversed in reverse mount order so nested mounts are frozen deepest-first; thaw traverses it forward. Before the first `FIFREEZE`, qeminga switches audit output to the freeze-safe ring and creates the recovery marker described in §4.4. If marker creation fails, it performs no freeze ioctl.
 
 **Errno handling during freeze:**
 - `EOPNOTSUPP` — the filesystem does not implement freeze (e.g. tmpfs, proc). Counted as skipped, not as frozen.
-- `EBUSY` — the superblock is already frozen. This is normal for bind mounts sharing the same superblock. Counted in the frozen total.
-- Any other errno — treated as a hard error. All previously frozen filesystems are thawed immediately (rollback), and the state returns to `Thawed`.
+- `EBUSY` — the superblock is already frozen. This is non-fatal (for example, a concurrent freezer may hold it) and is retained in the thaw plan.
+- Any other errno — treated as a hard error. All previously processed filesystems are thawed immediately in forward order; the recovery marker remains until the drain completes.
+
+Thaw is not idempotent at the kernel level. Multiple successful `FIFREEZE` calls can require multiple `FITHAW` calls, and a prior agent or another freezer can hold an unknown nesting depth. For each eligible mountpoint, qeminga issues `FITHAW` until it returns an error, counting a filesystem at most once when at least one call succeeds. A thaw received while qeminga believes it is `Thawed` still performs this recovery drain rather than returning a no-op.
 
 ### 4.3 Request Lifecycle
 
@@ -233,9 +243,9 @@ sequenceDiagram
     end
 ```
 
-### 4.4 Freeze Watchdog
+### 4.4 Freeze Watchdog and Crash Recovery
 
-A freeze watchdog runs as a dedicated `spawn_blocking` task on the tokio thread pool. It ensures that a hypervisor crash or a network partition mid-snapshot does not leave the guest permanently frozen.
+A per-freeze watchdog runs as a cancellable async task. It ensures that a hypervisor crash or a network partition mid-snapshot does not leave the guest permanently frozen.
 
 **Arming:** the watchdog is armed when the state transitions to `Frozen`. Its deadline is `now + fsfreeze_idle_timeout_secs`.
 
@@ -243,9 +253,11 @@ A freeze watchdog runs as a dedicated `spawn_blocking` task on the tokio thread 
 
 **Hard cap:** the deadline is capped at `arm_time + fsfreeze_max_timeout_secs` regardless of status heartbeats. A legitimately long backup that exceeds `fsfreeze_max_timeout_secs` will be auto-thawed; this is preferable to hanging indefinitely.
 
-**Disarming:** the watchdog is cancelled when the state transitions back to `Thawed` (whether via a normal `guest-fsfreeze-thaw` or via the watchdog itself).
+**Cancellation and races:** the watchdog waits with `tokio::select!` on its deadline, a refreshed deadline signal, and a cancellation signal. A normal thaw atomically claims the `Thawing` transition and signals cancellation; if the deadline wins, the watchdog claims that transition instead. `spawn_blocking` handles are never treated as cancellable.
 
-**Blocking requirement:** the `FITHAW` ioctls issued by the watchdog must run on `spawn_blocking`, not on the async reactor, for the same reason as §7: they block until writeback drains.
+**Blocking requirement:** only the `FIFREEZE` and `FITHAW` ioctls run through `spawn_blocking`; the timer, refresh, cancellation, and state transition remain on the async runtime. The watchdog hands its thaw drain to `spawn_blocking` only after it wins the state transition.
+
+**Recovery marker:** `state_path` is an atomically-created marker on an unfreezable runtime filesystem (default `/run/qeminga/frozen`). qeminga writes and syncs it before the first `FIFREEZE`, and removes it only after a complete thaw drain. A startup that finds the marker enters `Frozen` recovery mode, defers normal log and pid-file creation, keeps using the in-memory audit buffer, and accepts only the frozen-safe command set until thaw succeeds. The marker can be stale after a reboot or an external thaw; qeminga deliberately treats it pessimistically, because an unnecessary thaw is safer than proceeding while a filesystem might be frozen. This also recovers from `SIGKILL`, a seccomp kill, or a panic during freeze.
 
 ---
 

@@ -40,19 +40,19 @@ The upstream QEMU Guest Agent (`qemu-ga`) is a C daemon that runs inside a virtu
 
 ```mermaid
 graph TD
-    subgraph HypervisorSide["Hypervisor / Management Plane (UNTRUSTED)"]
+    subgraph HypervisorSide["Hypervisor — Management Plane UNTRUSTED"]
         H[Host Management API]
         QMP[QEMU Monitor Protocol]
     end
 
-    subgraph Channel["virtio-serial channel (bidirectional, framed)"]
-        VC["/dev/virtio-ports/org.qemu.guest_agent.0"]
+    subgraph Channel["virtio-serial channel — bidirectional framed"]
+        VC["virtio-ports: org.qemu.guest_agent.0"]
     end
 
-    subgraph GuestSide["Guest OS (TRUSTED)"]
+    subgraph GuestSide["Guest OS — TRUSTED"]
         DA[qeminga daemon]
         AL[Allowlist Dispatcher]
-        KB[Kernel / syscall boundary]
+        KB[Kernel syscall boundary]
         FS[Filesystems]
         PM[Power Management]
     end
@@ -62,9 +62,9 @@ graph TD
     VC -->|raw bytes| DA
     DA -->|parsed command| AL
     AL -->|allowed| KB
-    AL -->|denied — log + error reply| DA
-    KB -->|FIFREEZE / FITHAW ioctl| FS
-    KB -->|reboot(2) / halt(2)| PM
+    AL -->|denied: log and error reply| DA
+    KB -->|FIFREEZE and FITHAW ioctl| FS
+    KB -->|reboot or halt syscall| PM
 ```
 
 The hypervisor is treated as **untrusted input**. Every byte arriving from the virtio-serial channel is adversarial data from qeminga's perspective.
@@ -151,13 +151,13 @@ graph LR
         HS[guest-shutdown]
     end
 
-    subgraph Kernel["Kernel Interface (FFI shim)"]
-        KI["ioctl wrapper — FIFREEZE / FITHAW / FITRIM"]
-        KS["shutdown wrapper — reboot(2)"]
+    subgraph Kernel["Kernel Interface — FFI shim"]
+        KI["ioctl wrapper — FIFREEZE FITHAW FITRIM"]
+        KS["shutdown wrapper — reboot syscall"]
     end
 
     subgraph Logging["Structured Logging"]
-        LOG["tracing / tracing-subscriber — JSON output to stderr"]
+        LOG["tracing and tracing-subscriber — JSON to stderr"]
     end
 
     CH --> FD --> RPC

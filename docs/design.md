@@ -297,6 +297,8 @@ The frame decoder enforces three hard limits before handing data to the JSON par
 
 3. **String field length:** individual JSON string values are capped at **4,096 bytes** via a custom deserialiser visitor, preventing memory exhaustion from a single oversized string that stays within the overall frame limit.
 
+Before an audit record is created, the attacker-controlled method name is projected to at most 64 UTF-8 bytes at a character boundary. Longer names record that prefix, the original byte length, and a fixed-size digest instead of the full value. Audit fields are always JSON-serialised strings, never interpolated into a log format string.
+
 ### 5.3 Rate Limiting
 
 Each command class has a per-minute quota enforced by a token-bucket limiter:
@@ -310,66 +312,61 @@ Each command class has a per-minute quota enforced by a token-bucket limiter:
 | `guest-fstrim` | 5 / min | |
 | `guest-shutdown`, `guest-suspend-ram` | 2 / min | Decorative — a host that can call shutdown can also cut power; rate limit is a last-resort circuit-breaker, not a meaningful defence. |
 
-**While the agent is in `Frozen` state**, only the frozen-safe command set is accepted regardless of rate-limiter state: `guest-fsfreeze-status`, `guest-fsfreeze-thaw`, `guest-ping`, `guest-sync`, `guest-sync-delimited`, and `guest-info`. All other commands are rejected with `{"error": {"class": "FrozenGuest", ...}}` until the filesystems are thawed.
+**While the agent is in `Frozen` state**, only the frozen-safe command set is accepted regardless of rate-limiter state: `guest-fsfreeze-status`, `guest-fsfreeze-thaw`, `guest-ping`, `guest-sync`, `guest-sync-delimited`, and `guest-info`. All other commands are rejected with `{"error": {"class": "GenericError", "desc": "filesystems are frozen; retry after thaw"}}` until the filesystems are thawed. `GenericError` is a valid QAPI error class and accurately states that the command is known but unsafe in the current lifecycle state; qeminga intentionally does not rely on upstream's implementation detail of reporting these commands as absent.
 
 ### 5.4 Capability Dropping (Linux)
 
-At startup, after opening the virtio channel, qeminga calls `prctl(PR_SET_NO_NEW_PRIVS, 1)` and drops all Linux capabilities except:
+qeminga starts with the privilege needed to open the channel, then runs as the dedicated `qeminga` system user (UID/GID 600 by convention). Linux clears the effective capability set on a UID transition, so the order is part of the security design:
+
+1. Open the channel and perform other pre-drop setup.
+2. Set `PR_SET_KEEPCAPS`.
+3. Call `setresgid()` and `setresuid()` for the `qeminga` account.
+4. Re-raise the final capabilities and the temporary `CAP_SETPCAP` needed to trim the bounding set.
+5. Drop every non-final capability from the bounding set, including `CAP_SETPCAP`, then clear all non-final effective, permitted, inheritable, and ambient capabilities.
+6. Set `PR_SET_NO_NEW_PRIVS`, then install seccomp.
+
+The final effective and permitted sets contain exactly:
 
 | Capability | Required for |
 |---|---|
-| `CAP_SYS_ADMIN` | `FIFREEZE` / `FITHAW` ioctls |
+| `CAP_SYS_ADMIN` | `FIFREEZE`, `FITHAW`, and `FITRIM` ioctls; it must be held in the initial user namespace |
 | `CAP_SYS_BOOT` | `reboot(2)` syscall |
+| `CAP_DAC_READ_SEARCH` | Opening protected mountpoint directories for freeze/thaw |
 
-All other capabilities (`CAP_NET_ADMIN`, `CAP_DAC_READ_SEARCH`, `CAP_SETUID`, etc.) are permanently dropped. The process runs as a dedicated `qeminga` system user (UID/GID 600 by convention).
+`CAP_DAC_READ_SEARCH` is intentionally retained: `FIFREEZE` requires an fd opened on the mountpoint, and UID 600 would otherwise receive `EACCES` on a mode-0700 mountpoint and roll back the entire freeze. qeminga does not support running this path solely in a non-initial user namespace; startup fails rather than claiming freeze support that the kernel will reject.
 
-> **Important:** `CAP_SYS_ADMIN` is close to retaining root. It covers `mount`, `pivot_root`, `setns`, `bpf` on older kernels, and ioctls across a wide range of kernel subsystems. Running as UID 600 is defence in depth, but G6's "non-root where possible" should not be read as meaningful privilege reduction while `CAP_SYS_ADMIN` is held. The effective security boundary is the seccomp filter (§5.5), not the capability drop.
+> **Important:** `CAP_SYS_ADMIN` is close to retaining root. It covers `mount`, `pivot_root`, `setns`, `bpf` on older kernels, and ioctls across a wide range of kernel subsystems. Running as UID 600 is defence in depth, but G6's "non-root where possible" should not be read as meaningful privilege reduction while `CAP_SYS_ADMIN` is held. The effective narrowing boundary is the seccomp filter (§5.5), not the capability drop.
 
 ### 5.5 Seccomp Filter (optional, recommended)
 
 When the `seccomp` Cargo feature is compiled in **and** `[features] seccomp = true` is set in `config.toml`, qeminga installs a `SECCOMP_MODE_FILTER` policy at startup.
 
-The allowlist covers the full syscall surface of a tokio multi-threaded runtime plus the agent's own kernel calls:
+The policy is generated as a separate, target-specific profile for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; it is not one hand-maintained list of syscall spellings. Shared logical operations resolve to syscall numbers valid on the target. In particular, portable profiles use `openat`, `newfstatat`/`statx`, `ppoll`, and `epoll_pwait`; x86-64-only legacy aliases such as `open`, `stat`, `lstat`, `poll`, and `epoll_wait` are included only in the x86-64 profile when an observed runtime need requires them.
 
-```
-# I/O and fd management
-read, write, readv, writev, close, open, openat, stat, fstat, lstat,
-fcntl, ioctl, lseek, pread64, pwrite64
+Each profile covers both the multi-threaded tokio runtime and the agent's allowed commands:
 
-# Memory
-brk, mmap, mprotect, munmap, madvise, mremap
+| Surface | Required operations |
+|---|---|
+| File, metadata, and channel I/O | `read`, `write`, `readv`, `writev`, `close`, `openat`, `fcntl`, `ioctl`, `lseek`, `pread64`, `pwrite64`, `newfstatat`, `statx`, `statfs`, `fstatfs`, `getdents64` |
+| Runtime and reactor | Memory management; `clone`/`clone3`; robust-list, thread-ID, `rseq`, futex, scheduling, and `prlimit64` support; epoll, eventfd, and portable polling operations; signals, clocks, identity queries, and randomness |
+| OS and network information | `uname` for `guest-get-osinfo`; `socket`, `bind`, `sendto`/`sendmsg`, `recvmsg`, and `getsockname` for the netlink exchange used by `guest-network-get-interfaces` |
+| Privileged handlers | `reboot`; `ioctl` restricted by request number to `FIFREEZE`, `FITHAW`, and `FITRIM` |
 
-# Threads and synchronisation (tokio work-stealing scheduler)
-clone, clone3, exit, set_robust_list,
-futex, futex_waitv, futex_wait, futex_wake,
-sched_getaffinity, sched_yield
-
-# Async I/O reactor
-epoll_create1, epoll_ctl, epoll_wait, epoll_pwait,
-eventfd2, ppoll, poll
-
-# Signals
-rt_sigaction, rt_sigprocmask, rt_sigreturn, sigaltstack
-
-# Time
-clock_gettime, clock_nanosleep, nanosleep
-
-# Misc
-getrandom, getpid, gettid, getuid, getgid,
-exit_group, restart_syscall
-
-# Agent-specific
-reboot           # guest-shutdown
-ioctl(FIFREEZE)  # guest-fsfreeze-freeze (enforced by argument filter)
-ioctl(FITHAW)    # guest-fsfreeze-thaw
-ioctl(FITRIM)    # guest-fstrim
-```
-
-All other syscalls cause `SIGSYS`, terminating the process rather than allowing an exploit to pivot. The filter is installed **after** capability dropping so that `seccomp(2)` itself does not need to be in the allowlist.
+The production default action kills the process for an unlisted syscall. Compatibility builds first exercise the same profile with a logging action, then the enforced profile runs the complete command matrix in CI on both supported architectures and on every dependency update. The filter is installed after capability dropping and `PR_SET_NO_NEW_PRIVS`, so its installation syscall does not need to remain available afterward.
 
 ### 5.6 No `unsafe` Outside the Kernel Shim
 
-The `kernel` module is the single location permitted to use `unsafe`. It is gated behind a crate-internal `mod kernel` with `#[cfg(target_os = "linux")]`. All callers go through safe Rust wrappers that return `Result<T, KernelError>`.
+The `kernel` module is the single location permitted to use `unsafe`. Every non-kernel module carries `#![forbid(unsafe_code)]`; CI rejects any exception outside `src/kernel/`. The kernel module is gated behind `#[cfg(target_os = "linux")]`, narrowly reviewed, and exposes only safe wrappers returning `Result<T, KernelError>`.
+
+### 5.7 Process Failure and Channel Recovery
+
+Release builds use `panic = "abort"` and rely on the service manager to restart the process. A panic or seccomp kill never attempts a best-effort write or thaw from an indeterminate state; the pre-freeze marker forces the restarted process into the conservative recovery path in §4.4. A graceful stop requested while frozen is deferred until thaw; a forced stop leaves the marker in place.
+
+Channel EOF or HUP closes both channel handles, discards any partial frame, and retries opening the configured channel with bounded backoff. Reconnection never resets `FreezeState`, cancels a watchdog, clears the recovery marker, or enables the normal audit sink while frozen. A newly connected peer starts with a clean decoder and should use `guest-sync-delimited` to establish stream synchronisation.
+
+### 5.8 Supply-Chain Controls
+
+`Cargo.lock` is committed and release/CI builds use `--locked`. CI runs `cargo deny` for advisory, license, source, and duplicate-dependency policy, and runs `cargo audit` both on pull requests and on a scheduled job because advisories can arrive without a source change. A dependency update also triggers the enforced seccomp command-matrix test described in §5.5.
 
 ---
 

@@ -45,8 +45,8 @@ graph TD
         QMP[QEMU Monitor Protocol]
     end
 
-    subgraph Channel["virtio-serial channel\n(bidirectional, framed)"]
-        VC[/dev/virtio-ports/org.qemu.guest_agent.0/]
+    subgraph Channel["virtio-serial channel (bidirectional, framed)"]
+        VC["/dev/virtio-ports/org.qemu.guest_agent.0"]
     end
 
     subgraph GuestSide["Guest OS (TRUSTED)"]
@@ -125,20 +125,20 @@ Only the commands in the following table are implemented. All other commands rec
 ```mermaid
 graph LR
     subgraph IO["I/O Layer"]
-        CH[Channel Reader\nAsyncBufReader over virtio fd]
-        CW[Channel Writer\nAsyncBufWriter]
+        CH["Channel Reader — AsyncBufReader over virtio fd"]
+        CW["Channel Writer — AsyncBufWriter"]
     end
 
     subgraph Protocol["Protocol Layer"]
-        FD[Frame Decoder\nNUL-delimited JSON-RPC]
+        FD["Frame Decoder — NUL-delimited JSON-RPC"]
         FE[Frame Encoder]
         RPC[JSON-RPC Dispatcher]
     end
 
     subgraph Security["Security Layer"]
-        AL[Allowlist\nstatic match arms only]
-        RL[Rate Limiter\ntoken bucket per command]
-        ST[State Machine\nFreezeState enum]
+        AL["Allowlist — static match arms only"]
+        RL["Rate Limiter — token bucket per command"]
+        ST["State Machine — FreezeState enum"]
     end
 
     subgraph Handlers["Command Handlers"]
@@ -147,17 +147,17 @@ graph LR
         HO[guest-get-osinfo]
         HN[guest-get-interfaces]
         HFS[guest-get-fsinfo]
-        HFF[guest-fsfreeze-*]
+        HFF["guest-fsfreeze-*"]
         HS[guest-shutdown]
     end
 
     subgraph Kernel["Kernel Interface (FFI shim)"]
-        KI[ioctl wrapper\nFIFREEZE / FITHAW / FITRIM]
-        KS[shutdown wrapper\nreboot(2)]
+        KI["ioctl wrapper — FIFREEZE / FITHAW / FITRIM"]
+        KS["shutdown wrapper — reboot(2)"]
     end
 
     subgraph Logging["Structured Logging"]
-        LOG[tracing / tracing-subscriber\nJSON output to stderr]
+        LOG["tracing / tracing-subscriber — JSON output to stderr"]
     end
 
     CH --> FD --> RPC
@@ -353,9 +353,10 @@ qeminga reads a TOML configuration file (default: `/etc/qeminga/config.toml`):
 
 ```toml
 [agent]
-channel_path = "/dev/virtio-ports/org.qemu.guest_agent.0"
-log_level     = "info"   # trace | debug | info | warn | error
-version       = "1.0.0"
+channel_path            = "/dev/virtio-ports/org.qemu.guest_agent.0"
+log_level               = "info"   # trace | debug | info | warn | error
+version                 = "1.0.0"
+fsfreeze_watchdog_secs  = 30       # auto-thaw if hypervisor disappears mid-snapshot
 
 [rate_limits]
 ping_sync_per_min     = 120
@@ -364,7 +365,8 @@ fsfreeze_per_min      = 10
 shutdown_per_min      = 2
 
 [features]
-suspend_ram = false
+suspend_ram = false   # opt-in: can disrupt security monitoring
+fstrim      = true    # opt-out: discard unused blocks
 seccomp     = true
 ```
 
@@ -390,14 +392,14 @@ Denied commands use `"disposition": "denied"` and include `"reason"`.
 
 ---
 
-## 10. Open Questions
+## 10. Decisions
 
-| # | Question | Owner |
-|---|---|---|
-| OQ1 | Should `guest-suspend-ram` be allowed by default? It can disrupt security monitoring. Recommend opt-in via feature flag. | Architecture |
-| OQ2 | Should `guest-fstrim` be included? It leaks storage usage patterns to the hypervisor. Low risk but worth discussing. | Security |
-| OQ3 | What is the threat model for the configuration file itself? If the host can write `/etc/qeminga/config.toml`, it can adjust rate limits. Consider signing or embedding config at compile time. | Security |
-| OQ4 | Is a watchdog timer needed to auto-thaw filesystems if the hypervisor crashes mid-snapshot? | Reliability |
+| # | Decision |
+|---|---|
+| D1 | `guest-suspend-ram` is **opt-in**: disabled by default. Enable via `[features] suspend_ram = true` in `config.toml`. |
+| D2 | `guest-fstrim` is **included**: enabled by default; can be disabled via `[features] fstrim = false` in `config.toml`. |
+| D3 | The threat model for the configuration file is **out of scope**: if the host can overwrite `/etc/qeminga/config.toml` it can replace the agent binary entirely. OS-level file permissions are the appropriate control. |
+| D4 | A watchdog timer to auto-thaw filesystems if the hypervisor crashes mid-snapshot is **required**. The default timeout is 30 seconds and is configurable via `[agent] fsfreeze_watchdog_secs` in `config.toml`. |
 
 ---
 

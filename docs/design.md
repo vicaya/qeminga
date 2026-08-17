@@ -3,7 +3,7 @@
 ## Minimum Secure Subset of QEMU Guest Agent in Rust
 
 **Status:** Draft  
-**Last updated:** 2026-08-16
+**Last updated:** 2026-08-17
 
 ---
 
@@ -106,7 +106,7 @@ Only the commands in the following table are implemented. All other commands rec
 | Command | Direction | Description |
 |---|---|---|
 | `guest-ping` | host → guest | Liveness check; replies `{}` |
-| `guest-info` | host → guest | Returns agent version and capability list |
+| `guest-info` | host → guest | Returns agent version and a QAPI-compatible capability list (§3.1) |
 | `guest-sync` | host → guest | Synchronises the request ID for in-flight message tracking |
 | `guest-sync-delimited` | host → guest | Echo back the sync ID; prepend a `0xFF` sentinel byte to the response (and expect one in the request) so clients can flush stale partial JSON from a previous connection |
 | `guest-get-osinfo` | host → guest | Returns OS name, kernel release, kernel version, machine architecture, and `/etc/os-release` fields `ID`, `NAME`, `PRETTY_NAME`, `VERSION`, `VERSION_ID`, `VARIANT`, `VARIANT_ID` (read-only; **does not** return `/etc/machine-id`) |
@@ -119,6 +119,14 @@ Only the commands in the following table are implemented. All other commands rec
 | `guest-fstrim` | host → guest | Calls `FITRIM` ioctl to discard unused blocks (storage efficiency) |
 | `guest-shutdown` | host → guest | Initiates a clean shutdown. Accepts optional `mode` ∈ `{"halt", "powerdown", "reboot"}` (default `"powerdown"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. |
 | `guest-suspend-ram` | host → guest | Suspends guest to RAM (S3) — **opt-in, disabled by default** via `[features] suspend_ram = false` in `config.toml` |
+
+### 3.1 `guest-info` Capability Contract
+
+`guest-info` uses the upstream-compatible `GuestAgentInfo` shape: a build version and a `supported_commands` array (the member name deliberately uses an underscore). Each `GuestAgentCommandInfo` entry contains `name`, `enabled`, and `success-response`.
+
+Every command in §3 appears exactly once. `guest-suspend-ram` remains listed with `"enabled": false` when its Cargo feature is absent or its runtime setting is off; `guest-fstrim` similarly remains listed when disabled at runtime. The remaining implemented commands report `"enabled": true` in normal operation. A temporary `Frozen` state does not change these advertised capabilities; it is enforced by the lifecycle gate in §5.3.
+
+`guest-shutdown` is the sole listed command with `"success-response": false`; every other listed command has `"success-response": true`. Denied commands do not appear in `supported_commands`.
 
 ---
 
@@ -203,10 +211,10 @@ Mount order is load-bearing: the freeze plan is traversed in reverse mount order
 
 **Errno handling during freeze:**
 - `EOPNOTSUPP` — the filesystem does not implement freeze (e.g. tmpfs, proc). Counted as skipped, not as frozen.
-- `EBUSY` — the superblock is already frozen. This is non-fatal (for example, a concurrent freezer may hold it) and is retained in the thaw plan.
+- `EBUSY` — the superblock is already frozen. This is non-fatal (for example, a concurrent freezer may hold it) and does **not** increment the freeze result: only successful `FIFREEZE` calls count as frozen by qeminga. It is retained in the thaw plan by deliberate compatibility policy. Because nesting depth is unknowable during recovery, qeminga drains all planned filesystems; a concurrent in-guest freezer is therefore unsupported and may have its freeze released by qeminga's later thaw.
 - Any other errno — treated as a hard error. All previously processed filesystems are thawed immediately in forward order; the recovery marker remains until the drain completes.
 
-Thaw is not idempotent at the kernel level. Multiple successful `FIFREEZE` calls can require multiple `FITHAW` calls, and a prior agent or another freezer can hold an unknown nesting depth. For each eligible mountpoint, qeminga issues `FITHAW` until it returns an error, counting a filesystem at most once when at least one call succeeds. A thaw received while qeminga believes it is `Thawed` still performs this recovery drain rather than returning a no-op.
+Thaw is not idempotent at the kernel level. Multiple successful `FIFREEZE` calls can require multiple `FITHAW` calls, and a prior agent or another freezer can hold an unknown nesting depth. For each eligible mountpoint, including an `EBUSY` entry retained above, qeminga issues `FITHAW` until it returns an error, counting a filesystem at most once when at least one call succeeds. A thaw received while qeminga believes it is `Thawed` still performs this recovery drain rather than returning a no-op.
 
 ### 4.3 Request Lifecycle
 
@@ -256,7 +264,7 @@ A per-freeze watchdog runs as a cancellable async task. It ensures that a hyperv
 
 **Blocking requirement:** only the `FIFREEZE` and `FITHAW` ioctls run through `spawn_blocking`; the timer, refresh, cancellation, and state transition remain on the async runtime. The watchdog hands its thaw drain to `spawn_blocking` only after it wins the state transition.
 
-**Recovery marker:** `state_path` is an atomically-created marker on an unfreezable runtime filesystem (default `/run/qeminga/frozen`). qeminga writes and syncs it before the first `FIFREEZE`, and removes it only after a complete thaw drain. A startup that finds the marker enters `Frozen` recovery mode, defers normal log and pid-file creation, keeps using the in-memory audit buffer, and accepts only the frozen-safe command set until thaw succeeds. The marker can be stale after a reboot or an external thaw; qeminga deliberately treats it pessimistically, because an unnecessary thaw is safer than proceeding while a filesystem might be frozen. This also recovers from `SIGKILL`, a seccomp kill, or a panic during freeze.
+**Recovery marker:** `state_path` is an atomically-created marker on an unfreezable runtime filesystem (default `/run/qeminga/frozen`). The service manager provisions `/run/qeminga` before startup (§8.4), so qeminga creates the marker with `openat(..., O_CREAT|O_EXCL)`, `fsync`s it before the first `FIFREEZE`, and removes it with `unlinkat` only after a complete thaw drain. A startup that finds the marker enters `Frozen` recovery mode, defers normal log and pid-file creation, keeps using the in-memory audit buffer, and accepts only the frozen-safe command set until thaw succeeds. A reboot clears the default `/run` marker and resets the kernel freeze state together; an external thaw can still leave a stale marker, which qeminga treats pessimistically because an unnecessary thaw is safer than proceeding while a filesystem might be frozen. This also recovers from `SIGKILL`, a seccomp kill, or a panic during freeze.
 
 ---
 
@@ -280,7 +288,7 @@ match req.method.as_str() {
     "guest-fsfreeze-freeze"   => handlers::fsfreeze_freeze(req),
     "guest-fsfreeze-freeze-list" => handlers::fsfreeze_freeze_list(req),
     "guest-fsfreeze-thaw"     => handlers::fsfreeze_thaw(req),
-    "guest-fstrim"            => handlers::fstrim(req),
+    "guest-fstrim" if config.fstrim_enabled() => handlers::fstrim(req),
     "guest-shutdown"          => handlers::shutdown(req),
     "guest-suspend-ram" if config.suspend_ram_enabled() => handlers::suspend_ram(req),
     _                         => Err(Error::CommandNotFound(req.method)),
@@ -348,6 +356,7 @@ Each profile covers both the multi-threaded tokio runtime and the agent's allowe
 | Surface | Required operations |
 |---|---|
 | File, metadata, and channel I/O | `read`, `write`, `readv`, `writev`, `close`, `openat`, `fcntl`, `ioctl`, `lseek`, `pread64`, `pwrite64`, `newfstatat`, `statx`, `statfs`, `fstatfs`, `getdents64` |
+| Recovery marker | `openat` with `O_CREAT|O_EXCL`, `fsync`, and `unlinkat`; systemd creates the parent directory, so qeminga does not need `mkdirat` |
 | Runtime and reactor | Memory management; `clone`/`clone3`; robust-list, thread-ID, `rseq`, futex, scheduling, and `prlimit64` support; epoll, eventfd, and portable polling operations; signals, clocks, identity queries, and randomness |
 | OS and network information | `uname` for `guest-get-osinfo`; `socket`, `bind`, `sendto`/`sendmsg`, `recvmsg`, and `getsockname` for the netlink exchange used by `guest-network-get-interfaces` |
 | Privileged handlers | `reboot`; `ioctl` restricted by request number to `FIFREEZE`, `FITHAW`, and `FITRIM` |
@@ -360,7 +369,7 @@ The `kernel` module is the single location permitted to use `unsafe`. Every non-
 
 ### 5.7 Process Failure and Channel Recovery
 
-Release builds use `panic = "abort"` and rely on the service manager to restart the process. A panic or seccomp kill never attempts a best-effort write or thaw from an indeterminate state; the pre-freeze marker forces the restarted process into the conservative recovery path in §4.4. A graceful stop requested while frozen is deferred until thaw; a forced stop leaves the marker in place.
+Release builds use `panic = "abort"` and rely on the service manager to restart the process. A panic or seccomp kill never attempts a best-effort write or thaw from an indeterminate state; the pre-freeze marker forces the restarted process into the conservative recovery path in §4.4. A graceful stop requested while frozen is deferred until thaw only when the unit's `TimeoutStopSec` exceeds `fsfreeze_max_timeout_secs` plus a thaw-drain margin (§8.4); otherwise it intentionally degrades to the forced-stop recovery path. A forced stop leaves the marker in place.
 
 Channel EOF or HUP closes both channel handles, discards any partial frame, and retries opening the configured channel with bounded backoff. Reconnection never resets `FreezeState`, cancels a watchdog, clears the recovery marker, or enables the normal audit sink while frozen. A newly connected peer starts with a clean decoder and should use `guest-sync-delimited` to establish stream synchronisation.
 
@@ -475,11 +484,15 @@ SUBSYSTEM=="virtio-ports", ATTR{name}=="org.qemu.guest_agent.0", \
     OWNER="qeminga", GROUP="qeminga", MODE="0600"
 ```
 
-Without this rule, any process running as the same user as the agent (or root) can open the channel and send commands directly to QEMU.
+The agent runs as UID 600 (§5.4) and cannot open the port under its default `root:root` `0600` ownership; this rule transfers ownership to the dedicated `qeminga` account. The residual exposure is that a process running as `qeminga` or as root can still open the channel and speak directly to QEMU. The `qeminga` account therefore has no login shell and is used only by the service. This rule protects against unprivileged co-tenants, not a root process.
 
 ### 8.4 Packaging and Service Conflict
 
-qeminga and `qemu-guest-agent` must never run together: both contend for the single-open channel and can race responses even if both start successfully. A distribution package declares a package conflict where supported, and the qeminga system unit uses `Conflicts=qemu-guest-agent.service`. Installation stops and disables the upstream service before enabling qeminga; a migration does not share or multiplex the existing channel.
+qeminga and `qemu-guest-agent` must never run together: both contend for the single-open channel and can race responses even if both start successfully. A distribution package declares a package conflict where supported, and the qeminga system unit uses `Conflicts=qemu-guest-agent.service` plus explicit ordering after that unit. Installation stops and disables the upstream service before enabling qeminga; a migration does not share or multiplex the existing channel.
+
+The shipped systemd unit also binds to and starts after the specific virtio-port device, starts before ordinary multi-user workloads, and creates `/run/qeminga` through `RuntimeDirectory=qeminga` with ownership provisioned for the `qeminga` account. This lets the recovery marker use `openat(..., O_CREAT|O_EXCL)` without a runtime `mkdirat`. For the default `fsfreeze_max_timeout_secs = 300`, it sets `TimeoutStopSec=330s`; any change to the hard cap must keep `TimeoutStopSec` greater than that cap plus a thaw-drain margin, or service-stop deferral deliberately falls back to marker recovery (§5.7).
+
+At startup, an `EBUSY` opening the channel is a terminal, explicit `channel_already_open` error, not an in-process retry. This makes a boot-time single-open race with a leftover agent, debugger, or local process visible to the operator instead of presenting as a healthy but unreachable agent.
 
 ### 8.5 Supported Platform Matrix
 
@@ -489,6 +502,7 @@ qeminga and `qemu-guest-agent` must never run together: both contend for the sin
 | Architectures | `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, each with its own seccomp profile and CI coverage |
 | Kernel | Linux 5.4 or newer with seccomp-BPF and the requested filesystem ioctls available |
 | Execution context | A systemd-managed VM in the initial user namespace; unprivileged containers are unsupported for freeze/trim |
+| Runtime state | systemd creates `/run/qeminga` for the recovery marker before the daemon starts; qeminga never creates this directory after seccomp is installed |
 | Freeze coverage | ext4 and XFS are required interoperability targets; other local filesystems are eligible only when their `FIFREEZE` behavior is tested |
 | Excluded mounts | Pseudo and network filesystems; duplicate bind mounts are de-duplicated by filesystem identity |
 
@@ -540,7 +554,22 @@ While frozen, records accumulate in the ring. On overflow, the oldest records ar
 
 ---
 
-## 11. Acceptance Criteria
+## 11. Improvements Over Upstream `qemu-ga` Beyond Rust
+
+qeminga is a deliberately constrained replacement for the general-purpose upstream agent, not a feature-for-feature successor. The following are design and implementation improvements independent of the choice of programming language; they describe qeminga's security and operational contract rather than claiming that every upstream deployment lacks equivalent local hardening.
+
+| Area | qeminga improvement | Operational effect |
+|---|---|---|
+| Command exposure | A source-reviewed, default-deny command subset replaces the broad, configurable general-purpose RPC surface. Denied execution, file-I/O, credential, and topology-mutation commands cannot be enabled by runtime configuration. | Reduces the host-to-guest control surface to lifecycle and snapshot operations. |
+| Host-input containment | Fixed frame, nesting, string, and audit-field bounds are paired with deterministic newline and `0xFF` resynchronisation. | Malformed or oversized channel input cannot permanently desynchronise the protocol or grow audit work without bound. |
+| Privilege containment | Dedicated-account execution, a bounded capability set, `PR_SET_NO_NEW_PRIVS`, and target-specific seccomp policies are normative and verified with an installed-filter command matrix. | Limits the damage of a parser or handler defect after the channel is opened. |
+| Freeze liveness and recovery | An idle-plus-hard-cap watchdog bounds abandoned snapshots; a pre-freeze marker on `/run` drives conservative restart recovery and disappears with the kernel's freeze state on reboot. | Avoids indefinite freezes while avoiding stale persistent recovery state after a reboot. |
+| Freeze-window auditability | A byte-bounded in-memory audit ring defers sink I/O, records loss on overflow, and flushes after thaw. | Preserves useful audit evidence without allowing journald or another frozen filesystem to deadlock the thaw path. |
+| Deployment guardrails | Single-open startup failures are explicit, the upstream service is conflicted, and systemd creates the marker directory and couples stop timing to the freeze bound. | Turns common migration and boot-time availability failures into observable configuration errors. |
+
+---
+
+## 12. Acceptance Criteria
 
 | ID | Criterion |
 |---|---|
@@ -558,7 +587,8 @@ While frozen, records accumulate in the ring. On overflow, the oldest records ar
 | AC12 | `guest-shutdown` does not emit a JSON-RPC success response on the channel; the VM exits cleanly. |
 | AC13 | Under sustained logging volume with a filled journald pipe, a freeze/thaw cycle completes without a write to a frozen filesystem; any ring overflow is reported after thaw. |
 | AC14 | The frame decoder survives a `cargo fuzz` corpus for at least one hour with no panic, hang, or unbounded allocation, including oversized-frame discard and resynchronisation cases. |
-| AC15 | With seccomp **installed**, the full allowed-command matrix passes on x86-64 and arm64 in CI, including after every dependency update. |
+| AC15 | With seccomp **installed**, the full allowed-command matrix passes on x86-64 and arm64 in CI, including a freeze/thaw cycle that creates the marker with `openat(O_CREAT|O_EXCL)`, `fsync`s it, and removes it with `unlinkat`, and after every dependency update. |
 | AC16 | Against real libvirt, `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh domshutdown --mode agent` succeed. |
-| AC17 | Freeze succeeds with tmpfs and bind mounts present and can open a mode-0700 local mountpoint; unsupported or duplicate mounts do not turn the operation into a hard failure. |
+| AC17 | Freeze succeeds with tmpfs and bind mounts present and can open a mode-0700 local mountpoint; unsupported or duplicate mounts do not turn the operation into a hard failure, and an `EBUSY` mount does not inflate qeminga's freeze count. |
 | AC18 | Channel EOF/reopen during a freeze preserves the recovery marker and frozen state; after reconnection, a thaw request completes successfully. |
+| AC19 | `guest-info` returns `version` and `supported_commands` with `name`, `enabled`, and `success-response`; disabled optional commands remain listed as disabled, `guest-shutdown` reports `success-response: false`, and denied commands are absent. |

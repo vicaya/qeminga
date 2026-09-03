@@ -48,8 +48,10 @@ jobs:
         id: duration
         run: |
           if [ "${{ github.event_name }}" = "schedule" ]; then echo "secs=3600" >> "$GITHUB_OUTPUT"; else echo "secs=60" >> "$GITHUB_OUTPUT"; fi
+      # The prebuilt cargo-fuzz binary is statically linked against musl and
+      # defaults --target to its own build triple, so name the host triple.
       - name: Fuzz
-        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${{ steps.duration.outputs.secs }} -max_len=131072
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=${{ steps.duration.outputs.secs }} -max_len=131072
       - name: Upload crash artifacts
         if: failure()
         uses: actions/upload-artifact@v4

@@ -37,6 +37,8 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 governor = "0.10"
+# Audit digest of over-long method names (design §5.2, C-4).
+sha2 = "0.10"
 nix = { version = "0.31", features = ["fs", "ioctl", "user", "reboot", "net", "feature", "process", "signal", "poll"] }
 caps = "0.5"
 seccompiler = { version = "0.5", optional = true }

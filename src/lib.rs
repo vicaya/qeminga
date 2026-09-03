@@ -10,6 +10,7 @@
 //! in CI.
 #![deny(unsafe_code)]
 
+pub mod audit;
 pub mod framing;
 pub mod proto;
 

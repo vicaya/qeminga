@@ -214,7 +214,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the scanner is a fuzz target in T5.1 alongside the decoder.
 
 #### T1.4 — `audit`: records, method projection, freeze-safe ring ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 Logging, §5.2 (method projection), §9, §9.1, G7, AC13 (in-process part).
 - **Depends on:** T0.*
 - **Files:** `src/audit.rs`, `Cargo.toml` (add `sha2`).

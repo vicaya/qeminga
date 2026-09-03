@@ -198,7 +198,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** property tests pass with `PROPTEST_CASES=2000`; this module is the first fuzz target (T5.1).
 
 #### T1.3 — `proto::bounds`: nesting-depth and string-length limits ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.2 items 2–3, AC14.
 - **Depends on:** T1.1
 - **Files:** `src/proto.rs` (submodule `bounds`) or `src/proto/bounds.rs`.

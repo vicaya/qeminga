@@ -12,6 +12,8 @@
 //! [`ErrorClass::GenericError`] for everything else.
 #![forbid(unsafe_code)]
 
+pub mod bounds;
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -254,9 +256,12 @@ impl Response {
 
 /// Parses one frame into a [`Request`].
 ///
-/// Any failure is reported as [`Error::InvalidRequest`] with a description
-/// that does not echo attacker-controlled bytes.
+/// The depth, string-length and UTF-8 bounds of [`bounds`] are checked
+/// before any JSON parsing. Any failure is reported as
+/// [`Error::InvalidRequest`] with a description that does not echo
+/// attacker-controlled bytes.
 pub fn parse_request(bytes: &[u8]) -> Result<Request, Error> {
+    bounds::check_bounds(bytes).map_err(|err| Error::InvalidRequest(err.to_string()))?;
     serde_json::from_slice::<Request>(bytes).map_err(|err| Error::InvalidRequest(describe(&err)))
 }
 
@@ -560,6 +565,39 @@ mod tests {
         assert!(!err.to_string().contains("SECRET-TOKEN"), "{err}");
         let err = parse_request(b"SECRET-GARBAGE").unwrap_err();
         assert!(!err.to_string().contains("SECRET"), "{err}");
+    }
+
+    #[test]
+    fn parse_request_applies_bounds_before_serde() {
+        // 33 nested arrays inside `arguments` would be a schema error for
+        // serde (arguments must be an object) but the bounds check runs
+        // first and names the depth violation.
+        let mut v = b"{\"execute\":\"guest-ping\",\"arguments\":".to_vec();
+        v.extend(std::iter::repeat_n(b'[', 33));
+        v.extend(std::iter::repeat_n(b']', 33));
+        v.push(b'}');
+        let err = parse_request(&v).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest(bounds::BoundsError::DepthExceeded.to_string())
+        );
+
+        // An over-long method name is rejected by the string bound, not by
+        // the allowlist, so no 4 KiB string is ever allocated.
+        let mut v = b"{\"execute\":\"".to_vec();
+        v.extend(std::iter::repeat_n(b'x', bounds::MAX_STRING_BYTES + 1));
+        v.extend_from_slice(b"\"}");
+        let err = parse_request(&v).unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest(bounds::BoundsError::StringTooLong.to_string())
+        );
+
+        let err = parse_request(b"{\"execute\":\"\xff\"}").unwrap_err();
+        assert_eq!(
+            err,
+            Error::InvalidRequest(bounds::BoundsError::InvalidUtf8.to_string())
+        );
     }
 
     #[test]

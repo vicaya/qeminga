@@ -690,7 +690,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
 #### T5.6 — Mutation testing (optional) ∥
-- **Status:** in-progress (config and advisory CI job landed; surviving mutants tracked in §7)
+- **Status:** in-progress (config and advisory CI job landed; baseline run and surviving mutants recorded in §7)
 - **Design:** AC8 (test quality), §5.2.
 - **Depends on:** T1.*, T3.4
 - **Files:** `.cargo/mutants.toml`, CI job (allowed to fail initially).
@@ -730,3 +730,4 @@ the answer is a one-line change, and leave the question here.
 |---|---|---|
 | libvirt run log | `scripts/e2e-libvirt.sh` and the recipe in `docs/testing.md` exist, but no run against a real libvirt host has been recorded yet (no nested virtualisation in hosted CI or the development container). AC16 stays open until a log is attached to a PR. | T5.4 / T5.5 |
 | arm64 execution | The privileged job (T5.2) and the seccomp matrix (AC15) run on `x86_64` only. The `aarch64` profile is compiled and checked in every CI run (`cross-check-aarch64`, plus unit tests that build both profiles), but no arm64 runner executes it. Needs a public repository, a larger hosted runner, or a self-hosted arm64 machine. | T5.2 / T5.5 |
+| mutation survivors | Baseline `cargo mutants --all-features` on the examined files (186 mutants, 20 min, unit tests only per `.cargo/mutants.toml`): 120 caught, 43 unviable, 11 timeouts (the `framing.rs` decoder loops and `state.rs::starting_frozen`; a hang is a detection), 12 missed. The misses are `Context::fmt` (`dispatch.rs`), `RequestVisitor::expecting` and the two `describe` text mutants (`proto.rs`), `LifecycleHooks::on_freezing`/`on_thawed` and the `lost > 0` comparison (5, `handlers/fsfreeze.rs`), the `start_recovery` state check (2) and the negated condition in the `freeze_blocking` rollback (1). The fsfreeze ones are exercised by `tests/audit_freeze_window.rs`, `tests/startup.rs` and the E2E suites, which the unit-test-only run does not count; the proto/dispatch ones change Debug or error text only. Open: unit tests for the rollback condition and `start_recovery` from `Thawed`, then remove the advisory flag from the CI job. | T5.6 |

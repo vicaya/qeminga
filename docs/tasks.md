@@ -136,12 +136,12 @@ the answer is a one-line change, and leave the question here.
 #### T0.2 — Lint and unsafe policy `done`
 - **Design:** §5.6, AC7.
 - **Files:** `Cargo.toml` (`[lints]`), `clippy.toml`, `scripts/check-unsafe.sh`.
-- **Done:** `#![deny(unsafe_code)]` at the crate root, `#![forbid(unsafe_code)]` required in every other module, `unsafe` allowed only under `src/kernel/`, `undocumented_unsafe_blocks` on, `unwrap`/`expect`/`panic` denied outside tests.
+- **Done:** `#![deny(unsafe_code)]` at the crate root, `#![forbid(unsafe_code)]` required in every other `.rs` file (including tests, benches, examples, build scripts, and fuzz targets), `unsafe` allowed only under `src/kernel/`, `undocumented_unsafe_blocks` on, `unwrap`/`expect`/`panic` denied outside tests.
 
 #### T0.3 — Continuous integration `done`
 - **Design:** §5.8, AC6, AC7, AC8, D6.
 - **Files:** `.github/workflows/ci.yml`.
-- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit`, and an aarch64 cross-compile check. Native arm64 execution is T5.2 (the repository is private, so free arm64 runners are unavailable).
+- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit --deny warnings`, a release-profile build, and an aarch64 cross-compile check (the target is provisioned by `rust-toolchain.toml`). Native arm64 execution is T5.2 (the repository is private, so free arm64 runners are unavailable).
 
 #### T0.4 — Supply-chain policy `done`
 - **Design:** §5.8, AC6.
@@ -623,7 +623,7 @@ the answer is a one-line change, and leave the question here.
 - **Depends on:** T1.2, T1.3, T2.3, T2.5
 - **Files:** `fuzz/Cargo.toml`, `fuzz/fuzz_targets/{frame_decoder,bounds_checker,mountinfo,os_release}.rs`, `.github/workflows/fuzz.yml`, `Cargo.toml` (`[workspace] exclude = ["fuzz"]`).
 - **Tests first (red):** each target must at least run for 10 s locally without a crash; add a regression corpus directory with the AC4 oversized case and the `0xFF` resync case.
-- **Implement (green):** `cargo fuzz init`; nightly-only job: 60 s per target on PRs, 1 h per target weekly (AC14); artifacts on failure.
+- **Implement (green):** `cargo fuzz init`; every fuzz target starts with `#![forbid(unsafe_code)]` (`scripts/check-unsafe.sh` scans `fuzz/`); nightly-only job: 60 s per target on PRs, 1 h per target weekly (AC14); artifacts on failure.
 - **Done when:** the weekly job has one green run recorded in the PR description.
 
 #### T5.2 — Privileged CI job (loop-mounted ext4/xfs, caps, seccomp matrix, SIGKILL recovery)

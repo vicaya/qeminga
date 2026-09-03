@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
 # Enforces design §5.6: `unsafe` may appear only under src/kernel/, and every
-# other source file must opt out with `#![forbid(unsafe_code)]` (the crate
-# root uses `#![deny(unsafe_code)]` so that the kernel module can re-allow).
+# other Rust source file must opt out with `#![forbid(unsafe_code)]`. The
+# crate root src/lib.rs uses `#![deny(unsafe_code)]` instead so that the
+# kernel module can re-allow it.
+#
+# The compiler is the real enforcement: `forbid(unsafe_code)` rejects unsafe
+# blocks, functions, impls, traits and `#[unsafe(...)]` attributes. This
+# script makes sure the attribute is present everywhere it must be, covers
+# crates the library's attribute does not reach (tests, benches, examples,
+# build scripts, fuzz targets), and gives a fast, precise diagnostic before
+# a compile.
 #
 # Usage: scripts/check-unsafe.sh   (exit 0 = clean, 1 = violation)
 set -euo pipefail
@@ -10,18 +18,35 @@ cd "$(dirname "$0")/.."
 
 status=0
 
-# 1. No `unsafe` blocks/fns/impls/traits/extern outside src/kernel/.
-while IFS= read -r file; do
-    if grep -nE '\bunsafe[[:space:]]*(\{|fn\b|impl\b|trait\b|extern\b)' "$file" >/dev/null; then
+# Every Rust source root in the repository. Missing roots are fine; add new
+# ones here when they appear.
+mapfile -t files < <(
+    find src tests benches examples fuzz build.rs \
+        -name '*.rs' -not -path 'src/kernel/*' -not -path '*/target/*' \
+        2>/dev/null | sort
+)
+
+# Remove `// ...` line comments (including `///` and `//!` doc comments) and
+# single-line `/* ... */` block comments so prose about unsafe code is not
+# reported as unsafe code.
+strip_comments() {
+    sed -e 's,//.*$,,' -e 's,/\*.*\*/,,g' "$1"
+}
+
+pattern='\bunsafe[[:space:]]*(\{|fn\b|impl\b|trait\b|extern\b)'
+
+# 1. No unsafe blocks/fns/impls/traits/extern outside src/kernel/ (fast path;
+#    the compiler check in step 2 is authoritative).
+for file in "${files[@]}"; do
+    if strip_comments "$file" | grep -nE "$pattern" >/dev/null; then
         echo "error: unsafe code outside src/kernel/: $file" >&2
-        grep -nE '\bunsafe[[:space:]]*(\{|fn\b|impl\b|trait\b|extern\b)' "$file" >&2
+        strip_comments "$file" | grep -nE "$pattern" | sed "s,^,  $file:," >&2
         status=1
     fi
-done < <(find src -name '*.rs' -not -path 'src/kernel/*' | sort)
+done
 
-# 2. Every non-root, non-kernel module forbids unsafe_code; the crate root
-#    (src/lib.rs) must deny it.
-while IFS= read -r file; do
+# 2. Every non-kernel file carries the lint attribute the compiler enforces.
+for file in "${files[@]}"; do
     case "$file" in
         src/lib.rs)
             if ! grep -qE '^#!\[deny\(unsafe_code\)\]' "$file"; then
@@ -36,7 +61,7 @@ while IFS= read -r file; do
             fi
             ;;
     esac
-done < <(find src -name '*.rs' -not -path 'src/kernel/*' | sort)
+done
 
 # 3. Every unsafe block inside src/kernel/ must carry a SAFETY comment. Clippy's
 #    `undocumented_unsafe_blocks` lint enforces this precisely; this is only a
@@ -50,6 +75,6 @@ if [ -d src/kernel ]; then
 fi
 
 if [ "$status" -eq 0 ]; then
-    echo "ok: no unsafe code outside src/kernel/"
+    echo "ok: no unsafe code outside src/kernel/ (${#files[@]} files checked)"
 fi
 exit "$status"

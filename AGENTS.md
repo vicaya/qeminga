@@ -38,8 +38,9 @@ cargo test --locked                       # default features too
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 scripts/check-unsafe.sh
 cargo deny check                          # cargo install cargo-deny --locked
-cargo audit                               # cargo install cargo-audit --locked
+cargo audit --deny warnings              # cargo install cargo-audit --locked
 cargo check --target aarch64-unknown-linux-gnu --all-targets --all-features --locked
+cargo build --release --locked --all-features
 ```
 
 Privileged tests (root / `CAP_SYS_ADMIN`) are `#[ignore]`d, named
@@ -52,7 +53,8 @@ sudo -E cargo test --all-features -- --ignored privileged_
 ## Code rules
 
 - **No `unsafe` outside `src/kernel/`.** The crate root has
-  `#![deny(unsafe_code)]`; every other module starts with
+  `#![deny(unsafe_code)]`; every other `.rs` file (modules, tests, benches,
+  examples, build scripts, fuzz targets) starts with
   `#![forbid(unsafe_code)]`; `src/kernel/` may `#![allow(unsafe_code)]` and
   every `unsafe` block carries a `// SAFETY:` comment.
   `scripts/check-unsafe.sh` enforces this.

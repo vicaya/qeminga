@@ -43,6 +43,7 @@ deny = [
     # No dynamic plugin loading or scripting hooks (design §1.2).
     { crate = "libloading" },
     { crate = "dlopen" },
+    { crate = "dlopen2" },
 ]
 
 [sources]

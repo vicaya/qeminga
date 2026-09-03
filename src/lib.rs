@@ -16,25 +16,14 @@
 /// overridden by the runtime configuration file (design §8.2).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Returns the agent version string reported by `guest-info`.
-#[must_use]
-pub fn version() -> &'static str {
-    VERSION
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn version_is_semver_like() {
-        let parts: Vec<&str> = version().split('.').collect();
-        assert_eq!(
-            parts.len(),
-            3,
-            "expected MAJOR.MINOR.PATCH, got {}",
-            version()
-        );
+        let parts: Vec<&str> = VERSION.split('.').collect();
+        assert_eq!(parts.len(), 3, "expected MAJOR.MINOR.PATCH, got {VERSION}");
         for part in parts {
             part.parse::<u64>()
                 .unwrap_or_else(|_| panic!("non-numeric version component {part:?}"));

@@ -1,3 +1,7 @@
 target
 artifacts
 coverage
+
+# libFuzzer writes new corpus entries next to the checked-in seeds;
+# only the named seeds are tracked.
+corpus/*/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*

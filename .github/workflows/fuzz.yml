@@ -29,10 +29,15 @@ jobs:
       fail-fast: false
       matrix:
         target: [frame_decoder, bounds_checker, mountinfo, os_release]
+    # cargo-fuzz needs -Z flags, so every cargo invocation in this job must
+    # use nightly. rust-toolchain.toml pins stable and overrides `rustup
+    # default`, hence the environment variable rather than a default.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     steps:
       - uses: actions/checkout@v4
-      - name: Install nightly (cargo-fuzz needs -Z flags)
-        run: rustup toolchain install nightly --profile minimal && rustup default nightly
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal && rustup show active-toolchain
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz

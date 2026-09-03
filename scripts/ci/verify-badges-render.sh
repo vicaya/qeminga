@@ -3,7 +3,8 @@
 # it: fetch the README rendered by GitHub (the same HTML the web page
 # embeds), extract the badge image URLs GitHub rewrote, replace the
 # `badges/main/` path by the directory just published for BRANCH, and
-# require that each URL answers 200 with an SVG image content type.
+# require that each URL answers 200 with an SVG image content type for
+# an authenticated client (the repository is private).
 #
 #   GH_TOKEN=... scripts/ci/verify-badges-render.sh OWNER/REPO BRANCH
 set -eu
@@ -30,7 +31,10 @@ for url in $urls; do
             target=$url ;;
         *) target=$(printf '%s' "$url" | sed "s|/badges/main/|/badges/$branch/|") ;;
     esac
-    headers=$(curl -sS -o /dev/null -D - -L "$target" || true)
+    # Fetch as a signed-in viewer would: GitHub serves private raw content
+    # only to an authenticated client (a browser sends the session cookie,
+    # this check sends the token) and redirects to raw.githubusercontent.
+    headers=$(curl -sS -o /dev/null -D - -L -H "Authorization: Bearer ${GH_TOKEN}" "$target" || true)
     code=$(printf '%s' "$headers" | grep -i '^HTTP/' | tail -1 | awk '{print $2}')
     ctype=$(printf '%s' "$headers" | grep -i '^content-type:' | tail -1 | tr -d '\r')
     echo "$target -> $code ${ctype:-?}"

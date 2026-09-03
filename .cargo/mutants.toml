@@ -34,6 +34,6 @@ exclude_re = [
 # Each mutant runs the unit tests only; the E2E and privileged suites are
 # slow and covered by their own jobs.
 test_tool = "cargo"
-additional_cargo_test_args = ["--lib"]
+additional_cargo_test_args = ["--lib", "--locked"]
 timeout_multiplier = 3.0
 minimum_test_timeout = 60.0

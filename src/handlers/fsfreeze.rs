@@ -1011,6 +1011,115 @@ mod tests {
         list.iter().map(PathBuf::from).collect()
     }
 
+    /// Runs `f` under a WARN-level JSON subscriber and returns what it logged.
+    fn capture_warnings(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let sink = Sink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        tracing::subscriber::with_default(
+            crate::audit::subscriber(tracing::Level::WARN, router),
+            f,
+        );
+        String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
+    }
+
+    /// A context whose audit router has a tiny ring, plus a writer into it.
+    fn ring_ctx(capacity: usize) -> (Arc<Context>, Router) {
+        let router = Router::with_ring_capacity(Box::new(std::io::sink()), capacity);
+        let ctx = Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            router.clone(),
+        );
+        (Arc::new(ctx), router)
+    }
+
+    #[test]
+    fn lifecycle_hooks_enter_ring_on_freezing_and_flush_on_thawed() {
+        use tracing_subscriber::fmt::MakeWriter;
+        let (ctx, router) = ring_ctx(64);
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        LifecycleHooks.on_freezing(&ctx);
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
+        // Nothing lost: the thaw flushes silently.
+        let text = capture_warnings(|| LifecycleHooks.on_thawed(&ctx));
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(!text.contains("audit_ring_overflowed"), "{text}");
+        // Overflow the ring during a second window: the thaw reports the loss.
+        LifecycleHooks.on_freezing(&ctx);
+        for _ in 0..8 {
+            std::io::Write::write_all(&mut router.make_writer(), &[b'x'; 30]).unwrap();
+        }
+        assert!(router.lost() > 0);
+        let text = capture_warnings(|| LifecycleHooks.on_thawed(&ctx));
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(
+            text.contains("\"event\":\"audit_ring_overflowed\""),
+            "{text}"
+        );
+        assert!(text.contains("\"lost\":"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn start_recovery_requires_the_frozen_state() {
+        let rig = Rig::new(FreezeState::Thawed, "nested.txt");
+        let err = start_recovery(&rig.ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("requires the Frozen state"),
+            "{err}"
+        );
+        assert!(rig.hooks.events().is_empty());
+
+        let rig = Rig::new(FreezeState::Frozen, "nested.txt");
+        start_recovery(&rig.ctx).unwrap();
+        assert_eq!(rig.hooks.events(), vec!["freezing", "frozen"]);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[test]
+    fn rollback_tolerates_a_marker_removed_meanwhile() {
+        // A hard error on the second target rolls back the first; if the
+        // marker vanished during the freeze, its absence is not an error.
+        let rig = Rig::nested();
+        let marker_path = rig.marker().path().to_path_buf();
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        rig.kernel.set_hook(Box::new(move |call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new("/home/data")) {
+                let _ = std::fs::remove_file(&marker_path);
+            }
+        }));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut result = None;
+        let text = capture_warnings(|| {
+            result = Some(runtime.block_on(freeze(
+                &rig.ctx,
+                &req(r#"{"execute":"guest-fsfreeze-freeze"}"#),
+            )));
+        });
+        let err = result.unwrap().unwrap_err();
+        assert!(
+            err.to_string().contains("freeze of /home/data failed"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert!(text.contains("\"event\":\"fsfreeze_rollback\""), "{text}");
+        assert!(!text.contains("marker_remove_failed"), "{text}");
+    }
+
     #[tokio::test]
     async fn status_reports_thawed_or_frozen() {
         for (state, expected, heartbeats) in [

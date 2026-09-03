@@ -568,6 +568,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_error_description_names_the_category_and_position() {
+        // Syntax: a missing colon on line 1.
+        let err = parse_request(br#"{"execute" "guest-ping"}"#).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid request: malformed JSON at line 1 column 12"
+        );
+        // Eof: an unterminated object.
+        let err = parse_request(b"{\"execute\":\"guest-ping\"").unwrap_err();
+        assert_eq!(err.to_string(), "invalid request: unexpected end of input");
+        // Data: valid JSON that violates the schema (non-string execute).
+        let err = parse_request(br#"{"execute":7}"#).unwrap_err();
+        assert!(
+            err.to_string().starts_with(
+                "invalid request: request does not match the schema at line 1 column "
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn parse_request_applies_bounds_before_serde() {
         // 33 nested arrays inside `arguments` would be a schema error for
         // serde (arguments must be an object) but the bounds check runs

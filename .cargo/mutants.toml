@@ -23,11 +23,13 @@ exclude_globs = [
     "src/kernel/fake.rs",
 ]
 # Mutants that only change log text or Debug output are noise.
+# (cargo-mutants names a mutant like "replace <impl std::fmt::Debug for
+# Context>::fmt -> std::fmt::Result with Ok(Default::default())".)
 exclude_re = [
-    "impl Debug",
-    "impl Display",
-    "fn fmt",
-    "tracing::",
+    "Debug for",
+    "Display for",
+    "::fmt ",
+    "::expecting ",
 ]
 # Each mutant runs the unit tests only; the E2E and privileged suites are
 # slow and covered by their own jobs.

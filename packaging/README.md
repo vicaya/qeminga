@@ -48,7 +48,10 @@ waiting for the thaw. `tests/packaging.rs` checks the shipped pair.
 ## Recovery marker
 
 `/run/qeminga/frozen` is created before the first `FIFREEZE` and removed
-after a complete thaw (§4.4). `RuntimeDirectoryPreserve=yes` keeps the
+after a complete thaw (§4.4). The daemon creates it after dropping to
+the `qeminga` account, so the unit's `ExecStartPre=+chown` hands
+`/run/qeminga` (created root-owned by `RuntimeDirectory=`, mode 0700) to
+that account on every start. `RuntimeDirectoryPreserve=yes` keeps the
 directory across `systemctl stop`, so a marker left by a forced stop makes
 the next start enter recovery mode; a reboot clears `/run` and the kernel
 freeze state together. Never put `state_path` on a filesystem the freeze

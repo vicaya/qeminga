@@ -92,6 +92,14 @@ fn unit_provisions_and_preserves_the_runtime_directory() {
     let exec = values(&unit, "Service", "ExecStart");
     assert_eq!(exec[0], "/usr/bin/qeminga");
     assert!(exec.contains(&"/etc/qeminga/config.toml"));
+    // Without User= the runtime directory is created root-owned and 0700;
+    // the marker is created after the drop to `qeminga`, so the directory
+    // must be handed over first, with full privileges (`+`).
+    let pre = values(&unit, "Service", "ExecStartPre");
+    assert_eq!(pre[0], "+/usr/bin/chown", "{pre:?}");
+    assert_eq!(pre[1], "qeminga:qeminga", "{pre:?}");
+    assert_eq!(pre[2], "/run/qeminga", "{pre:?}");
+    assert_eq!(values(&unit, "Service", "RuntimeDirectoryMode"), ["0700"]);
     // The daemon drops privileges itself; systemd must not pre-empt it.
     assert!(values(&unit, "Service", "User").is_empty());
     assert!(values(&unit, "Service", "NoNewPrivileges").is_empty());

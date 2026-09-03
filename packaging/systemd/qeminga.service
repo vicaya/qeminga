@@ -3,9 +3,12 @@
 # The daemon starts as root to open the channel, then drops to the
 # `qeminga` account and installs seccomp itself (design §5.4, §5.5), so
 # no User= or NoNewPrivileges= here. RuntimeDirectory= provisions
-# /run/qeminga for the recovery marker; RuntimeDirectoryPreserve=yes keeps
-# it across stops so a marker survives (§5.7). TimeoutStopSec must exceed
-# fsfreeze_max_timeout_secs plus a thaw-drain margin (300 + 30).
+# /run/qeminga for the recovery marker; because there is no User=, systemd
+# creates it root-owned, so ExecStartPre hands it to the service account
+# before the drop (the marker is created after the drop, §4.4).
+# RuntimeDirectoryPreserve=yes keeps it across stops so a marker survives
+# (§5.7). TimeoutStopSec must exceed fsfreeze_max_timeout_secs plus a
+# thaw-drain margin (300 + 30).
 
 [Unit]
 Description=qeminga QEMU guest agent (minimum secure subset)
@@ -18,6 +21,7 @@ Before=multi-user.target
 
 [Service]
 Type=simple
+ExecStartPre=+/usr/bin/chown qeminga:qeminga /run/qeminga
 ExecStart=/usr/bin/qeminga --config /etc/qeminga/config.toml
 Restart=always
 RestartSec=1s

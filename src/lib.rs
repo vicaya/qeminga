@@ -13,6 +13,7 @@
 pub mod audit;
 pub mod channel;
 pub mod config;
+pub mod daemon;
 pub mod dispatch;
 pub mod framing;
 pub mod freeze_plan;
@@ -26,6 +27,8 @@ pub mod proto;
 pub mod seccomp;
 pub mod state;
 pub mod watchdog;
+
+pub use daemon::{Options, parse_args, run};
 
 /// Agent version reported by `guest-info`.
 ///

@@ -50,12 +50,70 @@ fn short_version_alias_matches_long_flag() {
     assert_eq!(short.stdout, long.stdout);
 }
 
+/// Exit status for a configuration problem (`EX_CONFIG` from sysexits).
+const EX_CONFIG: i32 = 78;
+
 #[test]
-fn no_arguments_is_a_usage_error_until_daemon_mode_exists() {
-    let output = qeminga().output().expect("failed to run qeminga");
-    assert_eq!(output.status.code(), Some(EX_USAGE), "expected EX_USAGE");
+fn cli_accepts_config_path_and_version() {
+    // `--config PATH` is honoured: a missing file is a configuration error
+    // that names the path, before anything else is attempted.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let missing = dir.path().join("missing.toml");
+    let output = qeminga()
+        .arg("--config")
+        .arg(&missing)
+        .output()
+        .expect("failed to run qeminga");
+    assert_eq!(output.status.code(), Some(EX_CONFIG), "expected EX_CONFIG");
     let stderr = stderr_of(&output);
-    assert!(stderr.contains("not implemented"), "stderr was: {stderr}");
+    assert!(stderr.contains("missing.toml"), "stderr was: {stderr}");
+    // `--config=PATH` too.
+    let output = qeminga()
+        .arg(format!("--config={}", missing.display()))
+        .output()
+        .expect("failed to run qeminga");
+    assert_eq!(output.status.code(), Some(EX_CONFIG));
+    // An invalid file names the offending key.
+    let bad = dir.path().join("bad.toml");
+    std::fs::write(&bad, "[agent]\nfsfreeze_idle_timeout_secs = 0\n").expect("write");
+    let output = qeminga()
+        .arg("--config")
+        .arg(&bad)
+        .output()
+        .expect("failed to run qeminga");
+    assert_eq!(output.status.code(), Some(EX_CONFIG));
+    assert!(stderr_of(&output).contains("fsfreeze_idle_timeout_secs"));
+    // `--config` without a value is a usage error.
+    let output = qeminga()
+        .arg("--config")
+        .output()
+        .expect("failed to run qeminga");
+    assert_eq!(output.status.code(), Some(EX_USAGE));
+    assert!(stderr_of(&output).contains("usage:"));
+    // `--version` wins over everything else.
+    let output = qeminga()
+        .args(["--config", "/nonexistent.toml", "--version"])
+        .output()
+        .expect("failed to run qeminga");
+    assert!(output.status.success());
+    assert!(stdout_of(&output).starts_with("qeminga "));
+}
+
+#[test]
+fn no_arguments_uses_the_default_config_path() {
+    // The default /etc/qeminga/config.toml is absent on a build host, so
+    // the daemon exits with EX_CONFIG naming it (and never touches a device).
+    let output = qeminga().output().expect("failed to run qeminga");
+    if output.status.code() == Some(EX_CONFIG) {
+        let stderr = stderr_of(&output);
+        assert!(
+            stderr.contains("/etc/qeminga/config.toml"),
+            "stderr was: {stderr}"
+        );
+    } else {
+        // A host that really has a configuration is out of scope here.
+        eprintln!("skipped: /etc/qeminga/config.toml exists");
+    }
 }
 
 #[test]

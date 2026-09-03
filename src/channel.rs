@@ -78,7 +78,8 @@ pub enum OpenError {
 }
 
 impl OpenError {
-    fn from_io(path: &Path, source: io::Error) -> Self {
+    /// Classifies an `open(2)` failure for `path`.
+    pub fn from_io(path: &Path, source: io::Error) -> Self {
         match source.raw_os_error().map(Errno::from_raw) {
             Some(Errno::EBUSY) => OpenError::AlreadyOpen {
                 path: path.to_owned(),
@@ -328,7 +329,7 @@ pub async fn serve<H: Handle>(
     handler: &H,
     cancel: Cancel,
 ) -> Result<(), OpenError> {
-    serve_with_backoff(path, open, handler, cancel, Backoff::default()).await
+    serve_inner(path, open, handler, cancel, None, Backoff::default()).await
 }
 
 /// Bounds of the pause between sessions (§5.7); production uses
@@ -355,9 +356,34 @@ pub async fn serve_with_backoff<H: Handle>(
     path: &Path,
     open: OpenFn,
     handler: &H,
-    mut cancel: Cancel,
+    cancel: Cancel,
     backoff: Backoff,
 ) -> Result<(), OpenError> {
+    serve_inner(path, open, handler, cancel, None, backoff).await
+}
+
+/// [`serve`] whose first session uses an already open descriptor (the one
+/// `main` opened before dropping privileges, §5.4 step 1); later sessions
+/// reopen through `open`.
+pub async fn serve_with_initial<H: Handle>(
+    path: &Path,
+    open: OpenFn,
+    handler: &H,
+    cancel: Cancel,
+    initial: Option<OwnedFd>,
+) -> Result<(), OpenError> {
+    serve_inner(path, open, handler, cancel, initial, Backoff::default()).await
+}
+
+async fn serve_inner<H: Handle>(
+    path: &Path,
+    open: OpenFn,
+    handler: &H,
+    mut cancel: Cancel,
+    initial: Option<OwnedFd>,
+    backoff: Backoff,
+) -> Result<(), OpenError> {
+    let mut initial = initial;
     // Zero before the first open; afterwards the pause before each reopen.
     let mut reopen_delay = Duration::ZERO;
     loop {
@@ -370,8 +396,20 @@ pub async fn serve_with_backoff<H: Handle>(
                 () = wait_cancel(&mut cancel) => return Ok(()),
             }
         }
-        let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
-            return Ok(());
+        let channel = match initial.take() {
+            Some(fd) => match Channel::from_fd(fd) {
+                Ok(channel) => channel,
+                Err(err) => {
+                    tracing::warn!(event = "channel_register_failed", error = %err, "cannot register the initial channel; reopening");
+                    continue;
+                }
+            },
+            None => {
+                let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
+                    return Ok(());
+                };
+                channel
+            }
         };
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
         let (reader, writer) = tokio::io::split(channel);

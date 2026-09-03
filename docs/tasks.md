@@ -595,7 +595,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the compatibility run produces zero `SECCOMP` audit lines in `dmesg` for the full matrix on both architectures.
 
 #### T4.6 — `main`: startup sequence, recovery mode, signals
-- **Status:** todo
+- **Status:** done
 - **Design:** §6 (`main.rs`), §5.4/§5.5 order, §4.4 (recovery mode), §5.7 (deferred stop), §8.2 (`state_path` validation), §8.4 (`EBUSY` terminal), C-14, C-18, C-21.
 - **Depends on:** T1.6, T3.2, T3.3, T3.5, T3.6, T4.1, T4.4, T4.5
 - **Files:** `src/main.rs`, `src/lib.rs` (`pub fn run(opts) -> Result<ExitCode>` so the sequence is testable), `tests/startup.rs`.

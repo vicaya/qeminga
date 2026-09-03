@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod config;
+pub mod dispatch;
 pub mod framing;
 pub mod proto;
 pub mod state;

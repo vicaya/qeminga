@@ -1,0 +1,52 @@
+# cargo-deny configuration (design §5.8, AC6).
+# Run locally with: cargo deny check
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+version = 2
+db-path = "$CARGO_HOME/advisory-dbs"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# The project itself is AGPL-3.0; dependencies must be permissively licensed
+# or otherwise compatible.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "Unicode-3.0",
+]
+confidence-threshold = 0.8
+
+# The agent itself is AGPL; that licence is allowed for this crate only so a
+# copyleft dependency cannot slip in unnoticed.
+[[licenses.exceptions]]
+crate = "qeminga"
+allow = ["AGPL-3.0-only"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+deny = [
+    # No dynamic plugin loading or scripting hooks (design §1.2).
+    { crate = "libloading" },
+    { crate = "dlopen" },
+    { crate = "dlopen2" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

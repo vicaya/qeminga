@@ -7,8 +7,8 @@
 #   cargo install cargo-mutants
 #   cargo mutants --all-features
 #
-# The CI job (mutants in ci.yml) is allowed to fail while the suite is
-# being tightened; the goal is zero surviving mutants in these files.
+# The CI job (mutants in ci.yml) fails on any surviving mutant in these
+# files; timeouts (the decoder loops) count as detections.
 examine_globs = [
     "src/framing.rs",
     "src/proto.rs",

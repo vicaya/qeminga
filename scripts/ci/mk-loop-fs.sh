@@ -5,6 +5,7 @@
 #   eval "$(scripts/ci/mk-loop-fs.sh setup)"    # prints export lines
 #   scripts/ci/mk-loop-fs.sh teardown
 #
+# Images are 320 MB because mkfs.xfs refuses anything under 300 MB.
 # Exports QEMINGA_TEST_EXT4_MOUNT and, when mkfs.xfs exists,
 # QEMINGA_TEST_XFS_MOUNT. The ext4 mountpoint is mode 0700 so the freeze
 # path exercises CAP_DAC_READ_SEARCH (AC17, D7); a bind mount of it is
@@ -12,7 +13,7 @@
 set -euo pipefail
 
 BASE="${QEMINGA_LOOP_BASE:-/mnt/qeminga-test}"
-SIZE_MB="${QEMINGA_LOOP_SIZE_MB:-64}"
+SIZE_MB="${QEMINGA_LOOP_SIZE_MB:-320}"
 STATE="$BASE/.state"
 
 setup() {

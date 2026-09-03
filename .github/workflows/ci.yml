@@ -146,7 +146,10 @@ jobs:
           cargo test --all-features --locked --no-run
           cargo test --features seccomp-log,test-fakes --locked --no-run
       - name: Create loop-mounted filesystems
-        run: sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh setup | tee /tmp/loop.env
+        run: |
+          set -o pipefail
+          sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh setup | tee /tmp/loop.env
+          grep -q QEMINGA_TEST_EXT4_BIND /tmp/loop.env
       - name: Privileged tests, seccomp-log build (compatibility run)
         run: |
           set -a; . /tmp/loop.env; set +a

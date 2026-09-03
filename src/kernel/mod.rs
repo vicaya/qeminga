@@ -9,6 +9,7 @@
 //! enforce this.
 #![allow(unsafe_code)]
 
+pub mod caps;
 pub mod fake;
 pub mod ioctl;
 pub mod shutdown;

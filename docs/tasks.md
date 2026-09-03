@@ -566,7 +566,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `cargo test --features suspend_ram` and default both pass; a privileged test (T5.2) shows the service account can open `/sys/power/state` for writing once the rule is applied.
 
 #### T4.4 — Capability drop (`kernel/caps.rs`) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.4 (six ordered steps, final set), G6, D7, AC3, C-18.
 - **Depends on:** T3.1
 - **Files:** `src/kernel/caps.rs` (uses the `caps` crate; may need no `unsafe`, but lives in `kernel/` per §6), `src/main.rs`.

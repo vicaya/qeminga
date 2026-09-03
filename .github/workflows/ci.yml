@@ -113,6 +113,29 @@ jobs:
       - run: sudo systemd-sysusers --dry-run "$PWD/packaging/sysusers.d/qeminga.conf"
       - run: cargo test --locked --test packaging
 
+  # T5.6 (optional): mutation testing of the gate and errno-policy code.
+  # Allowed to fail while the suite is tightened; the report is uploaded.
+  mutants:
+    name: cargo mutants (advisory)
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-mutants
+      - run: cargo mutants --all-features --no-shuffle --in-place -j 2 -- --all-features
+      - name: Upload mutants report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out
+          if-no-files-found: ignore
+
   deny:
     name: cargo deny
     runs-on: ubuntu-24.04

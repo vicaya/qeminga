@@ -690,7 +690,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
 #### T5.6 — Mutation testing (optional) ∥
-- **Status:** todo
+- **Status:** in-progress (config and advisory CI job landed; surviving mutants tracked in §7)
 - **Design:** AC8 (test quality), §5.2.
 - **Depends on:** T1.*, T3.4
 - **Files:** `.cargo/mutants.toml`, CI job (allowed to fail initially).

@@ -1,0 +1,37 @@
+# cargo-mutants configuration (T5.6, AC8 test quality, design §5.2).
+#
+# The interesting mutants are in the gate and errno-policy code: the frame
+# decoder, the protocol types, the state machine, the dispatcher gates, and
+# the freeze/thaw algorithm. Run locally with:
+#
+#   cargo install cargo-mutants
+#   cargo mutants --all-features -- --all-features
+#
+# The CI job (mutants in ci.yml) is allowed to fail while the suite is
+# being tightened; the goal is zero surviving mutants in these files.
+examine_globs = [
+    "src/framing.rs",
+    "src/proto.rs",
+    "src/proto/bounds.rs",
+    "src/state.rs",
+    "src/dispatch.rs",
+    "src/dispatch/ratelimit.rs",
+    "src/handlers/fsfreeze.rs",
+]
+# Test doubles and the privileged/E2E plumbing are not worth mutating.
+exclude_globs = [
+    "src/kernel/fake.rs",
+]
+# Mutants that only change log text or Debug output are noise.
+exclude_re = [
+    "impl Debug",
+    "impl Display",
+    "fn fmt",
+    "tracing::",
+]
+# Each mutant runs the unit tests only; the E2E and privileged suites are
+# slow and covered by their own jobs.
+test_tool = "cargo"
+additional_cargo_test_args = ["--lib", "--all-features"]
+timeout_multiplier = 3.0
+minimum_test_timeout = 60.0

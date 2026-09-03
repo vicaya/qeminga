@@ -580,7 +580,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the privileged CI job runs the AC3 test on both architectures.
 
 #### T4.5 — Seccomp profiles (`seccomp` feature) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.5 (per-target profiles, surfaces table, ioctl argument filtering, kill default, compat logging), §8.1, AC15, C-11, C-17.
 - **Depends on:** T2.4, T3.1, T4.1, T4.4 (to know the real syscall set)
 - **Files:** `src/seccomp.rs`, `Cargo.toml` (`seccomp-log = ["seccomp"]`).

@@ -22,6 +22,8 @@ pub mod kernel;
 pub mod marker;
 pub mod mountinfo;
 pub mod proto;
+#[cfg(feature = "seccomp")]
+pub mod seccomp;
 pub mod state;
 pub mod watchdog;
 

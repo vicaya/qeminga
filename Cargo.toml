@@ -25,7 +25,9 @@ default = []
 # The runtime half lives in `[features]` of config.toml.
 seccomp = ["dep:seccompiler"]
 # Compatibility builds (design §5.5, C-17): same profile, but an unlisted
-# syscall is logged instead of killing the process. Never used in releases.
+# syscall is logged instead of killing the process. Effective in debug
+# builds only (`seccomp::log_mode`), so a release built with
+# `--all-features` still enforces.
 seccomp-log = ["seccomp"]
 suspend_ram = []
 

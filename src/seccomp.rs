@@ -212,14 +212,24 @@ pub fn rules(target: Target) -> Vec<Rule> {
     out
 }
 
-/// The default (mismatch) action: kill the process, or log under the
-/// `seccomp-log` compatibility feature (C-17).
+/// `true` when an unlisted syscall is logged instead of killing the
+/// process: the `seccomp-log` compatibility feature (C-17) **in a debug
+/// build only**. A release build always enforces, so `--all-features`
+/// (which enables `seccomp-log`) can never produce a release binary with
+/// a logging filter.
+pub const fn log_mode() -> bool {
+    cfg!(feature = "seccomp-log") && cfg!(debug_assertions)
+}
+
+/// The filter mode for the startup audit record: `"enforce"` or `"log"`.
+pub const fn mode() -> &'static str {
+    if log_mode() { "log" } else { "enforce" }
+}
+
+/// The default (mismatch) action: kill the process, or log in
+/// [`log_mode`].
 pub const fn default_action() -> &'static str {
-    if cfg!(feature = "seccomp-log") {
-        "log"
-    } else {
-        "kill_process"
-    }
+    if log_mode() { "log" } else { "kill_process" }
 }
 
 /// The name of the single filter in the JSON document.
@@ -396,15 +406,23 @@ mod tests {
     }
 
     #[test]
-    fn default_action_is_kill_process_unless_seccomp_log() {
-        if cfg!(feature = "seccomp-log") {
+    fn default_action_is_kill_process_unless_seccomp_log_in_a_debug_build() {
+        if cfg!(feature = "seccomp-log") && cfg!(debug_assertions) {
+            assert!(log_mode());
+            assert_eq!(mode(), "log");
             assert_eq!(default_action(), "log");
             assert!(profile_json(Target::current()).contains("\"mismatch_action\":\"log\""));
         } else {
+            assert!(!log_mode());
+            assert_eq!(mode(), "enforce");
             assert_eq!(default_action(), "kill_process");
             assert!(
                 profile_json(Target::current()).contains("\"mismatch_action\":\"kill_process\"")
             );
+        }
+        // A release build enforces whatever features are on.
+        if !cfg!(debug_assertions) {
+            assert_eq!(default_action(), "kill_process");
         }
         assert!(profile_json(Target::current()).contains("\"match_action\":\"allow\""));
     }

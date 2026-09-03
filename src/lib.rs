@@ -15,6 +15,8 @@ pub mod config;
 pub mod dispatch;
 pub mod framing;
 pub mod handlers;
+#[cfg(target_os = "linux")]
+pub mod kernel;
 pub mod mountinfo;
 pub mod proto;
 pub mod state;

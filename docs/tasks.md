@@ -387,7 +387,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 3 — Kernel shim, freeze plan, marker, freeze/thaw, watchdog
 
 #### T3.1 — `kernel`: the single `unsafe` module and `KernelOps` trait
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.6, §4.1 Kernel Interface, §6 (`kernel/{mod,ioctl,shutdown}.rs`), G8, §7 (`nix`).
 - **Depends on:** T0.2
 - **Files:** `src/kernel/mod.rs`, `src/kernel/ioctl.rs`, `src/kernel/shutdown.rs`, `src/kernel/fake.rs` (`#[cfg(any(test, feature = "test-fakes"))]` or under `src/kernel/mod.rs` behind `cfg(test)` plus a `pub mod testing` for integration tests).

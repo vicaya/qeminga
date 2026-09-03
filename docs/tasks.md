@@ -251,7 +251,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the watchdog (T3.5) and the thaw handler (T3.4) can both call `claim_thaw` and rely on exactly one winning.
 
 #### T1.6 — `config`: TOML schema, defaults, validation ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §8.1, §8.2, D1, D2, D4, C-17.
 - **Depends on:** T0.*
 - **Files:** `src/config.rs`, `tests/fixtures/config/{default,minimal,invalid_*}.toml`.

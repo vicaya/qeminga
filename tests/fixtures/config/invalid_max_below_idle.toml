@@ -1,0 +1,3 @@
+[agent]
+fsfreeze_idle_timeout_secs = 60
+fsfreeze_max_timeout_secs = 59

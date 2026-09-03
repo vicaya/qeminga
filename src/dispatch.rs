@@ -96,6 +96,8 @@ pub struct Context {
     pub state: Arc<FreezeStateMachine>,
     /// The audit router (ring/normal mode switch, §9.1).
     pub audit: Router,
+    /// Source of `guest-get-osinfo` data (production: the running system).
+    pub osinfo: Arc<dyn handlers::osinfo::OsInfoSource>,
     handler_calls: AtomicU64,
 }
 
@@ -109,14 +111,23 @@ impl std::fmt::Debug for Context {
 }
 
 impl Context {
-    /// Builds a context from its parts.
+    /// Builds a context from its parts, using the production information
+    /// sources. Tests swap in fakes with the `with_*` methods.
     pub fn new(config: Arc<Config>, state: Arc<FreezeStateMachine>, audit: Router) -> Self {
         Context {
             config,
             state,
             audit,
+            osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
             handler_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Replaces the `guest-get-osinfo` source.
+    #[must_use]
+    pub fn with_osinfo(mut self, osinfo: Arc<dyn handlers::osinfo::OsInfoSource>) -> Self {
+        self.osinfo = osinfo;
+        self
     }
 
     /// Number of times a handler was invoked (gates passed).
@@ -277,7 +288,7 @@ impl Dispatcher {
             "guest-info" => handlers::info::handle(ctx, req).await,
             "guest-sync" => handlers::sync::sync(ctx, req).await,
             "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
-            "guest-get-osinfo" => not_implemented(),
+            "guest-get-osinfo" => handlers::osinfo::handle(ctx, req).await,
             "guest-network-get-interfaces" => not_implemented(),
             "guest-get-fsinfo" => not_implemented(),
             "guest-fsfreeze-status" => not_implemented(),

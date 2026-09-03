@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod info;
+pub mod osinfo;
 pub mod ping;
 pub mod sync;
 

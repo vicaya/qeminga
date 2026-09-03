@@ -338,7 +338,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** AC19 is fully covered by unit tests.
 
 #### T2.3 — `guest-get-osinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (field list, **no** `machine-id`), §5.5 (`uname`), C-5.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/osinfo.rs`, `tests/fixtures/os-release/{debian,fedora,quoted,escaped,empty}.txt`.

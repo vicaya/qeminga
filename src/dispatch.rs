@@ -23,7 +23,7 @@ pub mod ratelimit;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::audit::{AuditRecord, Disposition, Router, project_method};
 use crate::config::Config;
@@ -272,6 +272,7 @@ impl Context {
             Router::new(Box::new(std::io::sink())),
             crate::marker::Marker::for_tests(),
         )
+        .with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()))
     }
 }
 
@@ -424,9 +425,7 @@ impl Dispatcher {
             "guest-fsfreeze-freeze-list" => handlers::fsfreeze::freeze_list(&self.ctx, req).await,
             "guest-fsfreeze-thaw" => handlers::fsfreeze::thaw(&self.ctx, req).await,
             "guest-fstrim" => handlers::fstrim::handle(ctx, req).await,
-            // Placeholder until T4.2: a successful shutdown produces no
-            // reply (AC12), which is what this arm exercises.
-            "guest-shutdown" => Ok(json!({})),
+            "guest-shutdown" => handlers::shutdown::handle(ctx, req).await,
             "guest-suspend-ram" => not_implemented(),
             other => Err(Error::CommandNotFound(other.to_owned())),
         }
@@ -443,6 +442,7 @@ mod tests {
     use crate::audit;
     use crate::framing::MAX_FRAME_LEN;
     use crate::state::FreezeState;
+    use serde_json::json;
     use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;

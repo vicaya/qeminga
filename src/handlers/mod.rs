@@ -13,6 +13,7 @@ pub mod info;
 pub mod interfaces;
 pub mod osinfo;
 pub mod ping;
+pub mod shutdown;
 pub mod sync;
 
 /// A command in the allowlist as advertised by `guest-info`.

@@ -538,7 +538,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the E2E harness (T4.7) drives the real binary through a pty.
 
 #### T4.2 — `guest-shutdown` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (`mode`, no success reply), §4.1 (`reboot` syscall), §5.3 (2/min), AC12, C-11, OQ-1.
 - **Depends on:** T1.8, T3.1
 - **Files:** `src/handlers/shutdown.rs`, `src/kernel/shutdown.rs`.

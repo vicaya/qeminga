@@ -682,7 +682,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** a run log is attached to the PR; the job stays manual (no nested virtualisation in hosted CI).
 
 #### T5.5 — Documentation and release readiness ∥
-- **Status:** todo
+- **Status:** done (0.1.0 ready to tag once the task PRs are merged; open items in §7)
 - **Design:** §7 (C-4), §12.
 - **Depends on:** everything above
 - **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done, record arm64 gap).
@@ -700,27 +700,29 @@ the answer is a one-line change, and leave the question here.
 
 ## 6. Acceptance-criteria traceability
 
-| AC | Covered by | Kind |
-|---|---|---|
-| AC1 denied commands → `CommandNotFound` | T1.8, T4.7 | unit + E2E |
-| AC2 freeze/thaw on real ext4/xfs | T3.4, T5.2 | privileged |
-| AC3 exact final capability set | T4.4, T5.2 | privileged |
-| AC4 oversized frame resync | T1.2, T4.7 | unit + property + E2E |
-| AC5 1 000-ping flood | T1.7, T4.7 | unit + E2E |
-| AC6 lockfile, deny, audit | T0.1, T0.4 | CI |
-| AC7 clippy clean | T0.2 | CI |
-| AC8 unit tests pass | all | CI |
-| AC9 frozen gate, thaw never limited | T1.8, T3.4 | unit |
-| AC10 SIGKILL recovery | T3.3, T3.4, T4.6, T5.2 | unit + privileged |
-| AC11 watchdog idle and hard cap | T3.5, T5.2 | unit (paused time) + privileged |
-| AC12 shutdown has no success reply | T4.2, T4.7 | unit + E2E |
-| AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 | unit + privileged |
-| AC14 one-hour fuzz | T5.1 | scheduled CI |
-| AC15 seccomp matrix both arches | T4.5, T5.2 | privileged (arm64 pending runner) |
-| AC16 libvirt interop | T5.4 | manual |
-| AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 | unit + privileged |
-| AC18 EOF/reopen during freeze | T4.1, T4.7, T5.2 | unit + E2E + privileged |
-| AC19 `guest-info` contract | T2.2, T4.7 | unit + E2E |
+Status as of 0.1.0: **green** = automated and passing in CI or verified locally; **manual** = script exists, run log pending.
+
+| AC | Covered by | Kind | Status |
+|---|---|---|---|
+| AC1 denied commands → `CommandNotFound` | T1.8 (`every_denied_command_in_design_table_returns_command_not_found`), T4.7 (`guest_exec_and_every_denied_command_return_command_not_found`) | unit + E2E | green |
+| AC2 freeze/thaw on real ext4/xfs | T3.4 (`privileged_freeze_thaw_cycle_on_ext4_and_xfs`), T5.2 | privileged | green on ext4 (local + CI); xfs in CI |
+| AC3 exact final capability set | T4.4 (`privileged_drop_leaves_exactly_final_caps`), T5.2 | privileged | green (x86-64) |
+| AC4 oversized frame resync | T1.2, T4.7 (`oversized_frame_then_valid_command`), T5.1 corpus | unit + property + E2E + fuzz | green |
+| AC5 1 000-ping flood | T1.7, T4.7 (`flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served`) | unit + E2E | green |
+| AC6 lockfile, deny, audit | T0.1, T0.4 | CI | green |
+| AC7 clippy clean | T0.2 | CI | green |
+| AC8 unit tests pass | all | CI | green |
+| AC9 frozen gate, thaw never limited | T1.8, T3.4 | unit | green |
+| AC10 SIGKILL recovery | T3.3, T3.4, T4.6, T5.2 (`privileged_freeze_sigkill_restart_recovery_thaw`) | unit + privileged | green |
+| AC11 watchdog idle and hard cap | T3.5, T5.2 (`privileged_watchdog_idle_and_hard_cap_on_real_fs`) | unit (paused time) + privileged | green |
+| AC12 shutdown has no success reply | T4.2, T4.7 (`shutdown_emits_no_reply`) | unit + E2E | green |
+| AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 (`privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + privileged | green |
+| AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | green (60 s on PRs; first weekly run pending) |
+| AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64; arm64 pending runner (§7) |
+| AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`) | manual | manual, run log pending (§7) |
+| AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 (`privileged_freeze_with_tmpfs_bind_and_0700_mountpoint`) | unit + privileged | green |
+| AC18 EOF/reopen during freeze | T4.1, T4.7 (`channel_eof_then_reopen_preserves_state`), T5.2 (`privileged_channel_eof_during_freeze_preserves_marker`) | unit + E2E + privileged | green |
+| AC19 `guest-info` contract | T2.2, T4.7 (`guest_info_matches_capability_contract`) | unit + E2E | green |
 
 ---
 

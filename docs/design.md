@@ -2,8 +2,8 @@
 
 ## Minimum Secure Subset of QEMU Guest Agent in Rust
 
-**Status:** Draft  
-**Last updated:** 2026-08-17
+**Status:** Implemented (0.1.0)  
+**Last updated:** 2026-09-03
 
 ---
 
@@ -423,17 +423,21 @@ qeminga/
 
 ## 7. Key Dependencies
 
+Versions are those in `Cargo.lock` at release 0.1.0 (see C-4 in `docs/tasks.md`); `Cargo.lock` is authoritative.
+
 | Crate | Version | Purpose |
 |---|---|---|
-| `tokio` | 1.x | Async runtime — **multi-threaded** (`tokio::main` with `flavor = "multi_thread"`, min 2 worker threads). It hosts the cancellable watchdog and keeps the reactor alive while `FIFREEZE`, `FITHAW`, and `FITRIM` run on `spawn_blocking`. |
+| `tokio` | 1.53 | Async runtime — **multi-threaded** (`Builder::new_multi_thread`, min 2 worker threads). It hosts the cancellable watchdog and keeps the reactor alive while `FIFREEZE`, `FITHAW`, and `FITRIM` run on `spawn_blocking`. |
 | `serde` / `serde_json` | 1.x | JSON serialisation |
-| `nix` | 0.27.x | Safe-ish wrappers for Linux syscalls and ioctls |
-| `caps` | 0.5.x | Linux capability dropping |
-| `tracing` | 0.1.x | Structured logging |
-| `tracing-subscriber` | 0.3.x | Log formatting (JSON output) |
-| `thiserror` | 1.x | Error type derivation |
-| `governor` | 0.6.x | Token-bucket rate limiter |
-| `seccompiler` | 0.4.x | Target-specific seccomp BPF filter (optional feature) |
+| `toml` | 1.x | Configuration file parsing |
+| `nix` | 0.31 | Safe-ish wrappers for Linux syscalls and ioctls |
+| `caps` | 0.5 | Linux capability dropping |
+| `tracing` | 0.1 | Structured logging |
+| `tracing-subscriber` | 0.3 | Log formatting (JSON output) |
+| `thiserror` | 2.x | Error type derivation |
+| `governor` | 0.10 | Token-bucket rate limiter |
+| `sha2` | 0.10 | Digest of over-long method names in audit records (§5.2) |
+| `seccompiler` | 0.5 | Target-specific seccomp BPF filter (optional feature) |
 
 ---
 

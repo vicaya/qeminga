@@ -1,0 +1,49 @@
+[package]
+name = "qeminga-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "cargo-fuzz targets for qeminga's parsers and decoders (design §5.2, AC14)"
+license = "AGPL-3.0-only"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.qeminga]
+path = ".."
+
+# Fuzz targets must not be part of the main workspace build (Cargo.toml
+# excludes this directory); each is its own binary.
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bounds_checker"
+path = "fuzz_targets/bounds_checker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mountinfo"
+path = "fuzz_targets/mountinfo.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "os_release"
+path = "fuzz_targets/os_release.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

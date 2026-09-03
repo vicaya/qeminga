@@ -11,6 +11,11 @@ keywords = ["qemu", "guest-agent", "virtualization", "fsfreeze", "security"]
 categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
 publish = false
 
+# The fuzz crate (T5.1) is built by cargo-fuzz on nightly, never as part
+# of the workspace.
+[workspace]
+exclude = ["fuzz"]
+
 [lib]
 name = "qeminga"
 path = "src/lib.rs"

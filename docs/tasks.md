@@ -638,7 +638,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 5 — Hardening, privileged CI, packaging, release
 
 #### T5.1 — Fuzz targets ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** AC14, §5.2.
 - **Depends on:** T1.2, T1.3, T2.3, T2.5
 - **Files:** `fuzz/Cargo.toml`, `fuzz/fuzz_targets/{frame_decoder,bounds_checker,mountinfo,os_release}.rs`, `.github/workflows/fuzz.yml`, `Cargo.toml` (`[workspace] exclude = ["fuzz"]`).

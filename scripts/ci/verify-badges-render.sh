@@ -1,10 +1,19 @@
 #!/bin/sh
-# Checks that the README badges render in the repository as GitHub shows
-# it: fetch the README rendered by GitHub (the same HTML the web page
-# embeds), extract the badge image URLs GitHub rewrote, replace the
-# `badges/main/` path by the directory just published for BRANCH, and
-# require that each URL answers 200 with an SVG image content type for
-# an authenticated client (the repository is private).
+# Checks what CI can prove about the README badges of this private
+# repository, after a publication for BRANCH:
+#
+#   1. the README as GitHub renders it (the HTML the web page embeds)
+#      still carries the two badge <img> elements and GitHub left their
+#      same-repository raw URLs in place (no Camo rewrite);
+#   2. the files those URLs name, re-pointed at the directory just
+#      published for BRANCH, exist on the badges branch and are served to
+#      an authenticated client (the workflow token, as a signed-in browser
+#      sends its session) with an SVG content type.
+#
+# The github.com `raw/` path itself authenticates only by browser session,
+# so the fetch goes through raw.githubusercontent.com, which is where that
+# path redirects a browser. Whether the images finally appear in the page
+# is confirmed by a signed-in viewer of the README on `main`.
 #
 #   GH_TOKEN=... scripts/ci/verify-badges-render.sh OWNER/REPO BRANCH
 set -eu
@@ -24,26 +33,25 @@ status=0
 for url in $urls; do
     url=$(printf '%s' "$url" | sed 's|&amp;|\&|g')
     case "$url" in
-        *camo.githubusercontent.com*)
-            # A Camo URL embeds the original address; it cannot be
-            # re-pointed at another branch directory. Fetch it as is only
-            # when it already names the published directory.
-            target=$url ;;
-        *) target=$(printf '%s' "$url" | sed "s|/badges/main/|/badges/$branch/|") ;;
+        https://github.com/"$repo"/raw/badges/main/*) ;;
+        *)
+            echo "verify-badges-render: unexpected badge URL in the rendered README: $url" >&2
+            status=1
+            continue ;;
     esac
-    # Fetch as a signed-in viewer would: GitHub serves private raw content
-    # only to an authenticated client (a browser sends the session cookie,
-    # this check sends the token) and redirects to raw.githubusercontent.
-    headers=$(curl -sS -o /dev/null -D - -L -H "Authorization: Bearer ${GH_TOKEN}" "$target" || true)
+    file=${url##*/badges/main/}
+    raw="https://raw.githubusercontent.com/$repo/badges/$branch/$file"
+    headers=$(curl -sS -o /dev/null -D - -L -H "Authorization: token ${GH_TOKEN}" "$raw" || true)
     code=$(printf '%s' "$headers" | grep -i '^HTTP/' | tail -1 | awk '{print $2}')
-    ctype=$(printf '%s' "$headers" | grep -i '^content-type:' | tail -1 | tr -d '\r')
-    echo "$target -> $code ${ctype:-?}"
+    ctype=$(printf '%s' "$headers" | grep -i '^content-type:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
+    echo "README embeds $url"
+    echo "  published file $raw -> $code ${ctype:-?}"
     case "$code:$ctype" in
-        200:*image/svg*) ;;
+        200:*svg*) ;;
         *) status=1 ;;
     esac
 done
 if [ "$status" -ne 0 ]; then
-    echo "verify-badges-render: a badge does not render as an SVG image (see above)" >&2
+    echo "verify-badges-render: a published badge is missing or not served as SVG (see above)" >&2
 fi
 exit "$status"

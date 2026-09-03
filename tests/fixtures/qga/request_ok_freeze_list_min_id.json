@@ -1,0 +1,1 @@
+{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/","/home"]},"id":-9223372036854775808}

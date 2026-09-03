@@ -10,6 +10,8 @@
 //! in CI.
 #![deny(unsafe_code)]
 
+pub mod proto;
+
 /// Agent version reported by `guest-info`.
 ///
 /// This is build metadata taken from the Cargo manifest; it cannot be

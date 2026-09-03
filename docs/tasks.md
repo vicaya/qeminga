@@ -153,7 +153,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 1 — Protocol core (pure Rust, no OS access)
 
 #### T1.1 — `proto`: QGA wire types and error model
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §4.3, §5.1 (error classes), §9 (`id`), C-1, C-2, C-3.
 - **Depends on:** T0.*
 - **Files:** `src/proto.rs`, `src/lib.rs` (`pub mod proto`), `tests/fixtures/qga/*.json`.

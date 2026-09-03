@@ -18,6 +18,7 @@ pub mod freeze_plan;
 pub mod handlers;
 #[cfg(target_os = "linux")]
 pub mod kernel;
+pub mod marker;
 pub mod mountinfo;
 pub mod proto;
 pub mod state;

@@ -423,7 +423,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** T4.6 uses `covers_device` on the marker directory's device to reject a freezable `state_path` at startup with a clear error.
 
 #### T3.3 — Recovery marker ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.4 Recovery marker, §5.5 (`openat` `O_CREAT|O_EXCL`, `fsync`, `unlinkat`), §5.7, D5, AC10, C-20.
 - **Depends on:** T3.1 (only for the trait style; the marker itself needs no `unsafe`)
 - **Files:** `src/marker.rs` (new leaf module, C-19) or inside `src/handlers/fsfreeze/`.

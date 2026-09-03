@@ -2,7 +2,7 @@
 name = "qeminga"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.98"
 description = "Minimum secure subset of the QEMU guest agent, written in safe Rust"
 license = "AGPL-3.0-only"
 repository = "https://github.com/vicaya/qeminga"

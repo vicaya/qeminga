@@ -94,7 +94,7 @@ disagree, raise it as an open question rather than diverging.
 | C-5 | Response field names follow the upstream QAPI schema so libvirt parses them: `GuestOSInfo` (`kernel-release`, `kernel-version`, `machine`, `id`, `name`, `pretty-name`, `version`, `version-id`, `variant`, `variant-id`), `GuestNetworkInterface` (`name`, `hardware-address`, `ip-addresses[{ip-address, ip-address-type, prefix}]`), `GuestFilesystemInfo` (`name`, `mountpoint`, `type`, `used-bytes`, `total-bytes`, `disk: []`), `GuestFilesystemTrimResponse` (`paths[{path, trimmed?, minimum?, error?}]`). |
 | C-6 | "Mutex-guarded singleton" (§6, `state.rs`) means one `Arc<FreezeStateMachine>` created in `main` and handed to everything that needs it; there is no global static, so tests can create their own. |
 | C-7 | Dispatch order is exactly §4.1: parse → allowlist → runtime-feature gate → rate limiter → freeze gate → handler. Because `guest-fsfreeze-status`/`-thaw` are unlimited, AC9 holds regardless of limiter state. The freeze gate rejects whenever the state is **not** `Thawed` (so `Freezing`/`Thawing` are treated as frozen); `guest-fsfreeze-status` reports `"frozen"` in the same condition. |
-| C-8 | Rust edition 2024, toolchain pinned to 1.94.1 by `rust-toolchain.toml`, `rust-version = "1.94"`. |
+| C-8 | Rust edition 2024, toolchain pinned to the current stable (1.98.0) by `rust-toolchain.toml`, `rust-version = "1.98"`; the pin is bumped every six-week release cycle (T5.5 owns the reminder). |
 | C-9 | `guest-info` belongs to the `guest-ping`/`guest-sync*` rate-limit class (120/min); §5.3 does not classify it. |
 | C-10 | The `0xFF` sentinel is handled by the decoder wherever it appears (drop everything buffered before it, leave discard mode, flag the next frame). `guest-sync-delimited` **always** prefixes its reply with `0xFF`, whether or not the request carried one (upstream behaviour; §3 "expect one" means tolerate). |
 | C-11 | `guest-shutdown` calls `sync(2)` before `reboot(2)` (the `reboot(2)` man page requires it); `sync` is added to the seccomp profile. See OQ-1 for the graceful-shutdown gap. |
@@ -664,6 +664,7 @@ the answer is a one-line change, and leave the question here.
 - **Design:** §7 (C-4), §12.
 - **Depends on:** everything above
 - **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done, record arm64 gap).
+- **Also:** bump `rust-toolchain.toml` and `rust-version` to the current stable release (six-week cadence) and rerun the full check suite; consider Renovate, which understands `rust-toolchain.toml`.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
 #### T5.6 — Mutation testing (optional) ∥

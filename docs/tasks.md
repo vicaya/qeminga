@@ -673,7 +673,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit) and the suspend rule; `tests/packaging.rs` checks the tmpfiles line and `privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account` applies it (T5.2 job).
 
 #### T5.4 — libvirt interoperability script (manual) ∥
-- **Status:** todo
+- **Status:** done (script and recipe); a run log against a real libvirt host is still to be attached, see §7
 - **Design:** AC16, §3.
 - **Depends on:** T4.6, T5.3
 - **Files:** `scripts/e2e-libvirt.sh`, `docs/testing.md`.
@@ -728,4 +728,5 @@ the answer is a one-line change, and leave the question here.
 
 | Gap | Detail | Owner |
 |---|---|---|
+| libvirt run log | `scripts/e2e-libvirt.sh` and the recipe in `docs/testing.md` exist, but no run against a real libvirt host has been recorded yet (no nested virtualisation in hosted CI or the development container). AC16 stays open until a log is attached to a PR. | T5.4 / T5.5 |
 | arm64 execution | The privileged job (T5.2) and the seccomp matrix (AC15) run on `x86_64` only. The `aarch64` profile is compiled and checked in every CI run (`cross-check-aarch64`, plus unit tests that build both profiles), but no arm64 runner executes it. Needs a public repository, a larger hosted runner, or a self-hosted arm64 machine. | T5.2 / T5.5 |

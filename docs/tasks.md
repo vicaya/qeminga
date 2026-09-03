@@ -352,7 +352,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** a fixture-driven proptest shows the parser never panics on arbitrary text.
 
 #### T2.4 — `guest-network-get-interfaces` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (loopback and link-local filtered), G4, §5.5 (netlink syscalls), C-5.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/interfaces.rs`.

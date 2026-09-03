@@ -98,6 +98,8 @@ pub struct Context {
     pub audit: Router,
     /// Source of `guest-get-osinfo` data (production: the running system).
     pub osinfo: Arc<dyn handlers::osinfo::OsInfoSource>,
+    /// Source of `guest-network-get-interfaces` records.
+    pub interfaces: Arc<dyn handlers::interfaces::InterfaceSource>,
     handler_calls: AtomicU64,
 }
 
@@ -119,8 +121,19 @@ impl Context {
             state,
             audit,
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
+            interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
             handler_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Replaces the `guest-network-get-interfaces` source.
+    #[must_use]
+    pub fn with_interfaces(
+        mut self,
+        interfaces: Arc<dyn handlers::interfaces::InterfaceSource>,
+    ) -> Self {
+        self.interfaces = interfaces;
+        self
     }
 
     /// Replaces the `guest-get-osinfo` source.
@@ -289,7 +302,7 @@ impl Dispatcher {
             "guest-sync" => handlers::sync::sync(ctx, req).await,
             "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
             "guest-get-osinfo" => handlers::osinfo::handle(ctx, req).await,
-            "guest-network-get-interfaces" => not_implemented(),
+            "guest-network-get-interfaces" => handlers::interfaces::handle(ctx, req).await,
             "guest-get-fsinfo" => not_implemented(),
             "guest-fsfreeze-status" => not_implemented(),
             "guest-fsfreeze-freeze" => not_implemented(),

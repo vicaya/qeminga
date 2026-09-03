@@ -485,7 +485,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `guest-fsfreeze-status` in T3.4 calls `refresh()` only while the state is `Frozen`.
 
 #### T3.6 — Audit ring lifecycle integration and recovery-mode logging
-- **Status:** todo
+- **Status:** done
 - **Design:** §9.1, §4.2 ("Before the first FIFREEZE, qeminga switches audit output to the freeze-safe ring"), §4.4 (recovery startup keeps the ring), AC13.
 - **Depends on:** T1.4, T3.4
 - **Files:** `src/handlers/fsfreeze.rs`, `src/audit.rs` (hooks only), `tests/audit_freeze_window.rs`.

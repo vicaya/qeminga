@@ -1,0 +1,396 @@
+//! AC13, in-process half: no byte reaches the normal audit sink between
+//! the first `FIFREEZE` and the thaw; the ring is flushed after thaw or
+//! rollback with a loss record first; recovery-mode startup keeps the
+//! ring until a thaw (design §9.1, §4.2, §4.4).
+#![forbid(unsafe_code)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use nix::errno::Errno;
+use qeminga::audit::{self, Mode, Router};
+use qeminga::config::Config;
+use qeminga::dispatch::Context;
+use qeminga::framing::DecodeEvent;
+use qeminga::handlers::fsfreeze::{self, FreezeHooks, LifecycleHooks};
+use qeminga::kernel::fake::{Call, FakeKernel};
+use qeminga::marker::Marker;
+use qeminga::mountinfo::StaticMounts;
+use qeminga::state::{FreezeState, FreezeStateMachine};
+use serde_json::Value;
+use tracing::Level;
+use tracing::instrument::WithSubscriber;
+
+/// A sink that counts bytes and keeps the text.
+#[derive(Clone, Default)]
+struct CountingSink {
+    bytes: Arc<AtomicUsize>,
+    text: Arc<Mutex<Vec<u8>>>,
+}
+
+impl CountingSink {
+    fn len(&self) -> usize {
+        self.bytes.load(Ordering::SeqCst)
+    }
+    fn lines(&self) -> Vec<Value> {
+        String::from_utf8(self.text.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+}
+
+impl Write for CountingSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.fetch_add(buf.len(), Ordering::SeqCst);
+        self.text.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Ordered log shared by the hooks and the fake kernel.
+#[derive(Default)]
+struct EventLog(Mutex<Vec<String>>);
+
+impl EventLog {
+    fn push(&self, s: impl Into<String>) {
+        self.0.lock().unwrap().push(s.into());
+    }
+    fn events(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+/// Production hooks wrapped with logging of the router mode at each step.
+struct LoggingHooks {
+    inner: LifecycleHooks,
+    log: Arc<EventLog>,
+    marker: Marker,
+}
+
+impl FreezeHooks for LoggingHooks {
+    fn on_freezing(&self, ctx: &Arc<Context>) {
+        self.inner.on_freezing(ctx);
+        self.log.push(format!(
+            "freezing mode={:?} marker={}",
+            ctx.audit.mode(),
+            self.marker.exists()
+        ));
+    }
+    fn on_frozen(&self, ctx: &Arc<Context>) {
+        self.inner.on_frozen(ctx);
+        self.log.push(format!("frozen mode={:?}", ctx.audit.mode()));
+    }
+    fn on_thaw_claimed(&self, ctx: &Arc<Context>) {
+        self.inner.on_thaw_claimed(ctx);
+        self.log
+            .push(format!("thaw_claimed mode={:?}", ctx.audit.mode()));
+    }
+    fn on_thawed(&self, ctx: &Arc<Context>) {
+        self.inner.on_thawed(ctx);
+        self.log.push(format!("thawed mode={:?}", ctx.audit.mode()));
+    }
+    fn on_heartbeat(&self, ctx: &Arc<Context>) {
+        self.inner.on_heartbeat(ctx);
+    }
+}
+
+struct Rig {
+    ctx: Arc<Context>,
+    kernel: Arc<FakeKernel>,
+    sink: CountingSink,
+    log: Arc<EventLog>,
+    _dir: tempfile::TempDir,
+}
+
+fn fixture(name: &str) -> String {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/mountinfo")
+            .join(name),
+    )
+    .unwrap()
+}
+
+fn rig(state: FreezeState) -> Rig {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = Marker::new(dir.path().join("frozen"));
+    let sink = CountingSink::default();
+    let router = Router::new(Box::new(sink.clone()));
+    let kernel = Arc::new(FakeKernel::new());
+    let log = Arc::new(EventLog::default());
+    let hooks = LoggingHooks {
+        inner: LifecycleHooks,
+        log: log.clone(),
+        marker: marker.clone(),
+    };
+    let ctx = Context::new(
+        Arc::new(Config::default()),
+        Arc::new(FreezeStateMachine::starting_in(state)),
+        router,
+    )
+    .with_kernel(kernel.clone())
+    .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+    .with_marker(marker)
+    .with_hooks(Arc::new(hooks));
+    // The fake kernel logs the router mode and marker presence at every
+    // ioctl so ordering against the ring switch is provable.
+    let ctx = Arc::new(ctx);
+    let ctx2 = ctx.clone();
+    let log2 = log.clone();
+    kernel.set_hook(Box::new(move |call| {
+        let what = match call {
+            Call::Fifreeze(p) => format!("fifreeze {}", p.display()),
+            Call::Fithaw(p) => format!("fithaw {}", p.display()),
+            other => format!("{other:?}"),
+        };
+        log2.push(format!(
+            "{what} mode={:?} marker={}",
+            ctx2.audit.mode(),
+            ctx2.marker.exists()
+        ));
+    }));
+    Rig {
+        ctx,
+        kernel,
+        sink,
+        log,
+        _dir: dir,
+    }
+}
+
+fn request(json: &str) -> DecodeEvent {
+    DecodeEvent::Frame {
+        bytes: json.as_bytes().to_vec(),
+        sentinel: false,
+    }
+}
+
+async fn run<F: std::future::Future>(rig: &Rig, fut: F) -> F::Output {
+    fut.with_subscriber(audit::subscriber(Level::TRACE, rig.ctx.audit.clone()))
+        .await
+}
+
+async fn freeze(rig: &Rig) -> Value {
+    let req = qeminga::proto::parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+    run(rig, async { fsfreeze::freeze(&rig.ctx, &req).await })
+        .await
+        .unwrap()
+}
+
+async fn thaw(rig: &Rig) -> Value {
+    let req = qeminga::proto::parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+    run(rig, async { fsfreeze::thaw(&rig.ctx, &req).await })
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn entering_freezing_switches_router_to_ring_before_marker_and_ioctl() {
+    let rig = rig(FreezeState::Thawed);
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+    freeze(&rig).await;
+    let events = rig.log.events();
+    assert_eq!(
+        events,
+        [
+            "freezing mode=Ring marker=false",
+            "fifreeze /home mode=Ring marker=true",
+            "fifreeze / mode=Ring marker=true",
+            "frozen mode=Ring",
+        ],
+        "{events:#?}"
+    );
+    assert_eq!(rig.ctx.audit.mode(), Mode::Ring);
+    let _ = request("");
+}
+
+#[tokio::test]
+async fn no_bytes_reach_normal_sink_between_freeze_and_thaw() {
+    let rig = rig(FreezeState::Thawed);
+    // A record before the freeze reaches the sink.
+    run(&rig, async {
+        tracing::info!(event = "before", "x");
+    })
+    .await;
+    let before = rig.sink.len();
+    assert!(before > 0);
+    freeze(&rig).await;
+    // Well over 64 KiB of records while frozen.
+    run(&rig, async {
+        for i in 0..2000 {
+            tracing::info!(
+                event = "frozen_window",
+                i,
+                payload = "p".repeat(100).as_str(),
+                "record"
+            );
+        }
+    })
+    .await;
+    assert_eq!(
+        rig.sink.len(),
+        before,
+        "AC13: the sink saw nothing while frozen"
+    );
+    assert!(rig.ctx.audit.lost() > 0, "the ring overflowed");
+    thaw(&rig).await;
+    assert!(rig.sink.len() > before);
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+}
+
+#[tokio::test]
+async fn thaw_flushes_loss_record_first_then_buffered_records_in_order() {
+    let rig = rig(FreezeState::Thawed);
+    freeze(&rig).await;
+    let sink_before = rig.sink.lines().len();
+    run(&rig, async {
+        for i in 0..2000 {
+            tracing::info!(
+                event = "frozen_window",
+                seq = i,
+                payload = "p".repeat(100).as_str(),
+                "record"
+            );
+        }
+    })
+    .await;
+    let lost = rig.ctx.audit.lost();
+    assert!(lost > 0);
+    thaw(&rig).await;
+    let lines = rig.sink.lines();
+    let flushed = &lines[sink_before..];
+    assert_eq!(flushed[0]["event"], audit::EVENT_AUDIT_RECORDS_LOST);
+    assert_eq!(flushed[0]["lost"].as_u64().unwrap(), lost);
+    let seqs: Vec<u64> = flushed
+        .iter()
+        .filter(|l| l["event"] == "frozen_window")
+        .map(|l| l["seq"].as_u64().unwrap())
+        .collect();
+    assert!(!seqs.is_empty());
+    assert!(
+        seqs.windows(2).all(|w| w[0] + 1 == w[1]),
+        "in order, oldest dropped"
+    );
+    assert_eq!(*seqs.last().unwrap(), 1999);
+    // The thaw's own lifecycle records come after the flush, in Normal mode.
+    assert!(lines.iter().any(|l| l["event"] == "fsfreeze_thawed"));
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+    assert_eq!(rig.log.events().last().unwrap(), "thawed mode=Normal");
+}
+
+#[tokio::test]
+async fn rollback_after_hard_error_also_flushes() {
+    let rig = rig(FreezeState::Thawed);
+    rig.kernel.script_freeze_error("/", Errno::EIO);
+    let before = rig.sink.len();
+    let req = qeminga::proto::parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+    let err = run(&rig, async { fsfreeze::freeze(&rig.ctx, &req).await })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("rolled back"));
+    let events = rig.log.events();
+    assert_eq!(events[0], "freezing mode=Ring marker=false");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.starts_with("fithaw /home mode=Ring marker=true"))
+    );
+    assert_eq!(events.last().unwrap(), "thawed mode=Normal");
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+    assert!(rig.sink.len() > before, "the rollback records were flushed");
+    let lines = rig.sink.lines();
+    assert!(lines.iter().any(|l| l["event"] == "fsfreeze_rollback"));
+    assert!(lines.iter().any(|l| l["event"] == "fsfreeze_failed"));
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+}
+
+#[tokio::test]
+async fn recovery_mode_startup_uses_ring_until_thaw() {
+    // A pre-existing marker: main constructs the state machine Frozen and
+    // calls `start_recovery`.
+    let rig = rig(FreezeState::Frozen);
+    rig.ctx.marker.create().unwrap();
+    let before = rig.sink.len();
+    run(&rig, async { fsfreeze::start_recovery(&rig.ctx) })
+        .await
+        .unwrap();
+    assert_eq!(rig.ctx.audit.mode(), Mode::Ring);
+    assert!(
+        rig.ctx.watchdog_slot().is_some(),
+        "C-14: watchdog armed at startup"
+    );
+    run(&rig, async {
+        tracing::warn!(event = "while_recovering", "x");
+    })
+    .await;
+    assert_eq!(
+        rig.sink.len(),
+        before,
+        "nothing reaches the sink before thaw"
+    );
+    // Non-thaw commands are refused by the gate; thaw succeeds.
+    let dispatcher = qeminga::dispatch::Dispatcher::new(rig.ctx.clone());
+    let reply = run(
+        &rig,
+        dispatcher.handle(request(r#"{"execute":"guest-get-osinfo"}"#)),
+    )
+    .await
+    .unwrap();
+    assert!(String::from_utf8_lossy(&reply).contains("filesystems are frozen"));
+    assert_eq!(rig.sink.len(), before);
+    let reply = run(
+        &rig,
+        dispatcher.handle(request(r#"{"execute":"guest-fsfreeze-thaw"}"#)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8_lossy(&reply), "{\"return\":2}\n");
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+    assert!(!rig.ctx.marker.exists());
+    assert!(rig.ctx.watchdog_slot().is_none());
+    let lines = rig.sink.lines();
+    assert!(lines.iter().any(|l| l["event"] == "recovery_mode"));
+    assert!(lines.iter().any(|l| l["event"] == "while_recovering"));
+    // Startup in any other state is refused.
+    let thawed = self::rig(FreezeState::Thawed);
+    assert!(fsfreeze::start_recovery(&thawed.ctx).is_err());
+    assert_eq!(thawed.ctx.audit.mode(), Mode::Normal);
+}
+
+#[tokio::test]
+async fn background_flusher_runs_only_while_thawed() {
+    // No background flusher is implemented: the thaw-triggered flush is
+    // the only path back to the sink. Assert that nothing drains the ring
+    // on its own while frozen, and that Normal mode writes through
+    // immediately (so no flusher is needed while thawed either).
+    let rig = rig(FreezeState::Thawed);
+    freeze(&rig).await;
+    let before = rig.sink.len();
+    run(&rig, async {
+        tracing::info!(event = "buffered", "x");
+    })
+    .await;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(rig.sink.len(), before, "nothing flushes while frozen");
+    assert_eq!(rig.ctx.audit.mode(), Mode::Ring);
+    thaw(&rig).await;
+    let after = rig.sink.len();
+    run(&rig, async {
+        tracing::info!(event = "direct", "x");
+    })
+    .await;
+    assert!(rig.sink.len() > after, "write-through while thawed");
+    assert_eq!(rig.ctx.audit.lost(), 0);
+}

@@ -94,12 +94,31 @@ pub struct NoHooks;
 
 impl FreezeHooks for NoHooks {}
 
-/// The production hooks: arm the watchdog on `Frozen`, cancel it when a
-/// thaw is claimed, refresh it on heartbeats (§4.4).
+/// The production hooks: switch audit output to the freeze-safe ring on
+/// `Freezing` and flush it back on `Thawed` (§9.1, AC13); arm the watchdog
+/// on `Frozen`, cancel it when a thaw is claimed, refresh it on heartbeats
+/// (§4.4).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LifecycleHooks;
 
 impl FreezeHooks for LifecycleHooks {
+    fn on_freezing(&self, ctx: &Arc<Context>) {
+        // Synchronous and free of I/O: from here until `on_thawed` no
+        // descriptor that might reach a frozen filesystem is written.
+        ctx.audit.enter_ring();
+    }
+
+    fn on_thawed(&self, ctx: &Arc<Context>) {
+        let lost = ctx.audit.flush_to_normal();
+        if lost > 0 {
+            tracing::warn!(
+                event = "audit_ring_overflowed",
+                lost,
+                "audit records were dropped during the freeze window"
+            );
+        }
+    }
+
     fn on_frozen(&self, ctx: &Arc<Context>) {
         let cfg = WatchdogConfig::from(&ctx.config.agent);
         let weak = Arc::downgrade(ctx);
@@ -130,6 +149,28 @@ impl FreezeHooks for LifecycleHooks {
             handle.refresh();
         }
     }
+}
+
+/// Recovery-mode startup (§4.4, C-14): called by `main` when the recovery
+/// marker is present. The state machine must already be `Frozen`; audit
+/// output goes to the ring until a thaw succeeds, and the watchdog is
+/// armed immediately so an abandoned freeze is still bounded after a
+/// crash. Returns an error if the state is not `Frozen`.
+pub fn start_recovery(ctx: &Arc<Context>) -> Result<(), Error> {
+    if ctx.state.current() != FreezeState::Frozen {
+        return Err(Error::Internal(format!(
+            "recovery startup requires the Frozen state, found {}",
+            ctx.state.current()
+        )));
+    }
+    ctx.hooks.on_freezing(ctx);
+    ctx.hooks.on_frozen(ctx);
+    tracing::warn!(
+        event = "recovery_mode",
+        marker = %ctx.marker.path().display(),
+        "recovery marker present; starting frozen until a thaw succeeds"
+    );
+    Ok(())
 }
 
 /// Arguments of `guest-fsfreeze-freeze-list`.

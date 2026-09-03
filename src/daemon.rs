@@ -183,6 +183,21 @@ pub trait Startup {
     ) -> Result<(), RunError>;
 }
 
+/// The seccomp mode this binary installs: `"enforce"`, `"log"` (the
+/// `seccomp-log` feature in a debug build) or `"unavailable"` (built
+/// without the `seccomp` feature). Logged in the startup audit record so a
+/// test run can prove which policy it exercised.
+pub fn seccomp_mode() -> &'static str {
+    #[cfg(feature = "seccomp")]
+    {
+        crate::seccomp::mode()
+    }
+    #[cfg(not(feature = "seccomp"))]
+    {
+        "unavailable"
+    }
+}
+
 /// Runs the startup sequence through `startup`.
 pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     let config = startup.load_config(&opts.config_path)?;
@@ -224,7 +239,19 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
         Outcome::SkippedUnprivileged => {}
     }
     let seccomp = startup.install_seccomp(&config)?;
-    tracing::info!(event = "seccomp", installed = seccomp, "seccomp filter");
+    let mode = seccomp_mode();
+    tracing::info!(
+        event = "seccomp",
+        installed = seccomp,
+        mode,
+        "seccomp filter"
+    );
+    if seccomp && mode == "log" {
+        tracing::warn!(
+            event = "seccomp_log_mode",
+            "compatibility build: unlisted syscalls are logged, not killed (never for a release)"
+        );
+    }
     startup.serve(Arc::new(config), router, recovery, channel)
 }
 

@@ -564,4 +564,17 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
         "{stderr}"
     );
     assert!(stderr.contains("\"signal\":\"SIGTERM\""), "{stderr}");
+    // The startup record names the seccomp policy this build installs, so
+    // a run can prove whether it enforced or only logged.
+    let expected = format!(
+        "\"event\":\"seccomp\",\"installed\":{},\"mode\":\"{}\"",
+        cfg!(feature = "seccomp"),
+        daemon::seccomp_mode()
+    );
+    assert!(stderr.contains(&expected), "{expected} not in {stderr}");
+    assert_eq!(
+        stderr.contains("\"event\":\"seccomp_log_mode\""),
+        cfg!(feature = "seccomp") && daemon::seccomp_mode() == "log",
+        "{stderr}"
+    );
 }

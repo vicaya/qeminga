@@ -20,17 +20,16 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      checks: write
-      issues: write
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
-      - uses: rustsec/audit-check@v2
+      # Prebuilt binary: building cargo-audit from source with the pinned
+      # toolchain fails once one of its dependencies raises its MSRV.
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit --deny warnings
 
   deny-advisories:
     name: cargo deny advisories

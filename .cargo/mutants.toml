@@ -5,7 +5,7 @@
 # the freeze/thaw algorithm. Run locally with:
 #
 #   cargo install cargo-mutants
-#   cargo mutants --all-features -- --all-features
+#   cargo mutants --all-features
 #
 # The CI job (mutants in ci.yml) is allowed to fail while the suite is
 # being tightened; the goal is zero surviving mutants in these files.
@@ -32,6 +32,6 @@ exclude_re = [
 # Each mutant runs the unit tests only; the E2E and privileged suites are
 # slow and covered by their own jobs.
 test_tool = "cargo"
-additional_cargo_test_args = ["--lib", "--all-features"]
+additional_cargo_test_args = ["--lib"]
 timeout_multiplier = 3.0
 minimum_test_timeout = 60.0

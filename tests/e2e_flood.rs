@@ -40,7 +40,18 @@ fn flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served
     // The unlimited class is unaffected and the daemon is healthy.
     let status = agent.execute("guest-fsfreeze-status");
     assert_eq!(status["return"], "thawed");
+    // The thaw is a recovery drain from Thawed: with CAP_SYS_ADMIN it
+    // succeeds; unprivileged (CI runner) FITHAW is denied, which is
+    // reported but leaves the state Thawed.
     let thaw = agent.execute("guest-fsfreeze-thaw");
-    assert!(thaw.get("return").is_some(), "{thaw}");
+    assert!(
+        thaw.get("return").is_some()
+            || thaw["error"]["desc"]
+                .as_str()
+                .unwrap_or("")
+                .contains("EPERM"),
+        "{thaw}"
+    );
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "thawed");
     assert!(agent.stop().success());
 }

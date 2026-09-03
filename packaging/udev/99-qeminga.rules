@@ -1,0 +1,4 @@
+# qeminga: hand the single-open virtio-serial port to the service account
+# (design §8.3). Identical to the rule in docs/design.md §8.3.
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.qemu.guest_agent.0", \
+    OWNER="qeminga", GROUP="qeminga", MODE="0600"

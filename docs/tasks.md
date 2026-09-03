@@ -664,7 +664,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here. Every freezing test holds a `ThawGuard` that repeats `FITHAW` on drop, the job has `timeout-minutes`, and `mk-loop-fs.sh teardown` unfreezes before unmounting, so one failed assertion cannot leave the loop filesystem frozen for the rest of the job; both privileged steps run the whole `privileged_` set.
 
 #### T5.3 — Packaging: systemd unit, udev rule, sysusers, example config ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §8.2–§8.4, §5.7, §8.5, C-20.
 - **Depends on:** T4.6
 - **Files:** `packaging/systemd/qeminga.service`, `packaging/udev/99-qeminga.rules`, `packaging/sysusers.d/qeminga.conf`, `packaging/config.toml`, `packaging/README.md`.

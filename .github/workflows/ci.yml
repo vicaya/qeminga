@@ -96,6 +96,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --features seccomp
 
+  # T5.3: the shipped unit, udev rule, sysusers entry and example config
+  # are checked against the design by tests/packaging.rs; systemd-analyze
+  # additionally verifies the unit with the real binary installed.
+  packaging:
+    name: packaging (systemd-analyze verify)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --features seccomp
+      - run: sudo install -m 0755 target/debug/qeminga /usr/bin/qeminga
+      - run: systemd-analyze verify --man=no packaging/systemd/qeminga.service
+      - run: sudo systemd-sysusers --dry-run "$PWD/packaging/sysusers.d/qeminga.conf"
+      - run: cargo test --locked --test packaging
+
   deny:
     name: cargo deny
     runs-on: ubuntu-24.04

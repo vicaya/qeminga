@@ -48,7 +48,7 @@ Privileged tests (root / `CAP_SYS_ADMIN`) are `#[ignore]`d, named
 filesystem) with:
 
 ```sh
-sudo -E cargo test --all-features -- --ignored --test-threads=1 privileged_
+sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_
 ```
 
 The end-to-end suite (`tests/e2e_*.rs`) spawns the real binary against a
@@ -56,11 +56,14 @@ pty. The `test-fakes` Cargo feature lets that binary swap the kernel shim
 for the scripted fake when `QEMINGA_TEST_FAKE_KERNEL` is set, which is
 how `guest-shutdown` silence is observed without rebooting the host.
 `--all-features` therefore includes it; **release binaries are built with
-`--features seccomp`, never `--all-features`.** Running that suite (or
-`tests/startup.rs`) as root needs the `qeminga` account, since the daemon
-refuses to start as root without it (exit 77): create it with
-`sudo systemd-sysusers packaging/sysusers.d/qeminga.conf`, or run the
-tests unprivileged.
+`--features seccomp`, never `--all-features`.** `--all-features` also
+turns on `seccomp-log`, so a debug build of it only logs unlisted
+syscalls: runs that must exercise the enforced filter (the privileged
+suite, AC15) name their features explicitly, as above. Running the
+end-to-end suite (or `tests/startup.rs`) as root needs the `qeminga`
+account, since the daemon refuses to start as root without it (exit 77):
+create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf`,
+or run the tests unprivileged.
 
 ## Code rules
 

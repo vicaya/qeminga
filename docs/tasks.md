@@ -49,7 +49,7 @@ Status values: `todo` · `in-progress (who)` · `blocked (why)` · `done`.
   `OsInfoSource`, …) with a fake implementation used by tests.
 - Tests that need root or capabilities are `#[ignore]`d, named with the
   prefix `privileged_`, and run by the privileged CI job (T5.2) via
-  `sudo -E cargo test --all-features -- --ignored privileged_`.
+  `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`).
 - Time-dependent async code is tested with `#[tokio::test(start_paused = true)]`
   and `tokio::time::advance`.
 - Parsers and decoders get a `proptest` property test in addition to examples.
@@ -658,7 +658,7 @@ the answer is a one-line change, and leave the question here.
   - `privileged_channel_eof_during_freeze_preserves_marker` (AC18).
   - `privileged_journald_pipe_full_does_not_deadlock_thaw` (AC13): point stderr at a full pipe.
   - `privileged_seccomp_matrix_log_then_enforce` (AC15).
-- **Implement (green):** `sudo -E cargo test --all-features -- --ignored privileged_` on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
+- **Implement (green):** `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`) on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
 - **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here.
 
 #### T5.3 — Packaging: systemd unit, udev rule, sysusers, example config ∥

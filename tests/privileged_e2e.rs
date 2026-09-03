@@ -282,7 +282,8 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
 fn privileged_seccomp_matrix_log_then_enforce() {
     // Runs the full allowed-command matrix through the real binary with
     // the real kernel. The CI job runs this test twice: with the
-    // `seccomp-log` build and with the enforced build (AC15).
+    // `seccomp-log` build and with the enforced build, whose feature set
+    // deliberately excludes `seccomp-log` (AC15).
     let mount = ext4_mount();
     let audit_lines = || -> Option<usize> {
         std::process::Command::new("dmesg")
@@ -300,6 +301,14 @@ fn privileged_seccomp_matrix_log_then_enforce() {
     let stderr = agent.stderr_text();
     let installed = stderr.contains("\"event\":\"seccomp\",\"installed\":true");
     assert_eq!(installed, cfg!(feature = "seccomp"), "{stderr}");
+    // Prove which policy this run exercises: the daemon is built with the
+    // same features as this test, and its startup record names the mode.
+    let mode = qeminga::daemon::seccomp_mode();
+    assert!(
+        stderr.contains(&format!("\"mode\":\"{mode}\"")),
+        "expected seccomp mode {mode}: {stderr}"
+    );
+    println!("seccomp matrix under mode={mode}");
     for method in [
         "guest-ping",
         "guest-info",

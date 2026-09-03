@@ -131,6 +131,12 @@ jobs:
   privileged:
     name: privileged (loop ext4/xfs, caps, seccomp)
     runs-on: ubuntu-24.04
+    env:
+      # The enforced run must not carry `seccomp-log`, which `--all-features`
+      # would enable (debug builds of it only log). Listed explicitly and
+      # checked below.
+      ENFORCED_FEATURES: seccomp,suspend_ram,test-fakes
+      LOG_FEATURES: seccomp-log,test-fakes
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -141,10 +147,15 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs
           sudo groupadd -g 600 qeminga || true
           sudo useradd -u 600 -g 600 -M -r -s /usr/sbin/nologin qeminga || true
+      - name: The enforced feature set really enforces
+        run: |
+          cfg=$(cargo rustc --lib --locked --features "$ENFORCED_FEATURES" -- --print cfg)
+          echo "$cfg" | grep -q 'feature="seccomp"'
+          ! echo "$cfg" | grep -q 'feature="seccomp-log"'
       - name: Build test binaries as the runner user
         run: |
-          cargo test --all-features --locked --no-run
-          cargo test --features seccomp-log,test-fakes --locked --no-run
+          cargo test --features "$ENFORCED_FEATURES" --locked --no-run
+          cargo test --features "$LOG_FEATURES" --locked --no-run
       - name: Create loop-mounted filesystems
         run: |
           set -o pipefail
@@ -153,11 +164,11 @@ jobs:
       - name: Privileged tests, seccomp-log build (compatibility run)
         run: |
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" cargo test --features seccomp-log,test-fakes --locked -- --ignored --test-threads=1 privileged_seccomp_matrix
+          sudo -E env "PATH=$PATH" cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_seccomp_matrix
       - name: Privileged tests, enforced build
         run: |
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" cargo test --all-features --locked -- --ignored --test-threads=1 privileged_
+          sudo -E env "PATH=$PATH" cargo test --features "$ENFORCED_FEATURES" --locked -- --ignored --test-threads=1 privileged_
       - name: Tear down loop devices
         if: always()
         run: sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh teardown

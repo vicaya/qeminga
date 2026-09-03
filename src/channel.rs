@@ -14,6 +14,12 @@
 //! [`OpenError::AlreadyOpen`] (§8.4) and retries `ENOENT` (device not
 //! yet present) with a bounded exponential backoff: 1 s, 2 s, 4 s, ...
 //! capped at [`MAX_BACKOFF`], forever, until cancelled.
+//!
+//! The same backoff separates sessions: a virtio port whose host side is
+//! disconnected opens successfully and reports EOF at once, so reopening
+//! immediately would spin. After a session that received nothing the
+//! delay doubles up to [`MAX_BACKOFF`]; a session that carried data
+//! resets it to [`INITIAL_BACKOFF`].
 #![forbid(unsafe_code)]
 
 use std::future::Future;
@@ -34,6 +40,9 @@ use tokio::sync::watch;
 
 use crate::dispatch::Dispatcher;
 use crate::framing::{DecodeEvent, FrameDecoder};
+
+/// First delay of the open-retry and reopen backoff.
+pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Upper bound of the reopen backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -230,30 +239,43 @@ pub async fn run_session<R, W, H>(
     mut writer: W,
     handler: &H,
     decoder: &mut FrameDecoder,
-) -> SessionEnd
+) -> SessionReport
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
     H: Handle,
 {
     let mut buf = vec![0u8; READ_CHUNK];
+    let mut received: u64 = 0;
+    let report = |end, received| SessionReport { end, received };
     loop {
         let n = match reader.read(&mut buf).await {
-            Ok(0) => return SessionEnd::Eof,
+            Ok(0) => return report(SessionEnd::Eof, received),
             Ok(n) => n,
-            Err(err) => return SessionEnd::ReadError(err),
+            Err(err) => return report(SessionEnd::ReadError(err), received),
         };
+        received += n as u64;
         for event in decoder.push(&buf[..n]) {
             if let Some(reply) = handler.handle(event).await {
                 if let Err(err) = writer.write_all(&reply).await {
-                    return SessionEnd::WriteError(err);
+                    return report(SessionEnd::WriteError(err), received);
                 }
                 if let Err(err) = writer.flush().await {
-                    return SessionEnd::WriteError(err);
+                    return report(SessionEnd::WriteError(err), received);
                 }
             }
         }
     }
+}
+
+/// How a session ended and how much it read; [`serve`] uses the byte
+/// count to decide whether the next reopen backs off.
+#[derive(Debug)]
+pub struct SessionReport {
+    /// Why the session ended.
+    pub end: SessionEnd,
+    /// Bytes read from the channel during the session.
+    pub received: u64,
 }
 
 /// A cancellation signal for [`serve`]: `true` once cancelled.
@@ -272,7 +294,7 @@ pub async fn open_with_retry(
     open: &OpenFn,
     cancel: &mut Cancel,
 ) -> Result<Option<Channel>, OpenError> {
-    let mut delay = Duration::from_secs(1);
+    let mut delay = INITIAL_BACKOFF;
     loop {
         match Channel::open_with(path, open.as_ref()) {
             Ok(channel) => return Ok(Some(channel)),
@@ -304,11 +326,49 @@ pub async fn serve<H: Handle>(
     path: &Path,
     open: OpenFn,
     handler: &H,
-    mut cancel: Cancel,
+    cancel: Cancel,
 ) -> Result<(), OpenError> {
+    serve_with_backoff(path, open, handler, cancel, Backoff::default()).await
+}
+
+/// Bounds of the pause between sessions (§5.7); production uses
+/// [`INITIAL_BACKOFF`] and [`MAX_BACKOFF`], tests shorten them.
+#[derive(Debug, Clone, Copy)]
+pub struct Backoff {
+    /// The pause after a session that carried data, and the first pause.
+    pub initial: Duration,
+    /// The longest pause after repeated sessions that received nothing.
+    pub max: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Backoff {
+            initial: INITIAL_BACKOFF,
+            max: MAX_BACKOFF,
+        }
+    }
+}
+
+/// [`serve`] with explicit reopen backoff bounds.
+pub async fn serve_with_backoff<H: Handle>(
+    path: &Path,
+    open: OpenFn,
+    handler: &H,
+    mut cancel: Cancel,
+    backoff: Backoff,
+) -> Result<(), OpenError> {
+    // Zero before the first open; afterwards the pause before each reopen.
+    let mut reopen_delay = Duration::ZERO;
     loop {
         if *cancel.borrow() {
             return Ok(());
+        }
+        if !reopen_delay.is_zero() {
+            tokio::select! {
+                () = tokio::time::sleep(reopen_delay) => {}
+                () = wait_cancel(&mut cancel) => return Ok(()),
+            }
         }
         let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
             return Ok(());
@@ -316,11 +376,24 @@ pub async fn serve<H: Handle>(
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
         let (reader, writer) = tokio::io::split(channel);
         let mut decoder = FrameDecoder::new();
-        let end = tokio::select! {
-            end = run_session(reader, writer, handler, &mut decoder) => end,
+        let report = tokio::select! {
+            report = run_session(reader, writer, handler, &mut decoder) => report,
             _ = wait_cancel(&mut cancel) => return Ok(()),
         };
-        tracing::warn!(event = "channel_closed", reason = %end, "channel session ended; reopening");
+        // A session that carried data resets the backoff; a host-disconnected
+        // port reports EOF immediately and must not be reopened in a loop.
+        reopen_delay = if report.received > 0 {
+            backoff.initial
+        } else {
+            (reopen_delay * 2).clamp(backoff.initial, backoff.max)
+        };
+        tracing::warn!(
+            event = "channel_closed",
+            reason = %report.end,
+            received = report.received,
+            reopen_in_ms = reopen_delay.as_millis() as u64,
+            "channel session ended; reopening"
+        );
     }
 }
 
@@ -382,7 +455,9 @@ mod tests {
         let session = tokio::spawn(async move {
             let mut decoder = FrameDecoder::new();
             let handler = handler;
-            let end = run_session(reader, writer, &handler, &mut decoder).await;
+            let end = run_session(reader, writer, &handler, &mut decoder)
+                .await
+                .end;
             (end, handler)
         });
         peer.write_all(b"one\ntwo\nthr").await.unwrap();
@@ -407,9 +482,10 @@ mod tests {
         drop(peer);
         let handler = FakeDispatcher::default();
         let mut decoder = FrameDecoder::new();
-        let end = run_session(reader, writer, &handler, &mut decoder).await;
-        assert!(matches!(end, SessionEnd::Eof));
-        assert_eq!(end.to_string(), "eof");
+        let report = run_session(reader, writer, &handler, &mut decoder).await;
+        assert!(matches!(report.end, SessionEnd::Eof));
+        assert_eq!(report.end.to_string(), "eof");
+        assert_eq!(report.received, 0);
         assert!(handler.seen.lock().unwrap().is_empty());
     }
 
@@ -462,7 +538,9 @@ mod tests {
         peer.write_all(b"frame\n").await.unwrap();
         let handler = FakeDispatcher::default();
         let mut decoder = FrameDecoder::new();
-        let end = run_session(reader, FailingWriter, &handler, &mut decoder).await;
+        let end = run_session(reader, FailingWriter, &handler, &mut decoder)
+            .await
+            .end;
         assert!(matches!(end, SessionEnd::WriteError(_)), "{end}");
         assert!(end.to_string().contains("write error"));
     }
@@ -570,6 +648,7 @@ mod tests {
                 ends.push(
                     run_session(r, w, h.as_ref(), &mut decoder)
                         .await
+                        .end
                         .to_string(),
                 );
             }
@@ -607,6 +686,113 @@ mod tests {
             FreezeState::Frozen,
             "reconnection never touches the state"
         );
+    }
+
+    /// A socket whose peer is already gone: opens fine, EOF at once, like
+    /// a virtio port whose host side is disconnected.
+    fn dead_socket() -> OwnedFd {
+        let (ours, peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        drop(peer);
+        ours
+    }
+
+    /// Short real-time backoff for the reopen tests (paused time cannot be
+    /// combined with descriptor readiness).
+    const TEST_BACKOFF: Backoff = Backoff {
+        initial: Duration::from_millis(50),
+        max: Duration::from_millis(400),
+    };
+
+    /// Serves `open` for `horizon` and returns the gaps between successive
+    /// opens.
+    async fn open_gaps(
+        opens: Arc<Mutex<Vec<std::time::Instant>>>,
+        open: OpenFn,
+        horizon: Duration,
+    ) -> Vec<Duration> {
+        let (tx, cancel) = cancel_pair();
+        let handler = Arc::new(FakeDispatcher::default());
+        let server = tokio::spawn(async move {
+            serve_with_backoff(
+                Path::new("/dev/virtio-ports/fake"),
+                open,
+                handler.as_ref(),
+                cancel,
+                TEST_BACKOFF,
+            )
+            .await
+        });
+        tokio::time::sleep(horizon).await;
+        tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
+        let opens = opens.lock().unwrap();
+        opens.windows(2).map(|w| w[1] - w[0]).collect()
+    }
+
+    /// `gap` is at least `expected` and not absurdly longer (scheduling
+    /// jitter on a loaded runner).
+    fn about(gap: Duration, expected: Duration) -> bool {
+        gap >= expected && gap < expected + Duration::from_millis(100)
+    }
+
+    #[tokio::test]
+    async fn disconnected_port_is_reopened_with_growing_backoff_not_a_busy_loop() {
+        // Every session reads EOF immediately: reopen after 50, 100, 200,
+        // 400, 400, ... ms rather than in a tight loop.
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let o = opens.clone();
+        let open: OpenFn = Arc::new(move |_| {
+            o.lock().unwrap().push(std::time::Instant::now());
+            Ok(dead_socket())
+        });
+        let gaps = open_gaps(opens, open, Duration::from_millis(1600)).await;
+        assert!(gaps.len() >= 5, "{gaps:?}");
+        let ms = |n: u64| Duration::from_millis(n);
+        assert!(about(gaps[0], ms(50)), "{gaps:?}");
+        assert!(about(gaps[1], ms(100)), "{gaps:?}");
+        assert!(about(gaps[2], ms(200)), "{gaps:?}");
+        for gap in &gaps[3..] {
+            assert!(about(*gap, ms(400)), "capped: {gaps:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_session_that_carried_data_resets_the_reopen_backoff() {
+        // Two dead sessions (pauses 50 ms, 100 ms), then one that receives
+        // a frame: the next reopen waits only `initial` again, not 200 ms.
+        let opens = Arc::new(Mutex::new(Vec::new()));
+        let o = opens.clone();
+        let open: OpenFn = Arc::new(move |_| {
+            let mut o = o.lock().unwrap();
+            o.push(std::time::Instant::now());
+            if o.len() == 3 {
+                let (ours, peer) = nix::sys::socket::socketpair(
+                    nix::sys::socket::AddressFamily::Unix,
+                    nix::sys::socket::SockType::Stream,
+                    None,
+                    nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+                )
+                .unwrap();
+                nix::unistd::write(&peer, b"ping\n").unwrap();
+                drop(peer);
+                Ok(ours)
+            } else {
+                Ok(dead_socket())
+            }
+        });
+        let gaps = open_gaps(opens, open, Duration::from_millis(700)).await;
+        assert!(gaps.len() >= 4, "{gaps:?}");
+        let ms = |n: u64| Duration::from_millis(n);
+        assert!(about(gaps[0], ms(50)), "{gaps:?}");
+        assert!(about(gaps[1], ms(100)), "{gaps:?}");
+        assert!(about(gaps[2], ms(50)), "reset after data: {gaps:?}");
+        assert!(about(gaps[3], ms(100)), "{gaps:?}");
     }
 
     #[tokio::test]

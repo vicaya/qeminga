@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 pub mod audit;
+pub mod channel;
 pub mod config;
 pub mod dispatch;
 pub mod framing;

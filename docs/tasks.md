@@ -521,7 +521,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 4 — Channel, privilege, and daemon wiring
 
 #### T4.1 — `channel`: virtio-serial open, session loop, EOF/HUP reconnect ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 I/O layer, §5.7 (reconnect rules), §8.4 (`EBUSY` is terminal `channel_already_open`), AC18, C-15.
 - **Depends on:** T1.2, T1.8
 - **Files:** `src/channel.rs`.

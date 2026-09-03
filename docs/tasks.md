@@ -501,7 +501,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** AC13's in-process half is covered; the journald half is covered by the privileged E2E in T5.2.
 
 #### T3.7 — `guest-fstrim` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §5.3 (5/min), D2, §8.1 (runtime-only switch), C-13.
 - **Depends on:** T1.8, T3.1, T3.2
 - **Files:** `src/handlers/fsfreeze.rs` (design places fstrim here) or `src/handlers/fstrim.rs`.

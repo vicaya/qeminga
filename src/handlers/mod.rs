@@ -8,6 +8,7 @@
 
 pub mod fsfreeze;
 pub mod fsinfo;
+pub mod fstrim;
 pub mod info;
 pub mod interfaces;
 pub mod osinfo;

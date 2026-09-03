@@ -423,7 +423,7 @@ impl Dispatcher {
             "guest-fsfreeze-freeze" => handlers::fsfreeze::freeze(&self.ctx, req).await,
             "guest-fsfreeze-freeze-list" => handlers::fsfreeze::freeze_list(&self.ctx, req).await,
             "guest-fsfreeze-thaw" => handlers::fsfreeze::thaw(&self.ctx, req).await,
-            "guest-fstrim" => not_implemented(),
+            "guest-fstrim" => handlers::fstrim::handle(ctx, req).await,
             // Placeholder until T4.2: a successful shutdown produces no
             // reply (AC12), which is what this arm exercises.
             "guest-shutdown" => Ok(json!({})),
@@ -786,10 +786,11 @@ mod tests {
         let record = h.audit_records().pop().unwrap();
         assert_eq!(record["reason"], reason::DISABLED);
 
-        // Enabled: reaches the (placeholder) handler.
+        // Enabled: reaches the handler (which trims the plan; the default
+        // test context has no eligible mounts on a fixture-free rig, so the
+        // exact reply is the handler's concern, not the gate's).
         let h = Harness::thawed();
-        let reply = h.execute("guest-fstrim").await;
-        assert_eq!(error_desc(&reply), "not implemented");
+        let _ = h.execute("guest-fstrim").await;
         assert_eq!(h.ctx().handler_calls(), 1);
 
         // suspend-ram: disabled by default at runtime regardless of build.

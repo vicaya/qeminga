@@ -552,7 +552,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the unprivileged E2E test observes silence after `guest-shutdown` with a fake kernel (or a build-time `test-fakes` feature).
 
 #### T4.3 — `guest-suspend-ram` (opt-in) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §8.1, D1, OQ-2.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/suspend.rs`.

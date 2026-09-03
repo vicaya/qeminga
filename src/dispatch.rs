@@ -114,6 +114,8 @@ pub struct Context {
     pub marker: crate::marker::Marker,
     /// Freeze lifecycle callbacks (watchdog, audit ring).
     pub hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>,
+    /// The sysfs power interface (`guest-suspend-ram`).
+    pub suspend: Arc<dyn handlers::suspend::SuspendOps>,
     /// The armed watchdog, if any (§4.4).
     watchdog: std::sync::Mutex<Option<crate::watchdog::WatchdogHandle>>,
     /// Handles of the filesystems this process froze (or found frozen),
@@ -158,6 +160,7 @@ impl Context {
             kernel,
             marker,
             hooks: Arc::new(handlers::fsfreeze::LifecycleHooks),
+            suspend: Arc::new(handlers::suspend::SysPower),
             watchdog: std::sync::Mutex::new(None),
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
             interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
@@ -196,6 +199,13 @@ impl Context {
     #[must_use]
     pub fn with_marker(mut self, marker: crate::marker::Marker) -> Self {
         self.marker = marker;
+        self
+    }
+
+    /// Replaces the sysfs power interface.
+    #[must_use]
+    pub fn with_suspend(mut self, suspend: Arc<dyn handlers::suspend::SuspendOps>) -> Self {
+        self.suspend = suspend;
         self
     }
 
@@ -406,9 +416,8 @@ impl Dispatcher {
         }
     }
 
-    /// Step 6: the static allowlist `match` (§5.1). Handlers that later
-    /// tasks implement return `Internal("not implemented")` from their own
-    /// arm; nothing is looked up in a table.
+    /// Step 6: the static allowlist `match` (§5.1). Nothing is looked up
+    /// in a table.
     async fn run_handler(&self, req: &Request) -> Result<Value, Error> {
         self.ctx.handler_calls.fetch_add(1, Ordering::SeqCst);
         let ctx = &*self.ctx;
@@ -426,14 +435,15 @@ impl Dispatcher {
             "guest-fsfreeze-thaw" => handlers::fsfreeze::thaw(&self.ctx, req).await,
             "guest-fstrim" => handlers::fstrim::handle(ctx, req).await,
             "guest-shutdown" => handlers::shutdown::handle(ctx, req).await,
-            "guest-suspend-ram" => not_implemented(),
+            #[cfg(feature = "suspend_ram")]
+            "guest-suspend-ram" => handlers::suspend::handle(ctx, req).await,
+            // Unreachable: the runtime feature gate already answered
+            // `Disabled` for builds without the feature (§8.1).
+            #[cfg(not(feature = "suspend_ram"))]
+            "guest-suspend-ram" => Err(Error::Disabled(req.method.clone())),
             other => Err(Error::CommandNotFound(other.to_owned())),
         }
     }
-}
-
-fn not_implemented() -> Result<Value, Error> {
-    Err(Error::Internal("not implemented".to_owned()))
 }
 
 #[cfg(test)]

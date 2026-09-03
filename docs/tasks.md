@@ -673,7 +673,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit) and the suspend rule; `tests/packaging.rs` checks the tmpfiles line and `privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account` applies it (T5.2 job).
 
 #### T5.4 — libvirt interoperability script (manual) ∥
-- **Status:** done (script and recipe); a run log against a real libvirt host is still to be attached, see §7
+- **Status:** in-progress (script, VM recipe and a scripted-`virsh` test of the script landed; the run log from a real libvirt host is still to be attached, see §7) (script and recipe); a run log against a real libvirt host is still to be attached, see §7
 - **Design:** AC16, §3.
 - **Depends on:** T4.6, T5.3
 - **Files:** `scripts/e2e-libvirt.sh`, `docs/testing.md`.

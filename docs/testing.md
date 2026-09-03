@@ -27,7 +27,7 @@ runners have no nested virtualisation.
 
    ```sh
    cargo build --release --locked --features seccomp
-   scp target/release/qeminga packaging/ guest:/tmp/
+   scp -r target/release/qeminga packaging/ guest:/tmp/
    # in the guest, as root:
    systemctl disable --now qemu-guest-agent.service
    install -m 0755 /tmp/qeminga /usr/bin/qeminga

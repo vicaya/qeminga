@@ -50,6 +50,62 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked ${{ matrix.features.flags }}
 
+  # T5.7: line coverage over the unit, property, integration and E2E
+  # suites (all features, unprivileged). The job fails below the floor.
+  # On pushes to a branch (not pull requests) it also publishes the
+  # coverage and test-count badges to the `badges` branch under
+  # `<branch>/`, which the README embeds for `main`.
+  coverage:
+    name: coverage (llvm-cov, 90% line floor)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      COVERAGE_FLOOR_LINES: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Test with coverage (fails under the floor)
+        run: |
+          set -o pipefail
+          cargo llvm-cov --all-features --locked --lcov --output-path lcov.info \
+            --fail-under-lines "$COVERAGE_FLOOR_LINES" 2>&1 | tee coverage.log
+      - name: Coverage summary
+        run: |
+          cargo llvm-cov report --json --summary-only --output-path coverage.json
+          {
+            echo "## Coverage (all features)"
+            echo
+            echo "| Lines | Functions | Regions | Floor (lines) |"
+            echo "|---|---|---|---|"
+            jq -r '.data[0].totals | "| \(.lines.percent | . * 10 | round / 10)% | \(.functions.percent | . * 10 | round / 10)% | \(.regions.percent | . * 10 | round / 10)% | '"$COVERAGE_FLOOR_LINES"'% |"' coverage.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          cargo llvm-cov report --summary-only
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage.json
+            coverage.log
+          if-no-files-found: ignore
+      - name: Publish badges (pushes only)
+        if: github.event_name != 'pull_request'
+        env:
+          GIT_AUTHOR_NAME: github-actions[bot]
+          GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" coverage.json coverage.log
+
   docs:
     name: rustdoc (-D warnings)
     runs-on: ubuntu-24.04

@@ -10,6 +10,9 @@ First release: the complete command set of `docs/design.md`.
 
 ### Added
 
+- CI: line coverage over the unprivileged suites with `cargo llvm-cov`
+  and a 90 % floor; CI, tests and coverage badges rendered by
+  `scripts/ci/badge.sh` and published to the `badges` branch.
 - Protocol core: QGA wire types with a strict map-only request parser
   (unknown and duplicate keys rejected, `i64` ids), newline framing with a
   64 KiB frame bound, discard-until-newline and `0xFF` resynchronisation,

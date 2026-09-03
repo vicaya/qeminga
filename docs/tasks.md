@@ -696,6 +696,14 @@ the answer is a one-line change, and leave the question here.
 - **Files:** `.cargo/mutants.toml`, CI job `mutants` (advisory until the baseline survivors were killed).
 - **Done when:** `cargo mutants` on `framing`, `proto`, `state`, and `fsfreeze` reports no surviving mutants in the errno-policy and gate code paths.
 
+#### T5.7 — Coverage floor and status badges ∥
+- **Status:** done
+- **Design:** AC8 (test quality), §5.2.
+- **Depends on:** T4.7
+- **Files:** `.github/workflows/ci.yml` (`coverage` job), `scripts/ci/badge.sh`, `scripts/ci/publish-badges.sh`, `tests/badges.rs`, `README.md`, `docs/testing.md`, `AGENTS.md`.
+- **Tests:** `tests/badges.rs` (`badge_renders_label_value_and_colour`, `badge_escapes_markup_in_text`).
+- **Done when:** `cargo llvm-cov --all-features` runs the unprivileged suites in CI and fails under 90 % line coverage (measured 93 % at introduction); the README shows CI, tests and coverage badges that need no external service.
+
 ---
 
 ## 6. Acceptance-criteria traceability

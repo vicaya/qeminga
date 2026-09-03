@@ -99,3 +99,18 @@ run as root the daemon drops to it, so the account must exist
 cargo install cargo-fuzz
 cargo +nightly fuzz run frame_decoder -- -max_total_time=60
 ```
+
+## Coverage locally
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --all-features --locked --fail-under-lines 90   # same command as CI
+cargo llvm-cov --all-features --locked --html                  # target/llvm-cov/html/index.html
+```
+
+The privileged tests are `#[ignore]`d and therefore not counted; the
+kernel shim, the capability drop and the seccomp installer are the files
+with the lowest figures for that reason. CI publishes the numbers as
+badges on the `badges` branch (`scripts/ci/publish-badges.sh`, rendered
+by `scripts/ci/badge.sh`).

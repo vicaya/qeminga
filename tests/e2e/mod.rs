@@ -31,7 +31,7 @@ pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 pub const REOPEN_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// Options for [`Agent::spawn_with`].
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SpawnOptions {
     /// Use the fake kernel (`test-fakes` builds only; ignored otherwise).
     pub fake_kernel: bool,
@@ -39,6 +39,12 @@ pub struct SpawnOptions {
     pub agent_extra: String,
     /// Extra TOML appended to the `[features]` section.
     pub features_extra: String,
+    /// Reuse an existing state directory (a restart, AC10) instead of a
+    /// fresh one; the marker inside it is left untouched.
+    pub state_dir: Option<tempfile::TempDir>,
+    /// Give the daemon a pipe as stderr instead of a file; the read end is
+    /// returned by [`Agent::take_stderr_pipe`] (AC13).
+    pub stderr_pipe: bool,
 }
 
 impl Default for SpawnOptions {
@@ -47,6 +53,8 @@ impl Default for SpawnOptions {
             fake_kernel: true,
             agent_extra: String::new(),
             features_extra: String::new(),
+            state_dir: None,
+            stderr_pipe: false,
         }
     }
 }
@@ -117,9 +125,10 @@ pub fn require_service_account_when_root() {
 pub struct Agent {
     child: Child,
     pty: Pty,
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
     link: PathBuf,
     stderr_path: PathBuf,
+    stderr_pipe: Option<File>,
     pending: Vec<u8>,
 }
 
@@ -132,12 +141,15 @@ impl Agent {
     /// Spawns the real binary with a fresh configuration and pty.
     pub fn spawn_with(opts: SpawnOptions) -> Agent {
         require_service_account_when_root();
-        let dir = tempfile::Builder::new()
-            .prefix("qeminga-e2e-")
-            .tempdir_in("/dev/shm")
-            .expect("tmpfs at /dev/shm");
+        let dir = opts.state_dir.unwrap_or_else(|| {
+            tempfile::Builder::new()
+                .prefix("qeminga-e2e-")
+                .tempdir_in("/dev/shm")
+                .expect("tmpfs at /dev/shm")
+        });
         let pty = open_pty();
         let link = dir.path().join("channel");
+        let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&pty.slave_path, &link).unwrap();
         let config_path = dir.path().join("config.toml");
         std::fs::write(
@@ -157,13 +169,27 @@ impl Agent {
             nix::unistd::chown(dir.path(), Some(user.uid), Some(user.gid)).unwrap();
         }
         let stderr_path = dir.path().join("stderr.log");
-        let stderr = File::create(&stderr_path).unwrap();
+        let mut stderr_pipe = None;
+        let stderr: Stdio = if opts.stderr_pipe {
+            let (reader, writer) = std::io::pipe().unwrap();
+            stderr_pipe = Some(File::from(OwnedFd::from(reader)));
+            Stdio::from(writer)
+        } else {
+            // Append: a restart (AC10) keeps the previous log.
+            Stdio::from(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&stderr_path)
+                    .unwrap(),
+            )
+        };
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_qeminga"));
         cmd.arg("--config")
             .arg(&config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(stderr));
+            .stderr(stderr);
         if opts.fake_kernel && cfg!(feature = "test-fakes") {
             cmd.env("QEMINGA_TEST_FAKE_KERNEL", "1");
         }
@@ -171,13 +197,33 @@ impl Agent {
         let mut agent = Agent {
             child,
             pty,
-            dir,
+            dir: Some(dir),
             link,
             stderr_path,
+            stderr_pipe,
             pending: Vec::new(),
         };
-        agent.wait_for_stderr("\"event\":\"channel_open\"", Duration::from_secs(10));
+        if agent.stderr_pipe.is_none() {
+            agent.wait_for_stderr("\"event\":\"channel_open\"", Duration::from_secs(10));
+        } else {
+            // Give the daemon time to open the channel; the caller drains
+            // the pipe itself.
+            std::thread::sleep(Duration::from_millis(300));
+        }
         agent
+    }
+
+    /// The read end of the stderr pipe (once), for `stderr_pipe` spawns.
+    pub fn take_stderr_pipe(&mut self) -> Option<File> {
+        self.stderr_pipe.take()
+    }
+
+    /// Kills the daemon with SIGKILL (a crash) and returns the state
+    /// directory so a restart can reuse it (AC10).
+    pub fn kill(mut self) -> tempfile::TempDir {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.dir.take().unwrap()
     }
 
     /// `true` when the binary can fake the kernel.
@@ -317,7 +363,7 @@ impl Agent {
     /// with [`REOPEN_TIMEOUT`] for the first request afterwards.
     pub fn reopen_channel(&mut self) {
         let fresh = open_pty();
-        let tmp = self.dir.path().join("channel.new");
+        let tmp = self.state_dir().join("channel.new");
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&fresh.slave_path, &tmp).unwrap();
         std::fs::rename(&tmp, &self.link).unwrap();
@@ -342,7 +388,7 @@ impl Agent {
 
     /// The state directory.
     pub fn state_dir(&self) -> &Path {
-        self.dir.path()
+        self.dir.as_ref().unwrap().path()
     }
 
     /// `true` while the daemon is alive.

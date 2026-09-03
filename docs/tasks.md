@@ -647,7 +647,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the weekly job has one green run recorded in the PR description.
 
 #### T5.2 — Privileged CI job (loop-mounted ext4/xfs, caps, seccomp matrix, SIGKILL recovery)
-- **Status:** todo
+- **Status:** done (x86-64); arm64 pending a runner, see §7
 - **Design:** AC2, AC3, AC10, AC11, AC13, AC15, AC17, AC18, D6.
 - **Depends on:** T3.4, T3.5, T3.6, T4.4, T4.5, T4.7
 - **Files:** `.github/workflows/ci.yml` (new `privileged` job), `scripts/ci/mk-loop-fs.sh`, `tests/privileged_*.rs`.
@@ -719,3 +719,11 @@ the answer is a one-line change, and leave the question here.
 | AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 | unit + privileged |
 | AC18 EOF/reopen during freeze | T4.1, T4.7, T5.2 | unit + E2E + privileged |
 | AC19 `guest-info` contract | T2.2, T4.7 | unit + E2E |
+
+---
+
+## 7. Known gaps
+
+| Gap | Detail | Owner |
+|---|---|---|
+| arm64 execution | The privileged job (T5.2) and the seccomp matrix (AC15) run on `x86_64` only. The `aarch64` profile is compiled and checked in every CI run (`cross-check-aarch64`, plus unit tests that build both profiles), but no arm64 runner executes it. Needs a public repository, a larger hosted runner, or a self-hosted arm64 machine. | T5.2 / T5.5 |

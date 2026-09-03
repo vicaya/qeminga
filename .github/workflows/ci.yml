@@ -127,7 +127,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants
-      - run: cargo mutants --all-features --no-shuffle -j 2
+      - name: cargo mutants (exit 3 = timeouts only, which are detections)
+        run: |
+          cargo mutants --all-features --no-shuffle -j 2 && exit 0
+          code=$?
+          echo "cargo mutants exited with $code"
+          [ "$code" -eq 3 ]
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4

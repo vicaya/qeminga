@@ -100,6 +100,10 @@ pub struct Context {
     pub osinfo: Arc<dyn handlers::osinfo::OsInfoSource>,
     /// Source of `guest-network-get-interfaces` records.
     pub interfaces: Arc<dyn handlers::interfaces::InterfaceSource>,
+    /// Source of the mount table (`guest-get-fsinfo`, freeze plan).
+    pub mounts: Arc<dyn crate::mountinfo::MountSource>,
+    /// Source of filesystem sizes (`guest-get-fsinfo`).
+    pub statfs: Arc<dyn handlers::fsinfo::StatfsSource>,
     handler_calls: AtomicU64,
 }
 
@@ -122,8 +126,24 @@ impl Context {
             audit,
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
             interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
+            mounts: Arc::new(crate::mountinfo::ProcMounts),
+            statfs: Arc::new(handlers::fsinfo::SystemStatfs),
             handler_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Replaces the mount-table source.
+    #[must_use]
+    pub fn with_mounts(mut self, mounts: Arc<dyn crate::mountinfo::MountSource>) -> Self {
+        self.mounts = mounts;
+        self
+    }
+
+    /// Replaces the `statfs` source.
+    #[must_use]
+    pub fn with_statfs(mut self, statfs: Arc<dyn handlers::fsinfo::StatfsSource>) -> Self {
+        self.statfs = statfs;
+        self
     }
 
     /// Replaces the `guest-network-get-interfaces` source.
@@ -303,7 +323,7 @@ impl Dispatcher {
             "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
             "guest-get-osinfo" => handlers::osinfo::handle(ctx, req).await,
             "guest-network-get-interfaces" => handlers::interfaces::handle(ctx, req).await,
-            "guest-get-fsinfo" => not_implemented(),
+            "guest-get-fsinfo" => handlers::fsinfo::handle(ctx, req).await,
             "guest-fsfreeze-status" => not_implemented(),
             "guest-fsfreeze-freeze" => not_implemented(),
             "guest-fsfreeze-freeze-list" => not_implemented(),

@@ -367,7 +367,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the seccomp profile task (T4.5) lists exactly the syscalls this handler needs, verified with `strace -f -c`.
 
 #### T2.5 — `mountinfo` parser and `guest-get-fsinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (`guest-get-fsinfo`), §4.2 (mount plan needs the same parser), C-5, C-19.
 - **Depends on:** T1.8
 - **Files:** `src/mountinfo.rs`, `src/handlers/fsinfo.rs`, `tests/fixtures/mountinfo/{simple,bind_mounts,nested,escaped_paths,tmpfs_and_nfs,btrfs_subvols}.txt`.

@@ -15,6 +15,7 @@ pub mod config;
 pub mod dispatch;
 pub mod framing;
 pub mod handlers;
+pub mod mountinfo;
 pub mod proto;
 pub mod state;
 

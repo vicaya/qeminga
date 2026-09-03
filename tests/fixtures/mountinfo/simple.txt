@@ -1,0 +1,5 @@
+21 27 0:19 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw
+22 27 0:20 / /sys rw,nosuid,nodev,noexec,relatime shared:2 - sysfs sysfs rw
+23 27 0:5 / /dev rw,nosuid,relatime shared:8 - devtmpfs udev rw,size=1971364k,nr_inodes=492841,mode=755
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+30 27 8:2 / /home rw,relatime shared:3 - xfs /dev/sda2 rw,attr2,inode64

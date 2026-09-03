@@ -13,6 +13,7 @@
 pub mod audit;
 pub mod framing;
 pub mod proto;
+pub mod state;
 
 /// Agent version reported by `guest-info`.
 ///

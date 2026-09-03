@@ -234,7 +234,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** T3.6 can drive the mode switch from the freeze lifecycle without touching this module's internals.
 
 #### T1.5 — `state`: freeze state machine ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.2 diagram, §4.4 (atomic claim of `Thawing`), C-6, C-7.
 - **Depends on:** T0.*
 - **Files:** `src/state.rs`.

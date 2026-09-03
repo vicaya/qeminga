@@ -174,7 +174,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** fixtures round-trip; `cargo doc` has no missing-docs warnings for the module.
 
 #### T1.2 — `framing`: newline frame decoder/encoder with `0xFF` resync ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 Frame Decoder, §5.2 item 1, §3 (`guest-sync-delimited`), §5.7 (clean decoder after reconnect), AC4, AC14, C-10.
 - **Depends on:** T0.*
 - **Files:** `src/framing.rs`.

@@ -10,6 +10,7 @@
 //! in CI.
 #![deny(unsafe_code)]
 
+pub mod framing;
 pub mod proto;
 
 /// Agent version reported by `guest-info`.

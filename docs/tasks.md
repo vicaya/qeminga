@@ -407,7 +407,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `scripts/check-unsafe.sh` passes and clippy's `undocumented_unsafe_blocks` is clean.
 
 #### T3.2 — Freeze plan from `/proc/self/mountinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.2 (plan rules, ordering), §8.2 (`state_path` validation), §8.5 (excluded mounts), AC17, OQ-4, C-12.
 - **Depends on:** T2.5
 - **Files:** `src/handlers/fsfreeze/plan.rs` (or `src/freeze_plan.rs`), reusing `tests/fixtures/mountinfo/*`.

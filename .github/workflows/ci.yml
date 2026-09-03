@@ -85,6 +85,7 @@ jobs:
 
   # Design §5.7 relies on the release profile (panic=abort, fat LTO, one
   # codegen unit); build it so a profile-only breakage cannot ship green.
+  # Release binaries carry the seccomp feature and never `test-fakes`.
   release-build:
     name: release build
     runs-on: ubuntu-24.04
@@ -93,7 +94,7 @@ jobs:
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --all-features
+      - run: cargo build --release --locked --features seccomp
 
   deny:
     name: cargo deny

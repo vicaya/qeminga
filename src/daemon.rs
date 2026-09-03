@@ -485,8 +485,16 @@ pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
+/// Environment variable that, in `test-fakes` builds only, replaces the
+/// kernel shim with the scripted fake (`kernel::fake::FakeKernel`).
+pub const FAKE_KERNEL_ENV: &str = "QEMINGA_TEST_FAKE_KERNEL";
+
 /// The production context: real sources, state chosen by `recovery`, the
 /// marker handle opened at startup.
+///
+/// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set, the
+/// kernel shim is the fake: no ioctl, `sync` or `reboot` ever reaches the
+/// kernel. Release builds must not enable that feature.
 pub fn production_context(
     config: Arc<Config>,
     router: Router,
@@ -498,7 +506,18 @@ pub fn production_context(
     } else {
         FreezeStateMachine::new()
     };
-    Arc::new(Context::new(config, Arc::new(state), router, marker))
+    let ctx = Context::new(config, Arc::new(state), router, marker);
+    #[cfg(feature = "test-fakes")]
+    let ctx = if std::env::var_os(FAKE_KERNEL_ENV).is_some() {
+        tracing::warn!(
+            event = "fake_kernel",
+            "test-fakes: kernel operations are faked; no ioctl, sync or reboot will run"
+        );
+        ctx.with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()))
+    } else {
+        ctx
+    };
+    Arc::new(ctx)
 }
 
 /// Serves the channel until `signal` resolves and the state is `Thawed`

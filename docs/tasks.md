@@ -617,7 +617,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `qeminga --config tests/fixtures/config/default.toml` run unprivileged against a pty behaves per T4.7.
 
 #### T4.7 — End-to-end tests over a pty (unprivileged)
-- **Status:** todo
+- **Status:** done
 - **Design:** AC1, AC4, AC5, AC12, AC18, AC19, C-15, C-18.
 - **Depends on:** T4.6, T2.*, T4.2
 - **Files:** `tests/e2e/mod.rs` (harness: temp config, pty pair, spawn `CARGO_BIN_EXE_qeminga`, line-oriented client with timeouts), `tests/e2e_*.rs`.

@@ -40,15 +40,23 @@ scripts/check-unsafe.sh
 cargo deny check                          # cargo install cargo-deny --locked
 cargo audit --deny warnings              # cargo install cargo-audit --locked
 cargo check --target aarch64-unknown-linux-gnu --all-targets --all-features --locked
-cargo build --release --locked --all-features
+cargo build --release --locked --features seccomp
 ```
 
 Privileged tests (root / `CAP_SYS_ADMIN`) are `#[ignore]`d, named
-`privileged_*`, and run with:
+`privileged_*`, and run serially (several share one loop-mounted
+filesystem) with:
 
 ```sh
-sudo -E cargo test --all-features -- --ignored privileged_
+sudo -E cargo test --all-features -- --ignored --test-threads=1 privileged_
 ```
+
+The end-to-end suite (`tests/e2e_*.rs`) spawns the real binary against a
+pty. The `test-fakes` Cargo feature lets that binary swap the kernel shim
+for the scripted fake when `QEMINGA_TEST_FAKE_KERNEL` is set, which is
+how `guest-shutdown` silence is observed without rebooting the host.
+`--all-features` therefore includes it; **release binaries are built with
+`--features seccomp`, never `--all-features`.**
 
 ## Code rules
 

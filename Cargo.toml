@@ -30,6 +30,12 @@ seccomp = ["dep:seccompiler"]
 # `--all-features` still enforces.
 seccomp-log = ["seccomp"]
 suspend_ram = []
+# End-to-end test support (T4.7): lets the real binary swap `LinuxKernel`
+# for the scripted fake when QEMINGA_TEST_FAKE_KERNEL is set, so the
+# unprivileged E2E suite can observe `guest-shutdown` silence. Never enable
+# it in a release build (build releases with `--features seccomp`, not
+# `--all-features`).
+test-fakes = []
 
 [dependencies]
 # Async runtime (design §7): multi-threaded, hosts the freeze watchdog and

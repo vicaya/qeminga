@@ -22,6 +22,7 @@ pub mod marker;
 pub mod mountinfo;
 pub mod proto;
 pub mod state;
+pub mod watchdog;
 
 /// Agent version reported by `guest-info`.
 ///

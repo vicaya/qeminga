@@ -114,6 +114,8 @@ pub struct Context {
     pub marker: crate::marker::Marker,
     /// Freeze lifecycle callbacks (watchdog, audit ring).
     pub hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>,
+    /// The armed watchdog, if any (§4.4).
+    watchdog: std::sync::Mutex<Option<crate::watchdog::WatchdogHandle>>,
     /// Handles of the filesystems this process froze (or found frozen),
     /// held until their drain completes: a thaw drains the filesystem
     /// each was opened on, whatever its pathnames lead to by then (§4.2).
@@ -155,7 +157,8 @@ impl Context {
             audit,
             kernel,
             marker,
-            hooks: Arc::new(handlers::fsfreeze::NoHooks),
+            hooks: Arc::new(handlers::fsfreeze::LifecycleHooks),
+            watchdog: std::sync::Mutex::new(None),
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
             interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
             mounts: Arc::new(crate::mountinfo::ProcMounts),
@@ -218,6 +221,16 @@ impl Context {
     pub fn with_osinfo(mut self, osinfo: Arc<dyn handlers::osinfo::OsInfoSource>) -> Self {
         self.osinfo = osinfo;
         self
+    }
+
+    /// The watchdog slot. The guard is short-lived and never held across
+    /// an `.await`.
+    pub fn watchdog_slot(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<crate::watchdog::WatchdogHandle>> {
+        self.watchdog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Takes the held handles of frozen filesystems for a drain; the

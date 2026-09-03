@@ -187,6 +187,26 @@ impl FreezeStateMachine {
         }
     }
 
+    /// `Frozen → Thawing` only; unlike [`claim_thaw`](Self::claim_thaw) a
+    /// `Thawed` machine is *not* moved into a recovery drain. Used by the
+    /// watchdog so that a deadline firing after a completed manual thaw
+    /// does not start an unnecessary drain (§4.4).
+    pub fn claim_thaw_from_frozen(&self) -> Result<ThawToken, TransitionError> {
+        let mut state = self.lock();
+        match *state {
+            FreezeState::Frozen => {
+                *state = FreezeState::Thawing;
+                Ok(ThawToken {
+                    origin: FreezeState::Frozen,
+                })
+            }
+            current => Err(TransitionError {
+                attempted: "claim thaw from frozen",
+                current,
+            }),
+        }
+    }
+
     /// `Thawing → Thawed` (drain complete, marker removed).
     pub fn thaw_succeeded(&self, token: ThawToken) {
         drop(token);
@@ -308,6 +328,23 @@ mod tests {
                     current: start
                 }
             );
+            assert_eq!(sm.current(), start);
+        }
+    }
+
+    #[test]
+    fn claim_thaw_from_frozen_refuses_every_other_state() {
+        let sm = FreezeStateMachine::starting_frozen();
+        let token = sm.claim_thaw_from_frozen().unwrap();
+        assert!(!token.is_recovery_drain());
+        sm.thaw_succeeded(token);
+        for start in [
+            FreezeState::Thawed,
+            FreezeState::Freezing,
+            FreezeState::Thawing,
+        ] {
+            let sm = FreezeStateMachine::starting_in(start);
+            assert!(sm.claim_thaw_from_frozen().is_err(), "{start}");
             assert_eq!(sm.current(), start);
         }
     }

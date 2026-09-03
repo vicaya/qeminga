@@ -466,7 +466,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the state diagram's every edge is exercised by at least one test.
 
 #### T3.5 — Freeze watchdog
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.4 (arming, refreshing, hard cap, cancellation and races, blocking requirement), AC11, C-14.
 - **Depends on:** T1.5, T3.4
 - **Files:** `src/watchdog.rs`.

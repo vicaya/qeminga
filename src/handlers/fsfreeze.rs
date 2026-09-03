@@ -62,6 +62,7 @@ use crate::marker::{Marker, MarkerError};
 use crate::mountinfo::MountSource;
 use crate::proto::{Error, Request, arguments};
 use crate::state::{FreezeState, ThawToken};
+use crate::watchdog::{ThawFn, Watchdog, WatchdogConfig};
 
 /// Defensive upper bound on `FITHAW` calls per mountpoint in one drain.
 pub const MAX_THAW_ITERATIONS: u32 = 1024;
@@ -92,6 +93,44 @@ pub trait FreezeHooks: Send + Sync {
 pub struct NoHooks;
 
 impl FreezeHooks for NoHooks {}
+
+/// The production hooks: arm the watchdog on `Frozen`, cancel it when a
+/// thaw is claimed, refresh it on heartbeats (§4.4).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LifecycleHooks;
+
+impl FreezeHooks for LifecycleHooks {
+    fn on_frozen(&self, ctx: &Arc<Context>) {
+        let cfg = WatchdogConfig::from(&ctx.config.agent);
+        let weak = Arc::downgrade(ctx);
+        let thaw: ThawFn = Arc::new(move |token: ThawToken| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                // The context is gone only at shutdown; there is nothing
+                // left to drain on behalf of.
+                if let Some(ctx) = weak.upgrade() {
+                    let _ = run_thaw(&ctx, token).await;
+                }
+            })
+        });
+        let handle = Watchdog::arm(cfg, Arc::clone(&ctx.state), thaw);
+        if let Some(previous) = ctx.watchdog_slot().replace(handle) {
+            previous.cancel();
+        }
+    }
+
+    fn on_thaw_claimed(&self, ctx: &Arc<Context>) {
+        if let Some(handle) = ctx.watchdog_slot().take() {
+            handle.cancel();
+        }
+    }
+
+    fn on_heartbeat(&self, ctx: &Arc<Context>) {
+        if let Some(handle) = ctx.watchdog_slot().as_ref() {
+            handle.refresh();
+        }
+    }
+}
 
 /// Arguments of `guest-fsfreeze-freeze-list`.
 #[derive(Debug, Default, Deserialize)]
@@ -1756,6 +1795,133 @@ mod tests {
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().path().exists(), "marker path retained");
         assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
+    }
+
+    fn lifecycle_rig(
+        dir: &tempfile::TempDir,
+        idle: u64,
+        max: u64,
+    ) -> (Arc<Context>, Arc<FakeKernel>) {
+        let config = Config::parse(&format!(
+            "[agent]\nfsfreeze_idle_timeout_secs = {idle}\nfsfreeze_max_timeout_secs = {max}\n"
+        ))
+        .unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        let ctx = Context::new(
+            Arc::new(config),
+            Arc::new(FreezeStateMachine::new()),
+            Router::new(Box::new(std::io::sink())),
+        )
+        .with_kernel(kernel.clone())
+        .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+        .with_marker(Marker::new(dir.path().join("frozen")))
+        .with_hooks(Arc::new(LifecycleHooks));
+        (Arc::new(ctx), kernel)
+    }
+
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Waits (bounded, in real time) for the blocking-pool drain to
+    /// finish; paused Tokio time cannot be used to wait for a blocking
+    /// thread.
+    async fn wait_until_thawed(ctx: &Arc<Context>) {
+        let start = std::time::Instant::now();
+        while ctx.state.current() != FreezeState::Thawed {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "drain did not finish; state {}",
+                ctx.state.current()
+            );
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        settle().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_hooks_arm_watchdog_and_idle_timeout_drains() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, kernel) = lifecycle_rig(&dir, 30, 300);
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert!(ctx.watchdog_slot().is_some(), "armed on Frozen");
+        assert!(ctx.marker.exists());
+        // Heartbeats keep it frozen.
+        for _ in 0..4 {
+            tokio::time::advance(std::time::Duration::from_secs(20)).await;
+            settle().await;
+            status(&ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+                .await
+                .unwrap();
+            settle().await;
+        }
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        // Silence: the idle timeout drains, removes the marker, thaws.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        wait_until_thawed(&ctx).await;
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!ctx.marker.exists());
+        let thaws = kernel
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, Call::Fithaw(_)))
+            .count();
+        assert_eq!(thaws, 4, "two targets drained (success + EINVAL each)");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_hooks_cancel_watchdog_on_manual_thaw() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, kernel) = lifecycle_rig(&dir, 30, 300);
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        let value = thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(2));
+        assert!(
+            ctx.watchdog_slot().is_none(),
+            "handle taken on thaw_claimed"
+        );
+        let before = kernel.calls().len();
+        tokio::time::advance(std::time::Duration::from_secs(1000)).await;
+        settle().await;
+        assert_eq!(
+            kernel.calls().len(),
+            before,
+            "no watchdog drain after a manual thaw"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_hooks_hard_cap_wins_over_heartbeats() {
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, _kernel) = lifecycle_rig(&dir, 30, 60);
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            settle().await;
+            status(&ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+                .await
+                .unwrap();
+            settle().await;
+        }
+        wait_until_thawed(&ctx).await;
+        assert_eq!(
+            ctx.state.current(),
+            FreezeState::Thawed,
+            "thawed at the 60 s cap"
+        );
+        assert!(!ctx.marker.exists());
     }
 
     #[tokio::test]

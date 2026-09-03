@@ -274,7 +274,7 @@ impl Dispatcher {
         let ctx = &*self.ctx;
         match req.method.as_str() {
             "guest-ping" => handlers::ping::handle(ctx, req).await,
-            "guest-info" => not_implemented(),
+            "guest-info" => handlers::info::handle(ctx, req).await,
             "guest-sync" => handlers::sync::sync(ctx, req).await,
             "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
             "guest-get-osinfo" => not_implemented(),

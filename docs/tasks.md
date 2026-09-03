@@ -322,7 +322,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `tests/fixtures/qga/sync*.json` cover the cases.
 
 #### T2.2 — `guest-info` capability contract ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3.1, AC19, D1, D2, OQ-2.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/info.rs`.

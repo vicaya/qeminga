@@ -6,6 +6,7 @@
 //! used for dispatch: commands are dispatched by a static `match` (§5.1).
 #![forbid(unsafe_code)]
 
+pub mod info;
 pub mod ping;
 pub mod sync;
 

@@ -438,7 +438,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** T3.4 creates it before the first `FIFREEZE` and removes it only after a complete drain.
 
 #### T3.4 — `guest-fsfreeze-{freeze,freeze-list,thaw,status}`
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §4.2 (errno policy, rollback, drain semantics, non-idempotent thaw), §4.4 (blocking rules), AC2, AC9, AC10, AC17, OQ-3, C-12.
 - **Depends on:** T1.8, T3.1, T3.2, T3.3
 - **Files:** `src/handlers/fsfreeze.rs` (or `src/handlers/fsfreeze/mod.rs`).

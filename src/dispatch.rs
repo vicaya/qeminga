@@ -108,6 +108,12 @@ pub struct Context {
     /// ([`MAX_FSINFO_WALKS`](handlers::fsinfo::MAX_FSINFO_WALKS)); a slot is
     /// held by the walk itself until it returns, not by its request.
     pub fsinfo_walks: Arc<tokio::sync::Semaphore>,
+    /// The kernel shim (ioctls, sync, reboot).
+    pub kernel: Arc<dyn crate::kernel::KernelOps>,
+    /// The recovery marker at `config.agent.state_path` (§4.4).
+    pub marker: crate::marker::Marker,
+    /// Freeze lifecycle callbacks (watchdog, audit ring).
+    pub hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>,
     handler_calls: AtomicU64,
 }
 
@@ -124,10 +130,14 @@ impl Context {
     /// Builds a context from its parts, using the production information
     /// sources. Tests swap in fakes with the `with_*` methods.
     pub fn new(config: Arc<Config>, state: Arc<FreezeStateMachine>, audit: Router) -> Self {
+        let marker = crate::marker::Marker::new(&config.agent.state_path);
         Context {
             config,
             state,
             audit,
+            kernel: Arc::new(crate::kernel::LinuxKernel),
+            marker,
+            hooks: Arc::new(handlers::fsfreeze::NoHooks),
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
             interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
             mounts: Arc::new(crate::mountinfo::ProcMounts),
@@ -150,6 +160,27 @@ impl Context {
     #[must_use]
     pub fn with_statfs(mut self, statfs: Arc<dyn handlers::fsinfo::StatfsSource>) -> Self {
         self.statfs = statfs;
+        self
+    }
+
+    /// Replaces the kernel shim (tests use `kernel::fake::FakeKernel`).
+    #[must_use]
+    pub fn with_kernel(mut self, kernel: Arc<dyn crate::kernel::KernelOps>) -> Self {
+        self.kernel = kernel;
+        self
+    }
+
+    /// Replaces the recovery marker.
+    #[must_use]
+    pub fn with_marker(mut self, marker: crate::marker::Marker) -> Self {
+        self.marker = marker;
+        self
+    }
+
+    /// Replaces the freeze lifecycle hooks.
+    #[must_use]
+    pub fn with_hooks(mut self, hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>) -> Self {
+        self.hooks = hooks;
         self
     }
 
@@ -331,10 +362,10 @@ impl Dispatcher {
             "guest-get-osinfo" => handlers::osinfo::handle(ctx, req).await,
             "guest-network-get-interfaces" => handlers::interfaces::handle(ctx, req).await,
             "guest-get-fsinfo" => handlers::fsinfo::handle(ctx, req).await,
-            "guest-fsfreeze-status" => not_implemented(),
-            "guest-fsfreeze-freeze" => not_implemented(),
-            "guest-fsfreeze-freeze-list" => not_implemented(),
-            "guest-fsfreeze-thaw" => not_implemented(),
+            "guest-fsfreeze-status" => handlers::fsfreeze::status(&self.ctx, req).await,
+            "guest-fsfreeze-freeze" => handlers::fsfreeze::freeze(&self.ctx, req).await,
+            "guest-fsfreeze-freeze-list" => handlers::fsfreeze::freeze_list(&self.ctx, req).await,
+            "guest-fsfreeze-thaw" => handlers::fsfreeze::thaw(&self.ctx, req).await,
             "guest-fstrim" => not_implemented(),
             // Placeholder until T4.2: a successful shutdown produces no
             // reply (AC12), which is what this arm exercises.

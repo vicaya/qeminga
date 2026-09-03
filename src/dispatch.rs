@@ -129,13 +129,23 @@ impl std::fmt::Debug for Context {
 impl Context {
     /// Builds a context from its parts, using the production information
     /// sources. Tests swap in fakes with the `with_*` methods.
+    ///
+    /// In this crate's own unit tests (`cfg(test)`) the kernel shim defaults
+    /// to the scripted fake, so no unit test can reach `FIFREEZE`, `FITHAW`,
+    /// `FITRIM` or `reboot(2)` by omission; integration tests must install
+    /// the fake explicitly with [`Context::with_kernel`].
     pub fn new(config: Arc<Config>, state: Arc<FreezeStateMachine>, audit: Router) -> Self {
         let marker = crate::marker::Marker::new(&config.agent.state_path);
+        #[cfg(not(test))]
+        let kernel: Arc<dyn crate::kernel::KernelOps> = Arc::new(crate::kernel::LinuxKernel);
+        #[cfg(test)]
+        let kernel: Arc<dyn crate::kernel::KernelOps> =
+            Arc::new(crate::kernel::fake::FakeKernel::new());
         Context {
             config,
             state,
             audit,
-            kernel: Arc::new(crate::kernel::LinuxKernel),
+            kernel,
             marker,
             hooks: Arc::new(handlers::fsfreeze::NoHooks),
             osinfo: Arc::new(handlers::osinfo::SystemOsInfo),
@@ -462,7 +472,8 @@ mod tests {
                 Arc::new(config),
                 Arc::new(FreezeStateMachine::starting_in(state)),
                 router,
-            );
+            )
+            .with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()));
             Harness {
                 dispatcher: Dispatcher::new(Arc::new(ctx)),
                 sink,
@@ -515,6 +526,22 @@ mod tests {
 
     fn error_desc(reply: &Value) -> &str {
         reply["error"]["desc"].as_str().unwrap()
+    }
+
+    #[test]
+    fn unit_test_contexts_default_to_the_fake_kernel() {
+        // The real shim would fail to open this path (ENOENT); the fake
+        // records the call and succeeds.
+        let ctx = Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        assert!(
+            ctx.kernel
+                .fifreeze(std::path::Path::new("/definitely/not/a/mountpoint"))
+                .is_ok()
+        );
     }
 
     #[tokio::test]

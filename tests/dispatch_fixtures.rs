@@ -11,6 +11,9 @@ use qeminga::audit::Router;
 use qeminga::config::Config;
 use qeminga::dispatch::{Context, Dispatcher};
 use qeminga::framing::DecodeEvent;
+use qeminga::kernel::fake::FakeKernel;
+use qeminga::marker::Marker;
+use qeminga::mountinfo::StaticMounts;
 use qeminga::state::FreezeStateMachine;
 use serde_json::{Value, json};
 
@@ -21,12 +24,20 @@ fn fixture(name: &str) -> Vec<u8> {
     fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// A dispatcher over fakes only: the freeze-list fixture names real
+/// mountpoints, so the kernel shim, the mount table and the marker path
+/// must never be the production ones here.
 fn dispatcher() -> Dispatcher {
-    Dispatcher::new(Arc::new(Context::new(
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = Context::new(
         Arc::new(Config::default()),
         Arc::new(FreezeStateMachine::new()),
         Router::new(Box::new(std::io::sink())),
-    )))
+    )
+    .with_kernel(Arc::new(FakeKernel::new()))
+    .with_mounts(Arc::new(StaticMounts(String::new())))
+    .with_marker(Marker::new(dir.keep().join("frozen")));
+    Dispatcher::new(Arc::new(ctx))
 }
 
 async fn send(d: &Dispatcher, name: &str) -> Vec<u8> {

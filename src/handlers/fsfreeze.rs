@@ -148,6 +148,16 @@ async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result
             tracing::info!(event = "fsfreeze_frozen", frozen, "filesystems frozen");
             Ok(json!(frozen))
         }
+        Err(failure) if failure.retains_frozen_state() => {
+            // A filesystem may still be frozen (the rollback was denied or
+            // stopped at the drain bound) or the marker could not be
+            // removed: keep the frozen gate and the marker so a later
+            // thaw, the watchdog or a restart in recovery mode drains it.
+            ctx.state.freeze_succeeded(token);
+            ctx.hooks.on_frozen(ctx);
+            tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
+            Err(Error::Internal(failure.to_string()))
+        }
         Err(failure) => {
             ctx.state.freeze_failed(token);
             ctx.hooks.on_thawed(ctx);
@@ -204,9 +214,50 @@ pub enum FreezeFailure {
         /// The errno.
         errno: KernelError,
     },
+    /// `FIFREEZE` failed with a hard error and the rollback could not thaw
+    /// `mountpoint` (first `FITHAW` denied, or the drain bound reached):
+    /// the filesystem may still be frozen, so the state stays `Frozen`
+    /// and the marker is retained.
+    #[error(
+        "freeze of {failed} failed: {errno}; rollback of {mountpoint} incomplete ({reason}); marker retained"
+    )]
+    RollbackIncomplete {
+        /// The target whose `FIFREEZE` failed.
+        failed: String,
+        /// Its errno.
+        errno: KernelError,
+        /// The processed target that could not be thawed.
+        mountpoint: String,
+        /// Why the drain did not complete.
+        reason: String,
+    },
+    /// The rollback thawed every processed target but the marker could not
+    /// be removed: the state stays `Frozen` and the marker is retained.
+    #[error(
+        "freeze of {failed} failed: {errno}; rolled back but cannot remove recovery marker: {marker}"
+    )]
+    MarkerRetained {
+        /// The target whose `FIFREEZE` failed.
+        failed: String,
+        /// Its errno.
+        errno: KernelError,
+        /// The removal error.
+        marker: MarkerError,
+    },
     /// The blocking task could not be joined.
     #[error("freeze task failed: {0}")]
     Task(String),
+}
+
+impl FreezeFailure {
+    /// `true` when the failure leaves a filesystem possibly frozen or the
+    /// marker in place, so the agent must stay `Frozen` (design §4.2).
+    pub fn retains_frozen_state(&self) -> bool {
+        matches!(
+            self,
+            FreezeFailure::RollbackIncomplete { .. } | FreezeFailure::MarkerRetained { .. }
+        )
+    }
 }
 
 /// Why a thaw failed unrecoverably (the state returns to `Frozen`).
@@ -222,6 +273,18 @@ pub enum ThawFailure {
         mountpoint: String,
         /// The errno.
         errno: KernelError,
+    },
+    /// `FITHAW` still succeeded at the defensive bound: the nesting depth
+    /// is unknown and at least one hold may remain, so the drain is
+    /// incomplete and the marker is retained.
+    #[error(
+        "thaw of {mountpoint} did not converge after {iterations} FITHAW calls; marker retained"
+    )]
+    Unbounded {
+        /// The target that kept accepting `FITHAW`.
+        mountpoint: String,
+        /// The bound that was reached.
+        iterations: u32,
     },
     /// The marker could not be removed after the drain.
     #[error("drain complete but cannot remove recovery marker: {0}")]
@@ -288,18 +351,31 @@ fn freeze_blocking(
                 // Forward order: `processed` was filled in reverse mount
                 // order, so reverse it back.
                 for done in processed.iter().rev() {
-                    let (successes, _) = drain(kernel, done);
+                    let drained = drain(kernel, done);
                     tracing::warn!(
                         event = "fsfreeze_rollback",
                         mountpoint = *done,
-                        successes,
+                        successes = drained.successes,
                         "rolled back"
                     );
+                    if let Some(reason) = drained.incomplete() {
+                        return Err(FreezeFailure::RollbackIncomplete {
+                            failed: mountpoint.to_owned(),
+                            errno,
+                            mountpoint: (*done).to_owned(),
+                            reason,
+                        });
+                    }
                 }
-                if let Err(err) = marker.remove()
-                    && !matches!(err, MarkerError::Absent { .. })
-                {
-                    tracing::error!(event = "marker_remove_failed", error = %err, "marker left in place after rollback");
+                match marker.remove() {
+                    Ok(()) | Err(MarkerError::Absent { .. }) => {}
+                    Err(marker) => {
+                        return Err(FreezeFailure::MarkerRetained {
+                            failed: mountpoint.to_owned(),
+                            errno,
+                            marker,
+                        });
+                    }
                 }
                 return Err(FreezeFailure::Hard {
                     mountpoint: mountpoint.to_owned(),
@@ -321,10 +397,16 @@ fn thaw_blocking(
     let mut thawed: u64 = 0;
     for target in plan.thaw_order() {
         let mountpoint = target.mountpoint.as_str();
-        let (successes, first_error) = drain(kernel, mountpoint);
-        if successes > 0 {
+        let drained = drain(kernel, mountpoint);
+        if drained.capped {
+            return Err(ThawFailure::Unbounded {
+                mountpoint: mountpoint.to_owned(),
+                iterations: MAX_THAW_ITERATIONS,
+            });
+        }
+        if drained.successes > 0 {
             thawed += 1;
-        } else if let Some(errno) = first_error.filter(KernelError::is_permission) {
+        } else if let Some(errno) = drained.first_error.filter(KernelError::is_permission) {
             return Err(ThawFailure::Denied {
                 mountpoint: mountpoint.to_owned(),
                 errno,
@@ -339,22 +421,61 @@ fn thaw_blocking(
 
 /// `FITHAW` until the first error or the iteration bound. Returns the
 /// number of successes and the error that ended the drain, if any.
-fn drain(kernel: &dyn KernelOps, mountpoint: &str) -> (u32, Option<KernelError>) {
+fn drain(kernel: &dyn KernelOps, mountpoint: &str) -> Drained {
     let path = std::path::Path::new(mountpoint);
     let mut successes = 0;
     for _ in 0..MAX_THAW_ITERATIONS {
         match kernel.fithaw(path) {
             Ok(()) => successes += 1,
-            Err(err) => return (successes, Some(err)),
+            Err(err) => {
+                return Drained {
+                    successes,
+                    first_error: Some(err),
+                    capped: false,
+                };
+            }
         }
     }
-    tracing::warn!(
+    tracing::error!(
         event = "fsfreeze_drain_capped",
         mountpoint,
         iterations = MAX_THAW_ITERATIONS,
         "FITHAW kept succeeding; drain stopped at the defensive bound"
     );
-    (successes, None)
+    Drained {
+        successes,
+        first_error: None,
+        capped: true,
+    }
+}
+
+/// Result of draining one target with repeated `FITHAW`.
+#[derive(Debug)]
+struct Drained {
+    /// Successful `FITHAW` calls.
+    successes: u32,
+    /// The error that ended the drain, if any.
+    first_error: Option<KernelError>,
+    /// The drain hit [`MAX_THAW_ITERATIONS`] without an error.
+    capped: bool,
+}
+
+impl Drained {
+    /// Why the target may still be frozen, if it may: a first `FITHAW`
+    /// that was denied, or a drain that never converged.
+    fn incomplete(&self) -> Option<String> {
+        if self.capped {
+            return Some(format!(
+                "FITHAW still succeeding after {MAX_THAW_ITERATIONS} calls"
+            ));
+        }
+        match &self.first_error {
+            Some(err) if self.successes == 0 && err.is_permission() => {
+                Some(format!("first FITHAW denied: {err}"))
+            }
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -919,22 +1040,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drain_has_a_defensive_upper_bound() {
+    async fn drain_has_a_defensive_upper_bound_and_a_capped_drain_stays_frozen() {
+        // With an unknown nesting depth beyond the bound at least one hold
+        // may remain: the thaw fails, the state stays Frozen and the marker
+        // is retained.
         let rig = Rig::new(FreezeState::Frozen, "simple.txt");
         rig.marker().create().unwrap();
         rig.kernel.script_thaw_successes("/", u32::MAX);
-        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
-            .unwrap();
-        assert_eq!(value, json!(2));
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("did not converge after 1024 FITHAW calls"),
+            "{err}"
+        );
         let root_calls = rig
             .fithaws()
             .iter()
             .filter(|p| *p == Path::new("/"))
             .count();
         assert_eq!(root_calls, MAX_THAW_ITERATIONS as usize);
-        assert_eq!(rig.state(), FreezeState::Thawed);
-        assert!(!rig.marker().exists());
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_denied_thaw_keeps_the_frozen_state_and_marker() {
+        // deep freezes, then /home/data fails hard; the rollback's first
+        // FITHAW on deep is denied, so deep may still be frozen.
+        let rig = Rig::nested();
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        rig.kernel
+            .script_thaw_error("/home/data/deep", Errno::EPERM);
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rollback of /home/data/deep incomplete"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists(), "marker retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
+        // The frozen gate now applies until a thaw drains it.
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("denied: EPERM"), "{err}");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_that_cannot_remove_the_marker_keeps_the_frozen_state() {
+        // The rollback thaws deep, but the marker path was replaced by a
+        // non-empty directory meanwhile: unlink fails (not ENOENT).
+        let rig = Rig::nested();
+        let marker_path = rig.marker().path().to_path_buf();
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        rig.kernel.set_hook(Box::new(move |call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new("/home/data")) {
+                let _ = std::fs::remove_file(&marker_path);
+                std::fs::create_dir(&marker_path).unwrap();
+                std::fs::write(marker_path.join("child"), b"x").unwrap();
+            }
+        }));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rolled back but cannot remove recovery marker"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().path().exists(), "marker path retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
     }
 
     #[tokio::test]

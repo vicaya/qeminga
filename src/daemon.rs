@@ -329,24 +329,14 @@ impl Startup for SystemStartup {
         let path = config.agent.channel_path.clone();
         let ctx = production_context(config, router, recovery);
         runtime.block_on(async move {
-            let signal = async {
-                use tokio::signal::unix::{SignalKind, signal};
-                let mut term = match signal(SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::error!(event = "signal_setup_failed", error = %err, "cannot listen for SIGTERM");
-                        std::future::pending::<()>().await;
-                        unreachable!()
-                    }
-                };
-                let mut int = match signal(SignalKind::interrupt()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::error!(event = "signal_setup_failed", error = %err, "cannot listen for SIGINT");
-                        std::future::pending::<()>().await;
-                        unreachable!()
-                    }
-                };
+            // Register the handlers before serving anything: a SIGTERM that
+            // arrives after the first reply must be deferred, not fatal.
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate())
+                .map_err(|err| RunError::Runtime(format!("cannot listen for SIGTERM: {err}")))?;
+            let mut int = signal(SignalKind::interrupt())
+                .map_err(|err| RunError::Runtime(format!("cannot listen for SIGINT: {err}")))?;
+            let signal = async move {
                 tokio::select! {
                     _ = term.recv() => "SIGTERM",
                     _ = int.recv() => "SIGINT",
@@ -362,8 +352,8 @@ impl Startup for SystemStartup {
                 STOP_POLL,
             )
             .await
-        })?;
-        Ok(())
+            .map_err(RunError::from)
+        })
     }
 }
 

@@ -6,13 +6,13 @@
 
 use std::cell::RefCell;
 use std::io::Write;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nix::errno::Errno;
-use qeminga::audit::{self, Mode, Router};
+use qeminga::audit::{Mode, Router};
 use qeminga::channel::{Channel, OpenError, OpenFn};
 use qeminga::config::{Config, ConfigError, LogLevel};
 use qeminga::daemon::{self, EX_CONFIG, EX_UNAVAILABLE, Options, RunError, Startup};
@@ -219,23 +219,31 @@ fn ebusy_on_channel_exits_with_channel_already_open_and_nonzero_code() {
 
 #[test]
 fn feature_warnings_are_logged_once_at_startup() {
-    let mut startup = FakeStartup::new();
-    startup.config = "[features]\nseccomp = true\nsuspend_ram = true\n".to_owned();
-    let router = Router::new(Box::new(startup.sink.clone()));
-    tracing::subscriber::with_default(audit::subscriber(tracing::Level::WARN, router), || {
-        daemon::run_with(&Options::default(), &startup).unwrap();
-    });
-    let text = startup.sink.text();
-    let expected = Config::parse(&startup.config).unwrap().warnings().len();
+    // Observed on the real binary's stderr (its global subscriber), which is
+    // deterministic; scoped test subscribers race with each other under
+    // parallel tests.
+    let expected = Config::parse("[features]\nseccomp = true\nsuspend_ram = true\n")
+        .unwrap()
+        .warnings()
+        .len();
+    let (stderr, status) = run_binary_over_pty("seccomp = true\nsuspend_ram = true\n");
+    assert!(status.success(), "{status}: {stderr}");
     assert_eq!(
-        text.matches("\"event\":\"feature_warning\"").count(),
-        expected
+        stderr.matches("\"event\":\"feature_warning\"").count(),
+        expected,
+        "{stderr}"
     );
     if !cfg!(feature = "suspend_ram") {
-        assert!(text.contains("suspend_ram"), "{text}");
+        assert!(stderr.contains("suspend_ram"), "{stderr}");
     }
     if !cfg!(feature = "seccomp") {
-        assert!(text.contains("features.seccomp"), "{text}");
+        assert!(stderr.contains("features.seccomp"), "{stderr}");
+    }
+    // The warnings precede the startup record and appear exactly once.
+    let first_warning = stderr.find("feature_warning");
+    let startup = stderr.find("\"event\":\"startup\"").unwrap();
+    if let Some(w) = first_warning {
+        assert!(w < startup);
     }
 }
 
@@ -450,12 +458,13 @@ fn runtime_is_multi_thread_with_at_least_two_workers() {
     assert!(workers >= 2);
 }
 
-/// The real binary, unprivileged config, pty channel: ping round trip, then
-/// SIGTERM exits 0 (T4.6 "done when"; the full harness is T4.7).
-#[test]
-fn binary_serves_a_pty_and_exits_on_sigterm() {
+/// Runs the real binary against a fresh pty with `features_toml` in the
+/// `[features]` section: one ping round trip, then SIGTERM. Returns the
+/// daemon's stderr and exit status.
+fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus) {
     use nix::fcntl::OFlag;
-    let master = nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).unwrap();
+    let master =
+        nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).unwrap();
     nix::pty::grantpt(&master).unwrap();
     nix::pty::unlockpt(&master).unwrap();
     let slave_path = nix::pty::ptsname_r(&master).unwrap();
@@ -463,10 +472,10 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
     nix::sys::termios::cfmakeraw(&mut termios);
     nix::sys::termios::tcsetattr(&master, nix::sys::termios::SetArg::TCSANOW, &termios).unwrap();
     // The slave must be raw too. Keep this descriptor open for the whole
-    // test: with no slave open at all, reads on the master fail with EIO.
+    // run: with no slave open at all, reads on the master fail with EIO.
     let slave_holder = nix::fcntl::open(
         Path::new(&slave_path),
-        OFlag::O_RDWR | OFlag::O_NOCTTY,
+        OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
     )
     .unwrap();
@@ -474,11 +483,16 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
     nix::sys::termios::cfmakeraw(&mut t);
     nix::sys::termios::tcsetattr(&slave_holder, nix::sys::termios::SetArg::TCSANOW, &t).unwrap();
     let dir = shm_dir();
+    if nix::unistd::geteuid().is_root()
+        && let Some(user) = nix::unistd::User::from_name("qeminga").unwrap()
+    {
+        nix::unistd::chown(dir.path(), Some(user.uid), Some(user.gid)).unwrap();
+    }
     let config_path = dir.path().join("config.toml");
     std::fs::write(
         &config_path,
         format!(
-            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n[features]\nseccomp = true\n",
+            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n[features]\n{features_toml}\n",
             dir.path().join("frozen").display()
         ),
     )
@@ -489,7 +503,14 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let mut master_file = std::fs::File::from(OwnedFd::from(master));
+    let master: OwnedFd = master.into();
+    let flags = nix::fcntl::fcntl(master.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
+    nix::fcntl::fcntl(
+        master.as_fd(),
+        nix::fcntl::FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )
+    .unwrap();
+    let mut master_file = std::fs::File::from(master);
     use std::io::Read;
     master_file
         .write_all(b"{\"execute\":\"guest-ping\",\"id\":1}\n")
@@ -497,18 +518,26 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
     let mut reply = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !reply.ends_with(b"\n") {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no reply; stderr: {}",
-            {
-                let _ = child.kill();
-                let out = child.wait_with_output().unwrap();
-                String::from_utf8_lossy(&out.stderr).into_owned()
-            }
-        );
+        let exited = child.try_wait().unwrap().is_some();
+        if exited || std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "no reply (exited={exited}); stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let mut fds = [nix::poll::PollFd::new(
+            master_file.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        let _ = nix::poll::poll(&mut fds, nix::poll::PollTimeout::from(100u16));
         let mut buf = [0u8; 256];
-        let n = master_file.read(&mut buf).unwrap();
-        reply.extend_from_slice(&buf[..n]);
+        match master_file.read(&mut buf) {
+            Ok(n) => reply.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(err) => panic!("read: {err}"),
+        }
     }
     assert_eq!(reply, b"{\"return\":{},\"id\":1}\n");
     nix::sys::signal::kill(
@@ -517,16 +546,22 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
     )
     .unwrap();
     let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "status {:?}; stderr: {stderr}",
-        output.status
-    );
+    drop(slave_holder);
+    (
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status,
+    )
+}
+
+/// The real binary, unprivileged config, pty channel: ping round trip, then
+/// SIGTERM exits 0 (T4.6 "done when"; the full harness is T4.7).
+#[test]
+fn binary_serves_a_pty_and_exits_on_sigterm() {
+    let (stderr, status) = run_binary_over_pty("seccomp = true\n");
+    assert!(status.success(), "status {status}; stderr: {stderr}");
     assert!(
         stderr.contains("\"event\":\"command_received\""),
         "{stderr}"
     );
     assert!(stderr.contains("\"signal\":\"SIGTERM\""), "{stderr}");
-    drop(slave_holder);
 }

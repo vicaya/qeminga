@@ -281,7 +281,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the limiter is `Send + Sync` and cheap to call from the dispatcher on every request.
 
 #### T1.8 — `dispatch`: static allowlist, gates, and the `guest-ping` handler
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.1 (match arms only, no table), §5.3 (frozen-safe set, `GenericError` text), §4.3, §9 (audit on every request), AC1, AC9, C-2, C-7.
 - **Depends on:** T1.1, T1.2, T1.3, T1.4, T1.5, T1.6, T1.7
 - **Files:** `src/dispatch.rs` (or `src/dispatch/mod.rs`), `src/handlers/mod.rs`, `src/handlers/ping.rs`.

@@ -1,0 +1,71 @@
+[package]
+name = "qeminga"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Minimum secure subset of the QEMU guest agent, written in safe Rust"
+license = "AGPL-3.0-only"
+repository = "https://github.com/vicaya/qeminga"
+readme = "README.md"
+keywords = ["qemu", "guest-agent", "virtualization", "fsfreeze", "security"]
+categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
+publish = false
+
+[lib]
+name = "qeminga"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qeminga"
+path = "src/main.rs"
+
+[features]
+default = []
+# Compile-time half of the two-level feature switch (design §8.1).
+# The runtime half lives in `[features]` of config.toml.
+seccomp = ["dep:seccompiler"]
+suspend_ram = []
+
+[dependencies]
+# Async runtime (design §7): multi-threaded, hosts the freeze watchdog and
+# keeps the reactor alive while ioctls run on spawn_blocking.
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time", "signal", "fs"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
+governor = "0.10"
+nix = { version = "0.31", features = ["fs", "ioctl", "user", "reboot", "net", "feature", "process", "signal", "poll"] }
+caps = "0.5"
+seccompiler = { version = "0.5", optional = true }
+
+[dev-dependencies]
+proptest = "1.11"
+tempfile = "3.27"
+tokio = { version = "1.53", features = ["test-util"] }
+
+[profile.release]
+# Design §5.7: never unwind from an indeterminate state; let the service
+# manager restart the process and the recovery marker drive recovery.
+panic = "abort"
+lto = "fat"
+codegen-units = 1
+
+[lints.rust]
+missing_docs = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+# Restriction lints that matter for a security daemon. CI runs clippy with
+# `-D warnings`, so every "warn" below is a hard failure in CI.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+undocumented_unsafe_blocks = "warn"
+multiple_unsafe_ops_per_block = "warn"

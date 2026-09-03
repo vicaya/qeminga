@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod ping;
+pub mod sync;
 
 /// A command in the allowlist as advertised by `guest-info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

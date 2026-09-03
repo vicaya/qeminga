@@ -309,7 +309,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 2 — Read-only handlers
 
 #### T2.1 — `guest-sync` and `guest-sync-delimited` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, C-10.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/sync.rs` (add to `handlers/mod.rs`).

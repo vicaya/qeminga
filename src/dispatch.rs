@@ -221,9 +221,12 @@ impl Dispatcher {
         if result.is_ok() && suppress_success {
             return None;
         }
+        // Every reply to `guest-sync-delimited` (success or error) carries
+        // the sentinel so a client that is resynchronising can find it (C-10).
+        let sentinel = req.method == "guest-sync-delimited";
         Some(encode(
             &Response::from_result(req.id, result).to_json(),
-            false,
+            sentinel,
         ))
     }
 
@@ -272,8 +275,8 @@ impl Dispatcher {
         match req.method.as_str() {
             "guest-ping" => handlers::ping::handle(ctx, req).await,
             "guest-info" => not_implemented(),
-            "guest-sync" => not_implemented(),
-            "guest-sync-delimited" => not_implemented(),
+            "guest-sync" => handlers::sync::sync(ctx, req).await,
+            "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
             "guest-get-osinfo" => not_implemented(),
             "guest-network-get-interfaces" => not_implemented(),
             "guest-get-fsinfo" => not_implemented(),
@@ -406,7 +409,8 @@ mod tests {
         async fn send_json(&self, frame: &[u8]) -> Value {
             let reply = self.send(frame).await.expect("expected a reply");
             assert_eq!(reply.last(), Some(&b'\n'));
-            serde_json::from_slice(&reply[..reply.len() - 1]).unwrap()
+            let body = reply.strip_prefix(&[0xFF]).unwrap_or(&reply);
+            serde_json::from_slice(&body[..body.len() - 1]).unwrap()
         }
 
         async fn execute(&self, method: &str) -> Value {
@@ -724,6 +728,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_delimited_reply_starts_with_0xff() {
+        let h = Harness::thawed();
+        // Without a sentinel on the request frame.
+        let reply = h
+            .send(br#"{"execute":"guest-sync-delimited","arguments":{"id":1}}"#)
+            .await
+            .unwrap();
+        assert_eq!(reply[0], 0xFF);
+        assert_eq!(&reply[1..], b"{\"return\":1}\n");
+        // With one.
+        let router = h.ctx().audit.clone();
+        let reply = h
+            .dispatcher
+            .handle(DecodeEvent::Frame {
+                bytes: br#"{"execute":"guest-sync-delimited","arguments":{"id":2},"id":7}"#
+                    .to_vec(),
+                sentinel: true,
+            })
+            .with_subscriber(audit::subscriber(Level::TRACE, router))
+            .await
+            .unwrap();
+        assert_eq!(&reply[..2], b"\xff{");
+        assert_eq!(&reply[1..], b"{\"return\":2,\"id\":7}\n");
+        // Errors for that method carry it too; other methods never do.
+        let reply = h
+            .send(br#"{"execute":"guest-sync-delimited"}"#)
+            .await
+            .unwrap();
+        assert_eq!(reply[0], 0xFF);
+        assert!(reply[1..].starts_with(b"{\"error\""));
+        let reply = h
+            .send(br#"{"execute":"guest-sync","arguments":{"id":1}}"#)
+            .await
+            .unwrap();
+        assert_eq!(reply, b"{\"return\":1}\n");
+    }
+
+    #[tokio::test]
     async fn shutdown_success_yields_no_response() {
         let h = Harness::thawed();
         assert!(
@@ -772,7 +814,8 @@ mod tests {
                 assert_eq!(*name, "guest-shutdown", "only shutdown is silent");
                 continue;
             };
-            let reply: Value = serde_json::from_slice(&reply[..reply.len() - 1]).unwrap();
+            let body = reply.strip_prefix(&[0xFF]).unwrap_or(&reply);
+            let reply: Value = serde_json::from_slice(&body[..body.len() - 1]).unwrap();
             let class = reply
                 .get("error")
                 .map(|e| e["class"].as_str().unwrap().to_owned());

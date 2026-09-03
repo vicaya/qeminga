@@ -41,7 +41,7 @@ cargo deny check                          # cargo install cargo-deny --locked
 cargo audit --deny warnings              # cargo install cargo-audit --locked
 cargo check --target aarch64-unknown-linux-gnu --all-targets --all-features --locked
 cargo build --release --locked --features seccomp
-cargo llvm-cov --all-features --locked --fail-under-lines 90   # cargo install cargo-llvm-cov --locked; rustup component add llvm-tools-preview
+scripts/ci/coverage.sh                    # cargo llvm-cov + 85 % floor on production lines; cargo install cargo-llvm-cov --locked; rustup component add llvm-tools-preview
 ```
 
 Privileged tests (root / `CAP_SYS_ADMIN`) are `#[ignore]`d, named

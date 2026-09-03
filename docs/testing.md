@@ -105,12 +105,26 @@ cargo +nightly fuzz run frame_decoder -- -max_total_time=60
 ```sh
 rustup component add llvm-tools-preview
 cargo install cargo-llvm-cov --locked
-cargo llvm-cov --all-features --locked --fail-under-lines 90   # same command as CI
-cargo llvm-cov --all-features --locked --html                  # target/llvm-cov/html/index.html
+scripts/ci/coverage.sh                 # same command as CI; reports in target/coverage/
+cargo llvm-cov --features seccomp-log,suspend_ram,test-fakes --locked --html   # target/llvm-cov/html/index.html
 ```
 
-The privileged tests are `#[ignore]`d and therefore not counted; the
-kernel shim, the capability drop and the seccomp installer are the files
-with the lowest figures for that reason. CI publishes the numbers as
-badges on the `badges` branch (`scripts/ci/publish-badges.sh`, rendered
-by `scripts/ci/badge.sh`).
+`scripts/ci/coverage.sh` runs every unprivileged suite under
+`cargo llvm-cov`, writes `lcov.info`, `coverage.json` and `coverage.log`,
+then `scripts/ci/coverage-gate.py` removes each file's inline
+`#[cfg(test)] mod tests` block from the LCOV (`lcov-production.info`) and
+applies the floor (`COVERAGE_FLOOR_LINES`, 85 %) to the remaining
+production lines; `coverage-summary.md` and `coverage-summary.json`
+carry both figures. The gate requires the inline test module to be the
+last item of its file, which every module here follows.
+
+The measurement uses the seccomp logging build (`COVERAGE_FEATURES`):
+the LLVM profile runtime calls `prctl(2)` with an argument other than
+`PR_SET_NAME`, which the production filter kills, so an enforced
+instrumented daemon never writes its profile. The privileged tests are
+`#[ignore]`d and therefore not counted; the kernel shim, the capability
+drop and the seccomp installer are the files with the lowest figures for
+that reason. CI publishes the numbers as badges on the `badges` branch
+(`scripts/ci/publish-badges.sh`, rendered by `scripts/ci/badge.sh`) and
+then checks that the rendered README serves them as SVG images
+(`scripts/ci/verify-badges-render.sh`).

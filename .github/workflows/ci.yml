@@ -51,60 +51,92 @@ jobs:
       - run: cargo test --locked ${{ matrix.features.flags }}
 
   # T5.7: line coverage over the unit, property, integration and E2E
-  # suites (all features, unprivileged). The job fails below the floor.
-  # On pushes to a branch (not pull requests) it also publishes the
-  # coverage and test-count badges to the `badges` branch under
-  # `<branch>/`, which the README embeds for `main`.
+  # suites (unprivileged). scripts/ci/coverage.sh measures with
+  # cargo-llvm-cov, strips the inline `#[cfg(test)] mod tests` blocks from
+  # the LCOV (scripts/ci/coverage-gate.py) and applies the floor to the
+  # remaining production lines. Reports are uploaded even when the floor
+  # fails. The job has read-only access and does not keep the token: the
+  # badge publication below is a separate job.
+  #
+  # The daemon is measured with the seccomp *logging* build: the LLVM
+  # profile runtime calls prctl(2) with an argument the production filter
+  # refuses (only PR_SET_NAME is allowed), so an enforced, instrumented
+  # daemon is killed before it writes its profile. The enforced filter is
+  # exercised by the privileged job.
   coverage:
-    name: coverage (llvm-cov, 90% line floor)
+    name: coverage (production lines, 85% floor)
     runs-on: ubuntu-24.04
     permissions:
-      contents: write
+      contents: read
     env:
-      COVERAGE_FLOOR_LINES: 90
+      COVERAGE_FEATURES: seccomp-log,suspend_ram,test-fakes
+      COVERAGE_FLOOR_LINES: 85
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
       - run: rustup component add llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
-      - name: Test with coverage (fails under the floor)
-        run: |
-          set -o pipefail
-          cargo llvm-cov --all-features --locked --lcov --output-path lcov.info \
-            --fail-under-lines "$COVERAGE_FLOOR_LINES" 2>&1 | tee coverage.log
+          tool: cargo-llvm-cov@0.6.21
+      - name: Measure, report, then gate
+        run: scripts/ci/coverage.sh target/coverage
       - name: Coverage summary
+        if: always()
         run: |
-          cargo llvm-cov report --json --summary-only --output-path coverage.json
           {
-            echo "## Coverage (all features)"
+            echo "## Coverage (features: $COVERAGE_FEATURES)"
             echo
-            echo "| Lines | Functions | Regions | Floor (lines) |"
-            echo "|---|---|---|---|"
-            jq -r '.data[0].totals | "| \(.lines.percent | . * 10 | round / 10)% | \(.functions.percent | . * 10 | round / 10)% | \(.regions.percent | . * 10 | round / 10)% | '"$COVERAGE_FLOOR_LINES"'% |"' coverage.json
+            cat target/coverage/coverage-summary.md
           } >> "$GITHUB_STEP_SUMMARY"
-          cargo llvm-cov report --summary-only
-      - name: Upload coverage report
+      - name: Upload coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage
-          path: |
-            lcov.info
-            coverage.json
-            coverage.log
-          if-no-files-found: ignore
-      - name: Publish badges (pushes only)
-        if: github.event_name != 'pull_request'
+          path: target/coverage/
+          if-no-files-found: error
+
+  # Publishes the coverage and test-count badges for the pushed branch to
+  # the `badges` branch (path `<branch>/`); the README embeds `main/`. A
+  # separate job so that only this trusted, test-free step holds a
+  # write-capable token; the global concurrency group serialises every
+  # writer of the shared branch. Runs on pushes to main and on manual
+  # dispatch (any branch, so the mechanism can be exercised before merge).
+  publish-badges:
+    name: publish badges
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: coverage
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: qeminga-badges-publisher
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: coverage
+          path: target/coverage
+      - name: Publish
         env:
           GIT_AUTHOR_NAME: github-actions[bot]
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
-        run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" coverage.json coverage.log
+        run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" target/coverage/coverage-summary.json target/coverage/coverage.log
+      # Proves the README badges render in this private repository: fetch
+      # the README as GitHub renders it, take the badge image URLs it
+      # rewrote, point them at the directory just published, and check
+      # that GitHub serves each one as an SVG image.
+      - name: Verify the README badges render
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/verify-badges-render.sh "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME"
 
   docs:
     name: rustdoc (-D warnings)

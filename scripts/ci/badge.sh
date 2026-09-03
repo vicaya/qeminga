@@ -1,13 +1,14 @@
 #!/bin/sh
 # Renders a flat, shields.io-style SVG badge on stdout.
 #
-#   scripts/ci/badge.sh LABEL VALUE COLOR > badge.svg
+#   scripts/ci/badge.sh LABEL VALUE [COLOR] > badge.svg
 #
-# COLOR is a CSS colour (for example "#4c1" or "brightgreen"; the shields
-# names brightgreen, green, yellowgreen, yellow, orange and red are mapped
-# to their hex values). Text width is estimated at 7 px per character
-# plus 10 px of padding on each side, which matches shields.io closely for
-# the short ASCII labels used here. No network access, no dependencies.
+# COLOR is one of the shields names (brightgreen, green, yellowgreen,
+# yellow, orange, red, grey) or a hexadecimal colour (#rgb or #rrggbb);
+# anything else is rejected. Text is escaped for both element content and
+# attribute values. Text width is estimated at 7 px per character plus
+# 10 px of padding on each side, which matches shields.io closely for the
+# short ASCII labels used here. No network access, no dependencies.
 set -eu
 
 label=${1:?label}
@@ -22,10 +23,17 @@ case $color in
     orange) color='#fe7d37' ;;
     red) color='#e05d44' ;;
     grey | gray | lightgrey | lightgray) color='#9f9f9f' ;;
+    *)
+        if ! printf '%s' "$color" | grep -Eq '^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$'; then
+            echo "badge.sh: colour must be a shields name or #rgb/#rrggbb, got '$color'" >&2
+            exit 2
+        fi
+        ;;
 esac
 
 escape() {
-    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' -e "s/'/\&apos;/g"
 }
 
 label_width=$(( ${#label} * 7 + 10 ))

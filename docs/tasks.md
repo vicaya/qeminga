@@ -75,7 +75,7 @@ graph LR
 | 2 | T2.1–T2.5 | read-only (`/proc`, `/etc`, netlink) | all `∥` |
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
-| 5 | T5.1–T5.6 | CI runners with `sudo` | mostly `∥` |
+| 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
 
 ---
 
@@ -697,12 +697,12 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `cargo mutants` on `framing`, `proto`, `state`, and `fsfreeze` reports no surviving mutants in the errno-policy and gate code paths.
 
 #### T5.7 — Coverage floor and status badges ∥
-- **Status:** done
-- **Design:** AC8 (test quality), §5.2.
+- **Status:** in-progress (coverage job, floor and badge publication landed and exercised by `workflow_dispatch`; remaining: the first push to `main` must show the badges rendering in the README, checked by the publish job, and the maintainer confirms this self-authored task as a gate)
+- **Design:** AC8 (test quality), §12 (the check list).
 - **Depends on:** T4.7
-- **Files:** `.github/workflows/ci.yml` (`coverage` job), `scripts/ci/badge.sh`, `scripts/ci/publish-badges.sh`, `tests/badges.rs`, `README.md`, `docs/testing.md`, `AGENTS.md`.
-- **Tests:** `tests/badges.rs` (`badge_renders_label_value_and_colour`, `badge_escapes_markup_in_text`).
-- **Done when:** `cargo llvm-cov --all-features` runs the unprivileged suites in CI and fails under 90 % line coverage (measured 93 % at introduction); the README shows CI, tests and coverage badges that need no external service.
+- **Files:** `.github/workflows/ci.yml` (`coverage` and `publish-badges` jobs), `scripts/ci/coverage.sh`, `scripts/ci/coverage-gate.py`, `scripts/ci/badge.sh`, `scripts/ci/publish-badges.sh`, `scripts/ci/verify-badges-render.sh`, `tests/badges.rs`, `tests/badges_publish.rs`, `tests/coverage_gate.rs`, `README.md`, `docs/testing.md`, `AGENTS.md`.
+- **Tests:** `tests/badges.rs` (rendering, escaping, colour validation, well-formed XML), `tests/badges_publish.rs` (first publication, unchanged output, updates, separate branches, concurrent publication, attempt budget), `tests/coverage_gate.rs` (inline test lines excluded, floor on production lines, layout check).
+- **Done when:** CI fails under 85 % coverage of production lines (90.5 % measured locally at introduction; inline test modules excluded), the reports survive a failed gate, badge publication is serialised and write access is confined to the publish job, and the README shows CI, tests and coverage badges that render in this private repository.
 
 ---
 

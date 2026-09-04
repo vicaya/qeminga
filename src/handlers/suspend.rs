@@ -245,7 +245,25 @@ mod tests {
     #[test]
     fn sys_power_reads_the_real_file_or_reports_an_error() {
         // Never writes; only exercises the read path, which may or may not
-        // exist in the test environment.
-        let _ = SysPower.supported_states();
+        // exist in the test environment. Either way the result has the
+        // documented shape.
+        match SysPower.supported_states() {
+            Ok(states) => {
+                assert!(
+                    states.split_whitespace().all(|s| !s.is_empty()),
+                    "space-separated state names: {states:?}"
+                );
+                // Empty inside a container that cannot suspend; a
+                // newline-terminated list on a real guest.
+                assert!(states.is_empty() || states.ends_with('\n'), "{states:?}");
+            }
+            Err(err) => {
+                assert!(matches!(err, Error::Internal(_)), "{err:?}");
+                assert!(
+                    err.to_string().contains("cannot read /sys/power/state"),
+                    "{err}"
+                );
+            }
+        }
     }
 }

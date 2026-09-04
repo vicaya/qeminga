@@ -266,7 +266,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `main` can load `/etc/qeminga/config.toml` or a `--config` path and print validation errors with the offending key.
 
 #### T1.7 — `dispatch::ratelimit`: per-class token buckets ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.3 table and prose, AC5, C-9.
 - **Depends on:** T1.6
 - **Files:** `src/dispatch/ratelimit.rs` (or inside `src/dispatch.rs`).

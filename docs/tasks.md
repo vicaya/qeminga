@@ -478,6 +478,7 @@ the answer is a one-line change, and leave the question here.
   - `manual_thaw_and_deadline_race_produce_exactly_one_drain` — trigger both at the same instant; exactly one `claim_thaw` wins; the loser exits quietly.
   - `watchdog_handle_is_dropped_safely_after_thaw` — no panic, no leaked task (use `tokio::task::JoinHandle::is_finished`).
   - `spawn_blocking_handles_are_not_treated_as_cancellable` — cancellation only affects the timer loop; an in-flight drain runs to completion.
+  - `unrecoverable_thaw_failure_rearms_watchdog` — `Thawing → Frozen` (a failed thaw, manual or the watchdog's own) fires `on_frozen` again, so the watchdog is re-armed with idle/max measured from that moment (§4.4).
 - **Implement (green):** `Watchdog::arm(cfg, state, thaw: Arc<dyn Fn(ThawToken) -> BoxFuture<()>>) -> WatchdogHandle { refresh(), cancel() }`; loop with `tokio::select!` over `sleep_until(min(idle_deadline, hard_deadline))`, a `watch`/`Notify` for refresh, and a cancellation token; on deadline win call `state.claim_thaw()` first, then hand the drain to `spawn_blocking` via the callback.
 - **Done when:** `guest-fsfreeze-status` in T3.4 calls `refresh()` only while the state is `Frozen`.
 

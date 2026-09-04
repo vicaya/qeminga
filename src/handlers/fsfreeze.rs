@@ -1901,6 +1901,57 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn unrecoverable_thaw_failure_rearms_watchdog() {
+        // `Thawing → Frozen` is an entry into `Frozen` like any other
+        // (§4.2, §4.4): after a manual thaw fails with the marker retained
+        // the watchdog must be armed again, so that a dead orchestrator
+        // does not leave the filesystems frozen for ever; and when the
+        // watchdog's own drain fails, it is armed yet again.
+        let dir = tempfile::tempdir().unwrap();
+        let (ctx, kernel) = lifecycle_rig(&dir, 30, 300);
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        kernel.script_thaw_error("/", Errno::EPERM);
+        let err = thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("marker retained"), "{err}");
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        settle().await;
+        assert!(
+            ctx.watchdog_slot().is_some(),
+            "re-armed after the failed thaw"
+        );
+        // Silence: the re-armed idle timeout runs a drain (which fails
+        // again on `/`, so the state stays Frozen and it re-arms again).
+        let before = kernel.calls().len();
+        tokio::time::advance(std::time::Duration::from_secs(31)).await;
+        let start = std::time::Instant::now();
+        while kernel.calls().len() == before {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the re-armed watchdog never drained"
+            );
+            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        settle().await;
+        assert!(
+            kernel.calls()[before..]
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/home"))),
+            "the watchdog drain still thaws what it can"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+        assert!(
+            ctx.watchdog_slot().is_some(),
+            "re-armed after the watchdog's own failed drain"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn lifecycle_hooks_hard_cap_wins_over_heartbeats() {
         let dir = tempfile::tempdir().unwrap();
         let (ctx, _kernel) = lifecycle_rig(&dir, 30, 60);

@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tracing::Level;
+use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::time::FormatTime;
@@ -38,6 +39,11 @@ pub const EVENT_COMMAND_RECEIVED: &str = "command_received";
 
 /// The `event` value of the record that reports ring overflow after thaw.
 pub const EVENT_AUDIT_RECORDS_LOST: &str = "audit_records_lost";
+
+/// `tracing` target of every audit record. The subscriber keeps this
+/// target at INFO whatever `log_level` says, so audit records are never
+/// filtered out with the diagnostics (§9).
+pub const AUDIT_TARGET: &str = "qeminga::audit";
 
 /// A method name as it appears in an audit record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +176,7 @@ impl AuditRecord {
 macro_rules! audit_event {
     ($level:expr, $record:expr, $($method_fields:tt)*) => {
         tracing::event!(
+            target: AUDIT_TARGET,
             $level,
             event = EVENT_COMMAND_RECEIVED,
             $($method_fields)*
@@ -455,11 +462,16 @@ impl FormatTime for UtcTimestamp {
 }
 
 /// Builds the JSON subscriber used by qeminga: one flattened JSON object
-/// per event, written through `router`.
+/// per event, written through `router`. `level` filters diagnostics only;
+/// the [`AUDIT_TARGET`] stays at INFO so every audit record is written.
 pub fn subscriber(
     level: Level,
     router: Router,
 ) -> impl tracing::Subscriber + Send + Sync + 'static {
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let filter = Targets::new()
+        .with_default(level)
+        .with_target(AUDIT_TARGET, Level::INFO);
     tracing_subscriber::fmt()
         .json()
         .flatten_event(true)
@@ -467,9 +479,9 @@ pub fn subscriber(
         .with_current_span(false)
         .with_span_list(false)
         .with_timer(UtcTimestamp)
-        .with_max_level(level)
         .with_writer(router)
         .finish()
+        .with(filter)
 }
 
 /// Installs the qeminga subscriber as the global default (called once by
@@ -857,6 +869,29 @@ mod tests {
         assert_eq!(format_utc(t), "2024-02-29T00:00:00.000Z");
         let t = UNIX_EPOCH + Duration::from_secs(1_704_067_199);
         assert_eq!(format_utc(t), "2023-12-31T23:59:59.000Z");
+    }
+
+    #[test]
+    fn audit_records_are_written_whatever_the_log_level() {
+        // `log_level` governs diagnostics only (§9: every received command
+        // is written): under ERROR an allowed record still reaches the sink
+        // while an INFO diagnostic does not.
+        let sink = SharedSink::default();
+        let router = router_over(&sink, RING_CAPACITY);
+        let allowed = AuditRecord {
+            method: MethodField::Full("guest-fsfreeze-freeze".to_owned()),
+            id: Some(1),
+            disposition: Disposition::Allowed,
+            reason: None,
+            freeze_state_before: "thawed",
+        };
+        tracing::subscriber::with_default(subscriber(Level::ERROR, router), || {
+            tracing::info!(target: "qeminga::daemon", event = "diagnostic", "not written under ERROR");
+            allowed.emit();
+        });
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains(EVENT_COMMAND_RECEIVED), "{}", lines[0]);
     }
 
     #[test]

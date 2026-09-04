@@ -33,10 +33,14 @@ fn flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served
         }
     }
     let elapsed = started.elapsed();
-    // 120 tokens plus at most one refill per 500 ms of wall-clock time.
+    // 120 tokens plus at most one refill per 500 ms of wall-clock time: a
+    // slow runner may legitimately admit more than 120, so the bound
+    // scales with elapsed time rather than assuming the fake-clock figure
+    // (≥ 880 denials) of the T1.7 unit test.
     let max_ok = 120 + (elapsed.as_millis() / 500) as usize + 1;
     assert!(ok <= max_ok, "ok={ok} denied={denied} elapsed={elapsed:?}");
-    assert!(denied >= 878, "denied={denied} (elapsed {elapsed:?})");
+    assert_eq!(denied, 1000 - ok, "every frame was answered exactly once");
+    assert!(ok >= 120, "the bucket's 120 tokens are admitted: ok={ok}");
     // The unlimited class is unaffected and the daemon is healthy.
     let status = agent.execute("guest-fsfreeze-status");
     assert_eq!(status["return"], "thawed");

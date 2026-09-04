@@ -56,7 +56,11 @@ pty. The `test-fakes` Cargo feature lets that binary swap the kernel shim
 for the scripted fake when `QEMINGA_TEST_FAKE_KERNEL` is set, which is
 how `guest-shutdown` silence is observed without rebooting the host.
 `--all-features` therefore includes it; **release binaries are built with
-`--features seccomp`, never `--all-features`.**
+`--features seccomp`, never `--all-features`.** Running that suite (or
+`tests/startup.rs`) as root needs the `qeminga` account, since the daemon
+refuses to start as root without it (exit 77): create it with
+`sudo systemd-sysusers packaging/sysusers.d/qeminga.conf`, or run the
+tests unprivileged.
 
 ## Code rules
 

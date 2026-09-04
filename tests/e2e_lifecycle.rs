@@ -10,11 +10,12 @@ use serde_json::json;
 use std::time::Duration;
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fakes"),
+    ignore = "build with --features test-fakes to observe guest-shutdown without rebooting"
+)]
 fn shutdown_emits_no_reply() {
-    if !Agent::has_fake_kernel() {
-        eprintln!("skipped: build with --features test-fakes to observe guest-shutdown");
-        return;
-    }
+    assert!(Agent::has_fake_kernel());
     let mut agent = Agent::spawn();
     agent.send_line(r#"{"execute":"guest-shutdown","arguments":{"mode":"reboot"},"id":9}"#);
     assert!(
@@ -65,7 +66,8 @@ fn channel_eof_then_reopen_preserves_state() {
         e2e::REOPEN_TIMEOUT,
     );
     assert_eq!(status["return"], "frozen", "state survives");
-    // A partial frame before the EOF must not leak into the new session.
+    // The frozen gate still applies over the new session (a partial frame
+    // left before the EOF is covered by `partial_frame_is_dropped_on_reconnect`).
     let osinfo = agent.execute("guest-get-osinfo");
     assert_eq!(
         osinfo["error"]["desc"],

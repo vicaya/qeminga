@@ -96,6 +96,23 @@ fn open_pty() -> Pty {
     }
 }
 
+/// Root without the service account cannot run the daemon at all: the
+/// §5.4 drop is mandatory when started as root (C-18 skips it only when
+/// *not* root), so every test would otherwise report the daemon's exit 77.
+/// Fail once, before spawning, with the fix.
+pub fn require_service_account_when_root() {
+    if nix::unistd::geteuid().is_root()
+        && nix::unistd::User::from_name("qeminga").unwrap().is_none()
+    {
+        panic!(
+            "running as root without the `qeminga` account: the daemon refuses to start (cannot drop privileges, exit 77). \
+             Create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` \
+             (or `groupadd -g 600 qeminga && useradd -r -u 600 -g 600 -M -s /usr/sbin/nologin qeminga`), \
+             or run the tests unprivileged."
+        );
+    }
+}
+
 /// A running daemon and the client end of its channel.
 pub struct Agent {
     child: Child,
@@ -114,6 +131,7 @@ impl Agent {
 
     /// Spawns the real binary with a fresh configuration and pty.
     pub fn spawn_with(opts: SpawnOptions) -> Agent {
+        require_service_account_when_root();
         let dir = tempfile::Builder::new()
             .prefix("qeminga-e2e-")
             .tempdir_in("/dev/shm")

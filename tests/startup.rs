@@ -778,6 +778,16 @@ fn runtime_is_multi_thread_with_at_least_two_workers() {
 /// daemon's stderr and exit status.
 fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus) {
     use nix::fcntl::OFlag;
+    // As in tests/e2e/mod.rs: root without the service account cannot run
+    // the daemon (exit 77); say so once instead of failing obscurely.
+    if nix::unistd::geteuid().is_root()
+        && nix::unistd::User::from_name("qeminga").unwrap().is_none()
+    {
+        panic!(
+            "running as root without the `qeminga` account: create it with \
+             `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` or run the tests unprivileged"
+        );
+    }
     let master =
         nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).unwrap();
     nix::pty::grantpt(&master).unwrap();

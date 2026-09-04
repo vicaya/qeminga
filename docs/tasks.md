@@ -625,12 +625,12 @@ the answer is a one-line change, and leave the question here.
   - `ping_round_trip`, `sync_delimited_resyncs_after_garbage` (send `garbage`, then `0xFF{"execute":"guest-sync-delimited","arguments":{"id":1}}\n`).
   - `guest_exec_and_every_denied_command_return_command_not_found` (AC1).
   - `oversized_frame_then_valid_command` (AC4).
-  - `flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served` (AC5) — send in one write; count `GenericError` replies ≥ 880; then `guest-fsfreeze-status` → `thawed`.
+  - `flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served` (AC5) — send in one write; count `GenericError` replies ≥ 880 (the fake-clock figure of the T1.7 unit test; against the real binary the assertion is `denied == 1000 − ok` with `120 ≤ ok ≤ 120 + elapsed/500 ms + 1`, since a slow runner can legitimately refill more tokens while the 1000 replies are written); then `guest-fsfreeze-status` → `thawed`.
   - `guest_info_matches_capability_contract` (AC19).
   - `guest_get_osinfo_and_interfaces_and_fsinfo_return_well_formed_json` (schema-level assertions; values are host-dependent).
   - `shutdown_emits_no_reply` — requires a way to substitute the kernel ops in the real binary: add a `test-fakes` Cargo feature that swaps `LinuxKernel` for a scripted fake (never enabled in release; CI builds E2E with it) — decide and document in `AGENTS.md`.
   - `channel_eof_then_reopen_preserves_state` (AC18, unprivileged half): close the master, reopen a new pty at the same path (symlink swap), send `guest-fsfreeze-status`.
-- **Implement (green):** harness only; production changes should be limited to the `test-fakes` feature.
+- **Implement (green):** harness only; production changes should be limited to the `test-fakes` feature (the rule this suite relies on, a failed recovery drain from `Thawed` returning to `Thawed`, is T3.4's and is recorded under OQ-3). `kernel::fake` is compiled unconditionally: it performs no kernel operation and only the swap is feature-gated; keeping it out of release binaries would need a self dev-dependency, which is deliberately not done. Root needs the `qeminga` account to run the suite; the harness fails fast with the fix (AGENTS.md).
 - **Done when:** the whole file runs in under 30 s in CI.
 
 ---

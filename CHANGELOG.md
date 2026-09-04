@@ -24,7 +24,7 @@ First release: the complete command set of `docs/design.md`.
 - Freeze lifecycle: mount plan from `/proc/self/mountinfo` (ext4/xfs on
   `/dev` nodes, bind mounts de-duplicated, reverse mount order), recovery
   marker created with `O_EXCL` + `fsync` before the first `FIFREEZE`, thaw
-  drains until `EINVAL`, watchdog with idle timeout and hard cap, and
+  drains each target until its first error (bounded at 1024 calls; a denied first `FITHAW` or a drain that never converges keeps the state `Frozen`), watchdog with idle timeout and hard cap, and
   recovery mode after a crash.
 - Audit: one structured JSON record per command, method projection with a
   SHA-256 digest for over-long names, and a 64 KiB freeze-safe ring with a

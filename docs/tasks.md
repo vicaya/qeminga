@@ -682,7 +682,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** a run log is attached to the PR; the job stays manual (no nested virtualisation in hosted CI).
 
 #### T5.5 — Documentation and release readiness ∥
-- **Status:** done (0.1.0 ready to tag once the task PRs are merged; open items in §7)
+- **Status:** in-progress (documentation and §7 refreshed; the release itself waits on T5.4's run log and T5.7's first publication on `main`, both in-progress, and on the `v0.1.0` tag, which the maintainer applies after the merge; open items in §7)
 - **Design:** §7 (C-4), §12.
 - **Depends on:** everything above
 - **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done, record arm64 gap).
@@ -717,7 +717,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC11 watchdog idle and hard cap | T3.5, T5.2 (`privileged_watchdog_idle_and_hard_cap_on_real_fs`) | unit (paused time) + privileged | green |
 | AC12 shutdown has no success reply | T4.2, T4.7 (`shutdown_emits_no_reply`) | unit + E2E | green |
 | AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 (`privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + privileged | green |
-| AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | green (60 s on PRs; first weekly run pending) |
+| AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | pending: the 60 s run is green on every PR; the one-hour weekly run has not executed yet, so AC14 as written is not yet demonstrated |
 | AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64; arm64 pending runner (§7) |
 | AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`) | manual | manual, run log pending (§7) |
 | AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 (`privileged_freeze_with_tmpfs_bind_and_0700_mountpoint`) | unit + privileged | green |

@@ -29,6 +29,12 @@ pub struct Config {
     pub features: Features,
 }
 
+/// Upper bound on both freeze timeouts (one day). The watchdog adds them
+/// to an `Instant`, which would overflow (and abort the agent at the
+/// moment a freeze succeeds) for values near `u64::MAX`; anything longer
+/// than a day is an operator error caught at startup instead.
+pub const MAX_FSFREEZE_TIMEOUT_SECS: u64 = 86_400;
+
 /// `[agent]` section.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -266,6 +272,23 @@ impl Config {
                 "must be greater than zero",
             ));
         }
+        for (key, value) in [
+            (
+                "agent.fsfreeze_idle_timeout_secs",
+                agent.fsfreeze_idle_timeout_secs,
+            ),
+            (
+                "agent.fsfreeze_max_timeout_secs",
+                agent.fsfreeze_max_timeout_secs,
+            ),
+        ] {
+            if value > MAX_FSFREEZE_TIMEOUT_SECS {
+                return Err(invalid(
+                    key,
+                    format!("must be at most {MAX_FSFREEZE_TIMEOUT_SECS} (one day)"),
+                ));
+            }
+        }
         if agent.fsfreeze_max_timeout_secs < agent.fsfreeze_idle_timeout_secs {
             return Err(invalid(
                 "agent.fsfreeze_max_timeout_secs",
@@ -457,6 +480,41 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    #[test]
+    fn timeouts_above_the_cap_are_an_error() {
+        // The watchdog adds these to an Instant; a value near u64::MAX
+        // would overflow there, at the moment the freeze succeeds.
+        let err = parse_err("invalid_timeout_too_large.toml");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "agent.fsfreeze_max_timeout_secs",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(err.to_string().contains("86400"), "{err}");
+        let mut config = Config::default();
+        config.agent.fsfreeze_idle_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS + 1;
+        config.agent.fsfreeze_max_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS + 1;
+        let err = config.validate().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "agent.fsfreeze_idle_timeout_secs",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        config.agent.fsfreeze_idle_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS;
+        config.agent.fsfreeze_max_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS;
+        config.validate().unwrap();
     }
 
     #[test]

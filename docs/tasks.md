@@ -258,7 +258,7 @@ the answer is a one-line change, and leave the question here.
 - **Tests first (red):**
   - `example_from_design_parses` — the exact TOML block in §8.2 round-trips.
   - `empty_file_yields_documented_defaults` — every default in §8.2 (`channel_path`, `log_level = info`, `state_path`, `30`, `300`, quotas `120/30/10/5/2`, `suspend_ram = false`, `fstrim = true`, `seccomp = true`).
-  - `unknown_key_is_an_error`, `unknown_log_level_is_an_error`, `config_version_other_than_1_is_an_error`, `relative_state_path_is_an_error`, `idle_timeout_zero_is_an_error`, `max_timeout_below_idle_is_an_error`, `zero_quota_is_an_error`.
+  - `unknown_key_is_an_error`, `unknown_log_level_is_an_error`, `config_version_other_than_1_is_an_error`, `relative_state_path_is_an_error`, `idle_timeout_zero_is_an_error`, `max_timeout_below_idle_is_an_error`, `timeouts_above_the_cap_are_an_error` (both freeze timeouts are capped at 86 400 s, `MAX_FSFREEZE_TIMEOUT_SECS`: the watchdog adds them to an `Instant`, which would overflow near `u64::MAX`), `zero_quota_is_an_error`.
   - `runtime_feature_without_compile_feature_is_a_warning_not_an_error` — `Config::warnings()` lists `seccomp` when `cfg!(feature = "seccomp")` is false, likewise `suspend_ram`.
   - `effective_flags_combine_both_layers` — `fstrim_enabled()`, `suspend_ram_enabled()`, `seccomp_enabled()`.
   - `load_reports_path_in_error`.

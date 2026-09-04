@@ -94,3 +94,83 @@ fn production_code_after_the_test_module_is_rejected() {
         "{text}"
     );
 }
+
+// Function records: `FNDA:<count>,<name>` carries an execution count, not a
+// line, so it cannot be filtered by line; the filtered file is a line and
+// branch report and carries no function records at all.
+const LCOV_WITH_FUNCTIONS: &str = "SF:src/m.rs\nFN:1,a\nFN:5,b\nFN:11,tests::t\nFNDA:500,a\nFNDA:0,b\nFNDA:1,tests::t\nFNF:3\nFNH:2\nDA:1,500\nDA:2,500\nDA:5,0\nDA:6,0\nDA:11,1\nDA:12,1\nDA:13,1\nDA:14,1\nBRDA:2,0,0,500\nBRDA:12,0,0,1\nBRF:2\nBRH:2\nLF:8\nLH:6\nend_of_record\n";
+
+#[test]
+fn function_records_are_not_filtered_by_their_execution_count() {
+    let (code, text, filtered) = run(LCOV_WITH_FUNCTIONS, SOURCE, "40");
+    assert_eq!(code, 0, "{text}");
+    for record in ["FN:", "FNDA:", "FNF:", "FNH:", "FNL:", "FNA:"] {
+        assert!(
+            !filtered.contains(record),
+            "{record} must not survive into the line report:\n{filtered}"
+        );
+    }
+    // Branch records do carry a line and follow the same cut as DA.
+    assert!(filtered.contains("BRDA:2,0,0,500"), "{filtered}");
+    assert!(!filtered.contains("BRDA:12,"), "{filtered}");
+    assert!(text.contains("\"percent\": 50.0"), "{text}");
+}
+
+#[test]
+fn excluded_test_support_files_do_not_count_as_production() {
+    // Two files: the production module and a test double compiled
+    // unconditionally. The double is fully covered and would lift the
+    // production figure; `--exclude` removes it from that figure and from
+    // the filtered report while the all-lines figure still counts it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("src/kernel")).unwrap();
+    std::fs::write(dir.path().join("src/m.rs"), SOURCE).unwrap();
+    std::fs::write(
+        dir.path().join("src/kernel/fake.rs"),
+        "pub fn f() -> u32 {\n    3\n}\n",
+    )
+    .unwrap();
+    let lcov = format!("{LCOV}SF:src/kernel/fake.rs\nDA:1,1\nDA:2,1\nend_of_record\n");
+    std::fs::write(dir.path().join("cov.info"), lcov).unwrap();
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/coverage-gate.py");
+    let out = Command::new("python3")
+        .arg(script)
+        .args([
+            "cov.info",
+            "--floor",
+            "55",
+            "--exclude",
+            "src/kernel/fake.rs",
+            "--json",
+            "s.json",
+            "--filtered",
+            "prod.info",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        std::fs::read_to_string(dir.path().join("s.json")).unwrap_or_default()
+    );
+    // With the double counted the production figure would be 4/6 = 66.7 %
+    // and pass a 55 % floor; without it, 2/4 = 50 % fails.
+    assert_eq!(out.status.code().unwrap(), 1, "{text}");
+    assert!(
+        text.contains("\"found\": 4,\n    \"hit\": 2,\n    \"percent\": 50.0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"found\": 10,\n    \"hit\": 8,\n    \"percent\": 80.0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("\"excluded\": [\n    \"src/kernel/fake.rs\"\n  ]"),
+        "{text}"
+    );
+    let filtered = std::fs::read_to_string(dir.path().join("prod.info")).unwrap();
+    assert!(!filtered.contains("SF:src/kernel/fake.rs"), "{filtered}");
+    assert!(filtered.contains("SF:src/m.rs"), "{filtered}");
+}

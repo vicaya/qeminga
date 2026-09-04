@@ -3,8 +3,9 @@
 # repository, after a publication for BRANCH:
 #
 #   1. the README as GitHub renders it (the HTML the web page embeds)
-#      still carries the two badge <img> elements and GitHub left their
-#      same-repository raw URLs in place (no Camo rewrite);
+#      carries exactly the two badge <img> elements, tests.svg and
+#      coverage.svg, each once, and GitHub left their same-repository raw
+#      URLs in place (no Camo rewrite);
 #   2. the files those URLs name, re-pointed at the directory just
 #      published for BRANCH, exist on the badges branch and are served to
 #      an authenticated client (the workflow token, as a signed-in browser
@@ -30,10 +31,13 @@ if [ -z "$urls" ]; then
     exit 1
 fi
 status=0
+seen_tests=0
+seen_coverage=0
 for url in $urls; do
     url=$(printf '%s' "$url" | sed 's|&amp;|\&|g')
     case "$url" in
-        https://github.com/"$repo"/raw/badges/main/*) ;;
+        https://github.com/"$repo"/raw/badges/main/tests.svg) seen_tests=$((seen_tests + 1)) ;;
+        https://github.com/"$repo"/raw/badges/main/coverage.svg) seen_coverage=$((seen_coverage + 1)) ;;
         *)
             echo "verify-badges-render: unexpected badge URL in the rendered README: $url" >&2
             status=1
@@ -41,17 +45,29 @@ for url in $urls; do
     esac
     file=${url##*/badges/main/}
     raw="https://raw.githubusercontent.com/$repo/badges/$branch/$file"
-    headers=$(curl -sS -o /dev/null -D - -L -H "Authorization: token ${GH_TOKEN}" "$raw" || true)
+    headers=$(curl -sS -o /dev/null -D - -L -H "Authorization: token ${GH_TOKEN}" "$raw" | tr -d '\r' || true)
     code=$(printf '%s' "$headers" | grep -i '^HTTP/' | tail -1 | awk '{print $2}')
-    ctype=$(printf '%s' "$headers" | grep -i '^content-type:' | tail -1 | tr -d '\r' | cut -d' ' -f2-)
+    ctype=$(printf '%s' "$headers" | grep -i '^content-type:' | tail -1 | cut -d' ' -f2-)
     echo "README embeds $url"
     echo "  published file $raw -> $code ${ctype:-?}"
     case "$code:$ctype" in
         200:*svg*) ;;
-        *) status=1 ;;
+        *)
+            echo "verify-badges-render: $file is not served as SVG" >&2
+            status=1 ;;
     esac
 done
+for badge in tests coverage; do
+    eval "n=\$seen_$badge"
+    if [ "$n" -eq 0 ]; then
+        echo "verify-badges-render: the rendered README does not embed badges/main/$badge.svg" >&2
+        status=1
+    elif [ "$n" -gt 1 ]; then
+        echo "verify-badges-render: badges/main/$badge.svg is embedded more than once ($n)" >&2
+        status=1
+    fi
+done
 if [ "$status" -ne 0 ]; then
-    echo "verify-badges-render: a published badge is missing or not served as SVG (see above)" >&2
+    echo "verify-badges-render: the README badges do not verify (see above)" >&2
 fi
 exit "$status"

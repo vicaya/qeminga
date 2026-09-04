@@ -68,7 +68,8 @@ while :; do
     printf '{"branch":"%s","commit":"%s","production_lines_percent":%s,"tests_passed":%s}\n' \
         "$branch" "$sha" "$percent" "$passed" > "$out/summary.json"
 
-    if ! git -C "$work" add -A || git -C "$work" diff --cached --quiet; then
+    git -C "$work" add -A
+    if git -C "$work" diff --cached --quiet; then
         echo "badges unchanged for $branch (coverage ${percent}%, ${passed} tests)"
         exit 0
     fi

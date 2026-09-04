@@ -112,11 +112,15 @@ cargo llvm-cov --features seccomp-log,suspend_ram,test-fakes --locked --html   #
 `scripts/ci/coverage.sh` runs every unprivileged suite under
 `cargo llvm-cov`, writes `lcov.info`, `coverage.json` and `coverage.log`,
 then `scripts/ci/coverage-gate.py` removes each file's inline
-`#[cfg(test)] mod tests` block from the LCOV (`lcov-production.info`) and
-applies the floor (`COVERAGE_FLOOR_LINES`, 85 %) to the remaining
-production lines; `coverage-summary.md` and `coverage-summary.json`
-carry both figures. The gate requires the inline test module to be the
-last item of its file, which every module here follows.
+`#[cfg(test)] mod tests` block and the test-support files named by
+`COVERAGE_EXCLUDE` (default `src/kernel/fake.rs`, the scripted kernel
+double the end-to-end suite runs against) from the LCOV
+(`lcov-production.info`, a line and branch report without function
+records) and applies the floor (`COVERAGE_FLOOR_LINES`, 85 %) to the
+remaining **production lines**; `coverage-summary.md` and
+`coverage-summary.json` carry both figures and name the excluded files.
+The gate requires the inline test module to be the last item of its
+file, which every module here follows.
 
 The measurement uses the seccomp logging build (`COVERAGE_FEATURES`):
 the LLVM profile runtime calls `prctl(2)` with an argument other than

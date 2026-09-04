@@ -291,3 +291,59 @@ fn gives_up_after_the_attempt_budget() {
     assert!(!ok, "{text}");
     assert!(text.contains("giving up"), "{text}");
 }
+
+#[test]
+fn a_failed_git_add_is_an_error_not_unchanged_badges() {
+    // A `git` on PATH that fails `add` and forwards everything else: the
+    // publisher must fail loudly rather than report the badges unchanged.
+    let rig = Rig::new();
+    assert!(rig.publish("main", 80.0, 100, None).0);
+    let bin = rig._dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let shim = bin.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\nif [ \"${{1:-}}\" = -C ] && [ \"${{3:-}}\" = add ]; then echo 'git add: simulated I/O error' >&2; exit 128; fi\nexec {} \"$@\"\n",
+            real.trim()
+        ),
+    )
+    .unwrap();
+    let mut perm = std::fs::metadata(&shim).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perm.set_mode(0o755);
+    std::fs::set_permissions(&shim, perm).unwrap();
+    let (json, log) = rig.inputs(90.0, 300);
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/publish-badges.sh");
+    let out = Command::new("sh")
+        .arg(script)
+        .args(["main", json.to_str().unwrap(), log.to_str().unwrap()])
+        .current_dir(&rig.clone)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_AUTHOR_NAME", "bot")
+        .env("GIT_AUTHOR_EMAIL", "bot@x")
+        .env("GIT_COMMITTER_NAME", "bot")
+        .env("GIT_COMMITTER_EMAIL", "bot@x")
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{text}");
+    assert!(!text.contains("badges unchanged"), "{text}");
+    assert!(text.contains("simulated I/O error"), "{text}");
+    assert_eq!(rig.commits(), 1, "nothing was published");
+}

@@ -82,10 +82,12 @@ Tests that need root or `CAP_SYS_ADMIN` are `#[ignore]`d and named
 
 Coverage is measured by `cargo llvm-cov` over every suite that runs
 unprivileged (unit, property, integration and end-to-end) and CI fails
-below **85 % of production lines**: the inline `#[cfg(test)] mod tests`
-blocks are removed from the report first (`scripts/ci/coverage-gate.py`),
-because test code is covered by construction and would inflate the
-number. The run summary shows both figures. The daemon is measured with
+below **85 % of production lines**, meaning the instrumented lines of
+`src/` outside the inline `#[cfg(test)] mod tests` blocks and outside the
+scripted kernel double (`src/kernel/fake.rs`) that the end-to-end suite
+runs against: `scripts/ci/coverage-gate.py` removes both from the report
+first, because test code is covered by construction and would inflate
+the number. The run summary shows both figures. The daemon is measured with
 the seccomp *logging* build, since the LLVM profile runtime calls
 `prctl(2)` with an argument the production filter refuses; the enforced
 filter is exercised by the privileged CI job. The tests and coverage

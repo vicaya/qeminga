@@ -71,6 +71,8 @@ jobs:
     env:
       COVERAGE_FEATURES: seccomp-log,suspend_ram,test-fakes
       COVERAGE_FLOOR_LINES: 85
+      # Test-support source left out of the production figure (space-separated).
+      COVERAGE_EXCLUDE: src/kernel/fake.rs
     steps:
       - uses: actions/checkout@v4
         with:
@@ -129,10 +131,11 @@ jobs:
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
         run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" target/coverage/coverage-summary.json target/coverage/coverage.log
-      # Proves the README badges render in this private repository: fetch
-      # the README as GitHub renders it, take the badge image URLs it
-      # rewrote, point them at the directory just published, and check
-      # that GitHub serves each one as an SVG image.
+      # Proves what CI can about the README badges of this private
+      # repository: fetch the README as GitHub renders it, require exactly
+      # the two badge image URLs (each once, unrewritten), point them at the
+      # directory just published, and check that GitHub serves each one as
+      # an SVG image.
       - name: Verify the README badges render
         env:
           GH_TOKEN: ${{ github.token }}

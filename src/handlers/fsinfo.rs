@@ -5,10 +5,18 @@
 //! `statfs(2)`. A `statfs` failure omits the size fields of that entry
 //! rather than dropping the entry or failing the command. `disk` is always
 //! an empty array: qeminga does not walk sysfs for the backing devices.
+//!
+//! Liveness (a deviation from upstream, recorded in `docs/tasks.md`):
+//! `statfs` is not issued on network, FUSE and autofs mounts, whose server
+//! or daemon may be gone (an uninterruptible `statfs` on a hard-mounted
+//! share would block every later command), and `statfs(2)` on an autofs
+//! trigger would mount it; those entries are listed without sizes. The
+//! whole walk is also bounded by [`FSINFO_TIMEOUT`].
 #![forbid(unsafe_code)]
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -85,15 +93,44 @@ pub struct FilesystemInfo {
     pub disk: Vec<Value>,
 }
 
+/// Bound on the whole `statfs` walk; past it the command fails rather
+/// than holding the session (the blocking thread is abandoned).
+pub const FSINFO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Filesystem types whose `statfs` may block indefinitely (network
+/// shares, FUSE daemons) or have side effects (autofs triggers). Their
+/// entries are reported without sizes.
+pub fn sizes_are_queried(fs_type: &str) -> bool {
+    const SKIPPED: [&str; 14] = [
+        "nfs",
+        "nfs4",
+        "cifs",
+        "smb3",
+        "smbfs",
+        "ncpfs",
+        "afs",
+        "ceph",
+        "glusterfs",
+        "9p",
+        "coda",
+        "lustre",
+        "autofs",
+        "fuseblk",
+    ];
+    !(SKIPPED.contains(&fs_type) || fs_type.starts_with("fuse"))
+}
+
 /// Builds the reply for a mount table.
 pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<FilesystemInfo> {
     mounts
         .iter()
         .map(|m| {
-            let sizes = statfs.statfs(Path::new(&m.mount_point)).ok();
+            let sizes = sizes_are_queried(&m.fs_type)
+                .then(|| statfs.statfs(&m.mount_point).ok())
+                .flatten();
             FilesystemInfo {
                 name: m.source.clone(),
-                mountpoint: m.mount_point.clone(),
+                mountpoint: m.mount_point.to_string_lossy().into_owned(),
                 fs_type: m.fs_type.clone(),
                 used_bytes: sizes.map(|s| s.used_bytes()),
                 total_bytes: sizes.map(|s| s.total_bytes()),
@@ -103,18 +140,26 @@ pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<Filesyst
         .collect()
 }
 
-/// `guest-get-fsinfo` handler. `statfs` may block on a slow network
-/// filesystem, so the whole walk runs on the blocking pool.
+/// `guest-get-fsinfo` handler. `statfs` may block, so the whole walk runs
+/// on the blocking pool under [`FSINFO_TIMEOUT`]; a walk that does not
+/// finish in time fails the command and the session moves on.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
     let mounts: Arc<dyn MountSource> = Arc::clone(&ctx.mounts);
     let statfs: Arc<dyn StatfsSource> = Arc::clone(&ctx.statfs);
-    let info = tokio::task::spawn_blocking(move || {
+    let walk = tokio::task::spawn_blocking(move || {
         let entries = mounts.mounts()?;
         Ok::<_, Error>(fs_info(&entries, statfs.as_ref()))
-    })
-    .await
-    .map_err(|err| Error::Internal(format!("fsinfo task failed: {err}")))??;
+    });
+    let info = tokio::time::timeout(FSINFO_TIMEOUT, walk)
+        .await
+        .map_err(|_| {
+            Error::Internal(format!(
+                "fsinfo did not complete within {} s",
+                FSINFO_TIMEOUT.as_secs()
+            ))
+        })?
+        .map_err(|err| Error::Internal(format!("fsinfo task failed: {err}")))??;
     Ok(json!(info))
 }
 
@@ -138,7 +183,7 @@ mod tests {
     impl StatfsSource for FakeStatfs {
         fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error> {
             self.0
-                .get(mount_point.to_str().unwrap())
+                .get(mount_point.to_string_lossy().as_ref())
                 .copied()
                 .ok_or_else(|| Error::Internal("EIO".into()))
         }
@@ -243,6 +288,103 @@ mod tests {
         let mounts = parse_mountinfo(&fixture("escaped_paths.txt"));
         let info = fs_info(&mounts, &fake());
         assert_eq!(info[1].mountpoint, "/mnt/with space");
+    }
+
+    #[test]
+    fn fsinfo_does_not_statfs_remote_fuse_or_autofs_mounts() {
+        // Sizes are offered for every mount, yet the network, FUSE and 9p
+        // entries are listed without them: their statfs is never issued.
+        let mounts = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
+        let sizes = Statfs {
+            blocks: 1,
+            bfree: 0,
+            bsize: 4096,
+        };
+        let all = FakeStatfs(
+            mounts
+                .iter()
+                .map(|m| (m.mount_point.to_string_lossy().into_owned(), sizes))
+                .collect(),
+        );
+        let info = fs_info(&mounts, &all);
+        for entry in &info {
+            let queried = entry.total_bytes.is_some();
+            assert_eq!(
+                queried,
+                sizes_are_queried(&entry.fs_type),
+                "{} ({})",
+                entry.mountpoint,
+                entry.fs_type
+            );
+        }
+        let skipped: Vec<&str> = info
+            .iter()
+            .filter(|f| f.total_bytes.is_none())
+            .map(|f| f.fs_type.as_str())
+            .collect();
+        assert_eq!(skipped, ["nfs4", "cifs", "fuse.sshfs", "9p"]);
+        assert!(!sizes_are_queried("autofs"));
+        assert!(!sizes_are_queried("fuseblk"));
+        assert!(sizes_are_queried("ext4"));
+        assert!(sizes_are_queried("virtiofs"));
+    }
+
+    #[test]
+    fn non_utf8_mount_points_are_reported_lossily_but_queried_byte_exact() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::Mutex;
+        struct Recording(Mutex<Vec<Vec<u8>>>);
+        impl StatfsSource for Recording {
+            fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error> {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(mount_point.as_os_str().as_bytes().to_vec());
+                Err(Error::Internal("EIO".into()))
+            }
+        }
+        let mounts = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let recording = Recording(Mutex::new(Vec::new()));
+        let info = fs_info(&mounts, &recording);
+        assert_eq!(info.last().unwrap().mountpoint, "/mnt/caf\u{fffd}");
+        let asked = recording.0.lock().unwrap();
+        assert!(asked.contains(&b"/mnt/caf\xe9".to_vec()), "{asked:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stuck_statfs_fails_the_command_instead_of_the_session() {
+        struct Stuck(std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>);
+        impl StatfsSource for Stuck {
+            fn statfs(&self, _: &Path) -> Result<Statfs, Error> {
+                // Blocks until the test drops the sender (a D-state statfs).
+                let rx = self.0.lock().unwrap().take();
+                if let Some(rx) = rx {
+                    let _ = rx.recv();
+                }
+                Err(Error::Internal("EIO".into()))
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let ctx = Arc::new(
+            Context::for_tests()
+                .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+                .with_statfs(Arc::new(Stuck(std::sync::Mutex::new(Some(rx))))),
+        );
+        let req = crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+        // Paused time does not advance while a blocking task runs, so the
+        // handler is started, allowed to arm its timer, and the clock is
+        // moved past the bound by hand.
+        let task = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move { handle(&ctx, &req).await }
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(FSINFO_TIMEOUT + Duration::from_secs(1)).await;
+        let err = task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("did not complete"), "{err}");
+        drop(tx);
     }
 
     #[test]

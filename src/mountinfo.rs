@@ -15,7 +15,11 @@
 //! (mount order) is preserved.
 #![forbid(unsafe_code)]
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::File;
+use std::io::Read;
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 
 use crate::proto::Error;
 
@@ -31,19 +35,22 @@ pub struct MountEntry {
     /// Device minor number.
     pub minor: u32,
     /// Root of the mount within the filesystem (`/` unless a bind mount or
-    /// a subvolume).
-    pub root: String,
-    /// Mount point, unescaped.
-    pub mount_point: String,
+    /// a subvolume). Unescaped, byte-exact (paths need not be UTF-8).
+    pub root: PathBuf,
+    /// Mount point, unescaped and byte-exact: this is what the kernel is
+    /// asked to open, so a non-UTF-8 name must survive as is (the wire
+    /// reply converts lossily).
+    pub mount_point: PathBuf,
     /// Per-mount options (`rw,relatime,...`).
     pub mount_options: String,
     /// Optional fields such as `shared:1`, possibly empty.
     pub optional_fields: Vec<String>,
     /// Filesystem type (`ext4`, `tmpfs`, `fuse.sshfs`, ...).
     pub fs_type: String,
-    /// Mount source, unescaped (`/dev/sda1`, `tmpfs`, `filer:/export`).
+    /// Mount source, unescaped (`/dev/sda1`, `tmpfs`, `filer:/export`);
+    /// informational only, so a non-UTF-8 name is converted lossily.
     pub source: String,
-    /// Per-superblock options, unescaped.
+    /// Per-superblock options, unescaped (lossily, informational).
     pub super_options: String,
 }
 
@@ -56,9 +63,12 @@ impl MountEntry {
 }
 
 /// Decodes the octal escapes used in `mountinfo` paths (`\040` → space,
-/// `\011` → tab, `\012` → newline, `\134` → backslash). Any other
-/// backslash sequence is kept verbatim.
-pub fn unescape(field: &str) -> String {
+/// `\011` → tab, `\012` → newline, `\134` → backslash, and any other
+/// byte the kernel escaped, `\351` included). Any other backslash
+/// sequence is kept verbatim. Returns bytes: the kernel escapes exactly
+/// the bytes that are not printable ASCII, so the result need not be
+/// UTF-8; see [`unescape_path`] and [`unescape_lossy`].
+pub fn unescape(field: &str) -> Vec<u8> {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -79,7 +89,17 @@ pub fn unescape(field: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+/// [`unescape`] as a byte-exact path.
+pub fn unescape_path(field: &str) -> PathBuf {
+    PathBuf::from(OsString::from_vec(unescape(field)))
+}
+
+/// [`unescape`] for informational fields: non-UTF-8 bytes become U+FFFD.
+pub fn unescape_lossy(field: &str) -> String {
+    String::from_utf8_lossy(&unescape(field)).into_owned()
 }
 
 /// Parses `mountinfo` text. Malformed lines are skipped; never panics.
@@ -94,8 +114,8 @@ fn parse_line(line: &str) -> Option<MountEntry> {
     let (major, minor) = fields.next()?.split_once(':')?;
     let major = major.parse().ok()?;
     let minor = minor.parse().ok()?;
-    let root = unescape(fields.next()?);
-    let mount_point = unescape(fields.next()?);
+    let root = unescape_path(fields.next()?);
+    let mount_point = unescape_path(fields.next()?);
     let mount_options = fields.next()?.to_owned();
     let mut optional_fields = Vec::new();
     loop {
@@ -106,8 +126,8 @@ fn parse_line(line: &str) -> Option<MountEntry> {
         optional_fields.push(field.to_owned());
     }
     let fs_type = fields.next()?.to_owned();
-    let source = unescape(fields.next()?);
-    let super_options = fields.next().map(unescape).unwrap_or_default();
+    let source = unescape_lossy(fields.next()?);
+    let super_options = fields.next().map(unescape_lossy).unwrap_or_default();
     Some(MountEntry {
         mount_id,
         parent_id,
@@ -142,11 +162,34 @@ pub struct ProcMounts;
 /// The file [`ProcMounts`] reads.
 pub const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 
+/// Explicit bound on the mount table (32 MiB, room for the kernel's
+/// `fs.mount-max` default of 100 000 mounts at a few hundred bytes each);
+/// a larger table is an error rather than a partial parse.
+pub const MOUNTINFO_MAX_BYTES: usize = 32 * 1024 * 1024;
+
 impl MountSource for ProcMounts {
     fn read_mountinfo(&self) -> Result<String, Error> {
-        std::fs::read_to_string(Path::new(MOUNTINFO_PATH))
-            .map_err(|err| Error::Internal(format!("cannot read {MOUNTINFO_PATH}: {err}")))
+        read_mountinfo_bounded(Path::new(MOUNTINFO_PATH))
     }
+}
+
+/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`].
+pub fn read_mountinfo_bounded(path: &Path) -> Result<String, Error> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|f| {
+            f.take(MOUNTINFO_MAX_BYTES as u64 + 1)
+                .read_to_end(&mut bytes)
+        })
+        .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
+    if bytes.len() > MOUNTINFO_MAX_BYTES {
+        return Err(Error::Internal(format!(
+            "{} exceeds {MOUNTINFO_MAX_BYTES} bytes",
+            path.display()
+        )));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| Error::Internal(format!("{} is not UTF-8", path.display())))
 }
 
 /// A fixed mount table (tests and fixtures).
@@ -199,56 +242,91 @@ mod tests {
         let entries = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
         let overlay = entries.iter().find(|e| e.fs_type == "overlay").unwrap();
         assert!(overlay.optional_fields.is_empty());
-        assert_eq!(overlay.mount_point, "/var/lib/docker/overlay2/abc/merged");
+        assert_eq!(
+            overlay.mount_point,
+            Path::new("/var/lib/docker/overlay2/abc/merged")
+        );
         let simple = parse_mountinfo(&fixture("simple.txt"));
         assert_eq!(simple.len(), 5);
         assert_eq!(simple[3].fs_type, "ext4");
         assert_eq!(simple[3].source, "/dev/sda1");
-        assert_eq!(simple[4].mount_point, "/home");
+        assert_eq!(simple[4].mount_point, Path::new("/home"));
+    }
+
+    #[test]
+    fn non_utf8_mount_points_are_kept_byte_exact() {
+        // The kernel escapes every byte outside printable ASCII; `\351` is
+        // a Latin-1 "é", not UTF-8, and must reach the kernel unchanged.
+        use std::os::unix::ffi::OsStrExt;
+        let entries = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let latin1 = entries.last().unwrap();
+        assert_eq!(latin1.mount_point.as_os_str().as_bytes(), b"/mnt/caf\xe9");
+        assert_eq!(latin1.mount_point.to_string_lossy(), "/mnt/caf\u{fffd}");
+        assert_eq!(unescape_path("/a\\351").as_os_str().as_bytes(), b"/a\xe9");
+        assert_eq!(unescape_lossy("/a\\351"), "/a\u{fffd}");
+    }
+
+    #[test]
+    fn the_mount_table_read_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small");
+        std::fs::write(&small, fixture("simple.txt")).unwrap();
+        assert_eq!(
+            parse_mountinfo(&read_mountinfo_bounded(&small).unwrap()).len(),
+            5
+        );
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'#'; MOUNTINFO_MAX_BYTES + 1]).unwrap();
+        let err = read_mountinfo_bounded(&big).unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+        assert!(read_mountinfo_bounded(&dir.path().join("missing")).is_err());
     }
 
     #[test]
     fn decodes_octal_escapes_in_paths() {
-        assert_eq!(unescape("a\\040b"), "a b");
-        assert_eq!(unescape("a\\011b"), "a\tb");
-        assert_eq!(unescape("a\\012b"), "a\nb");
-        assert_eq!(unescape("a\\134b"), "a\\b");
-        assert_eq!(unescape("\\040\\040"), "  ");
+        assert_eq!(unescape("a\\040b"), b"a b");
+        assert_eq!(unescape("a\\011b"), b"a\tb");
+        assert_eq!(unescape("a\\012b"), b"a\nb");
+        assert_eq!(unescape("a\\134b"), b"a\\b");
+        assert_eq!(unescape("\\040\\040"), b"  ");
         // Not an escape: too short, non-octal, or out of range.
-        assert_eq!(unescape("a\\04"), "a\\04");
-        assert_eq!(unescape("a\\0x9b"), "a\\0x9b");
-        assert_eq!(unescape("trailing\\"), "trailing\\");
-        assert_eq!(unescape("\\777"), "\\777");
+        assert_eq!(unescape("a\\04"), b"a\\04");
+        assert_eq!(unescape("a\\0x9b"), b"a\\0x9b");
+        assert_eq!(unescape("trailing\\"), b"trailing\\");
+        assert_eq!(unescape("\\777"), b"\\777");
         let entries = parse_mountinfo(&fixture("escaped_paths.txt"));
-        let points: Vec<&str> = entries.iter().map(|e| e.mount_point.as_str()).collect();
+        let points: Vec<&Path> = entries.iter().map(|e| e.mount_point.as_path()).collect();
         assert_eq!(
-            points,
+            &points[..5],
             [
-                "/",
-                "/mnt/with space",
-                "/mnt/tab\there",
-                "/mnt/back\\slash",
-                "/mnt/nl\ninside"
+                Path::new("/"),
+                Path::new("/mnt/with space"),
+                Path::new("/mnt/tab\there"),
+                Path::new("/mnt/back\\slash"),
+                Path::new("/mnt/nl\ninside"),
             ]
         );
-        assert_eq!(entries[3].root, "/sub dir");
+        assert_eq!(entries[3].root, Path::new("/sub dir"));
         assert_eq!(entries[3].source, "/dev/disk/by-label/my label");
     }
 
     #[test]
     fn preserves_line_order_as_mount_order() {
         let entries = parse_mountinfo(&fixture("nested.txt"));
-        let points: Vec<&str> = entries.iter().map(|e| e.mount_point.as_str()).collect();
-        assert_eq!(points, ["/", "/home", "/home/data", "/home/data/deep"]);
+        let points: Vec<&Path> = entries.iter().map(|e| e.mount_point.as_path()).collect();
+        assert_eq!(
+            points,
+            ["/", "/home", "/home/data", "/home/data/deep"].map(Path::new)
+        );
         let ids: Vec<u32> = entries.iter().map(|e| e.mount_id).collect();
         assert_eq!(ids, [27, 30, 31, 32]);
         // Bind mounts share (major, minor) with their origin.
         let entries = parse_mountinfo(&fixture("bind_mounts.txt"));
         assert_eq!(entries[0].dev(), entries[1].dev());
-        assert_eq!(entries[1].root, "/srv/www");
+        assert_eq!(entries[1].root, Path::new("/srv/www"));
         let entries = parse_mountinfo(&fixture("btrfs_subvols.txt"));
         assert!(entries[..3].iter().all(|e| e.dev() == (0, 38)));
-        assert_eq!(entries[1].root, "/@home");
+        assert_eq!(entries[1].root, Path::new("/@home"));
     }
 
     #[test]
@@ -264,8 +342,8 @@ mod tests {
                     32 1 8:2 / /also-ok rw - xfs /dev/sda2\n\
                     33 1 8:3 / /fine rw - ext4 /dev/sda3 rw\n";
         let entries = parse_mountinfo(text);
-        let points: Vec<&str> = entries.iter().map(|e| e.mount_point.as_str()).collect();
-        assert_eq!(points, ["/", "/also-ok", "/fine"]);
+        let points: Vec<&Path> = entries.iter().map(|e| e.mount_point.as_path()).collect();
+        assert_eq!(points, ["/", "/also-ok", "/fine"].map(Path::new));
         assert_eq!(entries[1].super_options, "");
         assert!(parse_mountinfo("").is_empty());
     }
@@ -273,7 +351,7 @@ mod tests {
     #[test]
     fn proc_source_parses_the_running_system() {
         let entries = ProcMounts.mounts().unwrap();
-        assert!(entries.iter().any(|e| e.mount_point == "/"));
+        assert!(entries.iter().any(|e| e.mount_point == Path::new("/")));
         assert!(entries.iter().any(|e| e.fs_type == "proc"));
     }
 
@@ -301,7 +379,7 @@ mod tests {
 
         #[test]
         fn unescape_round_trips_plain_text(text in "[^\\\\]*") {
-            prop_assert_eq!(unescape(&text), text);
+            prop_assert_eq!(unescape(&text), text.as_bytes());
         }
     }
 }

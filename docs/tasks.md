@@ -121,6 +121,7 @@ the answer is a one-line change, and leave the question here.
 | OQ-2 | Upstream declares `guest-suspend-ram` with `success-response: false`; design §3.1 says `guest-shutdown` is the *sole* such command. A reply sent after resume is unexpected by libvirt (it waits for the QMP `SUSPEND` event instead). | T2.2, T4.3, AC19 | Follow the design (`success-response: true`, reply `{}`) until answered. |
 | OQ-3 | What counts as an "unrecoverable thaw failure" (§4.2 `Thawing → Frozen`)? `FITHAW` returning `EINVAL` is the normal end of a drain. | T3.4 | Treat a failure to remove the marker, or a **first** `FITHAW` on a planned mountpoint failing with `EPERM`/`EACCES`, as unrecoverable; everything else ends the drain for that mountpoint only. |
 | OQ-4 | The freeze-plan filesystem allowlist beyond ext4/XFS (§8.5 "eligible only when tested"). | T3.2 | `FREEZABLE_FS_TYPES = ["ext4", "xfs"]`; extending it requires a privileged test in T5.2 for that filesystem. |
+| OQ-5 | `guest-get-fsinfo` liveness vs. upstream parity: upstream calls `statfs(2)` on every mount, but on a hard-mounted NFS/CIFS share whose server is gone the call blocks in D state and the sequential session loop would never answer another command; `statfs` also resolves through autofs triggers. | T2.5 | Skip `statfs` for network, FUSE and autofs types (entries listed without `used-bytes`/`total-bytes`) and bound the walk at 10 s; revisit if a consumer needs sizes for those types. |
 
 ---
 
@@ -378,7 +379,7 @@ the answer is a one-line change, and leave the question here.
   - `fsinfo_reports_name_type_mountpoint_and_sizes` via a fake `Statfs` source; `used-bytes = (blocks - bfree) * bsize`, `total-bytes = blocks * bsize`.
   - `fsinfo_includes_pseudo_filesystems` (upstream lists everything mounted) and `disk_is_empty_array`.
   - `fsinfo_statfs_failure_omits_size_fields_not_the_entry`.
-- **Implement (green):** `MountEntry` struct, `parse_mountinfo(&str) -> Vec<MountEntry>`, `MountSource` trait (`read_mountinfo()`), `StatfsSource` trait; handler composes them.
+- **Implement (green):** `MountEntry` struct, `parse_mountinfo(&str) -> Vec<MountEntry>`, `MountSource` trait (`read_mountinfo()`), `StatfsSource` trait; handler composes them. `mount_point` and `root` are byte-exact `PathBuf`s (the kernel escapes every non-printable byte, and a non-UTF-8 name must reach `open(2)` unchanged; the wire `mountpoint` is converted lossily). The table read is bounded (`MOUNTINFO_MAX_BYTES`, 32 MiB). Liveness: `statfs` is not issued on network, FUSE and autofs types (`sizes_are_queried`; those entries are listed without sizes, a deviation from upstream, see OQ-5) and the whole walk is bounded by `FSINFO_TIMEOUT` (10 s), after which the command fails and the session moves on.
 - **Done when:** the parser is a fuzz target (T5.1) and is reused unchanged by T3.2.
 
 ---

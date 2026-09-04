@@ -82,9 +82,35 @@ impl Rig {
         (json, log)
     }
 
+    fn head(&self) -> String {
+        git(&self.clone, &["rev-parse", "HEAD"]).trim().to_owned()
+    }
+
+    /// Makes the clone's HEAD the tip of `branch` on the remote, as the
+    /// pushed commit of a CI run is.
+    fn push_source(&self, branch: &str) {
+        git(
+            &self.clone,
+            &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")],
+        );
+    }
+
     fn publish(
         &self,
         branch: &str,
+        percent: f64,
+        passed: u32,
+        hook: Option<&str>,
+    ) -> (bool, String) {
+        self.push_source(branch);
+        let sha = self.head();
+        self.publish_sha(branch, &sha, percent, passed, hook)
+    }
+
+    fn publish_sha(
+        &self,
+        branch: &str,
+        sha: &str,
         percent: f64,
         passed: u32,
         hook: Option<&str>,
@@ -94,6 +120,7 @@ impl Rig {
         let mut cmd = Command::new("sh");
         cmd.arg(script)
             .arg(branch)
+            .arg(sha)
             .arg(&json)
             .arg(&log)
             .current_dir(&self.clone)
@@ -248,8 +275,9 @@ fn a_concurrent_publication_is_retried_on_the_new_tip() {
     };
     let once = rig._dir.path().join("hook-ran");
     let hook = format!(
-        "[ -e '{once}' ] || {{ touch '{once}'; cd '{other}' && GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@x GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@x sh '{script}' main '{json}' '{log}' >/dev/null; }}",
+        "[ -e '{once}' ] || {{ touch '{once}'; cd '{other}' && GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@x GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@x sh '{script}' main {sha} '{json}' '{log}' >/dev/null; }}",
         once = once.display(),
+        sha = rig.head(),
         other = other.display(),
         script = script.display(),
         json = json2.display(),
@@ -325,7 +353,12 @@ fn a_failed_git_add_is_an_error_not_unchanged_badges() {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/publish-badges.sh");
     let out = Command::new("sh")
         .arg(script)
-        .args(["main", json.to_str().unwrap(), log.to_str().unwrap()])
+        .args([
+            "main",
+            &rig.head(),
+            json.to_str().unwrap(),
+            log.to_str().unwrap(),
+        ])
         .current_dir(&rig.clone)
         .env(
             "PATH",
@@ -346,4 +379,73 @@ fn a_failed_git_add_is_an_error_not_unchanged_badges() {
     assert!(!text.contains("badges unchanged"), "{text}");
     assert!(text.contains("simulated I/O error"), "{text}");
     assert_eq!(rig.commits(), 1, "nothing was published");
+}
+
+#[test]
+fn a_publication_for_a_superseded_source_commit_is_skipped() {
+    // Coverage for commit A was still running when B was pushed and
+    // published; A's publisher must notice that the source branch moved
+    // on and leave B's badges alone.
+    let rig = Rig::new();
+    let sha_a = rig.head();
+    rig.push_source("main");
+    std::fs::write(rig.clone.join("b"), "b").unwrap();
+    git(&rig.clone, &["add", "b"]);
+    git(&rig.clone, &["commit", "-q", "-m", "B"]);
+    let (ok, text) = rig.publish("main", 91.0, 301, None);
+    assert!(ok, "{text}");
+    assert_eq!(rig.commits(), 1);
+    let (ok, text) = rig.publish_sha("main", &sha_a, 80.0, 100, None);
+    assert!(ok, "a superseded publication is not a failure: {text}");
+    assert!(text.contains("superseded"), "{text}");
+    assert!(!text.contains("published main"), "{text}");
+    assert_eq!(rig.commits(), 1, "B's badges were not overwritten");
+    assert!(rig.show("main/coverage.svg").contains(">91.0%</text>"));
+}
+
+#[test]
+fn the_source_branch_advancing_during_a_retry_skips_the_publication() {
+    // The first push is rejected by a concurrent badges publication; by
+    // the time the publisher retries, the source branch has moved on.
+    let rig = Rig::new();
+    assert!(rig.publish("main", 80.0, 100, None).0);
+    let sha_a = rig.head();
+    let bump = format!(
+        "d=$(mktemp -d) && git -C $d init -q && git -C $d fetch -q '{remote}' badges && git -C $d checkout -q FETCH_HEAD && date +%s%N > $d/bump && git -C $d add bump && GIT_AUTHOR_NAME=o GIT_AUTHOR_EMAIL=o@x GIT_COMMITTER_NAME=o GIT_COMMITTER_EMAIL=o@x git -C $d commit -q -m bump && git -C $d push -q '{remote}' HEAD:refs/heads/badges",
+        remote = rig.remote.display()
+    );
+    // The hook runs before each push attempt: the first call lands a
+    // competing badges commit (so the first push is rejected), the second
+    // call, during the retry, advances the source branch.
+    let calls = rig._dir.path().join("hook-calls");
+    let hook = format!(
+        "if [ ! -e '{calls}' ]; then touch '{calls}'; {bump}; else cd '{clone}' && git commit -q --allow-empty -m B && git push -q origin HEAD:refs/heads/main; fi",
+        calls = calls.display(),
+        clone = rig.clone.display(),
+    );
+    let (ok, text) = rig.publish_sha("main", &sha_a, 90.0, 300, Some(&hook));
+    assert!(ok, "{text}");
+    assert!(text.contains("push rejected"), "{text}");
+    assert!(text.contains("superseded"), "{text}");
+    assert!(!text.contains("published main"), "{text}");
+    assert!(rig.show("main/coverage.svg").contains(">80.0%</text>"));
+}
+
+#[test]
+fn a_source_branch_missing_from_the_remote_is_not_published() {
+    let rig = Rig::new();
+    let (ok, text) = rig.publish_sha("gone", &rig.head(), 90.0, 300, None);
+    assert!(ok, "{text}");
+    assert!(text.contains("superseded"), "{text}");
+    let out = Command::new("git")
+        .args([
+            "--git-dir",
+            rig.remote.to_str().unwrap(),
+            "rev-parse",
+            "--verify",
+            "badges",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "no badges branch was created");
 }

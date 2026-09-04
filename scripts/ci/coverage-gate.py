@@ -23,7 +23,9 @@ The filtered report (`--filtered`) is a line and branch report: `DA` and
 `BRDA` records carry a source line and are cut at the test block, while
 function records (`FN`, `FNDA`, whose first field is an execution count,
 not a line, and the `FNF`/`FNH`/`FNL`/`FNA` totals) are dropped
-altogether rather than filtered by the wrong field.
+altogether rather than filtered by the wrong field. The `LF`/`LH` and
+`BRF`/`BRH` totals are recomputed from the retained records (a branch
+counts as hit when its taken count is a number above zero).
 
 Exit status 1 when the production percentage is below the floor, 2 on a
 layout or input problem.
@@ -85,6 +87,7 @@ def main() -> int:
     cutoff = None
     skip_file = False
     file_found = file_hit = 0
+    br_found = br_hit = 0
     for raw in Path(args.lcov).read_text(encoding="utf-8").splitlines():
         if raw.startswith("SF:"):
             p = Path(raw[3:])
@@ -95,6 +98,7 @@ def main() -> int:
                 excluded_seen.append(str(rel))
             cutoff = None if skip_file else test_block_start(current)
             file_found = file_hit = 0
+            br_found = br_hit = 0
             if not skip_file:
                 out_lines.append(raw)
             continue
@@ -114,9 +118,12 @@ def main() -> int:
             continue
         if raw.startswith("BRDA:"):
             # BRDA:<line>,<block>,<branch>,<taken>: cut at the test block.
-            line = int(raw[5:].split(",")[0])
+            fields = raw[5:].split(",")
+            line = int(fields[0])
             if skip_file or (cutoff is not None and line >= cutoff):
                 continue
+            br_found += 1
+            br_hit += fields[3].isdigit() and int(fields[3]) > 0
             out_lines.append(raw)
             continue
         if raw.startswith(("FN:", "FNDA:", "FNF:", "FNH:", "FNL:", "FNA:")):
@@ -126,6 +133,9 @@ def main() -> int:
         if raw == "end_of_record":
             if current is not None and not skip_file:
                 per_file.append((str(rel), file_found, file_hit))
+                if br_found:
+                    out_lines.append(f"BRF:{br_found}")
+                    out_lines.append(f"BRH:{br_hit}")
                 out_lines.append(f"LF:{file_found}")
                 out_lines.append(f"LH:{file_hit}")
                 out_lines.append(raw)

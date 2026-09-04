@@ -3,11 +3,21 @@
 # the `badges` branch of the repository, under `<branch>/`, so a private
 # repository can show them in its README without an external service.
 #
-#   scripts/ci/publish-badges.sh BRANCH coverage-summary.json coverage.log
+#   scripts/ci/publish-badges.sh BRANCH SHA coverage-summary.json coverage.log
 #
-# coverage-summary.json is written by scripts/ci/coverage-gate.py (the
-# badge shows its production-line percentage); coverage.log is the
-# captured test output (its "test result:" lines are summed).
+# BRANCH is the source branch the figures were measured on and SHA the
+# full commit they were measured at. coverage-summary.json is written by
+# scripts/ci/coverage-gate.py (the badge shows its production-line
+# percentage); coverage.log is the captured test output (its
+# "test result:" lines are summed).
+#
+# Publications are ordered by the source branch, not by which coverage
+# run finished first: before generating anything and again before every
+# push attempt, the script checks that BRANCH on the remote still points
+# at SHA, and exits 0 without publishing ("superseded") when it does not,
+# so a slower run for an older commit can never overwrite the badges of
+# a newer one. A branch that no longer exists on the remote counts as
+# superseded too.
 #
 # Every publication is generated on top of the current tip of the badges
 # branch and pushed with a plain fast-forward. If the push is rejected
@@ -23,12 +33,24 @@
 set -eu
 
 branch=${1:?branch}
-summary_json=${2:?coverage-summary.json}
-coverage_log=${3:?coverage.log}
+source_sha=${2:?source commit}
+summary_json=${3:?coverage-summary.json}
+coverage_log=${4:?coverage.log}
 remote=${BADGES_REMOTE:-origin}
 badges_branch=${BADGES_BRANCH:-badges}
 attempts=${BADGES_ATTEMPTS:-5}
 here=$(cd "$(dirname "$0")" && pwd)
+
+# Exits 0 (nothing to do) unless the source branch on the remote still
+# points at the commit these figures were measured at.
+source_is_current() {
+    current=$(git ls-remote "$remote" "refs/heads/$branch" | awk 'NR == 1 { print $1 }')
+    if [ "$current" != "$source_sha" ]; then
+        echo "publish-badges: $branch advanced from $source_sha to ${current:-nothing (branch gone)}; superseded, not publishing"
+        exit 0
+    fi
+}
+source_is_current
 
 percent=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["production_lines"]["percent"])' "$summary_json")
 percent=$(printf '%s' "$percent" | awk '{printf "%.1f", $1}')
@@ -42,7 +64,7 @@ elif [ "$whole" -ge 70 ]; then color=yellowgreen
 elif [ "$whole" -ge 60 ]; then color=yellow
 else color=red
 fi
-sha=$(git rev-parse --short HEAD)
+sha=$(git rev-parse --short "$source_sha")
 
 work=$(mktemp -d)
 cleanup() { git worktree remove --force "$work" 2>/dev/null || rm -rf "$work"; }
@@ -77,6 +99,7 @@ while :; do
     if [ -n "${BADGES_BEFORE_PUSH:-}" ]; then
         sh -c "$BADGES_BEFORE_PUSH"
     fi
+    source_is_current
     if git -C "$work" push -q "$remote" "HEAD:refs/heads/$badges_branch" 2>/dev/null; then
         echo "published $branch to $remote/$badges_branch (coverage ${percent}%, ${passed} tests, commit $sha, attempt $n)"
         exit 0

@@ -98,7 +98,7 @@ fn production_code_after_the_test_module_is_rejected() {
 // Function records: `FNDA:<count>,<name>` carries an execution count, not a
 // line, so it cannot be filtered by line; the filtered file is a line and
 // branch report and carries no function records at all.
-const LCOV_WITH_FUNCTIONS: &str = "SF:src/m.rs\nFN:1,a\nFN:5,b\nFN:11,tests::t\nFNDA:500,a\nFNDA:0,b\nFNDA:1,tests::t\nFNF:3\nFNH:2\nDA:1,500\nDA:2,500\nDA:5,0\nDA:6,0\nDA:11,1\nDA:12,1\nDA:13,1\nDA:14,1\nBRDA:2,0,0,500\nBRDA:12,0,0,1\nBRF:2\nBRH:2\nLF:8\nLH:6\nend_of_record\n";
+const LCOV_WITH_FUNCTIONS: &str = "SF:src/m.rs\nFN:1,a\nFN:5,b\nFN:11,tests::t\nFNDA:500,a\nFNDA:0,b\nFNDA:1,tests::t\nFNF:3\nFNH:2\nDA:1,500\nDA:2,500\nDA:5,0\nDA:6,0\nDA:11,1\nDA:12,1\nDA:13,1\nDA:14,1\nBRDA:2,0,0,500\nBRDA:2,0,1,-\nBRDA:6,0,0,0\nBRDA:12,0,0,1\nBRF:4\nBRH:2\nLF:8\nLH:6\nend_of_record\n";
 
 #[test]
 fn function_records_are_not_filtered_by_their_execution_count() {
@@ -114,6 +114,18 @@ fn function_records_are_not_filtered_by_their_execution_count() {
     assert!(filtered.contains("BRDA:2,0,0,500"), "{filtered}");
     assert!(!filtered.contains("BRDA:12,"), "{filtered}");
     assert!(text.contains("\"percent\": 50.0"), "{text}");
+}
+
+#[test]
+fn branch_totals_are_recomputed_from_the_retained_branch_records() {
+    // Three production branch records survive (taken 500, `-`, 0): one hit.
+    let (code, text, filtered) = run(LCOV_WITH_FUNCTIONS, SOURCE, "40");
+    assert_eq!(code, 0, "{text}");
+    assert!(filtered.contains("\nBRF:3\nBRH:1\n"), "{filtered}");
+    assert!(!filtered.contains("BRF:4"), "{filtered}");
+    // A file without branch records carries no branch totals.
+    let (_, _, filtered) = run(LCOV, SOURCE, "40");
+    assert!(!filtered.contains("BRF:"), "{filtered}");
 }
 
 #[test]

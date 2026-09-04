@@ -131,4 +131,8 @@ drop and the seccomp installer are the files with the lowest figures for
 that reason. CI publishes the numbers as badges on the `badges` branch
 (`scripts/ci/publish-badges.sh`, rendered by `scripts/ci/badge.sh`) and
 then checks that the rendered README serves them as SVG images
-(`scripts/ci/verify-badges-render.sh`).
+(`scripts/ci/verify-badges-render.sh`). The publisher only publishes
+figures for the current tip of their source branch (checked before
+generating and before every push), so a slow run for an older commit
+never overwrites a newer one's badges; overlapping writers of the badges
+branch are resolved by regenerating on the fetched tip and retrying.

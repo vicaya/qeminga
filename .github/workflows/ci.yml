@@ -105,9 +105,17 @@ jobs:
   # Publishes the coverage and test-count badges for the pushed branch to
   # the `badges` branch (path `<branch>/`); the README embeds `main/`. A
   # separate job so that only this trusted, test-free step holds a
-  # write-capable token; the global concurrency group serialises every
-  # writer of the shared branch. Runs on pushes to main and on manual
-  # dispatch (any branch, so the mechanism can be exercised before merge).
+  # write-capable token. Runs on pushes to main and on manual dispatch
+  # (any branch, so the mechanism can be exercised before merge).
+  #
+  # Ordering: the publisher refuses to publish figures for a commit that
+  # is no longer the tip of its source branch (checked before generating
+  # and before every push), so a slow coverage run for an older commit
+  # never overwrites a newer one's badges. Overlapping writers of the
+  # badges branch are handled by the script's fast-forward retry. The
+  # concurrency group only queues publications of the same source branch
+  # in order; a manual dispatch of another branch has its own group and
+  # cannot displace a pending publication for main.
   publish-badges:
     name: publish badges
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
@@ -116,7 +124,7 @@ jobs:
     permissions:
       contents: write
     concurrency:
-      group: qeminga-badges-publisher
+      group: qeminga-badges-${{ github.ref_name }}
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -130,7 +138,7 @@ jobs:
           GIT_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
           GIT_COMMITTER_NAME: github-actions[bot]
           GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
-        run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" target/coverage/coverage-summary.json target/coverage/coverage.log
+        run: scripts/ci/publish-badges.sh "$GITHUB_REF_NAME" "$GITHUB_SHA" target/coverage/coverage-summary.json target/coverage/coverage.log
       # Proves what CI can about the README badges of this private
       # repository: fetch the README as GitHub renders it, require exactly
       # the two badge image URLs (each once, unrewritten), point them at the

@@ -119,7 +119,7 @@ the answer is a one-line change, and leave the question here.
 |---|---|---|---|
 | OQ-1 | `reboot(2)` with `LINUX_REBOOT_CMD_POWER_OFF`/`RESTART`/`HALT` is an immediate kernel action, not the "graceful"/"clean" shutdown G1 and §3 describe: no units are stopped and no filesystems are unmounted. A graceful path under systemd is `kill(1, SIGRTMIN+4/+5/+3)`, which needs `CAP_KILL` (changing AC3) and `kill` in the seccomp profile, or a D-Bus call (much larger syscall surface). | T4.2, T4.4, T4.5, AC3 | Implement §4.1/§5.4 as written (`sync` + `reboot(2)`) behind `KernelOps::reboot`. |
 | OQ-2 | Upstream declares `guest-suspend-ram` with `success-response: false`; design §3.1 says `guest-shutdown` is the *sole* such command. A reply sent after resume is unexpected by libvirt (it waits for the QMP `SUSPEND` event instead). | T2.2, T4.3, AC19 | Follow the design (`success-response: true`, reply `{}`) until answered. |
-| OQ-3 | What counts as an "unrecoverable thaw failure" (§4.2 `Thawing → Frozen`)? `FITHAW` returning `EINVAL` is the normal end of a drain. | T3.4 | Treat a failure to remove the marker, or a **first** `FITHAW` on a planned mountpoint failing with `EPERM`/`EACCES`, as unrecoverable; everything else ends the drain for that mountpoint only. |
+| OQ-3 | What counts as an "unrecoverable thaw failure" (§4.2 `Thawing → Frozen`)? `FITHAW` returning `EINVAL` is the normal end of a drain. | T3.4 | Treat a failure to remove the marker, or a **first** `FITHAW` on a planned mountpoint failing with `EPERM`/`EACCES`, as unrecoverable; everything else ends the drain for that mountpoint only. A later target is still drained after such a failure (everything that can be thawed is thawed, then the failure is reported). `Thawing → Frozen` applies only to a thaw claimed from `Frozen`; a failed recovery drain claimed from `Thawed` returns to `Thawed` and reports the error, since nothing was frozen by this agent. |
 | OQ-4 | The freeze-plan filesystem allowlist beyond ext4/XFS (§8.5 "eligible only when tested"). | T3.2 | `FREEZABLE_FS_TYPES = ["ext4", "xfs"]`; extending it requires a privileged test in T5.2 for that filesystem. |
 | OQ-5 | `guest-get-fsinfo` liveness vs. upstream parity: upstream calls `statfs(2)` on every mount, but on a hard-mounted NFS/CIFS share whose server is gone the call blocks in D state and the sequential session loop would never answer another command; `statfs` also resolves through autofs triggers. | T2.5 | Skip `statfs` for network, FUSE and autofs types (entries listed without `used-bytes`/`total-bytes`), bound the walk at 10 s and the walks alive at once at 2 (a timed-out walk keeps its slot until it returns); revisit if a consumer needs sizes for those types. |
 
@@ -447,13 +447,13 @@ the answer is a one-line change, and leave the question here.
   - `freeze_calls_fifreeze_in_reverse_mount_order_and_counts_successes`.
   - `freeze_creates_marker_before_first_fifreeze` (fake records marker creation order by checking `exists()` inside the first `fifreeze` call, or by an ordered event log shared between fake kernel and marker).
   - `freeze_without_marker_performs_no_ioctl` — marker creation failure → zero `Fifreeze` calls, state back to `Thawed`, `GenericError`.
-  - `eopnotsupp_is_skipped_not_counted_and_not_thawed_later`.
+  - `eopnotsupp_is_skipped_not_counted_and_not_rolled_back` (named `…_and_not_thawed_later` in the original contract: the thaw plan is rebuilt from the mount table, so a later thaw does re-issue `FITHAW` on an unsupported target, which merely fails; what must hold is that a rollback never touches it).
   - `ebusy_is_not_counted_but_is_retained_in_thaw_plan` (AC17).
   - `hard_error_rolls_back_processed_in_forward_order_and_reports_error` — `EIO` on the second target → `fithaw` drains on the first, marker removed only after drain, state `Thawed`, response `GenericError`.
   - `freeze_while_not_thawed_is_generic_error`.
   - `freeze_list_restricts_to_requested_mountpoints` and `freeze_list_with_unknown_paths_freezes_nothing_and_returns_0`.
   - `thaw_drains_each_mountpoint_until_error_and_counts_once` — fake thaw succeeds 3× on `/`, 1× on `/home`; result `2`; call log shows 4 + 2 `Fithaw`.
-  - `thaw_from_thawed_state_still_drains` (recovery drain).
+  - `thaw_from_thawed_state_still_drains` (recovery drain), `recovery_drain_failure_returns_to_thawed` (OQ-3), `a_denied_thaw_still_drains_the_later_targets` (OQ-3), `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (the `frozen` hook fires again so the watchdog is re-armed, §4.4).
   - `thaw_removes_marker_only_after_all_drains`, `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (OQ-3 interim rule).
   - `thaw_cancels_watchdog_and_flushes_audit` (hooks are trait callbacks in `Context`; assert they fired in order).
   - `drain_has_a_defensive_upper_bound` — a fake that never fails stops after `MAX_THAW_ITERATIONS` (e.g. 1024) with a logged warning.

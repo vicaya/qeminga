@@ -462,21 +462,34 @@ mod tests {
     struct Harness {
         dispatcher: Dispatcher,
         sink: SharedSink,
+        _dir: tempfile::TempDir,
     }
 
     impl Harness {
         fn new(state: FreezeState, config: Config) -> Self {
             let sink = SharedSink::default();
             let router = Router::new(Box::new(sink.clone()));
+            // Fakes for everything a freeze touches: a root `cargo test`
+            // on a host that runs qeminga must never read its mount table
+            // or create and remove the live agent's marker.
+            let dir = tempfile::tempdir().unwrap();
+            let mountinfo = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/mountinfo/simple.txt"),
+            )
+            .unwrap();
             let ctx = Context::new(
                 Arc::new(config),
                 Arc::new(FreezeStateMachine::starting_in(state)),
                 router,
             )
-            .with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()));
+            .with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()))
+            .with_mounts(Arc::new(crate::mountinfo::StaticMounts(mountinfo)))
+            .with_marker(crate::marker::Marker::new(dir.path().join("frozen")));
             Harness {
                 dispatcher: Dispatcher::new(Arc::new(ctx)),
                 sink,
+                _dir: dir,
             }
         }
 

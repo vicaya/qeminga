@@ -34,6 +34,7 @@
 //! `spawn_blocking`.
 #![forbid(unsafe_code)]
 
+use std::path::Path;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -188,8 +189,21 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             tracing::info!(event = "fsfreeze_thawed", thawed, "filesystems thawed");
             Ok(thawed)
         }
+        Err(failure) if token.is_recovery_drain() => {
+            // Nothing was frozen by this agent (the drain started from
+            // `Thawed`), so there is no frozen state to retain: return to
+            // `Thawed` and report the error (OQ-3).
+            ctx.state.thaw_succeeded(token);
+            ctx.hooks.on_thawed(ctx);
+            tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
+            Err(Error::Internal(failure.to_string()))
+        }
         Err(failure) => {
+            // `Thawing → Frozen` (§4.2): the state is `Frozen` again, so
+            // the watchdog is re-armed like on any entry into `Frozen`
+            // (§4.4); without it a failed thaw would be unbounded.
             ctx.state.thaw_failed(token);
+            ctx.hooks.on_frozen(ctx);
             tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; marker retained");
             Err(Error::Internal(failure.to_string()))
         }
@@ -328,21 +342,21 @@ fn freeze_blocking(
     marker.create()?;
     let mut frozen: u64 = 0;
     // Targets that must be thawed on rollback: successes and EBUSY.
-    let mut processed: Vec<&str> = Vec::new();
+    let mut processed: Vec<&Path> = Vec::new();
     for target in plan.freeze_order() {
-        let mountpoint = target.mountpoint.as_str();
-        match kernel.fifreeze(std::path::Path::new(mountpoint)) {
+        let mountpoint = target.mountpoint.as_path();
+        match kernel.fifreeze(mountpoint) {
             Ok(()) => {
                 frozen += 1;
                 processed.push(mountpoint);
             }
             Err(err) if err.is_not_supported() => {
-                tracing::info!(event = "fsfreeze_skipped", mountpoint, errno = %err, "freeze not supported; skipped");
+                tracing::info!(event = "fsfreeze_skipped", mountpoint = %mountpoint.display(), errno = %err, "freeze not supported; skipped");
             }
             Err(err) if err.is_busy() => {
                 tracing::warn!(
                     event = "fsfreeze_busy",
-                    mountpoint,
+                    mountpoint = %mountpoint.display(),
                     "already frozen by another freezer; retained for thaw"
                 );
                 processed.push(mountpoint);
@@ -354,15 +368,15 @@ fn freeze_blocking(
                     let drained = drain(kernel, done);
                     tracing::warn!(
                         event = "fsfreeze_rollback",
-                        mountpoint = *done,
+                        mountpoint = %done.display(),
                         successes = drained.successes,
                         "rolled back"
                     );
                     if let Some(reason) = drained.incomplete() {
                         return Err(FreezeFailure::RollbackIncomplete {
-                            failed: mountpoint.to_owned(),
+                            failed: lossy(mountpoint),
                             errno,
-                            mountpoint: (*done).to_owned(),
+                            mountpoint: lossy(done),
                             reason,
                         });
                     }
@@ -371,14 +385,14 @@ fn freeze_blocking(
                     Ok(()) | Err(MarkerError::Absent { .. }) => {}
                     Err(marker) => {
                         return Err(FreezeFailure::MarkerRetained {
-                            failed: mountpoint.to_owned(),
+                            failed: lossy(mountpoint),
                             errno,
                             marker,
                         });
                     }
                 }
                 return Err(FreezeFailure::Hard {
-                    mountpoint: mountpoint.to_owned(),
+                    mountpoint: lossy(mountpoint),
                     errno,
                 });
             }
@@ -389,29 +403,52 @@ fn freeze_blocking(
 
 /// Drains every target in forward order, then removes the marker. Returns
 /// the number of targets on which at least one `FITHAW` succeeded.
+///
+/// An unrecoverable failure on one target (OQ-3: a denied first `FITHAW`,
+/// or a drain that never converges) does not stop the drain of the later
+/// targets: everything that can be thawed is thawed first (§4.2), then
+/// the first such failure is reported and the marker is retained.
 fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
     plan: &FreezePlan,
 ) -> Result<u64, ThawFailure> {
     let mut thawed: u64 = 0;
+    let mut unrecoverable: Option<ThawFailure> = None;
     for target in plan.thaw_order() {
-        let mountpoint = target.mountpoint.as_str();
+        let mountpoint = target.mountpoint.as_path();
         let drained = drain(kernel, mountpoint);
-        if drained.capped {
-            return Err(ThawFailure::Unbounded {
-                mountpoint: mountpoint.to_owned(),
-                iterations: MAX_THAW_ITERATIONS,
-            });
-        }
         if drained.successes > 0 {
             thawed += 1;
-        } else if let Some(errno) = drained.first_error.filter(KernelError::is_permission) {
-            return Err(ThawFailure::Denied {
-                mountpoint: mountpoint.to_owned(),
-                errno,
-            });
         }
+        let failure = if drained.capped {
+            Some(ThawFailure::Unbounded {
+                mountpoint: lossy(mountpoint),
+                iterations: MAX_THAW_ITERATIONS,
+            })
+        } else if drained.successes == 0 {
+            drained
+                .first_error
+                .filter(KernelError::is_permission)
+                .map(|errno| ThawFailure::Denied {
+                    mountpoint: lossy(mountpoint),
+                    errno,
+                })
+        } else {
+            None
+        };
+        if let Some(failure) = failure {
+            tracing::error!(
+                event = "fsfreeze_thaw_target_failed",
+                mountpoint = %mountpoint.display(),
+                error = %failure,
+                "target could not be thawed; draining the remaining targets"
+            );
+            unrecoverable.get_or_insert(failure);
+        }
+    }
+    if let Some(failure) = unrecoverable {
+        return Err(failure);
     }
     match marker.remove() {
         Ok(()) | Err(MarkerError::Absent { .. }) => Ok(thawed),
@@ -419,10 +456,14 @@ fn thaw_blocking(
     }
 }
 
+/// A mount point for an error message or a wire description.
+fn lossy(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// `FITHAW` until the first error or the iteration bound. Returns the
 /// number of successes and the error that ended the drain, if any.
-fn drain(kernel: &dyn KernelOps, mountpoint: &str) -> Drained {
-    let path = std::path::Path::new(mountpoint);
+fn drain(kernel: &dyn KernelOps, path: &Path) -> Drained {
     let mut successes = 0;
     for _ in 0..MAX_THAW_ITERATIONS {
         match kernel.fithaw(path) {
@@ -438,7 +479,7 @@ fn drain(kernel: &dyn KernelOps, mountpoint: &str) -> Drained {
     }
     tracing::error!(
         event = "fsfreeze_drain_capped",
-        mountpoint,
+        mountpoint = %path.display(),
         iterations = MAX_THAW_ITERATIONS,
         "FITHAW kept succeeding; drain stopped at the defensive bound"
     );
@@ -934,7 +975,11 @@ mod tests {
         assert!(err.to_string().contains("marker retained"), "{err}");
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
-        assert_eq!(rig.hooks.events(), ["thaw_claimed"], "no `thawed` hook");
+        assert_eq!(
+            rig.hooks.events(),
+            ["thaw_claimed", "frozen"],
+            "no `thawed` hook; `frozen` re-arms the watchdog (§4.4)"
+        );
         // The host can retry; a now-permitted drain completes.
         let rig2 = Rig::new(FreezeState::Frozen, "simple.txt");
         rig2.marker().create().unwrap();
@@ -999,6 +1044,71 @@ mod tests {
             <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_denied_thaw_still_drains_the_later_targets() {
+        // EPERM on the first target must not skip the drain of the later
+        // ones: everything that can be thawed is thawed, then the failure
+        // is reported with the marker retained.
+        let rig = Rig::new(FreezeState::Frozen, "nested.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_thaw_error("/", Errno::EPERM);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("thaw of / denied"), "{err}");
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/",
+                "/home",
+                "/home",
+                "/home/data",
+                "/home/data",
+                "/home/data/deep",
+                "/home/data/deep",
+            ]),
+            "every later target is drained (success + EINVAL)"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+        // A drain that never converges on one target does not stop the
+        // others either.
+        let rig = Rig::new(FreezeState::Frozen, "nested.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_thaw_successes("/home", u32::MAX);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("did not converge"), "{err}");
+        assert!(rig.fithaws().contains(&PathBuf::from("/home/data/deep")));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn recovery_drain_failure_returns_to_thawed() {
+        // An unprivileged agent (no CAP_SYS_ADMIN) gets EPERM on the first
+        // FITHAW of a recovery drain from Thawed: the error is reported but
+        // the state must not become Frozen, since nothing was frozen.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_thaw_error("/", Errno::EPERM);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(err.class(), ErrorClass::GenericError);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["thaw_claimed", "thawed"]);
+        // From Frozen the same failure keeps the marker and the state.
+        let rig = Rig::new(FreezeState::Frozen, "simple.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_thaw_error("/", Errno::EPERM);
+        thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
     }
 
     #[tokio::test]

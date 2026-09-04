@@ -178,6 +178,29 @@ fn example_config_equals_the_design_block_and_parses() {
 }
 
 #[test]
+fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
+    // OQ-6: after the drop the daemon cannot write the 0644 root:root
+    // file; the (optional) rule gives group qeminga write access.
+    let text = read("packaging/tmpfiles.d/qeminga-suspend.conf");
+    let rules: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(
+        rules[0].split_whitespace().collect::<Vec<_>>(),
+        ["z", "/sys/power/state", "0664", "root", "qeminga", "-"]
+    );
+    assert!(
+        text.contains("suspend_ram = true"),
+        "the header says when to install it"
+    );
+    let readme = read("packaging/README.md");
+    assert!(readme.contains("tmpfiles.d/qeminga-suspend.conf"));
+}
+
+#[test]
 fn systemd_analyze_verify_accepts_the_unit_when_available() {
     // `systemd-analyze verify` needs the ExecStart binary to exist; CI
     // installs it. Locally, run only when both are present.

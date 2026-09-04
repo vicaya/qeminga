@@ -691,6 +691,59 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
 }
 
 #[test]
+#[ignore = "needs root (changes and restores the mode of /sys/power/state)"]
+fn privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account() {
+    // OQ-6: applying packaging/tmpfiles.d/qeminga-suspend.conf must leave
+    // /sys/power/state writable for uid/gid 600 (the dropped daemon has no
+    // capability that bypasses the file mode). The original owner and
+    // mode are restored afterwards.
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let path = std::path::Path::new("/sys/power/state");
+    let before = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => {
+            eprintln!("skipped: {}: {err}", path.display());
+            return;
+        }
+    };
+    let group = nix::unistd::Group::from_name("qeminga")
+        .unwrap()
+        .expect("the qeminga group (packaging/sysusers.d/qeminga.conf)");
+    let conf = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("packaging/tmpfiles.d/qeminga-suspend.conf");
+    let output = std::process::Command::new("systemd-tmpfiles")
+        .arg("--create")
+        .arg(&conf)
+        .output()
+        .expect("systemd-tmpfiles");
+    let restore = || {
+        let _ = nix::unistd::chown(
+            path,
+            Some(nix::unistd::Uid::from_raw(before.uid())),
+            Some(nix::unistd::Gid::from_raw(before.gid())),
+        );
+        let _ = std::fs::set_permissions(
+            path,
+            std::fs::Permissions::from_mode(before.mode() & 0o7777),
+        );
+    };
+    if !output.status.success() {
+        restore();
+        panic!(
+            "systemd-tmpfiles --create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let after = std::fs::metadata(path).unwrap();
+    restore();
+    assert_eq!(after.gid(), group.gid.as_raw(), "group qeminga");
+    assert_eq!(after.mode() & 0o777, 0o664, "group-writable");
+    let restored = std::fs::metadata(path).unwrap();
+    assert_eq!(restored.mode() & 0o777, before.mode() & 0o777);
+    assert_eq!(restored.gid(), before.gid());
+}
+
+#[test]
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_seccomp_matrix_log_then_enforce() {
     // Runs the full allowed-command matrix through the real binary with

@@ -8,6 +8,7 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 | `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
 | `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
 | `config.toml` | `/etc/qeminga/config.toml` | The documented defaults (§8.2); every key is optional. |
+| `tmpfiles.d/qeminga-suspend.conf` | `/usr/lib/tmpfiles.d/` **only with** `[features] suspend_ram = true` | Hands `/sys/power/state` to group `qeminga` (mode 0664) on every boot, without which the dropped daemon cannot write it (OQ-6). Not installed by default. |
 
 The binary itself goes to `/usr/bin/qeminga`. Build releases with
 `cargo build --release --locked --features seccomp` (never
@@ -36,6 +37,17 @@ sudo systemctl enable --now qeminga.service
 
 Verify with `systemctl status qeminga` and, from the host,
 `virsh qemu-agent-command <domain> '{"execute":"guest-ping"}'`.
+
+## Suspend to RAM
+
+`guest-suspend-ram` is disabled by default. Enabling it takes the
+`suspend_ram` Cargo feature, `[features] suspend_ram = true` in
+`config.toml`, **and** write access to `/sys/power/state` for the service
+account: the file is `0644 root:root` and none of the daemon's remaining
+capabilities bypasses that, so install `tmpfiles.d/qeminga-suspend.conf`
+and run `sudo systemd-tmpfiles --create qeminga-suspend.conf` (OQ-6). Do
+not install the rule otherwise: it is what lets the account suspend the
+guest.
 
 ## Changing the freeze cap
 

@@ -667,10 +667,10 @@ the answer is a one-line change, and leave the question here.
 - **Status:** done
 - **Design:** §8.2–§8.4, §5.7, §8.5, C-20.
 - **Depends on:** T4.6
-- **Files:** `packaging/systemd/qeminga.service`, `packaging/udev/99-qeminga.rules`, `packaging/sysusers.d/qeminga.conf`, `packaging/config.toml`, `packaging/README.md`.
+- **Files:** `packaging/systemd/qeminga.service`, `packaging/udev/99-qeminga.rules`, `packaging/sysusers.d/qeminga.conf`, `packaging/tmpfiles.d/qeminga-suspend.conf` (OQ-6; installed only with the suspend feature), `packaging/config.toml`, `packaging/README.md`.
 - **Tests first (red):** `tests/packaging.rs` parses the shipped files and asserts: `Conflicts=qemu-guest-agent.service` and `After=qemu-guest-agent.service`; `BindsTo=`/`After=` the `dev-virtio\x2dports-org.qemu.guest_agent.0.device` unit; `RuntimeDirectory=qeminga`, `RuntimeDirectoryPreserve=yes`; `TimeoutStopSec=330s` ≥ `fsfreeze_max_timeout_secs + 30`; `Restart=always`; the udev rule matches §8.3 byte-for-byte; sysusers creates `qeminga` with uid/gid 600 and no login shell; the example config equals the §8.2 block and parses with T1.6.
 - **Implement (green):** the files; `systemd-analyze verify` in CI when available.
-- **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit).
+- **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit) and the suspend rule; `tests/packaging.rs` checks the tmpfiles line and `privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account` applies it (T5.2 job).
 
 #### T5.4 — libvirt interoperability script (manual) ∥
 - **Status:** todo

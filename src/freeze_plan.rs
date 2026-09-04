@@ -12,7 +12,7 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::mountinfo::MountEntry;
 
@@ -25,7 +25,7 @@ pub const FREEZABLE_FS_TYPES: &[&str] = &["ext4", "xfs"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     /// The (first, in mount order) mount point of the superblock.
-    pub mountpoint: String,
+    pub mountpoint: PathBuf,
     /// `(major, minor)` of the superblock.
     pub dev: (u32, u32),
     /// Filesystem type.
@@ -38,7 +38,7 @@ pub struct FreezePlan {
     /// Targets in mount order.
     targets: Vec<Target>,
     /// Every mount point with its device, for [`covers`](Self::covers).
-    mounts: Vec<(String, (u32, u32))>,
+    mounts: Vec<(PathBuf, (u32, u32))>,
 }
 
 /// `true` when the entry is a local, device-backed filesystem of an
@@ -97,14 +97,21 @@ impl FreezePlan {
     }
 
     /// The intersection with the requested mount points, matched exactly
-    /// on the unescaped mount point string; unknown paths are ignored, not
-    /// errors (C-12). Order and the mount table are preserved.
+    /// on the unescaped mount point (as a path, no normalisation; a mount
+    /// point that is not valid UTF-8 can never be named on the wire);
+    /// unknown paths are ignored, not errors (C-12). Order and the mount
+    /// table are preserved.
     pub fn restrict_to(&self, mountpoints: &[String]) -> FreezePlan {
         FreezePlan {
             targets: self
                 .targets
                 .iter()
-                .filter(|t| mountpoints.contains(&t.mountpoint))
+                .filter(|t| {
+                    // Byte-exact (`Path` equality would tolerate `/home/`).
+                    mountpoints
+                        .iter()
+                        .any(|m| m.as_str() == t.mountpoint.as_os_str())
+                })
                 .cloned()
                 .collect(),
             mounts: self.mounts.clone(),
@@ -113,12 +120,12 @@ impl FreezePlan {
 
     /// The mount point that holds `path` (longest matching prefix, by path
     /// components), with its device.
-    pub fn mount_of(&self, path: &Path) -> Option<(&str, (u32, u32))> {
+    pub fn mount_of(&self, path: &Path) -> Option<(&Path, (u32, u32))> {
         self.mounts
             .iter()
             .filter(|(mp, _)| path.starts_with(mp))
-            .max_by_key(|(mp, _)| Path::new(mp).components().count())
-            .map(|(mp, dev)| (mp.as_str(), *dev))
+            .max_by_key(|(mp, _)| mp.components().count())
+            .map(|(mp, dev)| (mp.as_path(), *dev))
     }
 
     /// `true` when the filesystem holding `path` is in the plan, i.e. a
@@ -148,7 +155,7 @@ mod tests {
     fn mountpoints(plan: &FreezePlan) -> Vec<&str> {
         plan.targets()
             .iter()
-            .map(|t| t.mountpoint.as_str())
+            .map(|t| t.mountpoint.to_str().unwrap())
             .collect()
     }
 
@@ -190,9 +197,15 @@ mod tests {
     #[test]
     fn freeze_order_is_reverse_mount_order_and_thaw_order_is_forward() {
         let plan = plan_from("nested.txt");
-        let freeze: Vec<&str> = plan.freeze_order().map(|t| t.mountpoint.as_str()).collect();
+        let freeze: Vec<&str> = plan
+            .freeze_order()
+            .map(|t| t.mountpoint.to_str().unwrap())
+            .collect();
         assert_eq!(freeze, ["/home/data/deep", "/home/data", "/home", "/"]);
-        let thaw: Vec<&str> = plan.thaw_order().map(|t| t.mountpoint.as_str()).collect();
+        let thaw: Vec<&str> = plan
+            .thaw_order()
+            .map(|t| t.mountpoint.to_str().unwrap())
+            .collect();
         assert_eq!(thaw, ["/", "/home", "/home/data", "/home/data/deep"]);
     }
 
@@ -208,7 +221,7 @@ mod tests {
         assert_eq!(mountpoints(&restricted), ["/home", "/home/data/deep"]);
         let freeze: Vec<&str> = restricted
             .freeze_order()
-            .map(|t| t.mountpoint.as_str())
+            .map(|t| t.mountpoint.to_str().unwrap())
             .collect();
         assert_eq!(freeze, ["/home/data/deep", "/home"]);
         // Exact string match on the unescaped mount point: no prefix
@@ -235,7 +248,7 @@ mod tests {
         );
         assert_eq!(
             plan.mount_of(Path::new("/run/qeminga/frozen")),
-            Some(("/run", (0, 30)))
+            Some((Path::new("/run"), (0, 30)))
         );
     }
 
@@ -249,11 +262,11 @@ mod tests {
         let plan = plan_from("nested.txt");
         assert_eq!(
             plan.mount_of(Path::new("/home/data/deep/x")),
-            Some(("/home/data/deep", (8, 4)))
+            Some((Path::new("/home/data/deep"), (8, 4)))
         );
         assert_eq!(
             plan.mount_of(Path::new("/home/datafile")),
-            Some(("/home", (8, 2)))
+            Some((Path::new("/home"), (8, 2)))
         );
         assert!(plan.covers(Path::new("/home/datafile")));
         // A relative path matches no mount.

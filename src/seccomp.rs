@@ -149,9 +149,9 @@ pub const COMMON: &[&str] = &[
     "getgid",
     "getegid",
     "getrandom",
-    // OS and network information.
+    // OS and network information (`socket` is listed separately,
+    // restricted to AF_NETLINK: getifaddrs(3) talks NETLINK_ROUTE).
     "uname",
-    "socket",
     "bind",
     "getsockname",
     "sendto",
@@ -165,20 +165,25 @@ pub const COMMON: &[&str] = &[
     // ioctl is listed separately with argument conditions.
 ];
 
-/// x86-64-only legacy aliases (§5.5), each with the observed need.
+/// x86-64-only legacy aliases (§5.5): an alias is listed only with an
+/// observed runtime need. `open`, `stat`, `lstat` and `poll` were dropped
+/// after no run needed them: the enforced privileged command matrix
+/// (T5.2, glibc 2.39) and the end-to-end suite (T4.7, enforced on
+/// x86-64) complete without them. A guest with a glibc old enough to
+/// issue them shows up as `SECCOMP` audit lines (`type=1326`) under the
+/// `seccomp-log` build, which is the way to establish the need before
+/// re-adding one.
 pub const X86_64_ONLY: &[&str] = &[
     // glibc's epoll_wait(3) is the epoll_wait syscall on x86-64 (mio's
-    // poller); aarch64 has no such syscall and uses epoll_pwait.
+    // poller calls it on every turn of the event loop); aarch64 has no
+    // such syscall and uses epoll_pwait.
     "epoll_wait",
-    // glibc's poll(3) is the poll syscall on x86-64; aarch64 uses ppoll.
-    "poll",
-    // Older glibc and some NSS paths still issue open(2) on x86-64.
-    "open",
-    // As above for stat(2), used by older glibc path lookups.
-    "stat",
-    // As above for lstat(2), used by older glibc symlink checks.
-    "lstat",
 ];
+
+/// `socket(2)` domain allowed: AF_NETLINK, the only family the daemon
+/// opens (getifaddrs(3) over NETLINK_ROUTE). AF_INET and AF_UNIX are
+/// refused, so a compromised handler has no socket egress path.
+pub const AF_NETLINK: u64 = 16;
 
 /// The allow rules for `target`, ioctl restricted to [`IOCTL_REQUESTS`].
 pub fn rules(target: Target) -> Vec<Rule> {
@@ -207,6 +212,13 @@ pub fn rules(target: Target) -> Vec<Rule> {
         conditions: vec![ArgEq {
             index: 0,
             value: PR_SET_NAME,
+        }],
+    });
+    out.push(Rule {
+        syscall: "socket",
+        conditions: vec![ArgEq {
+            index: 0,
+            value: AF_NETLINK,
         }],
     });
     out
@@ -376,16 +388,47 @@ mod tests {
     }
 
     #[test]
+    fn socket_is_restricted_to_af_netlink() {
+        for target in [Target::X86_64, Target::Aarch64] {
+            let socket: Vec<Rule> = rules(target)
+                .into_iter()
+                .filter(|r| r.syscall == "socket")
+                .collect();
+            assert_eq!(socket.len(), 1, "{target:?}");
+            assert_eq!(
+                socket[0].conditions,
+                [ArgEq {
+                    index: 0,
+                    value: AF_NETLINK
+                }]
+            );
+            assert!(!COMMON.contains(&"socket"));
+            let json = profile_json(target);
+            assert_eq!(json.matches("\"syscall\":\"socket\"").count(), 1);
+            assert!(json.contains("\"val\":16"));
+        }
+    }
+
+    #[test]
     fn x86_64_only_legacy_aliases_are_absent_from_aarch64_profile() {
         let names =
             |t: Target| -> Vec<&'static str> { rules(t).iter().map(|r| r.syscall).collect() };
         let a64 = names(Target::Aarch64);
         let x86 = names(Target::X86_64);
-        for alias in ["open", "stat", "lstat", "poll", "epoll_wait"] {
-            assert!(!a64.contains(&alias), "{alias} in aarch64 profile");
-            assert!(x86.contains(&alias), "{alias} missing from x86-64 profile");
-            assert!(X86_64_ONLY.contains(&alias));
-            assert!(!COMMON.contains(&alias));
+        assert_eq!(
+            X86_64_ONLY,
+            ["epoll_wait"],
+            "the aliases with an observed need"
+        );
+        for alias in X86_64_ONLY {
+            assert!(!a64.contains(alias), "{alias} in aarch64 profile");
+            assert!(x86.contains(alias), "{alias} missing from x86-64 profile");
+            assert!(!COMMON.contains(alias));
+        }
+        // Aliases without an observed need are in neither profile (§5.5).
+        for dropped in ["open", "stat", "lstat", "poll"] {
+            assert!(!x86.contains(&dropped), "{dropped} has no observed need");
+            assert!(!a64.contains(&dropped));
         }
         // Everything x86-64-only is documented with an observed need.
         let src = include_str!("seccomp.rs");

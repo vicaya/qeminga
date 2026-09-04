@@ -50,8 +50,8 @@ impl<'de> serde::de::Visitor<'de> for RequestVisitor {
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Request, A::Error> {
         use serde::de::Error as _;
         let mut method: Option<String> = None;
-        let mut arguments: Option<Option<Value>> = None;
-        let mut id: Option<Option<i64>> = None;
+        let mut arguments: Option<Value> = None;
+        let mut id: Option<i64> = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "execute" => {
@@ -64,19 +64,26 @@ impl<'de> serde::de::Visitor<'de> for RequestVisitor {
                     if arguments.is_some() {
                         return Err(A::Error::duplicate_field("arguments"));
                     }
-                    let value: Option<Value> = map.next_value()?;
-                    match value {
-                        None | Some(Value::Object(_)) => arguments = Some(value),
-                        Some(_) => {
-                            return Err(A::Error::custom("arguments must be an object"));
-                        }
+                    // An explicit `null` is not "absent" (C-3): only an
+                    // object is accepted.
+                    let value: Value = map.next_value()?;
+                    if !value.is_object() {
+                        return Err(A::Error::custom("arguments must be an object"));
                     }
+                    arguments = Some(value);
                 }
                 "id" => {
                     if id.is_some() {
                         return Err(A::Error::duplicate_field("id"));
                     }
-                    id = Some(map.next_value()?);
+                    // Only a JSON integer that fits i64 (C-3); `null`,
+                    // floats, strings and out-of-range numbers are rejected.
+                    let value: Value = map.next_value()?;
+                    id = Some(
+                        value
+                            .as_i64()
+                            .ok_or_else(|| A::Error::custom("id must be an integer"))?,
+                    );
                 }
                 _ => {
                     return Err(A::Error::unknown_field(
@@ -88,8 +95,8 @@ impl<'de> serde::de::Visitor<'de> for RequestVisitor {
         }
         Ok(Request {
             method: method.ok_or_else(|| A::Error::missing_field("execute"))?,
-            arguments: arguments.flatten(),
-            id: id.flatten(),
+            arguments,
+            id,
         })
     }
 }
@@ -356,8 +363,16 @@ mod tests {
                 "{input:?}: {err:?}"
             );
         }
-        let req = parse_request(br#"{"execute":"guest-sync","arguments":null}"#).unwrap();
-        assert_eq!(req.arguments, None);
+        // `null` is not "absent" (C-3): an explicit null is rejected too.
+        let err = parse_request(br#"{"execute":"guest-sync","arguments":null}"#).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+    }
+
+    #[test]
+    fn request_rejects_null_id() {
+        let err = parse_request(br#"{"execute":"guest-ping","id":null}"#).unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err:?}");
+        assert_eq!(err.class(), ErrorClass::GenericError);
     }
 
     #[test]

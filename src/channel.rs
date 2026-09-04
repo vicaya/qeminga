@@ -40,6 +40,7 @@ use tokio::sync::watch;
 
 use crate::dispatch::Dispatcher;
 use crate::framing::{DecodeEvent, FrameDecoder};
+use crate::state::FreezeState;
 
 /// First delay of the open-retry and reopen backoff.
 pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -202,17 +203,31 @@ impl AsyncWrite for Channel {
 pub trait Handle: Send + Sync {
     /// Handles one event and returns the encoded reply, if any.
     fn handle(&self, event: DecodeEvent) -> impl Future<Output = Option<Vec<u8>>> + Send;
+
+    /// `true` when a requested stop may take effect now. The daemon answers
+    /// `false` while the state is not `Thawed` (C-21), so a stop that
+    /// arrives while a command is mid-freeze is deferred until the thaw.
+    fn may_stop(&self) -> bool {
+        true
+    }
 }
 
 impl Handle for Dispatcher {
     fn handle(&self, event: DecodeEvent) -> impl Future<Output = Option<Vec<u8>>> + Send {
         Dispatcher::handle(self, event)
     }
+
+    fn may_stop(&self) -> bool {
+        self.context().state.current() == FreezeState::Thawed
+    }
 }
 
 /// Why a session ended.
 #[derive(Debug)]
 pub enum SessionEnd {
+    /// A requested stop took effect between commands (see
+    /// [`run_session_until`]).
+    Cancelled,
     /// The peer closed the channel (read returned 0, or HUP).
     Eof,
     /// A read failed.
@@ -225,6 +240,7 @@ impl std::fmt::Display for SessionEnd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SessionEnd::Eof => f.write_str("eof"),
+            SessionEnd::Cancelled => f.write_str("cancelled"),
             SessionEnd::ReadError(err) => write!(f, "read error: {err}"),
             SessionEnd::WriteError(err) => write!(f, "write error: {err}"),
         }
@@ -236,8 +252,8 @@ impl std::fmt::Display for SessionEnd {
 /// `decoder` is left in whatever state the stream reached (callers make a
 /// fresh one per session).
 pub async fn run_session<R, W, H>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     handler: &H,
     decoder: &mut FrameDecoder,
 ) -> SessionReport
@@ -246,11 +262,55 @@ where
     W: AsyncWrite + Unpin,
     H: Handle,
 {
+    // A cancellation source that never fires (the sender stays alive).
+    let (_never_sent, mut never) = cancel_pair();
+    run_session_until(reader, writer, handler, decoder, &mut never).await
+}
+
+/// [`run_session`] that also ends with [`SessionEnd::Cancelled`] once
+/// `cancel` is `true` **and** `handler.may_stop()` holds. Cancellation is
+/// only ever raced against the read: a command that is being handled is
+/// always finished, never dropped mid-way (a freeze abandoned at its
+/// `.await` would leave the filesystems frozen with the state stuck in
+/// `Freezing`, contrary to C-21/§5.7). A cancellation the handler does
+/// not yet allow is re-checked after every command and on every later
+/// notification.
+pub async fn run_session_until<R, W, H>(
+    mut reader: R,
+    mut writer: W,
+    handler: &H,
+    decoder: &mut FrameDecoder,
+    cancel: &mut Cancel,
+) -> SessionReport
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    H: Handle,
+{
     let mut buf = vec![0u8; READ_CHUNK];
     let mut received: u64 = 0;
+    // Once the sender is gone there is nothing left to wait for.
+    let mut cancel_live = true;
     let report = |end, received| SessionReport { end, received };
     loop {
-        let n = match reader.read(&mut buf).await {
+        if *cancel.borrow_and_update() && handler.may_stop() {
+            return report(SessionEnd::Cancelled, received);
+        }
+        let read = if cancel_live {
+            tokio::select! {
+                read = reader.read(&mut buf) => Some(read),
+                changed = cancel.changed() => {
+                    cancel_live = changed.is_ok();
+                    None
+                }
+            }
+        } else {
+            Some(reader.read(&mut buf).await)
+        };
+        let Some(read) = read else {
+            continue; // re-check the cancellation at the top of the loop
+        };
+        let n = match read {
             Ok(0) => return report(SessionEnd::Eof, received),
             Ok(n) => n,
             Err(err) => return report(SessionEnd::ReadError(err), received),
@@ -386,14 +446,21 @@ async fn serve_inner<H: Handle>(
     let mut initial = initial;
     // Zero before the first open; afterwards the pause before each reopen.
     let mut reopen_delay = Duration::ZERO;
+    let mut cancel_live = true;
     loop {
-        if *cancel.borrow() {
+        if stop_now(&mut cancel, handler) {
             return Ok(());
         }
         if !reopen_delay.is_zero() {
             tokio::select! {
                 () = tokio::time::sleep(reopen_delay) => {}
-                () = wait_cancel(&mut cancel) => return Ok(()),
+                changed = cancel.changed(), if cancel_live => {
+                    cancel_live = changed.is_ok();
+                    if stop_now(&mut cancel, handler) {
+                        return Ok(());
+                    }
+                    // Not allowed to stop yet (C-21): keep serving.
+                }
             }
         }
         let channel = match initial.take() {
@@ -406,7 +473,13 @@ async fn serve_inner<H: Handle>(
             },
             None => {
                 let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
-                    return Ok(());
+                    if handler.may_stop() {
+                        return Ok(());
+                    }
+                    // Stop requested but not allowed yet (C-21): keep
+                    // trying to reopen at a bounded cadence.
+                    tokio::time::sleep(backoff.initial).await;
+                    continue;
                 };
                 channel
             }
@@ -414,10 +487,10 @@ async fn serve_inner<H: Handle>(
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
         let (reader, writer) = tokio::io::split(channel);
         let mut decoder = FrameDecoder::new();
-        let report = tokio::select! {
-            report = run_session(reader, writer, handler, &mut decoder) => report,
-            _ = wait_cancel(&mut cancel) => return Ok(()),
-        };
+        let report = run_session_until(reader, writer, handler, &mut decoder, &mut cancel).await;
+        if matches!(report.end, SessionEnd::Cancelled) {
+            return Ok(());
+        }
         // A session that carried data resets the backoff; a host-disconnected
         // port reports EOF immediately and must not be reopened in a loop.
         reopen_delay = if report.received > 0 {
@@ -435,12 +508,9 @@ async fn serve_inner<H: Handle>(
     }
 }
 
-async fn wait_cancel(cancel: &mut Cancel) {
-    while !*cancel.borrow() {
-        if cancel.changed().await.is_err() {
-            return;
-        }
-    }
+/// `true` when a stop has been requested and the handler allows it now.
+fn stop_now<H: Handle>(cancel: &mut Cancel, handler: &H) -> bool {
+    *cancel.borrow_and_update() && handler.may_stop()
 }
 
 /// Production entry point: serve `path` with the real `open(2)`.
@@ -511,6 +581,81 @@ mod tests {
         let (end, handler) = session.await.unwrap();
         assert!(matches!(end, SessionEnd::Eof), "{end}");
         assert_eq!(handler.seen.lock().unwrap().len(), 4);
+    }
+
+    /// A handler that blocks inside `handle` until released and reports
+    /// whether it allows a stop; models a command that is mid-freeze.
+    struct SlowHandler {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        allow_stop: std::sync::atomic::AtomicBool,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl Handle for SlowHandler {
+        async fn handle(&self, _event: DecodeEvent) -> Option<Vec<u8>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(b"done\n".to_vec())
+        }
+        fn may_stop(&self) -> bool {
+            self.allow_stop.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_finishes_the_in_flight_command_and_waits_for_may_stop() {
+        use std::sync::atomic::Ordering;
+        let (mut peer, ours) = duplex(1024);
+        let (reader, writer) = tokio::io::split(ours);
+        let handler = Arc::new(SlowHandler {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            allow_stop: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (cancel_tx, mut cancel_rx) = cancel_pair();
+        let h = handler.clone();
+        let session = tokio::spawn(async move {
+            let mut decoder = FrameDecoder::new();
+            run_session_until(reader, writer, h.as_ref(), &mut decoder, &mut cancel_rx).await
+        });
+        peer.write_all(b"freeze\n").await.unwrap();
+        handler.started.notified().await;
+        // The stop arrives while the command is being handled: the
+        // command must complete (its reply is written) and, because the
+        // handler does not allow a stop yet, the session must go on.
+        cancel_tx.send(true).unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!handler.finished.load(Ordering::SeqCst));
+        assert!(!session.is_finished(), "handler still running");
+        handler.release.notify_one();
+        let mut out = [0u8; 8];
+        let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut out))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&out[..n], b"done\n", "the in-flight command completed");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !session.is_finished(),
+            "not allowed to stop yet: the session keeps serving"
+        );
+        // Once the handler allows it, the next notification ends the session.
+        handler.allow_stop.store(true, Ordering::SeqCst);
+        cancel_tx.send(true).unwrap();
+        let report = tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(report.end, SessionEnd::Cancelled),
+            "{}",
+            report.end
+        );
+        assert_eq!(report.end.to_string(), "cancelled");
     }
 
     #[tokio::test]

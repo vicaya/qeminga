@@ -23,6 +23,7 @@ use qeminga::marker::Marker;
 use qeminga::mountinfo::{MountEntry, StaticMounts, parse_mountinfo};
 use qeminga::state::FreezeState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::instrument::WithSubscriber;
 
 fn fixture(name: &str) -> String {
     std::fs::read_to_string(
@@ -177,7 +178,8 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
     // never involved and the marker step is read-only by construction
     // (`marker_present` returns a bool, nothing else is offered).
     let text = startup.sink.text();
-    assert!(text.is_empty() || !text.contains("fifreeze"));
+    assert!(!text.contains("fifreeze"), "{text}");
+    assert!(!text.contains("fithaw"), "{text}");
 }
 
 #[test]
@@ -414,18 +416,22 @@ async fn sigterm_while_frozen_is_deferred_until_thaw() {
     let ctx = rig.ctx.clone();
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
     let initial = take_initial();
-    let server = tokio::spawn(async move {
-        daemon::serve_until_signal(
-            ctx,
-            Path::new("/dev/virtio-ports/fake"),
-            never_open(),
-            Some(initial),
-            false,
-            async move { signal_rx.await.unwrap_or("closed") },
-            Duration::from_millis(20),
-        )
-        .await
-    });
+    let router = rig.ctx.audit.clone();
+    let server = tokio::spawn(
+        async move {
+            daemon::serve_until_signal(
+                ctx,
+                Path::new("/dev/virtio-ports/fake"),
+                never_open(),
+                Some(initial),
+                false,
+                async move { signal_rx.await.unwrap_or("closed") },
+                Duration::from_millis(20),
+            )
+            .await
+        }
+        .with_subscriber(qeminga::audit::subscriber(tracing::Level::INFO, router)),
+    );
     let mut peer = Channel::from_fd(rig.peer).unwrap();
     let reply = request(&mut peer, r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
     assert_eq!(reply, "{\"return\":2}\n");
@@ -448,7 +454,11 @@ async fn sigterm_while_frozen_is_deferred_until_thaw() {
         .unwrap();
     assert!(result.is_ok(), "exits after the thaw");
     assert!(!rig.ctx.marker.exists());
-    assert!(sink.text().contains("\"event\":\"stop_deferred\"") || sink.text().is_empty());
+    let text = sink.text();
+    assert!(
+        text.contains("\"event\":\"stop_deferred\""),
+        "the deferral is logged: {text}"
+    );
 }
 
 #[test]

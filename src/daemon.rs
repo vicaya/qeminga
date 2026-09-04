@@ -19,9 +19,11 @@
 //! (C-21).
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::future::Future;
+use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -95,11 +97,13 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, U
                 Some(path) => opts.config_path = PathBuf::from(path),
                 None => return Err(UsageError("--config needs a PATH".to_owned())),
             }
-        } else if let Some(path) = arg.to_str().and_then(|s| s.strip_prefix("--config=")) {
+        } else if let Some(path) = arg.as_encoded_bytes().strip_prefix(b"--config=") {
+            // Byte-wise, so a non-UTF-8 path works in this form as it does
+            // in the two-token form.
             if path.is_empty() {
                 return Err(UsageError("--config needs a PATH".to_owned()));
             }
-            opts.config_path = PathBuf::from(path);
+            opts.config_path = PathBuf::from(OsStr::from_bytes(path));
         } else {
             return Err(UsageError(format!(
                 "unrecognised argument: {}",
@@ -118,13 +122,15 @@ pub enum RunError {
     Config(#[from] ConfigError),
     /// `state_path` is on a filesystem the freeze plan would freeze.
     #[error(
-        "state_path {path} is on {mount}, which the freeze plan would freeze; put it on tmpfs (e.g. /run)"
+        "state_path {} is on {}, which the freeze plan would freeze; put it on tmpfs (e.g. /run)",
+        path.display(),
+        mount.display()
     )]
     StatePath {
         /// The configured path.
         path: PathBuf,
         /// The covering mount point.
-        mount: String,
+        mount: PathBuf,
     },
     /// The mount table could not be read for the `state_path` check.
     #[error("cannot read the mount table: {0}")]
@@ -258,19 +264,35 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
 /// Production entry point: parse, run, map errors to exit codes.
 pub fn run(opts: Options) -> ExitCode {
     if opts.version {
-        println!("qeminga {}", crate::VERSION);
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "qeminga {}", crate::VERSION);
         return ExitCode::SUCCESS;
     }
     match run_with(&opts, &SystemStartup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            // Logging may not be up yet (config errors); stderr is the sink
-            // either way.
-            eprintln!("qeminga: {err}");
-            tracing::error!(event = "startup_failed", error = %err, "exiting");
+            if tracing::dispatcher::has_been_set() {
+                // Logging is up: the record goes where the router sends
+                // it. In recovery mode that is the ring, never fd 2
+                // (§4.4, §9.1), and in normal mode this is the one line
+                // on stderr.
+                tracing::error!(event = "startup_failed", error = %err, "exiting");
+            } else {
+                // Failed before logging existed (a configuration error):
+                // stderr is the only channel left.
+                diag(&format!("qeminga: {err}"));
+            }
             ExitCode::from(err.exit_code())
         }
     }
+}
+
+/// Best-effort diagnostic on stderr. A failed write is deliberately
+/// ignored: there is nowhere left to report it, and panicking would be
+/// worse.
+pub fn diag(msg: &str) {
+    let mut err = std::io::stderr().lock();
+    let _ = writeln!(err, "{msg}");
 }
 
 /// The real steps.
@@ -433,15 +455,25 @@ where
     let stopper = async move {
         let name = signal.await;
         tracing::info!(event = "signal", signal = name, "stop requested");
-        let mut warned = false;
-        while stop_ctx.state.current() != FreezeState::Thawed {
-            if !warned {
-                tracing::warn!(event = "stop_deferred", state = %stop_ctx.state.current(), "stop deferred until thaw completes");
-                warned = true;
+        loop {
+            let mut warned = false;
+            while stop_ctx.state.current() != FreezeState::Thawed {
+                if !warned {
+                    tracing::warn!(event = "stop_deferred", state = %stop_ctx.state.current(), "stop deferred until thaw completes");
+                    warned = true;
+                }
+                tokio::time::sleep(stop_poll).await;
+            }
+            // Ask the loop to stop. A session finishes the command it is
+            // handling first and stops only if the state is still
+            // `Thawed`; a freeze that slipped in between this check and
+            // the request is therefore never abandoned, and the request
+            // is simply repeated once the state is `Thawed` again.
+            if cancel_tx.send(true).is_err() {
+                return;
             }
             tokio::time::sleep(stop_poll).await;
         }
-        let _ = cancel_tx.send(true);
     };
     let served = channel::serve_with_initial(path, open, &dispatcher, cancel_rx, initial);
     tokio::pin!(served);
@@ -458,6 +490,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::os::unix::ffi::OsStringExt;
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
@@ -483,6 +517,16 @@ mod tests {
         assert!(parse_args(args(&["--bogus"])).is_err());
         assert!(parse_args(args(&["extra"])).is_err());
         assert!(parse_args(vec![OsString::from("--\u{fffd}")]).is_err());
+        // A non-UTF-8 path in the `--config=` form (bytes preserved).
+        let raw = OsString::from_vec(b"--config=/etc/q\xff.toml".to_vec());
+        assert_eq!(
+            parse_args(vec![raw])
+                .unwrap()
+                .config_path
+                .as_os_str()
+                .as_bytes(),
+            b"/etc/q\xff.toml"
+        );
         assert_eq!(
             parse_args(args(&["--bogus"])).unwrap_err().to_string(),
             "unrecognised argument: --bogus"

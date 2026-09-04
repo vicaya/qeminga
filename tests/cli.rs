@@ -102,18 +102,38 @@ fn cli_accepts_config_path_and_version() {
 #[test]
 fn no_arguments_uses_the_default_config_path() {
     // The default /etc/qeminga/config.toml is absent on a build host, so
-    // the daemon exits with EX_CONFIG naming it (and never touches a device).
-    let output = qeminga().output().expect("failed to run qeminga");
-    if output.status.code() == Some(EX_CONFIG) {
-        let stderr = stderr_of(&output);
-        assert!(
-            stderr.contains("/etc/qeminga/config.toml"),
-            "stderr was: {stderr}"
-        );
-    } else {
-        // A host that really has a configuration is out of scope here.
+    // the daemon exits with EX_CONFIG naming it (and never touches a
+    // device). On a host that has the file (the package installed) the
+    // daemon would open the real channel or retry it for ever, so the
+    // test is skipped before spawning anything, and the spawn is bounded.
+    if std::path::Path::new("/etc/qeminga/config.toml").exists() {
         eprintln!("skipped: /etc/qeminga/config.toml exists");
+        return;
     }
+    let mut child = qeminga()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to run qeminga");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("qeminga did not exit within 10 s without a configuration");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+    assert_eq!(status.code(), Some(EX_CONFIG), "stderr was: {stderr}");
+    assert!(
+        stderr.contains("/etc/qeminga/config.toml"),
+        "stderr was: {stderr}"
+    );
 }
 
 #[test]

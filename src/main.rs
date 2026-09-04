@@ -10,7 +10,7 @@
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-use qeminga::daemon::{EX_USAGE, USAGE};
+use qeminga::daemon::{EX_USAGE, USAGE, diag};
 
 fn main() -> ExitCode {
     match qeminga::parse_args(std::env::args_os().skip(1)) {
@@ -36,11 +36,4 @@ fn print_version() -> ExitCode {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(EXIT_IOERR),
     }
-}
-
-/// Best-effort diagnostic on stderr. A failed write is deliberately ignored:
-/// there is nowhere left to report it, and panicking would be worse.
-fn diag(msg: &str) {
-    let mut err = io::stderr().lock();
-    let _ = writeln!(err, "{msg}");
 }

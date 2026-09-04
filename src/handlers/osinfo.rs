@@ -9,7 +9,9 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -60,18 +62,64 @@ impl OsInfoSource for SystemOsInfo {
     }
 
     fn os_release(&self) -> Option<String> {
-        OS_RELEASE_PATHS
-            .iter()
-            .find_map(|path| std::fs::read_to_string(Path::new(path)).ok())
+        os_release_from(&OS_RELEASE_PATHS.map(PathBuf::from))
     }
+}
+
+/// Explicit bound on an os-release file (64 KiB): the file is guest-local
+/// and normally a few hundred bytes; anything larger is treated as
+/// unreadable rather than parsed.
+pub const OS_RELEASE_MAX_BYTES: usize = 64 * 1024;
+
+/// Reads one os-release file under [`OS_RELEASE_MAX_BYTES`]. A file over
+/// the bound or not valid UTF-8 is an `InvalidData` error; a missing one
+/// is `NotFound`.
+fn read_os_release(path: &Path) -> io::Result<String> {
+    let mut bytes = Vec::new();
+    File::open(path)?
+        .take(OS_RELEASE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > OS_RELEASE_MAX_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "os-release file larger than the bound",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "os-release is not UTF-8"))
+}
+
+/// The first readable file of `paths`, per os-release(5): a later path is
+/// tried only when the earlier one is **missing**. Any other failure
+/// (permissions, size, encoding) is reported and yields `None`, so the
+/// reply carries the kernel fields only rather than a stale vendor file.
+fn os_release_from(paths: &[PathBuf]) -> Option<String> {
+    for path in paths {
+        match read_os_release(path) {
+            Ok(text) => return Some(text),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                tracing::warn!(
+                    event = "os_release_unreadable",
+                    path = %path.display(),
+                    error = %err,
+                    "os-release file unreadable; reporting kernel fields only"
+                );
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Parses `os-release(5)` text into `KEY → value`.
 ///
 /// Comment and blank lines are skipped; keys are `[A-Za-z0-9_]+`; values
 /// may be unquoted, single-quoted (literal) or double-quoted (backslash
-/// escapes `\"`, `\\`, `\$`, `` \` ``); anything after a closing quote is
-/// ignored; a later assignment overrides an earlier one. Never panics.
+/// escapes exactly `\"`, `\\`, `\$`, `` \` ``; before any other character
+/// the backslash is literal, as in the shell); anything after a closing
+/// quote is ignored; a later assignment overrides an earlier one. Never
+/// panics.
 pub fn parse_os_release(text: &str) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     for line in text.lines() {
@@ -101,6 +149,9 @@ fn unquote(raw: &str) -> String {
             let mut escaped = false;
             for c in chars {
                 if escaped {
+                    if !matches!(c, '$' | '`' | '"' | '\\') {
+                        out.push('\\');
+                    }
                     out.push(c);
                     escaped = false;
                 } else if c == '\\' {
@@ -110,6 +161,9 @@ fn unquote(raw: &str) -> String {
                 } else {
                     out.push(c);
                 }
+            }
+            if escaped {
+                out.push('\\');
             }
             out
         }
@@ -238,6 +292,39 @@ mod tests {
     }
 
     #[test]
+    fn os_release_file_reads_are_bounded_and_only_absence_falls_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        assert_eq!(
+            read_os_release(&missing).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let ok = dir.path().join("ok");
+        std::fs::write(&ok, "ID=x\n").unwrap();
+        assert_eq!(read_os_release(&ok).unwrap(), "ID=x\n");
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'#'; OS_RELEASE_MAX_BYTES + 1]).unwrap();
+        assert_eq!(
+            read_os_release(&big).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        let binary = dir.path().join("binary");
+        std::fs::write(&binary, b"ID=\xff\n").unwrap();
+        assert_eq!(
+            read_os_release(&binary).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+        // The production source falls through to the next path only when
+        // the first is missing; any other failure yields no text at all.
+        assert_eq!(
+            os_release_from(&[missing.clone(), ok.clone()]).as_deref(),
+            Some("ID=x\n")
+        );
+        assert_eq!(os_release_from(&[big, ok.clone()]), None);
+        assert_eq!(os_release_from(&[missing.clone(), missing]), None);
+    }
+
+    #[test]
     fn parse_os_release_handles_quotes_and_escapes() {
         let map = parse_os_release(&fixture("quoted.txt"));
         assert_eq!(map["NAME"], "Single Quoted \"Name\"");
@@ -258,6 +345,9 @@ mod tests {
         assert_eq!(map["ID"], "escaped$id");
         assert_eq!(map["VERSION"], "lit\\eral", "single quotes are literal");
         assert_eq!(map["VERSION_ID"], "unterminated");
+        // Inside double quotes a backslash is literal unless it precedes
+        // one of `$`, `` ` ``, `"`, `\` (shell rules, as os-release(5) says).
+        assert_eq!(map["VARIANT"], "Foo\\Bar 1.0 with \\n kept");
 
         // Real-world files.
         let debian = parse_os_release(&fixture("debian.txt"));

@@ -348,7 +348,7 @@ the answer is a one-line change, and leave the question here.
   - `missing_file_falls_back_to_usr_lib` then `missing_both_yields_kernel_fields_only`.
   - `output_uses_qapi_field_names` and `omits_absent_fields` (no `null`s).
   - `uname_fields_are_mapped` — `kernel-release` ← release, `kernel-version` ← version, `machine` ← machine.
-- **Implement (green):** `OsInfoSource` trait (`uname()`, `os_release()`), production impl via `nix::sys::utsname::uname` and file reads; pure `parse_os_release(&str) -> BTreeMap<String, String>`.
+- **Implement (green):** `OsInfoSource` trait (`uname()`, `os_release()`), production impl via `nix::sys::utsname::uname` and file reads; pure `parse_os_release(&str) -> BTreeMap<String, String>`. The file read is bounded (`OS_RELEASE_MAX_BYTES`, 64 KiB); per os-release(5) `/usr/lib/os-release` is tried only when `/etc/os-release` is *missing*, and any other failure (permissions, size, encoding) is logged (`os_release_unreadable`) and answered with the kernel fields only. Inside double quotes a backslash escapes only `$`, `` ` ``, `"` and `\` (shell rules).
 - **Done when:** a fixture-driven proptest shows the parser never panics on arbitrary text.
 
 #### T2.4 — `guest-network-get-interfaces` ∥

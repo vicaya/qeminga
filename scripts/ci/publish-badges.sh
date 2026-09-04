@@ -66,15 +66,24 @@ else color=red
 fi
 sha=$(git rev-parse --short "$source_sha")
 
-work=$(mktemp -d)
-cleanup() { git worktree remove --force "$work" 2>/dev/null || rm -rf "$work"; }
+# Every attempt gets a worktree of its own: reusing one path would reuse
+# its `.git/worktrees/<name>` entry, and a `worktree add` racing with
+# the removal of the previous attempt's entry has been seen to fail.
+work=
+cleanup() {
+    if [ -n "$work" ]; then
+        git worktree remove --force "$work" 2>/dev/null || rm -rf "$work"
+    fi
+    git worktree prune 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 
 n=0
 while :; do
     n=$((n + 1))
-    git worktree remove --force "$work" 2>/dev/null || true
-    rm -rf "$work"
+    cleanup
+    work=$(mktemp -d)
+    rmdir "$work"
     if git fetch -q "$remote" "$badges_branch" 2>/dev/null; then
         git worktree add -q --detach "$work" FETCH_HEAD
     else

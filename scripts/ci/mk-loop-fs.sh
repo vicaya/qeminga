@@ -47,7 +47,13 @@ setup() {
 
 teardown() {
     for m in "$BASE/ext4-bind" "$BASE/ext4" "$BASE/xfs"; do
-        if mountpoint -q "$m" 2>/dev/null; then umount "$m" || umount -l "$m"; fi
+        if mountpoint -q "$m" 2>/dev/null; then
+            # A test that failed between freeze and thaw leaves the
+            # superblock frozen (nested freezes need repeated unfreezes).
+            n=0
+            while fsfreeze --unfreeze "$m" 2>/dev/null && [ "$n" -lt 64 ]; do n=$((n + 1)); done
+            umount "$m" || umount -l "$m"
+        fi
     done
     for f in "$STATE"/*.loop; do
         [ -e "$f" ] || continue

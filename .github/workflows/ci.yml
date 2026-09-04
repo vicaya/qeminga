@@ -131,6 +131,9 @@ jobs:
   privileged:
     name: privileged (loop ext4/xfs, caps, seccomp)
     runs-on: ubuntu-24.04
+    # A test stuck on a frozen loop filesystem must not run to GitHub's
+    # six-hour default; the suite takes about a minute.
+    timeout-minutes: 20
     env:
       # The enforced run must not carry `seccomp-log`, which `--all-features`
       # would enable (debug builds of it only log). Listed explicitly and
@@ -164,7 +167,7 @@ jobs:
       - name: Privileged tests, seccomp-log build (compatibility run)
         run: |
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_seccomp_matrix
+          sudo -E env "PATH=$PATH" cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_
       - name: Privileged tests, enforced build
         run: |
           set -a; . /tmp/loop.env; set +a

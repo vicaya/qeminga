@@ -22,6 +22,35 @@ fn ext4_mount() -> String {
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup")
 }
 
+/// Thaws the named mounts when dropped, whatever happened in between: a
+/// failed assertion between freeze and thaw would otherwise leave the
+/// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
+/// taking its watchdog with it), so every later test would get EBUSY and
+/// a write to the mount would block in D state. `FITHAW` is repeated
+/// until it fails (nested freezes), bounded.
+struct ThawGuard(Vec<String>);
+
+impl ThawGuard {
+    fn new(mounts: &[String]) -> Self {
+        ThawGuard(mounts.to_vec())
+    }
+}
+
+impl Drop for ThawGuard {
+    fn drop(&mut self) {
+        use qeminga::kernel::KernelOps;
+        for mount in &self.0 {
+            let path = std::path::Path::new(mount);
+            for _ in 0..64 {
+                if qeminga::kernel::LinuxKernel.fithaw(path).is_err() {
+                    break;
+                }
+                eprintln!("ThawGuard: thawed {mount} left frozen by the test");
+            }
+        }
+    }
+}
+
 fn real_kernel(agent_extra: &str) -> SpawnOptions {
     SpawnOptions {
         fake_kernel: false,
@@ -40,6 +69,7 @@ fn freeze_list(agent: &mut Agent, mounts: &[String]) -> Value {
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_freeze_sigkill_restart_recovery_thaw() {
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let mut agent = Agent::spawn_with(real_kernel(""));
     assert_eq!(
         freeze_list(&mut agent, std::slice::from_ref(&mount)),
@@ -86,6 +116,7 @@ fn privileged_freeze_sigkill_restart_recovery_thaw() {
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_watchdog_idle_and_hard_cap_on_real_fs() {
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let mut agent = Agent::spawn_with(real_kernel(
         "fsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\n",
     ));
@@ -130,6 +161,7 @@ fn privileged_watchdog_idle_and_hard_cap_on_real_fs() {
 #[ignore = "needs root, a loop-mounted ext4 with a bind mount and a 0700 mountpoint (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_freeze_with_tmpfs_bind_and_0700_mountpoint() {
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let bind = std::env::var("QEMINGA_TEST_EXT4_BIND").expect("QEMINGA_TEST_EXT4_BIND");
     let mode = std::fs::metadata(&mount).unwrap().permissions();
     use std::os::unix::fs::PermissionsExt;
@@ -169,6 +201,7 @@ fn privileged_freeze_with_tmpfs_bind_and_0700_mountpoint() {
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_channel_eof_during_freeze_preserves_marker() {
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let mut agent = Agent::spawn_with(real_kernel(""));
     assert_eq!(
         freeze_list(&mut agent, std::slice::from_ref(&mount)),
@@ -195,6 +228,7 @@ fn privileged_channel_eof_during_freeze_preserves_marker() {
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let mut agent = Agent::spawn_with(SpawnOptions {
         stderr_pipe: true,
         ..real_kernel("")
@@ -246,9 +280,63 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
         drained_before,
         "no bytes to stderr while frozen (AC13)"
     );
-    // Thaw: the flush goes to the pipe; drain it concurrently so the
-    // reply can arrive, as journald would once its filesystem thawed.
+    // The §9.1 hazard proper: journald has stopped reading and its pipe
+    // is full, so any write to stderr blocks. Fill it to capacity from the
+    // test's own write end and leave it full while the thaw runs.
+    // O_NONBLOCK is a status flag of the *open file description*, which
+    // this dup shares with the daemon's stderr: it is set only while the
+    // pipe is being filled and cleared again before the thaw, so that the
+    // daemon's own writes block as journald's would make them.
+    let mut writer = agent.take_stderr_writer().unwrap();
+    let set_nonblock = |writer: &std::fs::File, on: bool| {
+        use std::os::fd::AsFd;
+        let fd = writer.as_fd();
+        let flags = nix::fcntl::OFlag::from_bits_retain(
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).unwrap(),
+        );
+        let flags = if on {
+            flags | nix::fcntl::OFlag::O_NONBLOCK
+        } else {
+            flags - nix::fcntl::OFlag::O_NONBLOCK
+        };
+        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).unwrap();
+    };
+    set_nonblock(&writer, true);
+    let mut filled = 0usize;
+    loop {
+        match writer.write(&[b'#'; 4096]) {
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("filling the pipe: {err}"),
+        }
+    }
+    assert!(filled > 0, "the pipe was filled to capacity");
+    set_nonblock(&writer, false);
+    // Thaw with the pipe full. The proof that the FITHAW drain completed
+    // comes from the filesystem itself, not from the daemon's reply (which
+    // cannot be written until the flush that precedes it unblocks): a
+    // write to the mount blocks in D state while frozen and completes as
+    // soon as the drain has thawed it.
     agent.send_line(r#"{"execute":"guest-fsfreeze-thaw","id":9999}"#);
+    let probe_path = format!("{mount}/probe-during-full-pipe");
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::write(&probe_path, b"ok");
+        let _ = done_tx.send(result);
+    });
+    match done_rx.recv_timeout(Duration::from_secs(20)) {
+        Ok(result) => result.expect("write to the thawed mount"),
+        Err(_) => panic!(
+            "the filesystem was not thawed within 20 s while stderr was blocked: the drain waited on the flush (§9.1)"
+        ),
+    }
+    // Nothing more reached the pipe (still full) and no reply yet: the
+    // flush, and the reply after it, wait for journald, not the drain.
+    assert!(
+        agent.read_line(Duration::from_millis(300)).is_none(),
+        "the reply is written only after the flush, which is blocked"
+    );
+    // journald comes back: drain the pipe, and the flush and reply follow.
     let deadline = Instant::now() + Duration::from_secs(20);
     let reply = loop {
         drain(&mut stderr, &mut drained);
@@ -257,7 +345,7 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
         }
         assert!(
             Instant::now() < deadline,
-            "thaw deadlocked; drained {} bytes",
+            "no thaw reply after draining; drained {} bytes",
             drained.len()
         );
     };
@@ -285,6 +373,7 @@ fn privileged_seccomp_matrix_log_then_enforce() {
     // `seccomp-log` build and with the enforced build, whose feature set
     // deliberately excludes `seccomp-log` (AC15).
     let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let audit_lines = || -> Option<usize> {
         std::process::Command::new("dmesg")
             .output()

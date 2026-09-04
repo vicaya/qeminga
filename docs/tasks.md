@@ -656,10 +656,10 @@ the answer is a one-line change, and leave the question here.
   - `privileged_watchdog_idle_and_hard_cap_on_real_fs` with short configured timeouts (AC11).
   - `privileged_freeze_with_tmpfs_bind_and_0700_mountpoint` (AC17).
   - `privileged_channel_eof_during_freeze_preserves_marker` (AC18).
-  - `privileged_journald_pipe_full_does_not_deadlock_thaw` (AC13): point stderr at a full pipe.
+  - `privileged_journald_pipe_full_does_not_deadlock_thaw` (AC13): stderr is a pipe the test fills to capacity (a dup of the write end) before sending the thaw and does not drain; the thaw is proved from the filesystem side (a write to the mount, blocked while frozen, completes within the deadline) while the daemon's flush and reply stay blocked; only then is the pipe drained and the reply read.
   - `privileged_seccomp_matrix_log_then_enforce` (AC15).
 - **Implement (green):** `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`) on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
-- **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here.
+- **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here. Every freezing test holds a `ThawGuard` that repeats `FITHAW` on drop, the job has `timeout-minutes`, and `mk-loop-fs.sh teardown` unfreezes before unmounting, so one failed assertion cannot leave the loop filesystem frozen for the rest of the job; both privileged steps run the whole `privileged_` set.
 
 #### T5.3 — Packaging: systemd unit, udev rule, sysusers, example config ∥
 - **Status:** todo

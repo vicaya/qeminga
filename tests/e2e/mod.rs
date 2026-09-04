@@ -129,6 +129,7 @@ pub struct Agent {
     link: PathBuf,
     stderr_path: PathBuf,
     stderr_pipe: Option<File>,
+    stderr_writer: Option<File>,
     pending: Vec<u8>,
 }
 
@@ -170,9 +171,13 @@ impl Agent {
         }
         let stderr_path = dir.path().join("stderr.log");
         let mut stderr_pipe = None;
+        let mut stderr_writer = None;
         let stderr: Stdio = if opts.stderr_pipe {
             let (reader, writer) = std::io::pipe().unwrap();
             stderr_pipe = Some(File::from(OwnedFd::from(reader)));
+            // A dup of the write end stays with the test so it can fill
+            // the pipe itself (a blocked journald leaves it full).
+            stderr_writer = Some(File::from(OwnedFd::from(writer.try_clone().unwrap())));
             Stdio::from(writer)
         } else {
             // Append: a restart (AC10) keeps the previous log.
@@ -201,6 +206,7 @@ impl Agent {
             link,
             stderr_path,
             stderr_pipe,
+            stderr_writer,
             pending: Vec::new(),
         };
         if agent.stderr_pipe.is_none() {
@@ -216,6 +222,13 @@ impl Agent {
     /// The read end of the stderr pipe (once), for `stderr_pipe` spawns.
     pub fn take_stderr_pipe(&mut self) -> Option<File> {
         self.stderr_pipe.take()
+    }
+
+    /// A write end of the stderr pipe (once), for `stderr_pipe` spawns:
+    /// lets a test fill the pipe to capacity, as a journald that stopped
+    /// reading would leave it.
+    pub fn take_stderr_writer(&mut self) -> Option<File> {
+        self.stderr_writer.take()
     }
 
     /// Kills the daemon with SIGKILL (a crash) and returns the state

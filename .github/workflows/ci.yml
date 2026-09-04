@@ -119,6 +119,8 @@ jobs:
   mutants:
     name: cargo mutants
     runs-on: ubuntu-24.04
+    # About 45 minutes on the shared runners; never GitHub's six-hour default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -126,7 +128,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-mutants
+          tool: cargo-mutants@27.1.0
       - name: cargo mutants (exit 3 = timeouts only, which are detections)
         run: |
           cargo mutants --all-features --no-shuffle -j 2 && exit 0

@@ -31,6 +31,10 @@ exclude_re = [
     "::fmt ",
     "::expecting ",
 ]
+# The workflow sets RUSTFLAGS="-D warnings"; a mutant that merely warns
+# (an unused variable, unreachable code) must still build, or it is
+# silently skipped as "unviable" instead of being tested.
+cap_lints = true
 # Each mutant runs the unit tests only; the E2E and privileged suites are
 # slow and covered by their own jobs.
 test_tool = "cargo"

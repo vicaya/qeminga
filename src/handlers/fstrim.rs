@@ -8,7 +8,6 @@
 //! dispatcher before this handler runs; so is the freeze gate.
 #![forbid(unsafe_code)]
 
-use std::path::Path;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -58,8 +57,10 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
         paths: plan
             .thaw_order()
             .map(|target| {
-                let path = target.mountpoint.clone();
-                match kernel.fitrim(Path::new(&path), minimum) {
+                // The ioctl gets the byte-exact path; the reply is lossy.
+                let mountpoint = target.mountpoint.as_path();
+                let path = mountpoint.to_string_lossy().into_owned();
+                match kernel.fitrim(mountpoint, minimum) {
                     Ok(trimmed) => TrimResult {
                         path,
                         trimmed: Some(trimmed),
@@ -67,7 +68,7 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
                         error: None,
                     },
                     Err(err) => {
-                        tracing::warn!(event = "fstrim_failed", mountpoint = path.as_str(), errno = %err, "trim failed");
+                        tracing::warn!(event = "fstrim_failed", mountpoint = %mountpoint.display(), errno = %err, "trim failed");
                         TrimResult {
                             path,
                             trimmed: None,
@@ -111,6 +112,7 @@ mod tests {
     use crate::proto::parse_request;
     use crate::state::{FreezeState, FreezeStateMachine};
     use nix::errno::Errno;
+    use std::path::Path;
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(

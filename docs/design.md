@@ -330,7 +330,7 @@ Each command class has a per-minute quota enforced by a token-bucket limiter:
 
 qeminga starts with the privilege needed to open the channel, then runs as the dedicated `qeminga` system user (UID/GID 600 by convention). Linux clears the effective capability set on a UID transition, so the order is part of the security design:
 
-1. Open the channel and perform other pre-drop setup.
+1. Attempt to open the channel once (the port is root-owned until the udev rule of §8.3 applies) and perform other pre-drop setup. A port that cannot be opened yet (`ENOENT`, or any error other than the terminal `EBUSY` of §8.4) does not hold the process here: the reopen loop of §5.7 retries after the drop, so a missing device never delays the privilege drop, the seccomp filter or the recovery watchdog of §4.4.
 2. Set `PR_SET_KEEPCAPS`.
 3. Call `setresgid()` and `setresuid()` for the `qeminga` account.
 4. Re-raise the final capabilities and the temporary `CAP_SETPCAP` needed to trim the bounding set.
@@ -375,7 +375,7 @@ The `kernel` module is the single location permitted to use `unsafe`. Every non-
 
 Release builds use `panic = "abort"` and rely on the service manager to restart the process. A panic or seccomp kill never attempts a best-effort write or thaw from an indeterminate state; the pre-freeze marker forces the restarted process into the conservative recovery path in §4.4. A graceful stop requested while frozen is deferred until thaw only when the unit's `TimeoutStopSec` exceeds `fsfreeze_max_timeout_secs` plus a thaw-drain margin (§8.4); otherwise it intentionally degrades to the forced-stop recovery path. A forced stop leaves the marker in place.
 
-Channel EOF or HUP closes both channel handles, discards any partial frame, and retries opening the configured channel with bounded backoff. Reconnection never resets `FreezeState`, cancels a watchdog, clears the recovery marker, or enables the normal audit sink while frozen. A newly connected peer starts with a clean decoder and should use `guest-sync-delimited` to establish stream synchronisation.
+Channel EOF or HUP closes both channel handles, discards any partial frame, and retries opening the configured channel with bounded backoff; the same loop performs the first open when the pre-drop attempt of §5.4 found no device. Reconnection never resets `FreezeState`, cancels a watchdog, clears the recovery marker, or enables the normal audit sink while frozen. Recovery-mode startup (§4.4) does not wait for the channel: the watchdog is armed as soon as the runtime starts, so an abandoned freeze is bounded even if the host never connects. A newly connected peer starts with a clean decoder and should use `guest-sync-delimited` to establish stream synchronisation.
 
 ### 5.8 Supply-Chain Controls
 

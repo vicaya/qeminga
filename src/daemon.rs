@@ -172,20 +172,24 @@ pub trait Startup {
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError>;
     /// Step 3: the mount table for the `state_path` check.
     fn mount_table(&self) -> Result<Vec<MountEntry>, String>;
-    /// Step 4: open the channel; `EBUSY` is terminal, other errors may be
-    /// retried inside.
-    fn open_channel(&self, path: &Path) -> Result<OwnedFd, OpenError>;
+    /// Step 4: one attempt to open the channel while still privileged.
+    /// `EBUSY` is terminal; any other failure yields `Ok(None)` and the
+    /// runtime's reopen loop (§5.7) retries after the drop, so a missing
+    /// device never delays the privilege drop, the seccomp filter or the
+    /// recovery watchdog (C-14, OQ-7).
+    fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
     /// Step 5.
     fn drop_privileges(&self) -> Result<Outcome, PrivilegeError>;
     /// Step 6: `Ok(true)` when a filter was installed.
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError>;
-    /// Step 7: run until a signal; `recovery` selects the `Frozen` start.
+    /// Step 7: run until a signal; `recovery` selects the `Frozen` start;
+    /// `channel` is the descriptor step 4 opened, if it did.
     fn serve(
         &self,
         config: Arc<Config>,
         router: Router,
         recovery: bool,
-        channel: OwnedFd,
+        channel: Option<OwnedFd>,
     ) -> Result<(), RunError>;
 }
 
@@ -236,6 +240,13 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
         });
     }
     let channel = startup.open_channel(&config.agent.channel_path)?;
+    if channel.is_none() {
+        tracing::warn!(
+            event = "channel_open_deferred",
+            path = %config.agent.channel_path.display(),
+            "channel not open yet; the runtime retries after the privilege drop"
+        );
+    }
     match startup.drop_privileges()? {
         Outcome::Dropped => tracing::info!(
             event = "privileges_dropped",
@@ -326,22 +337,21 @@ impl Startup for SystemStartup {
             .map_err(|err| err.to_string())
     }
 
-    fn open_channel(&self, path: &Path) -> Result<OwnedFd, OpenError> {
-        // Retry non-terminal failures with the channel's backoff, blocking:
-        // there is no runtime yet and nothing else to do.
-        let mut delay = Duration::from_secs(1);
-        loop {
-            match channel::open_device(path) {
-                Ok(fd) => return Ok(fd),
-                Err(err) => {
-                    let err = OpenError::from_io(path, err);
-                    if err.is_terminal() {
-                        return Err(err);
-                    }
-                    tracing::warn!(event = "channel_open_retry", error = %err, delay_secs = delay.as_secs(), "cannot open channel; retrying");
-                    std::thread::sleep(delay);
-                    delay = (delay * 2).min(channel::MAX_BACKOFF);
+    fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError> {
+        // One attempt, no waiting: retrying here would hold the process as
+        // root with no runtime, no seccomp and, in recovery mode, no
+        // watchdog, for as long as the device is missing. The reopen loop
+        // retries with backoff once the runtime is up (the udev rule of
+        // §8.3 lets the service account open the port).
+        match channel::open_device(path) {
+            Ok(fd) => Ok(Some(fd)),
+            Err(err) => {
+                let err = OpenError::from_io(path, err);
+                if err.is_terminal() {
+                    return Err(err);
                 }
+                tracing::warn!(event = "channel_open_failed", error = %err, "cannot open channel now");
+                Ok(None)
             }
         }
     }
@@ -372,7 +382,7 @@ impl Startup for SystemStartup {
         config: Arc<Config>,
         router: Router,
         recovery: bool,
-        channel: OwnedFd,
+        channel: Option<OwnedFd>,
     ) -> Result<(), RunError> {
         let runtime = build_runtime().map_err(|err| RunError::Runtime(err.to_string()))?;
         let path = config.agent.channel_path.clone();
@@ -395,7 +405,7 @@ impl Startup for SystemStartup {
                 ctx,
                 &path,
                 Arc::new(channel::open_device),
-                Some(channel),
+                channel,
                 recovery,
                 signal,
                 STOP_POLL,
@@ -432,8 +442,11 @@ pub fn production_context(config: Arc<Config>, router: Router, recovery: bool) -
 
 /// Serves the channel until `signal` resolves and the state is `Thawed`
 /// (a stop while not thawed is deferred, C-21). In recovery mode the ring
-/// and the watchdog are set up first (C-14). Returns the terminal channel
-/// error, if any.
+/// and the watchdog are set up first (C-14), before and independently of
+/// any channel: with no `initial` descriptor the loop keeps trying to
+/// open `path` with backoff while the watchdog runs, so an abandoned
+/// freeze is bounded even if the host never connects (OQ-7). Returns the
+/// terminal channel error, if any.
 pub async fn serve_until_signal<S>(
     ctx: Arc<Context>,
     path: &Path,

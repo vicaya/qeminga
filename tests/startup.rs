@@ -111,7 +111,7 @@ impl Startup for FakeStartup {
         self.log("mounts");
         Ok(parse_mountinfo(&self.mountinfo))
     }
-    fn open_channel(&self, path: &Path) -> Result<OwnedFd, OpenError> {
+    fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError> {
         self.log(format!("channel {}", path.display()));
         match self.open {
             Ok(()) => {
@@ -122,12 +122,17 @@ impl Startup for FakeStartup {
                     nix::sys::socket::SockFlag::SOCK_CLOEXEC,
                 )
                 .unwrap();
-                Ok(a)
+                Ok(Some(a))
             }
-            Err(errno) => Err(OpenError::from_io(
-                path,
-                std::io::Error::from_raw_os_error(errno as i32),
-            )),
+            Err(errno) => {
+                let err = OpenError::from_io(path, std::io::Error::from_raw_os_error(errno as i32));
+                if err.is_terminal() {
+                    Err(err)
+                } else {
+                    self.log("channel deferred");
+                    Ok(None)
+                }
+            }
         }
     }
     fn drop_privileges(&self) -> Result<Outcome, PrivilegeError> {
@@ -143,11 +148,12 @@ impl Startup for FakeStartup {
         _config: Arc<Config>,
         router: Router,
         recovery: bool,
-        _channel: OwnedFd,
+        channel: Option<OwnedFd>,
     ) -> Result<(), RunError> {
         self.log(format!(
-            "runtime recovery={recovery} mode={:?}",
-            router.mode()
+            "runtime recovery={recovery} mode={:?} channel={}",
+            router.mode(),
+            if channel.is_some() { "open" } else { "none" }
         ));
         Ok(())
     }
@@ -171,7 +177,7 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
             "channel /dev/virtio-ports/org.qemu.guest_agent.0",
             "caps",
             "seccomp enabled=true",
-            "runtime recovery=false mode=Normal",
+            "runtime recovery=false mode=Normal channel=open",
         ]
     );
     // No ioctl and no marker write before the runtime: the fake kernel is
@@ -220,6 +226,37 @@ fn ebusy_on_channel_exits_with_channel_already_open_and_nonzero_code() {
 }
 
 #[test]
+fn a_missing_channel_never_delays_the_drop_the_filter_or_recovery() {
+    // ENOENT on the one privileged open attempt is not terminal: the
+    // sequence goes on to the privilege drop, the seccomp filter and the
+    // runtime, which starts in recovery mode with no channel and leaves
+    // the reopening to the loop (OQ-7).
+    let mut startup = FakeStartup::new();
+    startup.marker = true;
+    startup.open = Err(Errno::ENOENT);
+    daemon::run_with(&Options::default(), &startup).unwrap();
+    assert_eq!(
+        startup.steps()[4..],
+        [
+            "channel /dev/virtio-ports/org.qemu.guest_agent.0",
+            "channel deferred",
+            "caps",
+            "seccomp enabled=true",
+            "runtime recovery=true mode=Ring channel=none",
+        ]
+    );
+    // Any other non-EBUSY error is deferred the same way.
+    let mut startup = FakeStartup::new();
+    startup.open = Err(Errno::EACCES);
+    daemon::run_with(&Options::default(), &startup).unwrap();
+    assert!(startup.steps().contains(&"channel deferred".to_owned()));
+    assert_eq!(
+        startup.steps().last().unwrap(),
+        "runtime recovery=false mode=Normal channel=none"
+    );
+}
+
+#[test]
 fn feature_warnings_are_logged_once_at_startup() {
     // Observed on the real binary's stderr (its global subscriber), which is
     // deterministic; scoped test subscribers race with each other under
@@ -258,6 +295,10 @@ struct Rig {
 }
 
 fn rig(recovery: bool, sink: &SharedSink) -> Rig {
+    rig_with_idle(recovery, sink, 30)
+}
+
+fn rig_with_idle(recovery: bool, sink: &SharedSink, idle_secs: u64) -> Rig {
     let dir = shm_dir();
     let marker = Marker::new(dir.path().join("frozen"));
     if recovery {
@@ -268,7 +309,7 @@ fn rig(recovery: bool, sink: &SharedSink) -> Rig {
         router.enter_ring();
     }
     let config = Config::parse(&format!(
-        "[agent]\nstate_path = \"{}\"\nfsfreeze_idle_timeout_secs = 30\n",
+        "[agent]\nstate_path = \"{}\"\nfsfreeze_idle_timeout_secs = {idle_secs}\n",
         marker.path().display()
     ))
     .unwrap();
@@ -371,6 +412,61 @@ async fn marker_present_starts_in_frozen_recovery_mode_with_ring_audit_and_watch
         .unwrap()
         .unwrap();
     assert!(result.is_ok());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_thaws_without_the_channel_ever_opening() {
+    // A marker from a previous instance and a port that never appears:
+    // the watchdog armed at startup drains and removes the marker on its
+    // own, and the agent then honours the stop (OQ-7, C-14).
+    let sink = SharedSink::default();
+    let rig = rig_with_idle(true, &sink, 1);
+    let ctx = rig.ctx.clone();
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    drop(take_initial());
+    let router = rig.ctx.audit.clone();
+    let server = tokio::spawn(
+        async move {
+            daemon::serve_until_signal(
+                ctx,
+                Path::new("/dev/virtio-ports/never"),
+                never_open(),
+                None,
+                true,
+                async move { signal_rx.await.unwrap_or("closed") },
+                Duration::from_millis(20),
+            )
+            .await
+        }
+        .with_subscriber(qeminga::audit::subscriber(tracing::Level::INFO, router)),
+    );
+    assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+    let start = std::time::Instant::now();
+    while rig.ctx.watchdog_slot().is_none() && rig.ctx.state.current() == FreezeState::Frozen {
+        assert!(start.elapsed() < Duration::from_secs(5), "never armed");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    while rig.ctx.state.current() != FreezeState::Thawed {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the watchdog never thawed: {}",
+            rig.ctx.state.current()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(!rig.ctx.marker.exists(), "recovered without a host");
+    assert_eq!(rig.ctx.audit.mode(), Mode::Normal);
+    assert!(!server.is_finished(), "still trying to open the port");
+    signal_tx.send("SIGTERM").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("exits while the port is still missing")
+        .unwrap();
+    assert!(result.is_ok());
+    // The stop was logged by the loop itself (the watchdog task's own
+    // records go to the global dispatcher, not this scoped one).
+    let text = sink.text();
+    assert!(text.contains("\"event\":\"signal\""), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5,8 +5,15 @@
 //! handler flushes stderr, calls `sync(2)` and then `reboot(2)` on the
 //! blocking pool. On success the kernel never returns, and the dispatcher
 //! suppresses the reply anyway (`success-response: false`); errors are
-//! still reported. The mode → syscall mapping lives in one function so
-//! that OQ-1 (a graceful systemd shutdown) is a local change.
+//! still reported.
+//!
+//! These are *hard* shutdown semantics: `reboot(2)` is an immediate
+//! kernel action. No service is stopped, no unit is given a chance to
+//! shut down, and no filesystem is unmounted; the `sync(2)` is the only
+//! flush. Upstream's `guest-shutdown` asks the service manager for an
+//! orderly shutdown instead. That path needs `CAP_KILL` (or D-Bus) and
+//! is a design change recorded as OQ-1; the mode → syscall mapping lives
+//! in one function so it stays a local change.
 #![forbid(unsafe_code)]
 
 use std::io::Write;

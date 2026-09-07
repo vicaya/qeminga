@@ -17,7 +17,7 @@ The upstream QEMU Guest Agent (`qemu-ga`) is a C daemon that runs inside a virtu
 
 | # | Goal |
 |---|------|
-| G1 | Support graceful reboot and power-off initiated by the hypervisor. |
+| G1 | Support reboot and power-off initiated by the hypervisor. (The implemented path is `sync(2)` + `reboot(2)`, a kernel-level action rather than a service-manager shutdown; §3 and OQ-1.) |
 | G2 | Support filesystem freeze/thaw (`guest-fsfreeze-freeze` / `guest-fsfreeze-thaw`) so hypervisor-initiated snapshots are crash-consistent. |
 | G3 | Report guest information (OS version, file-system state, agent version) so the hypervisor can make informed decisions. |
 | G4 | Support host-requested, read-only network interface enumeration (used during cloud-init / IP reporting). |
@@ -117,7 +117,7 @@ Only the commands in the following table are implemented. All other commands rec
 | `guest-fsfreeze-freeze-list` | host → guest | As above, restricted to a specified subset of discovered freezable local mountpoints |
 | `guest-fsfreeze-thaw` | host → guest | Drains `FITHAW` calls on all discovered freezable local filesystems; returns count of thawed FSes |
 | `guest-fstrim` | host → guest | Calls `FITRIM` ioctl to discard unused blocks (storage efficiency) |
-| `guest-shutdown` | host → guest | Initiates a clean shutdown. Accepts optional `mode` ∈ `{"halt", "powerdown", "reboot"}` (default `"powerdown"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. |
+| `guest-shutdown` | host → guest | Initiates a shutdown. Accepts optional `mode` ∈ `{"halt", "powerdown", "reboot"}` (default `"powerdown"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. **Hard semantics:** the agent calls `sync(2)` and then `reboot(2)`, an immediate kernel action; no service is stopped and no filesystem is unmounted (upstream asks the service manager instead; see OQ-1 in `docs/tasks.md`). |
 | `guest-suspend-ram` | host → guest | Suspends guest to RAM (S3) — **opt-in, disabled by default** via `[features] suspend_ram = false` in `config.toml` |
 
 ### 3.1 `guest-info` Capability Contract

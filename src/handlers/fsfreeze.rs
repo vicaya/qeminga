@@ -836,6 +836,7 @@ mod tests {
     use nix::errno::Errno;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use std::time::Duration;
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(
@@ -1967,7 +1968,11 @@ mod tests {
                 async move { thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#)).await },
             )
         };
-        hooks.reached.notified().await;
+        // Bounded: a thaw that never reaches its finalisation (a mutant
+        // that skips the hook) must fail here, not hang the test binary.
+        tokio::time::timeout(Duration::from_secs(10), hooks.reached.notified())
+            .await
+            .expect("the thaw reached the finalisation gate");
         assert_eq!(ctx.state.current(), FreezeState::Thawing);
         assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
         assert!(sink.0.lock().unwrap().is_empty(), "nothing flushed yet");

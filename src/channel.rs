@@ -586,6 +586,16 @@ mod tests {
     use super::*;
     use crate::state::{FreezeState, FreezeStateMachine};
     use std::sync::Mutex;
+
+    /// Runs a session test under a real-time bound. A decoder or session
+    /// that never replies then fails this test alone instead of hanging
+    /// the test binary until cargo-mutants kills it: a mutant that breaks
+    /// framing is caught, not timed out (T5.6).
+    async fn bounded<T>(test: impl Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), test)
+            .await
+            .expect("session test hung: no reply within 10 s")
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::duplex;
 
@@ -616,30 +626,33 @@ mod tests {
 
     #[tokio::test]
     async fn session_reads_frames_dispatches_and_writes_replies() {
-        let (mut peer, ours) = duplex(1024);
-        let (reader, writer) = tokio::io::split(ours);
-        let handler = FakeDispatcher::default();
-        let session = tokio::spawn(async move {
-            let mut decoder = FrameDecoder::new();
-            let handler = handler;
-            let end = run_session(reader, writer, &handler, &mut decoder)
-                .await
-                .end;
-            (end, handler)
-        });
-        peer.write_all(b"one\ntwo\nthr").await.unwrap();
-        peer.write_all(b"ee\n\xFFfour\n").await.unwrap();
-        let mut out = vec![0u8; 64];
-        let mut got = Vec::new();
-        while got.len() < b"ONE\nTWO\nTHREE\n\xFFFOUR\n".len() {
-            let n = peer.read(&mut out).await.unwrap();
-            got.extend_from_slice(&out[..n]);
-        }
-        assert_eq!(got, b"ONE\nTWO\nTHREE\n\xFFFOUR\n");
-        drop(peer);
-        let (end, handler) = session.await.unwrap();
-        assert!(matches!(end, SessionEnd::Eof), "{end}");
-        assert_eq!(handler.seen.lock().unwrap().len(), 4);
+        bounded(async {
+            let (mut peer, ours) = duplex(1024);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = FakeDispatcher::default();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                let handler = handler;
+                let end = run_session(reader, writer, &handler, &mut decoder)
+                    .await
+                    .end;
+                (end, handler)
+            });
+            peer.write_all(b"one\ntwo\nthr").await.unwrap();
+            peer.write_all(b"ee\n\xFFfour\n").await.unwrap();
+            let mut out = vec![0u8; 64];
+            let mut got = Vec::new();
+            while got.len() < b"ONE\nTWO\nTHREE\n\xFFFOUR\n".len() {
+                let n = peer.read(&mut out).await.unwrap();
+                got.extend_from_slice(&out[..n]);
+            }
+            assert_eq!(got, b"ONE\nTWO\nTHREE\n\xFFFOUR\n");
+            drop(peer);
+            let (end, handler) = session.await.unwrap();
+            assert!(matches!(end, SessionEnd::Eof), "{end}");
+            assert_eq!(handler.seen.lock().unwrap().len(), 4);
+        })
+        .await;
     }
 
     /// A handler that blocks inside `handle` until released and reports
@@ -666,55 +679,58 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_finishes_the_in_flight_command_and_waits_for_may_stop() {
-        use std::sync::atomic::Ordering;
-        let (mut peer, ours) = duplex(1024);
-        let (reader, writer) = tokio::io::split(ours);
-        let handler = Arc::new(SlowHandler {
-            started: tokio::sync::Notify::new(),
-            release: tokio::sync::Notify::new(),
-            allow_stop: std::sync::atomic::AtomicBool::new(false),
-            finished: std::sync::atomic::AtomicBool::new(false),
-        });
-        let (cancel_tx, mut cancel_rx) = cancel_pair();
-        let h = handler.clone();
-        let session = tokio::spawn(async move {
-            let mut decoder = FrameDecoder::new();
-            run_session_until(reader, writer, h.as_ref(), &mut decoder, &mut cancel_rx).await
-        });
-        peer.write_all(b"freeze\n").await.unwrap();
-        handler.started.notified().await;
-        // The stop arrives while the command is being handled: the
-        // command must complete (its reply is written) and, because the
-        // handler does not allow a stop yet, the session must go on.
-        cancel_tx.send(true).unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!handler.finished.load(Ordering::SeqCst));
-        assert!(!session.is_finished(), "handler still running");
-        handler.release.notify_one();
-        let mut out = [0u8; 8];
-        let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut out))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(&out[..n], b"done\n", "the in-flight command completed");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(
-            !session.is_finished(),
-            "not allowed to stop yet: the session keeps serving"
-        );
-        // Once the handler allows it, the next notification ends the session.
-        handler.allow_stop.store(true, Ordering::SeqCst);
-        cancel_tx.send(true).unwrap();
-        let report = tokio::time::timeout(Duration::from_secs(5), session)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            matches!(report.end, SessionEnd::Cancelled),
-            "{}",
-            report.end
-        );
-        assert_eq!(report.end.to_string(), "cancelled");
+        bounded(async {
+            use std::sync::atomic::Ordering;
+            let (mut peer, ours) = duplex(1024);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = Arc::new(SlowHandler {
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+                allow_stop: std::sync::atomic::AtomicBool::new(false),
+                finished: std::sync::atomic::AtomicBool::new(false),
+            });
+            let (cancel_tx, mut cancel_rx) = cancel_pair();
+            let h = handler.clone();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                run_session_until(reader, writer, h.as_ref(), &mut decoder, &mut cancel_rx).await
+            });
+            peer.write_all(b"freeze\n").await.unwrap();
+            handler.started.notified().await;
+            // The stop arrives while the command is being handled: the
+            // command must complete (its reply is written) and, because the
+            // handler does not allow a stop yet, the session must go on.
+            cancel_tx.send(true).unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!handler.finished.load(Ordering::SeqCst));
+            assert!(!session.is_finished(), "handler still running");
+            handler.release.notify_one();
+            let mut out = [0u8; 8];
+            let n = tokio::time::timeout(Duration::from_secs(5), peer.read(&mut out))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&out[..n], b"done\n", "the in-flight command completed");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !session.is_finished(),
+                "not allowed to stop yet: the session keeps serving"
+            );
+            // Once the handler allows it, the next notification ends the session.
+            handler.allow_stop.store(true, Ordering::SeqCst);
+            cancel_tx.send(true).unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(5), session)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(report.end, SessionEnd::Cancelled),
+                "{}",
+                report.end
+            );
+            assert_eq!(report.end.to_string(), "cancelled");
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -733,25 +749,28 @@ mod tests {
 
     #[tokio::test]
     async fn session_never_replies_to_a_shutdown_success() {
-        let (mut peer, ours) = duplex(1024);
-        let (reader, writer) = tokio::io::split(ours);
-        let handler = Arc::new(FakeDispatcher::default());
-        let h = handler.clone();
-        let session = tokio::spawn(async move {
-            let mut decoder = FrameDecoder::new();
-            run_session(reader, writer, h.as_ref(), &mut decoder).await
-        });
-        peer.write_all(b"shutdown\nafter\n").await.unwrap();
-        let mut out = vec![0u8; 64];
-        let n = peer.read(&mut out).await.unwrap();
-        assert_eq!(
-            &out[..n],
-            b"AFTER\n",
-            "nothing was written for the shutdown frame"
-        );
-        drop(peer);
-        session.await.unwrap();
-        assert_eq!(handler.seen.lock().unwrap().len(), 2);
+        bounded(async {
+            let (mut peer, ours) = duplex(1024);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = Arc::new(FakeDispatcher::default());
+            let h = handler.clone();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                run_session(reader, writer, h.as_ref(), &mut decoder).await
+            });
+            peer.write_all(b"shutdown\nafter\n").await.unwrap();
+            let mut out = vec![0u8; 64];
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(
+                &out[..n],
+                b"AFTER\n",
+                "nothing was written for the shutdown frame"
+            );
+            drop(peer);
+            session.await.unwrap();
+            assert_eq!(handler.seen.lock().unwrap().len(), 2);
+        })
+        .await;
     }
 
     /// Replies with a frame far larger than a tiny duplex buffer and
@@ -869,35 +888,41 @@ mod tests {
 
     #[tokio::test]
     async fn write_error_ends_session_without_panic() {
-        struct FailingWriter;
-        impl AsyncWrite for FailingWriter {
-            fn poll_write(
-                self: Pin<&mut Self>,
-                _: &mut TaskContext<'_>,
-                _: &[u8],
-            ) -> Poll<io::Result<usize>> {
-                Poll::Ready(Err(io::Error::from_raw_os_error(Errno::EPIPE as i32)))
+        bounded(async {
+            struct FailingWriter;
+            impl AsyncWrite for FailingWriter {
+                fn poll_write(
+                    self: Pin<&mut Self>,
+                    _: &mut TaskContext<'_>,
+                    _: &[u8],
+                ) -> Poll<io::Result<usize>> {
+                    Poll::Ready(Err(io::Error::from_raw_os_error(Errno::EPIPE as i32)))
+                }
+                fn poll_flush(
+                    self: Pin<&mut Self>,
+                    _: &mut TaskContext<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
+                fn poll_shutdown(
+                    self: Pin<&mut Self>,
+                    _: &mut TaskContext<'_>,
+                ) -> Poll<io::Result<()>> {
+                    Poll::Ready(Ok(()))
+                }
             }
-            fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-            fn poll_shutdown(
-                self: Pin<&mut Self>,
-                _: &mut TaskContext<'_>,
-            ) -> Poll<io::Result<()>> {
-                Poll::Ready(Ok(()))
-            }
-        }
-        let (mut peer, ours) = duplex(64);
-        let (reader, _writer) = tokio::io::split(ours);
-        peer.write_all(b"frame\n").await.unwrap();
-        let handler = FakeDispatcher::default();
-        let mut decoder = FrameDecoder::new();
-        let end = run_session(reader, FailingWriter, &handler, &mut decoder)
-            .await
-            .end;
-        assert!(matches!(end, SessionEnd::WriteError(_)), "{end}");
-        assert!(end.to_string().contains("write error"));
+            let (mut peer, ours) = duplex(64);
+            let (reader, _writer) = tokio::io::split(ours);
+            peer.write_all(b"frame\n").await.unwrap();
+            let handler = FakeDispatcher::default();
+            let mut decoder = FrameDecoder::new();
+            let end = run_session(reader, FailingWriter, &handler, &mut decoder)
+                .await
+                .end;
+            assert!(matches!(end, SessionEnd::WriteError(_)), "{end}");
+            assert!(end.to_string().contains("write error"));
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -979,68 +1004,72 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_resets_decoder_but_not_state() {
-        // Two sessions over the same `serve` loop: the first ends after a
-        // partial frame; the second must not see it. The freeze state
-        // machine handed to the (fake) dispatcher stays Frozen throughout.
-        let state = Arc::new(FreezeStateMachine::starting_frozen());
-        let handler = Arc::new(FakeDispatcher::default());
-        let sessions: Arc<Mutex<Vec<tokio::io::DuplexStream>>> = Arc::new(Mutex::new(Vec::new()));
-        let (peer1, ours1) = duplex(1024);
-        let (peer2, ours2) = duplex(1024);
-        sessions.lock().unwrap().push(ours2);
-        sessions.lock().unwrap().push(ours1);
-        // The "device": each open hands out the next duplex end as a pty-like
-        // fd is not available for DuplexStream, so drive `run_session`
-        // directly the way `serve` does, with a fresh decoder per session.
-        let h = handler.clone();
-        let loop_task = tokio::spawn(async move {
-            let mut ends = Vec::new();
-            loop {
-                let next = sessions.lock().unwrap().pop();
-                let Some(stream) = next else { break };
-                let (r, w) = tokio::io::split(stream);
-                let mut decoder = FrameDecoder::new();
-                ends.push(
-                    run_session(r, w, h.as_ref(), &mut decoder)
-                        .await
-                        .end
-                        .to_string(),
-                );
-            }
-            ends
-        });
-        let mut peer1 = peer1;
-        peer1
-            .write_all(b"complete\npartial-without-newline")
-            .await
-            .unwrap();
-        let mut out = vec![0u8; 64];
-        let n = peer1.read(&mut out).await.unwrap();
-        assert_eq!(&out[..n], b"COMPLETE\n");
-        drop(peer1); // EOF: session 1 ends with the partial frame buffered.
-        let mut peer2 = peer2;
-        peer2.write_all(b"fresh\n").await.unwrap();
-        let n = peer2.read(&mut out).await.unwrap();
-        assert_eq!(&out[..n], b"FRESH\n", "the partial frame was discarded");
-        drop(peer2);
-        let ends = loop_task.await.unwrap();
-        assert_eq!(ends, ["eof", "eof"]);
-        let frames: Vec<Vec<u8>> = handler
-            .seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|e| match e {
-                DecodeEvent::Frame { bytes, .. } => Some(bytes.clone()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(frames, [b"complete".to_vec(), b"fresh".to_vec()]);
-        assert_eq!(
-            state.current(),
-            FreezeState::Frozen,
-            "reconnection never touches the state"
-        );
+        bounded(async {
+            // Two sessions over the same `serve` loop: the first ends after a
+            // partial frame; the second must not see it. The freeze state
+            // machine handed to the (fake) dispatcher stays Frozen throughout.
+            let state = Arc::new(FreezeStateMachine::starting_frozen());
+            let handler = Arc::new(FakeDispatcher::default());
+            let sessions: Arc<Mutex<Vec<tokio::io::DuplexStream>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let (peer1, ours1) = duplex(1024);
+            let (peer2, ours2) = duplex(1024);
+            sessions.lock().unwrap().push(ours2);
+            sessions.lock().unwrap().push(ours1);
+            // The "device": each open hands out the next duplex end as a pty-like
+            // fd is not available for DuplexStream, so drive `run_session`
+            // directly the way `serve` does, with a fresh decoder per session.
+            let h = handler.clone();
+            let loop_task = tokio::spawn(async move {
+                let mut ends = Vec::new();
+                loop {
+                    let next = sessions.lock().unwrap().pop();
+                    let Some(stream) = next else { break };
+                    let (r, w) = tokio::io::split(stream);
+                    let mut decoder = FrameDecoder::new();
+                    ends.push(
+                        run_session(r, w, h.as_ref(), &mut decoder)
+                            .await
+                            .end
+                            .to_string(),
+                    );
+                }
+                ends
+            });
+            let mut peer1 = peer1;
+            peer1
+                .write_all(b"complete\npartial-without-newline")
+                .await
+                .unwrap();
+            let mut out = vec![0u8; 64];
+            let n = peer1.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"COMPLETE\n");
+            drop(peer1); // EOF: session 1 ends with the partial frame buffered.
+            let mut peer2 = peer2;
+            peer2.write_all(b"fresh\n").await.unwrap();
+            let n = peer2.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"FRESH\n", "the partial frame was discarded");
+            drop(peer2);
+            let ends = loop_task.await.unwrap();
+            assert_eq!(ends, ["eof", "eof"]);
+            let frames: Vec<Vec<u8>> = handler
+                .seen
+                .lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| match e {
+                    DecodeEvent::Frame { bytes, .. } => Some(bytes.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(frames, [b"complete".to_vec(), b"fresh".to_vec()]);
+            assert_eq!(
+                state.current(),
+                FreezeState::Frozen,
+                "reconnection never touches the state"
+            );
+        })
+        .await;
     }
 
     /// A socket whose peer is already gone: opens fine, EOF at once, like
@@ -1152,60 +1181,63 @@ mod tests {
 
     #[tokio::test]
     async fn serve_reopens_after_eof_until_cancelled() {
-        // A real fd-backed channel through a pty pair, reopened twice.
-        let opened = Arc::new(AtomicUsize::new(0));
-        let masters: Arc<Mutex<Vec<nix::pty::PtyMaster>>> = Arc::new(Mutex::new(Vec::new()));
-        let o = opened.clone();
-        let m = masters.clone();
-        let open: OpenFn = Arc::new(move |_| {
-            let master = nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
-            nix::pty::grantpt(&master)?;
-            nix::pty::unlockpt(&master)?;
-            let slave_path = nix::pty::ptsname_r(&master)?;
-            raw_mode(&master);
-            let slave = open_device(Path::new(&slave_path))?;
-            raw_mode(&slave);
-            m.lock().unwrap().push(master);
-            o.fetch_add(1, Ordering::SeqCst);
-            Ok(slave)
-        });
-        let handler = Arc::new(FakeDispatcher::default());
-        let (tx, cancel) = cancel_pair();
-        let h = handler.clone();
-        let server = tokio::spawn(async move {
-            serve(
-                Path::new("/dev/virtio-ports/fake"),
-                open,
-                h.as_ref(),
-                cancel,
-            )
-            .await
-        });
-        for round in 0..2 {
-            while opened.load(Ordering::SeqCst) <= round {
+        bounded(async {
+            // A real fd-backed channel through a pty pair, reopened twice.
+            let opened = Arc::new(AtomicUsize::new(0));
+            let masters: Arc<Mutex<Vec<nix::pty::PtyMaster>>> = Arc::new(Mutex::new(Vec::new()));
+            let o = opened.clone();
+            let m = masters.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                let master = nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY)?;
+                nix::pty::grantpt(&master)?;
+                nix::pty::unlockpt(&master)?;
+                let slave_path = nix::pty::ptsname_r(&master)?;
+                raw_mode(&master);
+                let slave = open_device(Path::new(&slave_path))?;
+                raw_mode(&slave);
+                m.lock().unwrap().push(master);
+                o.fetch_add(1, Ordering::SeqCst);
+                Ok(slave)
+            });
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                )
+                .await
+            });
+            for round in 0..2 {
+                while opened.load(Ordering::SeqCst) <= round {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let master = {
+                    let mut m = masters.lock().unwrap();
+                    OwnedFd::from(m.remove(0))
+                };
+                let mut master = Channel::from_fd(master).unwrap();
+                master.write_all(b"ping\n").await.unwrap();
+                let mut out = vec![0u8; 16];
+                let n = master.read(&mut out).await.unwrap();
+                assert_eq!(&out[..n], b"PING\n", "round {round}");
+                drop(master); // HUP on the slave: the session ends and serve reopens.
+            }
+            while opened.load(Ordering::SeqCst) < 3 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            let master = {
-                let mut m = masters.lock().unwrap();
-                OwnedFd::from(m.remove(0))
-            };
-            let mut master = Channel::from_fd(master).unwrap();
-            master.write_all(b"ping\n").await.unwrap();
-            let mut out = vec![0u8; 16];
-            let n = master.read(&mut out).await.unwrap();
-            assert_eq!(&out[..n], b"PING\n", "round {round}");
-            drop(master); // HUP on the slave: the session ends and serve reopens.
-        }
-        while opened.load(Ordering::SeqCst) < 3 {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        tx.send(true).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(5), server)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(result.is_ok());
-        assert_eq!(handler.seen.lock().unwrap().len(), 2);
+            tx.send(true).unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), server)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(result.is_ok());
+            assert_eq!(handler.seen.lock().unwrap().len(), 2);
+        })
+        .await;
     }
 
     fn raw_mode(fd: &impl AsFd) {

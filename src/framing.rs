@@ -65,22 +65,29 @@ impl FrameDecoder {
     /// Feeds bytes into the decoder and returns the events they complete,
     /// in stream order. Splitting the input into chunks in any way yields
     /// the same events as feeding it at once.
-    pub fn push(&mut self, mut input: &[u8]) -> Vec<DecodeEvent> {
+    pub fn push(&mut self, input: &[u8]) -> Vec<DecodeEvent> {
+        // One indexed pass: the loop is bounded by the input length whatever
+        // happens to its body, so no single-token change can make it
+        // unbounded (T5.6: a mutant that re-scanned a delimiter forever
+        // allocated events without limit and took a CI runner down).
         let mut events = Vec::new();
-        while !input.is_empty() {
-            let pos = input.iter().position(|&b| b == b'\n' || b == SENTINEL);
-            let (data, delimiter, rest) = match pos {
-                Some(p) => (&input[..p], Some(input[p]), &input[p + 1..]),
-                None => (input, None, &input[input.len()..]),
-            };
-            self.consume_data(data);
-            match delimiter {
-                Some(b'\n') => self.end_of_frame(&mut events),
-                Some(_) => self.sentinel(&mut events),
-                None => {}
+        let mut start = 0;
+        for (pos, &byte) in input.iter().enumerate() {
+            match byte {
+                b'\n' => {
+                    self.consume_data(&input[start..pos]);
+                    self.end_of_frame(&mut events);
+                    start = pos + 1;
+                }
+                SENTINEL => {
+                    self.consume_data(&input[start..pos]);
+                    self.sentinel(&mut events);
+                    start = pos + 1;
+                }
+                _ => {}
             }
-            input = rest;
         }
+        self.consume_data(&input[start..]);
         events
     }
 
@@ -360,7 +367,25 @@ mod tests {
     }
 
     proptest! {
+
         #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// One event at most per delimiter byte: the decoder's output, like
+        /// its buffer, is bounded by its input.
+        #[test]
+        fn events_never_outnumber_delimiters(
+            chunks in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 0..300), 0..8)
+        ) {
+            let mut d = FrameDecoder::new();
+            for chunk in &chunks {
+                let delimiters = chunk
+                    .iter()
+                    .filter(|&&b| b == b'\n' || b == SENTINEL)
+                    .count();
+                prop_assert!(d.push(chunk).len() <= delimiters);
+            }
+        }
 
         #[test]
         fn chunking_is_transparent(input in stream(), cuts in prop::collection::vec(any::<prop::sample::Index>(), 0..8)) {

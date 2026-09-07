@@ -8,7 +8,10 @@
 #   cargo mutants --all-features
 #
 # The CI job (mutants in ci.yml) fails on any surviving mutant in these
-# files; timeouts (the decoder loops) count as detections.
+# files (it reads mutants.out/missed.txt: the exit status reports timeouts
+# ahead of misses). A timeout counts as a detection, and the job runs the
+# test binaries under a memory cap (scripts/ci/bounded-test.sh) so a mutant
+# that allocates without bound cannot take the runner down.
 examine_globs = [
     "src/framing.rs",
     "src/proto.rs",

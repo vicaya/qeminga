@@ -115,7 +115,8 @@ jobs:
 
   # T5.6: mutation testing of the gate and errno-policy code. A surviving
   # mutant fails the job (timeouts count as detections); the report is
-  # uploaded either way.
+  # uploaded either way. Test binaries run under a memory cap: a mutant
+  # that allocates without bound must abort its test, not the runner.
   mutants:
     name: cargo mutants
     runs-on: ubuntu-24.04
@@ -129,12 +130,26 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-mutants@27.1.0
-      - name: cargo mutants (exit 3 = timeouts only, which are detections)
+      - name: cargo mutants (timeouts are detections; a missed mutant fails)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/ci/bounded-test.sh
         run: |
-          cargo mutants --all-features --no-shuffle -j 2 && exit 0
+          set +e
+          cargo mutants --all-features --no-shuffle -j 2
           code=$?
+          set -e
           echo "cargo mutants exited with $code"
-          [ "$code" -eq 3 ]
+          # 0: every mutant caught. 3: some timed out, which is a detection.
+          # 4: some did not compile (cap_lints is on, so that is genuine).
+          # Anything else (1 internal error, 2 missed) fails the job.
+          case "$code" in 0 | 3 | 4) ;; *) exit "$code" ;; esac
+          # The exit status reports timeouts ahead of misses, so a survivor
+          # can hide behind a 3: the missed list is authoritative.
+          if [ -s mutants.out/missed.txt ]; then
+            echo '::error::surviving mutants:'
+            cat mutants.out/missed.txt
+            exit 2
+          fi
       - name: Upload mutants report
         if: always()
         uses: actions/upload-artifact@v4

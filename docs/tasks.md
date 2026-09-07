@@ -496,6 +496,7 @@ the answer is a one-line change, and leave the question here.
   - `rollback_after_hard_error_also_flushes`.
   - `recovery_mode_startup_uses_ring_until_thaw` — construct the runtime pieces with a pre-existing marker; assert mode is `Ring` before and `Normal` after a thaw.
   - `background_flusher_runs_only_while_thawed` (if a background flusher is implemented; otherwise the thaw-triggered flush is the only path and this test asserts no task exists).
+  - `a_thaw_finalisation_cannot_touch_the_logging_of_a_newer_freeze` — the flush runs before `Thawed` is published (gated `LifecycleHooks`): a freeze arriving during the flush is refused, the ring is flushed exactly once, and the next freeze window keeps every record off the sink (review follow-up; the ordering itself is T3.4's hook contract).
 - **Implement (green):** wire `Router::enter_ring()` / `flush_to_normal()` into the freeze/thaw/rollback paths and into recovery-mode startup; keep it synchronous (no I/O) on the freeze side.
 - **Done when:** AC13's in-process half is covered; the journald half is covered by the privileged E2E in T5.2.
 

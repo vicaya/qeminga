@@ -1883,6 +1883,131 @@ mod tests {
         settle().await;
     }
 
+    /// The production hooks with a gate in front of the thaw finalisation:
+    /// `on_thawed` signals `reached`, then blocks until `release` fires,
+    /// then flushes like [`LifecycleHooks`].
+    struct GatedHooks {
+        reached: tokio::sync::Notify,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl FreezeHooks for GatedHooks {
+        fn on_freezing(&self, ctx: &Arc<Context>) {
+            LifecycleHooks.on_freezing(ctx);
+        }
+        fn on_frozen(&self, ctx: &Arc<Context>) {
+            LifecycleHooks.on_frozen(ctx);
+        }
+        fn on_thaw_claimed(&self, ctx: &Arc<Context>) {
+            LifecycleHooks.on_thaw_claimed(ctx);
+        }
+        fn on_thawed(&self, ctx: &Arc<Context>) {
+            self.reached.notify_one();
+            self.release.lock().unwrap().recv().unwrap();
+            LifecycleHooks.on_thawed(ctx);
+        }
+        fn on_heartbeat(&self, ctx: &Arc<Context>) {
+            LifecycleHooks.on_heartbeat(ctx);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct SharedSink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for SharedSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_thaw_finalisation_cannot_touch_the_logging_of_a_newer_freeze() {
+        // The audit flush of a completed thaw runs before the state is
+        // published as `Thawed`. A freeze that arrives while the flush is
+        // still in progress is refused, so it can never enter the ring
+        // and then have this thaw's flush switch the router back to the
+        // normal sink underneath it (a write to a frozen journal).
+        use std::io::Write;
+        use tracing_subscriber::fmt::MakeWriter;
+        let dir = tempfile::tempdir().unwrap();
+        let sink = SharedSink::default();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hooks = Arc::new(GatedHooks {
+            reached: tokio::sync::Notify::new(),
+            release: Mutex::new(release_rx),
+        });
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(sink.clone())),
+            )
+            .with_kernel(Arc::new(FakeKernel::new()))
+            .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+            .with_marker(Marker::new(dir.path().join("frozen")))
+            .with_hooks(hooks.clone()),
+        );
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
+        // Something is in the ring for the flush to write.
+        ctx.audit
+            .make_writer()
+            .write_all(b"{\"event\":\"during_freeze\"}\n")
+            .unwrap();
+        // The thaw drains, then stops at the gate before its flush.
+        let thawing = {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(
+                async move { thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#)).await },
+            )
+        };
+        hooks.reached.notified().await;
+        assert_eq!(ctx.state.current(), FreezeState::Thawing);
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
+        assert!(sink.0.lock().unwrap().is_empty(), "nothing flushed yet");
+        // A new freeze while the finalisation is pending is refused: the
+        // state is not `Thawed` yet.
+        let err = freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot freeze"), "{err}");
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
+        // Let the thaw finish: it flushes the ring and publishes `Thawed`.
+        release_tx.send(()).unwrap();
+        thawing.await.unwrap().unwrap();
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        let flushed = sink.0.lock().unwrap().len();
+        assert!(flushed > 0, "the ring was flushed to the sink");
+        // The next freeze window is intact: its records stay in the ring
+        // and nothing reaches the sink while it is frozen.
+        freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Ring);
+        ctx.audit
+            .make_writer()
+            .write_all(b"{\"event\":\"second_window\"}\n")
+            .unwrap();
+        assert_eq!(
+            sink.0.lock().unwrap().len(),
+            flushed,
+            "no sink write while frozen"
+        );
+        release_tx.send(()).unwrap();
+        thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(sink.0.lock().unwrap().len() > flushed);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn lifecycle_hooks_arm_watchdog_and_idle_timeout_drains() {
         let dir = tempfile::tempdir().unwrap();

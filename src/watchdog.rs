@@ -118,29 +118,47 @@ async fn run(
     let hard_deadline = armed + cfg.max;
     let mut idle_deadline = armed + cfg.idle;
     loop {
-        let deadline = idle_deadline.min(hard_deadline);
+        // `biased` polls the branches in order: a cancel first, then the
+        // two deadlines, and a heartbeat last. A heartbeat extends the
+        // idle deadline, never the hard cap, and a refresh that is ready
+        // at every poll cannot keep an expired deadline from being taken
+        // (with the refresh branch ahead of the deadlines only Tokio's
+        // cooperative budget bounded that starvation).
         tokio::select! {
             biased;
             () = cancel.notified() => {
                 tracing::debug!(event = "watchdog_cancelled", "freeze watchdog cancelled");
                 return;
             }
+            () = sleep_until(hard_deadline) => {
+                expire(&state, &thaw, "hard_cap").await;
+                return;
+            }
+            () = sleep_until(idle_deadline) => {
+                expire(&state, &thaw, "idle_timeout").await;
+                return;
+            }
             () = refresh.notified() => {
                 idle_deadline = Instant::now() + cfg.idle;
             }
-            () = sleep_until(deadline) => {
-                let cause = if deadline == hard_deadline { "hard_cap" } else { "idle_timeout" };
-                match state.claim_thaw_from_frozen() {
-                    Ok(token) => {
-                        tracing::warn!(event = "watchdog_thaw", cause, "freeze watchdog expired; thawing");
-                        thaw(token).await;
-                    }
-                    Err(err) => {
-                        tracing::debug!(event = "watchdog_lost_race", cause, error = %err, "another thaw is in progress");
-                    }
-                }
-                return;
-            }
+        }
+    }
+}
+
+/// The watchdog expired: claim the thaw and run the drain, unless another
+/// thaw already claimed it.
+async fn expire(state: &FreezeStateMachine, thaw: &ThawFn, cause: &'static str) {
+    match state.claim_thaw_from_frozen() {
+        Ok(token) => {
+            tracing::warn!(
+                event = "watchdog_thaw",
+                cause,
+                "freeze watchdog expired; thawing"
+            );
+            thaw(token).await;
+        }
+        Err(err) => {
+            tracing::debug!(event = "watchdog_lost_race", cause, error = %err, "another thaw is in progress");
         }
     }
 }
@@ -252,6 +270,57 @@ mod tests {
         assert!(handle.is_finished());
         // A refresh after the fact is harmless.
         handle.refresh();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_heartbeat_storm_cannot_defer_the_hard_cap() {
+        // Real time, short cap: a thread refreshes the watchdog in a busy
+        // loop, so a refresh is ready at every poll of the timer loop.
+        // The hard deadline must still be taken as soon as it expires: a
+        // refresh may extend the idle deadline, never the hard cap, and a
+        // continuously ready refresh branch must not starve the deadline
+        // branch (Tokio's `biased` select polls in order).
+        use std::sync::atomic::AtomicBool;
+        let cfg = WatchdogConfig {
+            idle: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+        };
+        let state = Arc::new(FreezeStateMachine::starting_frozen());
+        let (thaw, calls) = counting_thaw(Arc::clone(&state));
+        let started = std::time::Instant::now();
+        let handle = Watchdog::arm(cfg, Arc::clone(&state), thaw);
+        let stop = Arc::new(AtomicBool::new(false));
+        let storm = {
+            let refresh = Arc::clone(&handle.refresh);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    refresh.notify_one();
+                }
+            })
+        };
+        let mut thawed_after = None;
+        while started.elapsed() < Duration::from_secs(3) {
+            if calls.load(Ordering::SeqCst) == 1 {
+                thawed_after = Some(started.elapsed());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        storm.join().unwrap();
+        let after = thawed_after.expect("the hard cap never fired under the heartbeat storm");
+        assert!(
+            after < Duration::from_millis(1500),
+            "hard cap deferred to {after:?} by the storm"
+        );
+        assert!(
+            after >= Duration::from_millis(200),
+            "not before the cap: {after:?}"
+        );
+        assert_eq!(state.current(), FreezeState::Thawed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(handle.is_finished());
     }
 
     #[tokio::test(start_paused = true)]

@@ -479,7 +479,8 @@ the answer is a one-line change, and leave the question here.
   - `watchdog_handle_is_dropped_safely_after_thaw` — no panic, no leaked task (use `tokio::task::JoinHandle::is_finished`).
   - `spawn_blocking_handles_are_not_treated_as_cancellable` — cancellation only affects the timer loop; an in-flight drain runs to completion.
   - `unrecoverable_thaw_failure_rearms_watchdog` — `Thawing → Frozen` (a failed thaw, manual or the watchdog's own) fires `on_frozen` again, so the watchdog is re-armed with idle/max measured from that moment (§4.4).
-- **Implement (green):** `Watchdog::arm(cfg, state, thaw: Arc<dyn Fn(ThawToken) -> BoxFuture<()>>) -> WatchdogHandle { refresh(), cancel() }`; loop with `tokio::select!` over `sleep_until(min(idle_deadline, hard_deadline))`, a `watch`/`Notify` for refresh, and a cancellation token; on deadline win call `state.claim_thaw()` first, then hand the drain to `spawn_blocking` via the callback.
+  - `a_heartbeat_storm_cannot_defer_the_hard_cap` — a thread refreshes in a busy loop across the hard cap (real time, short cap); the thaw is claimed exactly once, at the cap. The select polls the deadlines ahead of the refresh branch (review follow-up).
+- **Implement (green):** `Watchdog::arm(cfg, state, thaw: Arc<dyn Fn(ThawToken) -> BoxFuture<()>>) -> WatchdogHandle { refresh(), cancel() }`; loop with a `biased` `tokio::select!` over the cancellation token, `sleep_until(hard_deadline)`, `sleep_until(idle_deadline)` and the refresh `Notify`, in that order; on deadline win call `state.claim_thaw()` first, then hand the drain to `spawn_blocking` via the callback.
 - **Done when:** `guest-fsfreeze-status` in T3.4 calls `refresh()` only while the state is `Frozen`.
 
 #### T3.6 — Audit ring lifecycle integration and recovery-mode logging

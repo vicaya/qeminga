@@ -511,6 +511,7 @@ the answer is a one-line change, and leave the question here.
   - `per_path_error_is_reported_inline_not_as_command_failure` — `EOPNOTSUPP` on one target yields `{"path": ..., "error": "..."}` while others report `trimmed`.
   - `fstrim_disabled_at_runtime_is_command_not_found` (dispatcher-level, already in T1.8; keep one here that goes through the handler table).
   - `fstrim_is_rejected_while_frozen` (gate).
+  - `fstrim_reports_the_effective_minimum_not_the_requested_one` — the reply's `minimum` is the value `FITRIM` wrote back (rounded up by the kernel), per mount point (review follow-up; T3.1 returns it).
 - **Implement (green):** `spawn_blocking` per ioctl, output `GuestFilesystemTrimResponse`.
 - **Done when:** the privileged job trims a loop-mounted ext4 without error.
 

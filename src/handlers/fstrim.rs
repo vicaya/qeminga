@@ -36,7 +36,9 @@ pub struct TrimResult {
     /// Bytes trimmed; absent on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trimmed: Option<u64>,
-    /// The minimum extent used; absent on error.
+    /// The minimum extent the kernel applied (the request rounded up to
+    /// the block size and the discard granularity, as `FITRIM` writes it
+    /// back); absent on error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub minimum: Option<u64>,
     /// Why this mount point could not be trimmed; absent on success.
@@ -63,8 +65,8 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
                 match kernel.fitrim(mountpoint, minimum) {
                     Ok(trimmed) => TrimResult {
                         path,
-                        trimmed: Some(trimmed),
-                        minimum: Some(minimum),
+                        trimmed: Some(trimmed.bytes),
+                        minimum: Some(trimmed.minimum),
                         error: None,
                     },
                     Err(err) => {
@@ -168,6 +170,33 @@ mod tests {
         assert_eq!(paths[1]["trimmed"], 8192);
         assert_eq!(paths[2]["trimmed"], 0);
         assert!(paths[0].get("error").is_none());
+    }
+
+    #[tokio::test]
+    async fn fstrim_reports_the_effective_minimum_not_the_requested_one() {
+        // The kernel rounds the requested minimum up to its block size and
+        // the device's discard granularity and writes it back; the reply's
+        // `minimum` is that effective value (C-5), per mount point.
+        let (ctx, kernel) = rig(FreezeState::Thawed, Config::default());
+        kernel.script_trim_rounded("/", 4096, 2_097_152);
+        kernel.script_trim("/home", Ok(8192));
+        let value = handle(
+            &ctx,
+            &req(r#"{"execute":"guest-fstrim","arguments":{"minimum":1048576}}"#),
+        )
+        .await
+        .unwrap();
+        let paths = value["paths"].as_array().unwrap();
+        assert_eq!(
+            paths[0],
+            json!({"path": "/", "trimmed": 4096, "minimum": 2_097_152}),
+            "rounded up by the kernel"
+        );
+        assert_eq!(
+            paths[1],
+            json!({"path": "/home", "trimmed": 8192, "minimum": 1_048_576}),
+            "accepted as requested"
+        );
     }
 
     #[tokio::test]

@@ -37,7 +37,10 @@ freezes are bounded by a watchdog (30 s idle, 300 s hard cap by default)
 and survive an agent crash through a recovery marker on tmpfs. Every
 command is audited as one JSON line on stderr; during a freeze the audit
 records are held in a 64 KiB ring so the agent can never block on a frozen
-journal.
+journal. A marker left by a crashed instance arms that watchdog at startup
+whether or not the host's port can be opened yet. `guest-shutdown` is a
+hard shutdown, `sync(2)` followed by `reboot(2)`: no service is stopped
+and nothing is unmounted (`docs/tasks.md` OQ-1).
 
 Installation files (systemd unit, udev rule, sysusers, example config) and
 the migration steps from `qemu-guest-agent` are in

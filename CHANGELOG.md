@@ -19,13 +19,23 @@ First release: the complete command set of `docs/design.md`.
   thaw and status unlimited), and the frozen gate.
 - Handlers: `guest-ping`, `guest-info`, `guest-sync`, `guest-sync-delimited`,
   `guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`,
-  `guest-fsfreeze-status/freeze/freeze-list/thaw`, `guest-fstrim`,
-  `guest-shutdown`, and the opt-in `guest-suspend-ram`.
-- Freeze lifecycle: mount plan from `/proc/self/mountinfo` (ext4/xfs on
+  `guest-fsfreeze-status/freeze/freeze-list/thaw`, `guest-fstrim` (reports
+  the minimum extent the kernel applied, not the requested one),
+  `guest-shutdown` (`sync(2)` then `reboot(2)`: a hard shutdown, no
+  service is stopped; no success reply), and the opt-in
+  `guest-suspend-ram` (no success reply, as upstream: the host watches the
+  QMP `SUSPEND`/`WAKEUP` events).
+- Freeze lifecycle: mount plan from `/proc/self/mountinfo`, parsed as
+  bytes so a mount point that is not UTF-8 is kept byte-exact (ext4/xfs on
   `/dev` nodes, bind mounts de-duplicated, reverse mount order), recovery
   marker created with `O_EXCL` + `fsync` before the first `FIFREEZE`, thaw
-  drains each target until its first error (bounded at 1024 calls; a denied first `FITHAW` or a drain that never converges keeps the state `Frozen`), watchdog with idle timeout and hard cap, and
-  recovery mode after a crash.
+  drains each target until its first error (bounded at 1024 calls; a denied
+  first `FITHAW` or a drain that never converges keeps the state `Frozen`),
+  a failed freeze rolls back every processed target before reporting the
+  first one it could not thaw, the audit flush of a thaw completes before
+  the state is published as thawed, watchdog with idle timeout and hard cap
+  (deadlines take priority over heartbeats), and recovery mode after a
+  crash, armed before and independently of the channel.
 - Audit: one structured JSON record per command, method projection with a
   SHA-256 digest for over-long names, and a 64 KiB freeze-safe ring with a
   loss record on overflow.
@@ -42,6 +52,10 @@ First release: the complete command set of `docs/design.md`.
   libvirt interoperability script.
 
 ### Known gaps
+
+- `guest-shutdown` has hard semantics (`sync(2)` + `reboot(2)`); an orderly
+  service-manager shutdown needs `CAP_KILL` or D-Bus and is an open design
+  decision (`docs/tasks.md` OQ-1).
 
 - The privileged and seccomp matrix jobs run on x86-64 only; the aarch64
   profile is compiled and checked but not executed.

@@ -117,18 +117,23 @@ fn guest_info_matches_capability_contract() {
         .find(|c| c["name"] == "guest-shutdown")
         .unwrap();
     assert_eq!(shutdown["success-response"], false);
-    assert!(
-        commands
-            .iter()
-            .filter(|c| c["success-response"] == false)
-            .count()
-            == 1
-    );
     let suspend = commands
         .iter()
         .find(|c| c["name"] == "guest-suspend-ram")
         .unwrap();
     assert_eq!(suspend["enabled"], false, "opt-in, off by default");
+    assert_eq!(
+        suspend["success-response"], false,
+        "upstream contract: no reply after a suspend (OQ-2)"
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|c| c["success-response"] == false)
+            .count(),
+        2,
+        "shutdown and suspend-ram are the only commands without a success reply"
+    );
     for method in DENIED {
         assert!(!commands.iter().any(|c| c["name"] == *method), "{method}");
     }

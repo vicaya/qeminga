@@ -4,8 +4,11 @@
 //!
 //! ```sh
 //! eval "$(sudo scripts/ci/mk-loop-fs.sh setup)"
-//! sudo -E cargo test --all-features -- --ignored --test-threads=1 privileged_
+//! sudo -E cargo test --features seccomp,suspend_ram,test-fakes --locked -- --ignored --test-threads=1 privileged_
 //! ```
+//!
+//! (`--all-features` would include `seccomp-log`, a build whose filter only
+//! logs; the enforced feature set is the one CI gates on, AC15.)
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -154,6 +157,100 @@ fn privileged_watchdog_idle_and_hard_cap_on_real_fs() {
         "{at:?}"
     );
     std::fs::write(format!("{mount}/cap"), b"ok").unwrap();
+    assert!(agent.stop().success());
+}
+
+/// A bind mount made by the test, unmounted and removed on drop.
+struct BindMount(std::path::PathBuf);
+
+impl BindMount {
+    fn of(source: &str, at: std::path::PathBuf) -> Self {
+        let _ = std::fs::remove_dir(&at);
+        std::fs::create_dir(&at).unwrap();
+        let status = std::process::Command::new("mount")
+            .arg("--bind")
+            .arg(source)
+            .arg(&at)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mount --bind failed");
+        BindMount(at)
+    }
+}
+
+impl Drop for BindMount {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("umount").arg(&self.0).status();
+        let _ = std::fs::remove_dir(&self.0);
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
+    // A mount point whose name carries a raw non-UTF-8 byte: the kernel
+    // writes it raw into mountinfo (only space, tab, newline and backslash
+    // are escaped), so the table is not text. The parser must keep the
+    // byte, the ioctls must get it byte-exact, and the daemon must start
+    // (its state_path check reads the table), report the mount lossily in
+    // fsinfo, and freeze/thaw with it present.
+    use qeminga::kernel::{KernelOps, LinuxKernel};
+    use qeminga::mountinfo::{MountSource, ProcMounts};
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let base = std::path::Path::new(&mount).parent().unwrap().to_path_buf();
+    let bind = BindMount::of(&mount, base.join(OsStr::from_bytes(b"caf\xe9-bind")));
+    let dir = bind.0.clone();
+    let table = qeminga::mountinfo::read_mountinfo_bounded(std::path::Path::new(
+        qeminga::mountinfo::MOUNTINFO_PATH,
+    ))
+    .unwrap();
+    assert!(
+        std::str::from_utf8(&table).is_err(),
+        "the kernel wrote the byte raw: the table is not UTF-8"
+    );
+    let entries = ProcMounts.mounts().unwrap();
+    let entry = entries
+        .iter()
+        .find(|e| e.mount_point == dir)
+        .expect("the raw-byte mount point is parsed byte-exact");
+    assert_eq!(entry.fs_type, "ext4");
+    let origin = entries
+        .iter()
+        .find(|e| e.mount_point == std::path::Path::new(&mount))
+        .unwrap();
+    assert_eq!(entry.dev(), origin.dev(), "same superblock as its origin");
+    // The kernel accepts the byte-exact path for the freeze ioctls.
+    LinuxKernel
+        .fifreeze(&dir)
+        .expect("FIFREEZE on the raw-byte path");
+    LinuxKernel
+        .fithaw(&dir)
+        .expect("FITHAW on the raw-byte path");
+    // The daemon: startup, fsinfo (lossy name), freeze-list, thaw.
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    let lossy = dir.to_string_lossy().into_owned();
+    assert!(lossy.contains('\u{fffd}'));
+    let fsinfo = agent.execute("guest-get-fsinfo");
+    let reported = fsinfo["return"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fs| fs["mountpoint"] == lossy)
+        .unwrap_or_else(|| panic!("fsinfo lists the mount lossily: {fsinfo}"));
+    assert_eq!(reported["type"], "ext4");
+    let reply = freeze_list(&mut agent, &[mount.clone(), lossy]);
+    assert_eq!(
+        reply,
+        json!({"return": 1}),
+        "the ext4 superblock frozen once; the lossy name matches nothing"
+    );
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert!(thawed["return"].as_u64().unwrap() >= 1, "{thawed}");
+    std::fs::write(dir.join("after"), b"ok").unwrap();
     assert!(agent.stop().success());
 }
 

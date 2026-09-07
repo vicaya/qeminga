@@ -822,6 +822,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rollback_of_a_retained_target_already_thawed_by_its_freezer_completes() {
+        // `deep` is frozen by another freezer (EBUSY, retained for thaw);
+        // the freeze then fails hard on `data`. By the time the rollback
+        // drains `deep`, the other freezer has thawed it: its first FITHAW
+        // answers EINVAL with no success. That is the ordinary end of a
+        // drain, not a denial: the rollback completes, the marker goes,
+        // and the agent is Thawed rather than wedged Frozen.
+        let rig = Rig::nested();
+        rig.kernel
+            .script_freeze_error("/home/data/deep", Errno::EBUSY);
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        rig.kernel.script_thaw_successes("/home/data/deep", 0);
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "freeze of /home/data failed: EIO: I/O error; rolled back"
+        );
+        assert_eq!(rig.fithaws(), paths(&["/home/data/deep"]));
+        assert!(!rig.marker().exists(), "nothing is frozen: the marker goes");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+    }
+
+    #[test]
+    fn a_drain_is_incomplete_only_when_denied_at_once_or_never_converging() {
+        let drained = |successes, errno: Option<Errno>, capped| Drained {
+            successes,
+            first_error: errno.map(KernelError::from),
+            capped,
+        };
+        // The normal end of a drain: EINVAL after the successes.
+        assert_eq!(drained(3, Some(Errno::EINVAL), false).incomplete(), None);
+        // A first FITHAW that is denied leaves the target frozen (OQ-3)...
+        let denied = drained(0, Some(Errno::EPERM), false).incomplete();
+        assert!(denied.unwrap().contains("first FITHAW denied"));
+        assert!(
+            drained(0, Some(Errno::EACCES), false)
+                .incomplete()
+                .is_some()
+        );
+        // ...but a denial after a success does not: the target was thawed.
+        assert_eq!(drained(2, Some(Errno::EACCES), false).incomplete(), None);
+        // Nor does any other first error (EINVAL, EIO) with no successes:
+        // it is not a permission problem, so the drain is reported through
+        // its errno, never as "still frozen".
+        assert_eq!(drained(0, Some(Errno::EINVAL), false).incomplete(), None);
+        assert_eq!(drained(0, Some(Errno::EIO), false).incomplete(), None);
+        assert_eq!(drained(0, None, false).incomplete(), None);
+        // A drain that never converged is incomplete whatever else happened.
+        let capped = drained(u32::MAX, None, true).incomplete();
+        assert!(capped.unwrap().contains("still succeeding"));
+    }
+
+    #[tokio::test]
     async fn freeze_while_not_thawed_is_generic_error() {
         for state in [
             FreezeState::Freezing,

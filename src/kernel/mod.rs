@@ -78,6 +78,19 @@ impl From<Errno> for KernelError {
     }
 }
 
+/// What a `FITRIM` reports back. The kernel rewrites the request range:
+/// `len` becomes the number of bytes discarded and `minlen` the minimum
+/// extent it actually used, rounded up to the filesystem's block size and
+/// the device's discard granularity. The wire reply carries the effective
+/// value, not the requested one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Trimmed {
+    /// Bytes discarded.
+    pub bytes: u64,
+    /// The minimum extent the kernel applied.
+    pub minimum: u64,
+}
+
 /// The kernel operations qeminga performs. Production: [`LinuxKernel`];
 /// tests: [`fake::FakeKernel`].
 pub trait KernelOps: Send + Sync {
@@ -86,8 +99,9 @@ pub trait KernelOps: Send + Sync {
     /// `FITHAW` on the filesystem mounted at `mountpoint`.
     fn fithaw(&self, mountpoint: &Path) -> Result<(), KernelError>;
     /// `FITRIM` over the whole filesystem with the given minimum extent;
-    /// returns the number of bytes trimmed.
-    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<u64, KernelError>;
+    /// returns what the kernel wrote back: the bytes trimmed and the
+    /// minimum extent it actually applied.
+    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError>;
     /// `sync(2)`; never fails.
     fn sync(&self);
     /// `reboot(2)`. On success the call does not return; `Ok(())` is only
@@ -108,7 +122,7 @@ impl KernelOps for LinuxKernel {
         ioctl::fithaw(mountpoint)
     }
 
-    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<u64, KernelError> {
+    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError> {
         ioctl::fitrim(mountpoint, minimum)
     }
 

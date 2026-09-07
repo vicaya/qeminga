@@ -11,7 +11,7 @@ use std::sync::Mutex;
 
 use nix::errno::Errno;
 
-use super::{KernelError, KernelOps, RebootCommand};
+use super::{KernelError, KernelOps, RebootCommand, Trimmed};
 
 /// One recorded call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,7 +38,7 @@ struct Inner {
     freeze_errors: HashMap<PathBuf, Errno>,
     thaw_successes: HashMap<PathBuf, u32>,
     thaw_errors: HashMap<PathBuf, Errno>,
-    trim_results: HashMap<PathBuf, Result<u64, Errno>>,
+    trim_results: HashMap<PathBuf, Result<(u64, Option<u64>), Errno>>,
     reboot_error: Option<Errno>,
     hook: Option<Hook>,
 }
@@ -104,11 +104,21 @@ impl FakeKernel {
             .insert(path.as_ref().to_owned(), errno);
     }
 
-    /// Scripts the result of `fitrim(path, _)`.
+    /// Scripts the result of `fitrim(path, _)`: the bytes trimmed (the
+    /// effective minimum is the requested one) or an errno.
     pub fn script_trim(&self, path: impl AsRef<Path>, result: Result<u64, Errno>) {
         self.lock()
             .trim_results
-            .insert(path.as_ref().to_owned(), result);
+            .insert(path.as_ref().to_owned(), result.map(|bytes| (bytes, None)));
+    }
+
+    /// Scripts `fitrim(path, _)` to report `bytes` trimmed with `minimum`
+    /// as the effective minimum extent, whatever was requested (models a
+    /// kernel rounding the request up to its discard granularity).
+    pub fn script_trim_rounded(&self, path: impl AsRef<Path>, bytes: u64, minimum: u64) {
+        self.lock()
+            .trim_results
+            .insert(path.as_ref().to_owned(), Ok((bytes, Some(minimum))));
     }
 
     /// Makes `reboot` fail with `errno`.
@@ -157,12 +167,15 @@ impl KernelOps for FakeKernel {
         }
     }
 
-    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<u64, KernelError> {
+    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError> {
         self.record(Call::Fitrim(mountpoint.to_owned(), minimum));
         match self.lock().trim_results.get(mountpoint) {
-            Some(Ok(bytes)) => Ok(*bytes),
+            Some(Ok((bytes, effective))) => Ok(Trimmed {
+                bytes: *bytes,
+                minimum: effective.unwrap_or(minimum),
+            }),
             Some(Err(errno)) => Err(KernelError::Errno(*errno)),
-            None => Ok(0),
+            None => Ok(Trimmed { bytes: 0, minimum }),
         }
     }
 
@@ -228,8 +241,16 @@ mod tests {
         );
         k.script_trim("/mnt/a", Ok(123));
         k.script_trim("/mnt/bad", Err(Errno::EOPNOTSUPP));
-        assert_eq!(k.fitrim(Path::new("/mnt/a"), 0), Ok(123));
-        assert_eq!(k.fitrim(Path::new("/mnt/other"), 0), Ok(0));
+        k.script_trim_rounded("/mnt/coarse", 7, 4096);
+        let trimmed = |bytes, minimum| Ok(Trimmed { bytes, minimum });
+        assert_eq!(k.fitrim(Path::new("/mnt/a"), 0), trimmed(123, 0));
+        assert_eq!(k.fitrim(Path::new("/mnt/a"), 512), trimmed(123, 512));
+        assert_eq!(k.fitrim(Path::new("/mnt/other"), 0), trimmed(0, 0));
+        assert_eq!(
+            k.fitrim(Path::new("/mnt/coarse"), 1),
+            trimmed(7, 4096),
+            "the effective minimum, not the requested one"
+        );
         assert!(
             k.fitrim(Path::new("/mnt/bad"), 0)
                 .unwrap_err()

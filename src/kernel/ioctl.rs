@@ -12,7 +12,7 @@ use std::path::Path;
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 
-use super::KernelError;
+use super::{KernelError, Trimmed};
 
 /// `_IOWR('X', 119, int)`: freeze the filesystem.
 pub const FIFREEZE: u32 = 0xC004_5877;
@@ -80,8 +80,9 @@ pub fn fithaw(mountpoint: &Path) -> Result<(), KernelError> {
 }
 
 /// `FITRIM` over the whole filesystem mounted at `mountpoint` with the
-/// given minimum extent; returns the number of bytes trimmed.
-pub fn fitrim(mountpoint: &Path, minimum: u64) -> Result<u64, KernelError> {
+/// given minimum extent; returns the bytes trimmed and the minimum extent
+/// the kernel applied (it rewrites both fields of the range).
+pub fn fitrim(mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError> {
     let fd = open_dir(mountpoint)?;
     let mut range = FstrimRange {
         start: 0,
@@ -92,7 +93,10 @@ pub fn fitrim(mountpoint: &Path, minimum: u64) -> Result<u64, KernelError> {
     // live, correctly laid out (`repr(C)`) `struct fstrim_range` that
     // outlives the call; the kernel reads and writes only that struct.
     unsafe { fitrim_raw(fd.as_raw_fd(), &raw mut range) }?;
-    Ok(range.len)
+    Ok(Trimmed {
+        bytes: range.len,
+        minimum: range.minlen,
+    })
 }
 
 #[cfg(test)]
@@ -125,6 +129,13 @@ mod tests {
         // Fully thawed: FITHAW now returns EINVAL, the end of a drain.
         assert!(fithaw(mount).unwrap_err().is_invalid());
         let trimmed = fitrim(mount, 0).expect("FITRIM");
-        let _ = trimmed;
+        let _ = trimmed.bytes;
+        // The kernel rounds the requested minimum up to its block size and
+        // the device's discard granularity and writes the value back: a
+        // 1-byte request comes back larger, and the effective value is a
+        // fixed point (asking for it again yields it again).
+        let effective = fitrim(mount, 1).expect("FITRIM").minimum;
+        assert!(effective >= 1);
+        assert_eq!(fitrim(mount, effective).expect("FITRIM").minimum, effective);
     }
 }

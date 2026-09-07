@@ -71,10 +71,22 @@ RESULT: PASS (AC16)
 
 ## Privileged tests locally
 
+The enforced build, which is what CI gates on (AC15):
+
 ```sh
 eval "$(sudo scripts/ci/mk-loop-fs.sh setup)"
-sudo -E cargo test --all-features -- --ignored --test-threads=1 privileged_
+sudo -E cargo test \
+  --features seccomp,suspend_ram,test-fakes \
+  --locked -- --ignored --test-threads=1 privileged_
 sudo scripts/ci/mk-loop-fs.sh teardown
+```
+
+`--all-features` would build the `seccomp-log` filter, which only logs
+unlisted syscalls instead of killing the process; that compatibility run
+is a separate, clearly labelled step:
+
+```sh
+sudo -E cargo test --all-features --locked -- --ignored --test-threads=1 privileged_   # seccomp-log build: logs, does not enforce
 ```
 
 The privileged E2E tests create a `qeminga` account requirement: when

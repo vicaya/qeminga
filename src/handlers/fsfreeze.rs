@@ -63,8 +63,11 @@ pub trait FreezeHooks: Send + Sync {
     fn on_frozen(&self, _ctx: &Arc<Context>) {}
     /// After a successful `claim_thaw`, before the drain starts.
     fn on_thaw_claimed(&self, _ctx: &Arc<Context>) {}
-    /// After the state returned to `Thawed` (thaw success or freeze
-    /// rollback).
+    /// After the drain (thaw success or freeze rollback) and *before* the
+    /// state is published as `Thawed`: it runs in `Thawing` (or
+    /// `Freezing`), while the gate still refuses a new freeze. A
+    /// finalisation such as the audit flush therefore can never overlap,
+    /// or undo, the setup of a newer freeze window.
     fn on_thawed(&self, _ctx: &Arc<Context>) {}
     /// A `guest-fsfreeze-status` heartbeat received while `Frozen`.
     fn on_heartbeat(&self, _ctx: &Arc<Context>) {}
@@ -160,8 +163,9 @@ async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result
             Err(Error::Internal(failure.to_string()))
         }
         Err(failure) => {
-            ctx.state.freeze_failed(token);
+            // Finalise first, publish `Thawed` last (see `on_thawed`).
             ctx.hooks.on_thawed(ctx);
+            ctx.state.freeze_failed(token);
             tracing::warn!(event = "fsfreeze_failed", error = %failure, "freeze failed");
             Err(Error::Internal(failure.to_string()))
         }
@@ -184,8 +188,11 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
 
     match outcome {
         Ok(thawed) => {
-            ctx.state.thaw_succeeded(token);
+            // Finalise (audit flush) while still `Thawing`, then publish
+            // `Thawed`: a freeze accepted after the publication can never
+            // have its logging mode changed by this thaw's completion.
             ctx.hooks.on_thawed(ctx);
+            ctx.state.thaw_succeeded(token);
             tracing::info!(event = "fsfreeze_thawed", thawed, "filesystems thawed");
             Ok(thawed)
         }
@@ -193,8 +200,8 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // Nothing was frozen by this agent (the drain started from
             // `Thawed`), so there is no frozen state to retain: return to
             // `Thawed` and report the error (OQ-3).
-            ctx.state.thaw_succeeded(token);
             ctx.hooks.on_thawed(ctx);
+            ctx.state.thaw_succeeded(token);
             tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
             Err(Error::Internal(failure.to_string()))
         }
@@ -363,7 +370,11 @@ fn freeze_blocking(
             }
             Err(errno) => {
                 // Forward order: `processed` was filled in reverse mount
-                // order, so reverse it back.
+                // order, so reverse it back. Every processed target gets
+                // its drain, as in `thaw_blocking`: one that cannot be
+                // thawed is remembered and reported afterwards, and must
+                // not leave the later ones frozen until a recovery.
+                let mut incomplete: Option<FreezeFailure> = None;
                 for done in processed.iter().rev() {
                     let drained = drain(kernel, done);
                     tracing::warn!(
@@ -373,13 +384,22 @@ fn freeze_blocking(
                         "rolled back"
                     );
                     if let Some(reason) = drained.incomplete() {
-                        return Err(FreezeFailure::RollbackIncomplete {
+                        tracing::error!(
+                            event = "fsfreeze_rollback_incomplete",
+                            mountpoint = %done.display(),
+                            reason,
+                            "rollback target may still be frozen"
+                        );
+                        incomplete.get_or_insert(FreezeFailure::RollbackIncomplete {
                             failed: lossy(mountpoint),
                             errno,
                             mountpoint: lossy(done),
                             reason,
                         });
                     }
+                }
+                if let Some(failure) = incomplete {
+                    return Err(failure);
                 }
                 match marker.remove() {
                     Ok(()) | Err(MarkerError::Absent { .. }) => {}
@@ -541,33 +561,45 @@ mod tests {
         .unwrap()
     }
 
+    /// Records every hook with the state the machine was in when the hook
+    /// ran (the hook contract fixes that state).
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<&'static str>>);
+    struct Recorder(Mutex<Vec<(&'static str, FreezeState)>>);
 
     impl Recorder {
         fn events(&self) -> Vec<&'static str> {
-            self.0.lock().unwrap().clone()
+            self.0.lock().unwrap().iter().map(|(e, _)| *e).collect()
         }
-        fn push(&self, e: &'static str) {
-            self.0.lock().unwrap().push(e);
+        /// The states seen by every occurrence of hook `event`.
+        fn states_at(&self, event: &str) -> Vec<FreezeState> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(e, _)| *e == event)
+                .map(|(_, s)| *s)
+                .collect()
+        }
+        fn push(&self, ctx: &Arc<Context>, e: &'static str) {
+            self.0.lock().unwrap().push((e, ctx.state.current()));
         }
     }
 
     impl FreezeHooks for Recorder {
-        fn on_freezing(&self, _: &Arc<Context>) {
-            self.push("freezing");
+        fn on_freezing(&self, ctx: &Arc<Context>) {
+            self.push(ctx, "freezing");
         }
-        fn on_frozen(&self, _: &Arc<Context>) {
-            self.push("frozen");
+        fn on_frozen(&self, ctx: &Arc<Context>) {
+            self.push(ctx, "frozen");
         }
-        fn on_thaw_claimed(&self, _: &Arc<Context>) {
-            self.push("thaw_claimed");
+        fn on_thaw_claimed(&self, ctx: &Arc<Context>) {
+            self.push(ctx, "thaw_claimed");
         }
-        fn on_thawed(&self, _: &Arc<Context>) {
-            self.push("thawed");
+        fn on_thawed(&self, ctx: &Arc<Context>) {
+            self.push(ctx, "thawed");
         }
-        fn on_heartbeat(&self, _: &Arc<Context>) {
-            self.push("heartbeat");
+        fn on_heartbeat(&self, ctx: &Arc<Context>) {
+            self.push(ctx, "heartbeat");
         }
     }
 
@@ -1229,6 +1261,82 @@ mod tests {
         assert_eq!(root_calls, MAX_THAW_ITERATIONS as usize);
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn rollback_drains_every_processed_target_even_after_a_denied_one() {
+        // Freeze order: deep, data, home, /. Fail hard on the third (home),
+        // so deep and data were frozen; the rollback runs forward (data,
+        // then deep) and the first FITHAW on data is denied. deep must
+        // still be drained: a target that can be thawed now is not left
+        // frozen until a later recovery. The denial is what is reported,
+        // the marker and the frozen gate are retained.
+        let rig = Rig::nested();
+        rig.kernel.script_freeze_error("/home", Errno::EIO);
+        rig.kernel.script_thaw_error("/home/data", Errno::EPERM);
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rollback of /home/data incomplete (first FITHAW denied"),
+            "{err}"
+        );
+        assert_eq!(
+            rig.fifreezes(),
+            paths(&["/home/data/deep", "/home/data", "/home"])
+        );
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data", "/home/data/deep", "/home/data/deep"]),
+            "data denied at once; deep still drained (success + EINVAL)"
+        );
+        assert!(rig.marker().exists(), "marker retained");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
+    }
+
+    #[tokio::test]
+    async fn thawed_is_published_only_after_the_finalisation_hook() {
+        // `on_thawed` (the audit flush in production) runs while the
+        // machine is still `Thawing`, so a new freeze cannot be accepted
+        // until it has completed; the same for a rollback (`Freezing`).
+        let rig = Rig::new(FreezeState::Frozen, "simple.txt");
+        rig.marker().create().unwrap();
+        thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.hooks.states_at("thawed"), [FreezeState::Thawing]);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        // A recovery drain that fails still finalises before publishing.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_thaw_error("/", Errno::EPERM);
+        thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(rig.hooks.states_at("thawed"), [FreezeState::Thawing]);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        // Rollback after a hard freeze error.
+        let rig = Rig::nested();
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(rig.hooks.states_at("thawed"), [FreezeState::Freezing]);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        // And the frozen side of the contract: `frozen` after `Frozen`,
+        // `freezing` in `Freezing`, `thaw_claimed` in `Thawing`.
+        let rig = Rig::nested();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.hooks.states_at("freezing"), [FreezeState::Freezing]);
+        assert_eq!(rig.hooks.states_at("frozen"), [FreezeState::Frozen]);
+        assert_eq!(rig.hooks.states_at("thaw_claimed"), [FreezeState::Thawing]);
+        assert_eq!(rig.hooks.states_at("thawed"), [FreezeState::Thawing]);
     }
 
     #[tokio::test]

@@ -455,6 +455,8 @@ the answer is a one-line change, and leave the question here.
   - `thaw_drains_each_mountpoint_until_error_and_counts_once` — fake thaw succeeds 3× on `/`, 1× on `/home`; result `2`; call log shows 4 + 2 `Fithaw`.
   - `thaw_from_thawed_state_still_drains` (recovery drain), `recovery_drain_failure_returns_to_thawed` (OQ-3), `a_denied_thaw_still_drains_the_later_targets` (OQ-3), `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (the `frozen` hook fires again so the watchdog is re-armed, §4.4).
   - `thaw_removes_marker_only_after_all_drains`, `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (OQ-3 interim rule).
+  - `rollback_drains_every_processed_target_even_after_a_denied_one` — the rollback, like the thaw drain, attempts every processed target and reports the first incomplete one afterwards, marker retained (review follow-up).
+  - `thawed_is_published_only_after_the_finalisation_hook` — `on_thawed` runs in `Thawing`/`Freezing`, before `Thawed` is published, so a lifecycle completion (the audit flush) can never overlap the setup of a newer freeze window (review follow-up; the hook contract is in the `FreezeHooks` docs).
   - `thaw_cancels_watchdog_and_flushes_audit` (hooks are trait callbacks in `Context`; assert they fired in order).
   - `drain_has_a_defensive_upper_bound` — a fake that never fails stops after `MAX_THAW_ITERATIONS` (e.g. 1024) with a logged warning.
   - `privileged_freeze_thaw_cycle_on_ext4_and_xfs` (`#[ignore]`, T5.2; AC2).

@@ -11,12 +11,11 @@ use qeminga::freeze_plan::{FREEZABLE_FS_TYPES, FreezePlan};
 use qeminga::mountinfo::{parse_mountinfo, unescape};
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(text) = std::str::from_utf8(data) else {
-        let _ = unescape(&String::from_utf8_lossy(data));
-        return;
-    };
-    let entries = parse_mountinfo(text);
-    assert!(entries.len() <= text.lines().count());
+    // The table is bytes, not text: the kernel escapes only space, tab,
+    // newline and backslash in a path and writes every other byte raw, so
+    // the parser must take arbitrary bytes, non-UTF-8 included, straight.
+    let entries = parse_mountinfo(data);
+    assert!(entries.len() <= data.split(|&b| b == b'\n').count());
     let plan = FreezePlan::build(&entries);
     let mut devs = HashSet::new();
     for target in plan.targets() {
@@ -25,5 +24,5 @@ fuzz_target!(|data: &[u8]| {
     }
     assert_eq!(plan.freeze_order().count(), plan.thaw_order().count());
     let _ = plan.covers(std::path::Path::new("/run/qeminga/frozen"));
-    let _ = unescape(text);
+    let _ = unescape(data);
 });

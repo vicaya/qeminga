@@ -690,7 +690,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
 #### T5.6 — Mutation testing (optional) ∥
-- **Status:** done (`cargo mutants --all-features`: 184 mutants, 130 caught, 43 unviable, 11 timeouts in the decoder loops, **0 missed**; the CI job is a gate)
+- **Status:** done (`cargo mutants --all-features`: 194 mutants, **0 missed**; the CI job is a gate). Review follow-ups: the gate reads `mutants.out/missed.txt` (the exit status reports timeouts ahead of misses, which hid one survivor in `Drained::incomplete`, killed by the tests added on T3.4); `FrameDecoder::push` is an indexed loop bounded by its input, so no mutant of it can loop (one re-scanned a delimiter forever, allocated without bound, and got the CI runner shut down); the channel session tests run under a real-time bound so a broken decoder fails them instead of hanging the binary; the job runs test binaries under a 4 GiB memory cap (`scripts/ci/bounded-test.sh`).
 - **Design:** AC8 (test quality), §5.2.
 - **Depends on:** T1.*, T3.4
 - **Files:** `.cargo/mutants.toml`, CI job `mutants` (advisory until the baseline survivors were killed).

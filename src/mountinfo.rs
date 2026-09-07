@@ -10,9 +10,13 @@
 //! ```
 //!
 //! Fields 4, 5, 10 and 11 escape space, tab, newline and backslash as
-//! `\040`, `\011`, `\012` and `\134`; [`unescape`] decodes them. Malformed
-//! lines are skipped rather than failing the whole parse, and line order
-//! (mount order) is preserved.
+//! `\040`, `\011`, `\012` and `\134`; [`unescape`] decodes them. The
+//! kernel escapes nothing else: a path name is otherwise emitted byte for
+//! byte, so the table is not text and need not be UTF-8. The parser works
+//! on bytes; path fields stay byte-exact (`PathBuf`), the numeric and
+//! structural fields are ASCII, and the informational fields are
+//! converted lossily. Malformed lines are skipped rather than failing the
+//! whole parse, and line order (mount order) is preserved.
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
@@ -63,13 +67,13 @@ impl MountEntry {
 }
 
 /// Decodes the octal escapes used in `mountinfo` paths (`\040` → space,
-/// `\011` → tab, `\012` → newline, `\134` → backslash, and any other
-/// byte the kernel escaped, `\351` included). Any other backslash
-/// sequence is kept verbatim. Returns bytes: the kernel escapes exactly
-/// the bytes that are not printable ASCII, so the result need not be
-/// UTF-8; see [`unescape_path`] and [`unescape_lossy`].
-pub fn unescape(field: &str) -> Vec<u8> {
-    let bytes = field.as_bytes();
+/// `\011` → tab, `\012` → newline, `\134` → backslash; any three-digit
+/// octal escape is decoded the same way). Any other backslash sequence is
+/// kept verbatim, and so is every other byte: the result is the path the
+/// kernel had, which need not be UTF-8; see [`unescape_path`] and
+/// [`unescape_lossy`].
+pub fn unescape(field: impl AsRef<[u8]>) -> Vec<u8> {
+    let bytes = field.as_ref();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
@@ -93,39 +97,58 @@ pub fn unescape(field: &str) -> Vec<u8> {
 }
 
 /// [`unescape`] as a byte-exact path.
-pub fn unescape_path(field: &str) -> PathBuf {
+pub fn unescape_path(field: impl AsRef<[u8]>) -> PathBuf {
     PathBuf::from(OsString::from_vec(unescape(field)))
 }
 
 /// [`unescape`] for informational fields: non-UTF-8 bytes become U+FFFD.
-pub fn unescape_lossy(field: &str) -> String {
+pub fn unescape_lossy(field: impl AsRef<[u8]>) -> String {
     String::from_utf8_lossy(&unescape(field)).into_owned()
 }
 
-/// Parses `mountinfo` text. Malformed lines are skipped; never panics.
-pub fn parse_mountinfo(text: &str) -> Vec<MountEntry> {
-    text.lines().filter_map(parse_line).collect()
+/// Parses a `mountinfo` table (bytes; it need not be UTF-8). Malformed
+/// lines are skipped; never panics.
+pub fn parse_mountinfo(table: impl AsRef<[u8]>) -> Vec<MountEntry> {
+    table
+        .as_ref()
+        .split(|&b| b == b'\n')
+        .filter_map(parse_line)
+        .collect()
 }
 
-fn parse_line(line: &str) -> Option<MountEntry> {
-    let mut fields = line.split(' ').filter(|f| !f.is_empty());
-    let mount_id = fields.next()?.parse().ok()?;
-    let parent_id = fields.next()?.parse().ok()?;
-    let (major, minor) = fields.next()?.split_once(':')?;
+/// An ASCII field as text, for the numeric and structural fields.
+fn ascii(field: &[u8]) -> Option<&str> {
+    std::str::from_utf8(field).ok().filter(|s| s.is_ascii())
+}
+
+fn number(field: &[u8]) -> Option<u32> {
+    ascii(field)?.parse().ok()
+}
+
+/// An informational field as text; non-UTF-8 bytes become U+FFFD.
+fn lossy(field: &[u8]) -> String {
+    String::from_utf8_lossy(field).into_owned()
+}
+
+fn parse_line(line: &[u8]) -> Option<MountEntry> {
+    let mut fields = line.split(|&b| b == b' ').filter(|f| !f.is_empty());
+    let mount_id = number(fields.next()?)?;
+    let parent_id = number(fields.next()?)?;
+    let (major, minor) = ascii(fields.next()?)?.split_once(':')?;
     let major = major.parse().ok()?;
     let minor = minor.parse().ok()?;
     let root = unescape_path(fields.next()?);
     let mount_point = unescape_path(fields.next()?);
-    let mount_options = fields.next()?.to_owned();
+    let mount_options = lossy(fields.next()?);
     let mut optional_fields = Vec::new();
     loop {
         let field = fields.next()?;
-        if field == "-" {
+        if field == b"-" {
             break;
         }
-        optional_fields.push(field.to_owned());
+        optional_fields.push(lossy(field));
     }
-    let fs_type = fields.next()?.to_owned();
+    let fs_type = lossy(fields.next()?);
     let source = unescape_lossy(fields.next()?);
     let super_options = fields.next().map(unescape_lossy).unwrap_or_default();
     Some(MountEntry {
@@ -146,12 +169,12 @@ fn parse_line(line: &str) -> Option<MountEntry> {
 /// Where the mount table comes from; production reads
 /// `/proc/self/mountinfo`, tests use fixtures.
 pub trait MountSource: Send + Sync {
-    /// The raw `mountinfo` text.
-    fn read_mountinfo(&self) -> Result<String, Error>;
+    /// The raw `mountinfo` table, byte for byte.
+    fn read_mountinfo(&self) -> Result<Vec<u8>, Error>;
 
     /// Parsed entries in mount order.
     fn mounts(&self) -> Result<Vec<MountEntry>, Error> {
-        Ok(parse_mountinfo(&self.read_mountinfo()?))
+        Ok(parse_mountinfo(self.read_mountinfo()?))
     }
 }
 
@@ -168,13 +191,13 @@ pub const MOUNTINFO_PATH: &str = "/proc/self/mountinfo";
 pub const MOUNTINFO_MAX_BYTES: usize = 32 * 1024 * 1024;
 
 impl MountSource for ProcMounts {
-    fn read_mountinfo(&self) -> Result<String, Error> {
+    fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
         read_mountinfo_bounded(Path::new(MOUNTINFO_PATH))
     }
 }
 
-/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`].
-pub fn read_mountinfo_bounded(path: &Path) -> Result<String, Error> {
+/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`], byte for byte.
+pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
     File::open(path)
         .and_then(|f| {
@@ -188,8 +211,7 @@ pub fn read_mountinfo_bounded(path: &Path) -> Result<String, Error> {
             path.display()
         )));
     }
-    String::from_utf8(bytes)
-        .map_err(|_| Error::Internal(format!("{} is not UTF-8", path.display())))
+    Ok(bytes)
 }
 
 /// A fixed mount table (tests and fixtures).
@@ -197,8 +219,8 @@ pub fn read_mountinfo_bounded(path: &Path) -> Result<String, Error> {
 pub struct StaticMounts(pub String);
 
 impl MountSource for StaticMounts {
-    fn read_mountinfo(&self) -> Result<String, Error> {
-        Ok(self.0.clone())
+    fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+        Ok(self.0.clone().into_bytes())
     }
 }
 
@@ -214,6 +236,50 @@ mod tests {
                 .join(name),
         )
         .unwrap()
+    }
+
+    /// A fixture that is not UTF-8.
+    fn fixture_bytes(name: &str) -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/mountinfo")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn raw_non_utf8_bytes_survive_the_parse_and_the_read() {
+        // The kernel escapes only space, tab, newline and backslash: a
+        // Latin-1 "é" (0xE9) in a mount point is written raw, so the table
+        // is not UTF-8. Every other line must still parse, and the raw
+        // path must reach the kernel byte-exact.
+        use std::os::unix::ffi::OsStrExt;
+        let table = fixture_bytes("raw_bytes.txt");
+        assert!(std::str::from_utf8(&table).is_err(), "fixture is not UTF-8");
+        let entries = parse_mountinfo(&table);
+        let points: Vec<&[u8]> = entries
+            .iter()
+            .map(|e| e.mount_point.as_os_str().as_bytes())
+            .collect();
+        assert_eq!(
+            points,
+            [&b"/"[..], b"/mnt/caf\xe9", b"/mnt/\xff\xfe bytes", b"/home"]
+        );
+        assert_eq!(entries[1].mount_point.to_string_lossy(), "/mnt/caf\u{fffd}");
+        assert_eq!(entries[1].fs_type, "ext4");
+        assert_eq!(entries[1].root, Path::new("/"));
+        // A raw byte in an informational field is reported lossily.
+        assert_eq!(entries[2].source, "/dev/disk/by-label/caf\u{fffd}");
+        // The bounded reader hands the bytes over untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mountinfo");
+        std::fs::write(&file, &table).unwrap();
+        assert_eq!(read_mountinfo_bounded(&file).unwrap(), table);
+        assert_eq!(
+            parse_mountinfo(read_mountinfo_bounded(&file).unwrap()).len(),
+            4
+        );
     }
 
     #[test]
@@ -239,14 +305,14 @@ mod tests {
         );
         assert_eq!(entries[0].dev(), (98, 0));
         // No optional fields at all.
-        let entries = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
+        let entries = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
         let overlay = entries.iter().find(|e| e.fs_type == "overlay").unwrap();
         assert!(overlay.optional_fields.is_empty());
         assert_eq!(
             overlay.mount_point,
             Path::new("/var/lib/docker/overlay2/abc/merged")
         );
-        let simple = parse_mountinfo(&fixture("simple.txt"));
+        let simple = parse_mountinfo(fixture("simple.txt"));
         assert_eq!(simple.len(), 5);
         assert_eq!(simple[3].fs_type, "ext4");
         assert_eq!(simple[3].source, "/dev/sda1");
@@ -258,7 +324,7 @@ mod tests {
         // The kernel escapes every byte outside printable ASCII; `\351` is
         // a Latin-1 "é", not UTF-8, and must reach the kernel unchanged.
         use std::os::unix::ffi::OsStrExt;
-        let entries = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let entries = parse_mountinfo(fixture("escaped_paths.txt"));
         let latin1 = entries.last().unwrap();
         assert_eq!(latin1.mount_point.as_os_str().as_bytes(), b"/mnt/caf\xe9");
         assert_eq!(latin1.mount_point.to_string_lossy(), "/mnt/caf\u{fffd}");
@@ -272,7 +338,7 @@ mod tests {
         let small = dir.path().join("small");
         std::fs::write(&small, fixture("simple.txt")).unwrap();
         assert_eq!(
-            parse_mountinfo(&read_mountinfo_bounded(&small).unwrap()).len(),
+            parse_mountinfo(read_mountinfo_bounded(&small).unwrap()).len(),
             5
         );
         let big = dir.path().join("big");
@@ -294,7 +360,7 @@ mod tests {
         assert_eq!(unescape("a\\0x9b"), b"a\\0x9b");
         assert_eq!(unescape("trailing\\"), b"trailing\\");
         assert_eq!(unescape("\\777"), b"\\777");
-        let entries = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let entries = parse_mountinfo(fixture("escaped_paths.txt"));
         let points: Vec<&Path> = entries.iter().map(|e| e.mount_point.as_path()).collect();
         assert_eq!(
             &points[..5],
@@ -312,7 +378,7 @@ mod tests {
 
     #[test]
     fn preserves_line_order_as_mount_order() {
-        let entries = parse_mountinfo(&fixture("nested.txt"));
+        let entries = parse_mountinfo(fixture("nested.txt"));
         let points: Vec<&Path> = entries.iter().map(|e| e.mount_point.as_path()).collect();
         assert_eq!(
             points,
@@ -321,10 +387,10 @@ mod tests {
         let ids: Vec<u32> = entries.iter().map(|e| e.mount_id).collect();
         assert_eq!(ids, [27, 30, 31, 32]);
         // Bind mounts share (major, minor) with their origin.
-        let entries = parse_mountinfo(&fixture("bind_mounts.txt"));
+        let entries = parse_mountinfo(fixture("bind_mounts.txt"));
         assert_eq!(entries[0].dev(), entries[1].dev());
         assert_eq!(entries[1].root, Path::new("/srv/www"));
-        let entries = parse_mountinfo(&fixture("btrfs_subvols.txt"));
+        let entries = parse_mountinfo(fixture("btrfs_subvols.txt"));
         assert!(entries[..3].iter().all(|e| e.dev() == (0, 38)));
         assert_eq!(entries[1].root, Path::new("/@home"));
     }
@@ -360,6 +426,13 @@ mod tests {
         fn parser_never_panics(text in "\\PC*") {
             let _ = parse_mountinfo(&text);
             let _ = unescape(&text);
+        }
+
+        #[test]
+        fn parser_never_panics_on_bytes(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
+            let entries = parse_mountinfo(&bytes);
+            prop_assert!(entries.len() <= bytes.iter().filter(|&&b| b == b'\n').count() + 1);
+            let _ = unescape(&bytes);
         }
 
         #[test]

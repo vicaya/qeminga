@@ -220,7 +220,7 @@ mod tests {
 
     #[test]
     fn fsinfo_reports_name_type_mountpoint_and_sizes() {
-        let mounts = parse_mountinfo(&fixture("simple.txt"));
+        let mounts = parse_mountinfo(fixture("simple.txt"));
         let info = fs_info(&mounts, &fake());
         let root = info.iter().find(|f| f.mountpoint == "/").unwrap();
         assert_eq!(root.name, "/dev/sda1");
@@ -255,7 +255,7 @@ mod tests {
 
     #[test]
     fn fsinfo_includes_pseudo_filesystems_and_disk_is_empty_array() {
-        let mounts = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
+        let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
         let info = fs_info(&mounts, &fake());
         assert_eq!(info.len(), mounts.len());
         let types: Vec<&str> = info.iter().map(|f| f.fs_type.as_str()).collect();
@@ -274,7 +274,7 @@ mod tests {
 
     #[test]
     fn fsinfo_statfs_failure_omits_size_fields_not_the_entry() {
-        let mounts = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
+        let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
         let info = fs_info(&mounts, &fake());
         let nfs = info.iter().find(|f| f.fs_type == "nfs4").unwrap();
         assert_eq!(nfs.name, "filer:/export");
@@ -285,7 +285,7 @@ mod tests {
         assert!(value.get("total-bytes").is_none());
         assert!(!value.to_string().contains("null"));
         // Escaped mount points are reported unescaped.
-        let mounts = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let mounts = parse_mountinfo(fixture("escaped_paths.txt"));
         let info = fs_info(&mounts, &fake());
         assert_eq!(info[1].mountpoint, "/mnt/with space");
     }
@@ -294,7 +294,7 @@ mod tests {
     fn fsinfo_does_not_statfs_remote_fuse_or_autofs_mounts() {
         // Sizes are offered for every mount, yet the network, FUSE and 9p
         // entries are listed without them: their statfs is never issued.
-        let mounts = parse_mountinfo(&fixture("tmpfs_and_nfs.txt"));
+        let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
         let sizes = Statfs {
             blocks: 1,
             bfree: 0,
@@ -343,7 +343,7 @@ mod tests {
                 Err(Error::Internal("EIO".into()))
             }
         }
-        let mounts = parse_mountinfo(&fixture("escaped_paths.txt"));
+        let mounts = parse_mountinfo(fixture("escaped_paths.txt"));
         let recording = Recording(Mutex::new(Vec::new()));
         let info = fs_info(&mounts, &recording);
         assert_eq!(info.last().unwrap().mountpoint, "/mnt/caf\u{fffd}");

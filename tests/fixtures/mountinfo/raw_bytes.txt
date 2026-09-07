@@ -1,0 +1,4 @@
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 27 8:2 / /mnt/café rw,relatime shared:2 - ext4 /dev/sdb1 rw
+41 27 8:3 / /mnt/ÿþ\040bytes rw shared:3 - xfs /dev/disk/by-label/café rw
+42 27 8:4 / /home rw,relatime shared:4 - ext4 /dev/sda2 rw

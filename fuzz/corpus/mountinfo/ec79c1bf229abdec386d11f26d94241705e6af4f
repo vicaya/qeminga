@@ -1,0 +1,5 @@
+27  8:1 rsount-ro
+41 27 - xfs ro
+41 2277 - xf rw127,attr2,inod=64
+4 3 27 8:p@rtsnt-ro
+41 27 - xfs /dev4 28 8:51227 /sdba1s

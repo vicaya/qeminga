@@ -1,0 +1,3 @@
+oc qroc rw
+22 27 -: proc qroc rw
+22 27 -:20 / /sys rw,nosuid,fe 

@@ -1,0 +1,4 @@
+21 27 0:19 / /proc rw,nosui27 1 8:1 / / rwv/sda1 rw,relatime shared:1 - ext4 /dev/sda1 rw
+50 27 8:5 / /mnt/with\040space rw,relatime shared:7 - ext4 /dev/sda5 rw
+51 27 8:6 / /mnt/tab\011here rw,relatime shared:8 - xfs /dev/sda6 rw
+52 27 8:7 /sud,b\040dir /mnt/back\134slash rw,relatime shared:9 - ext4 /dev/disk/by-lnodev,noexec,relatabel/myime shar\04e0

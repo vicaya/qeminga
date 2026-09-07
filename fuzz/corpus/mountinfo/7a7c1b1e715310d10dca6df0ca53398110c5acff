@@ -1,0 +1,3 @@
+27 1 8:1 / / rwv/sda1 rw shared:7 - efs /dev/sda6 rw
+52 27 8:7 /sub\040dir /mnt/back\134slashtime shared:9 - ext4 /dev/disk/by-label/my\040label rw
+53 27 8:8 / /tnt/nl\012ime shared:10 - ext4 /dev/sda8 rw

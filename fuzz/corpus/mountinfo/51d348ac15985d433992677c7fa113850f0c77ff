@@ -1,0 +1,5 @@
+27 1 8:1 / / rw,relati shared:1 - ext4 /dev/sda1 rw
+50 27!8:5 / /mnt/with\040 rw
+51 27 8:6 / /mnÿÿÿÿ
+52 27 8:7 /sub\040dir /mnt/back\134slash rw,relatime shared:/9 - ext4 /dev/diskÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿ/by-label/my\040label rw
+53`27 8:8 / /xtt 

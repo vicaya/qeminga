@@ -1,0 +1,33 @@
+21 27 0:19 / /proc rw,nosuid,.odev,noexecred:0 - ex sysfs sysfs rw
+23 27/dew,errors=remount-ro
+40 27 834
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+slash rw,fs sysfs rw
+id,rel

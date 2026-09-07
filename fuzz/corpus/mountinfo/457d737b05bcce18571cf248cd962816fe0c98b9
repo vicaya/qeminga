@@ -1,0 +1,3 @@
+27 1 8:1 / / rme shared:5 - xfs /deme dev/sda1 rwe,rrors=remount-ro
+42 27 8:2 / /data rw,relatime shared:5 - xfs /dev/sdb1 rw,attr2.inode64
+43 27 8:2 /exports /srv/exports rw,relatime shared:5 - xfs /dev/sdb1 rw,inode64

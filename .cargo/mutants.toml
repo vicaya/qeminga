@@ -20,7 +20,12 @@ examine_globs = [
     "src/dispatch.rs",
     "src/dispatch/ratelimit.rs",
     "src/handlers/fsfreeze.rs",
+    # Lifecycle coordination: the timer loop's deadline/heartbeat order.
+    "src/watchdog.rs",
 ]
+# Not examined: src/audit.rs (about 140 mutants, most in formatting and
+# the ring's bookkeeping) would double the job; its lifecycle half (ring
+# entry and flush) is exercised through the fsfreeze hooks above.
 # Test doubles and the privileged/E2E plumbing are not worth mutating.
 exclude_globs = [
     "src/kernel/fake.rs",

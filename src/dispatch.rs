@@ -308,7 +308,8 @@ impl Dispatcher {
     /// Handles one decoder event and returns the encoded reply, if any.
     ///
     /// `None` is returned for an oversized frame (nothing to reply to) and
-    /// for a successful `guest-shutdown` (`success-response: false`).
+    /// for a successful `guest-shutdown` or `guest-suspend-ram`
+    /// (`success-response: false`).
     pub async fn handle(&self, event: DecodeEvent) -> Option<Vec<u8>> {
         let freeze_state_before = self.ctx.state.current().as_str();
         let bytes = match event {
@@ -1006,8 +1007,9 @@ mod tests {
                 assert_ne!(class.as_deref(), Some("CommandNotFound"), "{name}");
             }
         }
-        // Each name appears exactly once and `guest-shutdown` is the only
-        // command without a success response.
+        // Each name appears exactly once; `guest-shutdown` and
+        // `guest-suspend-ram` are the commands without a success response
+        // (upstream's contract, OQ-2).
         let count = names.len();
         names.sort_unstable();
         names.dedup();
@@ -1018,7 +1020,7 @@ mod tests {
             .filter(|s| !s.success_response)
             .map(|s| s.name)
             .collect();
-        assert_eq!(no_success, ["guest-shutdown"]);
+        assert_eq!(no_success, ["guest-shutdown", "guest-suspend-ram"]);
         // Every match arm's name is in the table: probing the arms with a
         // method that is allowlisted but absent from the table is impossible
         // by construction, so check the inverse direction on the allowlist.

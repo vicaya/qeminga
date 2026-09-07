@@ -144,14 +144,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_is_the_only_success_response_false() {
+    async fn shutdown_and_suspend_ram_are_the_only_success_response_false() {
         let value = info(&Context::for_tests()).await;
         let no_reply: Vec<&str> = entries(&value)
             .iter()
             .filter(|e| e["success-response"] == false)
             .map(|e| e["name"].as_str().unwrap())
             .collect();
-        assert_eq!(no_reply, ["guest-shutdown"]);
+        assert_eq!(no_reply, ["guest-shutdown", "guest-suspend-ram"]);
     }
 
     #[tokio::test]

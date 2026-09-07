@@ -22,7 +22,9 @@ pub mod sync;
 pub struct CommandSpec {
     /// The wire name.
     pub name: &'static str,
-    /// `false` only for `guest-shutdown`, which never sends a success reply.
+    /// `false` for `guest-shutdown` and `guest-suspend-ram`, which never
+    /// send a success reply (the host watches for the VM exit or the QMP
+    /// `SUSPEND` event instead); errors are still reported.
     pub success_response: bool,
 }
 
@@ -82,7 +84,7 @@ pub const SUPPORTED_COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "guest-suspend-ram",
-        success_response: true,
+        success_response: false,
     },
 ];
 

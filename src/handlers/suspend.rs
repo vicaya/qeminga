@@ -5,8 +5,11 @@
 //! answers `CommandNotFound` (`command guest-suspend-ram has been
 //! disabled`) when either is off, so [`handle`] only exists in builds
 //! with the feature. It checks that `/sys/power/state` lists `mem` and
-//! then writes `mem` to it. Per OQ-2 the reply is `{}` (a success
-//! response), sent after resume.
+//! then writes `mem` to it. Like upstream (`success-response: false`,
+//! OQ-2) a successful suspend sends no reply: the host learns of it from
+//! the QMP `SUSPEND` event and of the resume from `WAKEUP`, and a reply
+//! written after the resume would be unexpected. Errors are still
+//! reported.
 //!
 //! The [`SuspendOps`] trait and the production [`SysPower`] are compiled
 //! unconditionally so the `Context` shape does not depend on the feature.
@@ -115,15 +118,19 @@ mod tests {
         (Arc::new(ctx), suspend)
     }
 
-    async fn send(ctx: &Arc<Context>, json: &str) -> String {
-        let reply = Dispatcher::new(ctx.clone())
+    /// The dispatcher's reply to one frame, if it produced one.
+    async fn send_opt(ctx: &Arc<Context>, json: &str) -> Option<String> {
+        Dispatcher::new(ctx.clone())
             .handle(DecodeEvent::Frame {
                 bytes: json.as_bytes().to_vec(),
                 sentinel: false,
             })
             .await
-            .expect("a reply");
-        String::from_utf8(reply).unwrap()
+            .map(|reply| String::from_utf8(reply).unwrap())
+    }
+
+    async fn send(ctx: &Arc<Context>, json: &str) -> String {
+        send_opt(ctx, json).await.expect("a reply")
     }
 
     const DISABLED: &str = "{\"error\":{\"class\":\"CommandNotFound\",\"desc\":\"command guest-suspend-ram has been disabled\"}}\n";
@@ -182,12 +189,13 @@ mod tests {
             "[features]\nsuspend_ram = true\n",
             "freeze mem disk\n",
         );
-        let reply = send(&ctx, r#"{"execute":"guest-suspend-ram","id":4}"#).await;
+        let reply = send_opt(&ctx, r#"{"execute":"guest-suspend-ram","id":4}"#).await;
         assert_eq!(
-            reply, "{\"return\":{},\"id\":4}\n",
-            "OQ-2: a success reply after resume"
+            reply, None,
+            "no success reply after resume (success-response: false, OQ-2)"
         );
         assert_eq!(*suspend.written.lock().unwrap(), ["mem"]);
+        assert_eq!(ctx.handler_calls(), 1, "the handler did run");
         // Arguments are rejected.
         let reply = send(
             &ctx,

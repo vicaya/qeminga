@@ -118,7 +118,7 @@ Only the commands in the following table are implemented. All other commands rec
 | `guest-fsfreeze-thaw` | host → guest | Drains `FITHAW` calls on all discovered freezable local filesystems; returns count of thawed FSes |
 | `guest-fstrim` | host → guest | Calls `FITRIM` ioctl to discard unused blocks (storage efficiency) |
 | `guest-shutdown` | host → guest | Initiates a shutdown. Accepts optional `mode` ∈ `{"halt", "powerdown", "reboot"}` (default `"powerdown"`). **Does not send a success reply** (`success-response: false` upstream); errors are still reported. Clients watch for VM exit. **Hard semantics:** the agent calls `sync(2)` and then `reboot(2)`, an immediate kernel action; no service is stopped and no filesystem is unmounted (upstream asks the service manager instead; see OQ-1 in `docs/tasks.md`). |
-| `guest-suspend-ram` | host → guest | Suspends guest to RAM (S3) — **opt-in, disabled by default** via `[features] suspend_ram = false` in `config.toml` |
+| `guest-suspend-ram` | host → guest | Suspends guest to RAM (S3) — **opt-in, disabled by default** via `[features] suspend_ram = false` in `config.toml`. **Does not send a success reply** (`success-response: false` upstream; the host watches the QMP `SUSPEND`/`WAKEUP` events); errors are still reported. |
 
 ### 3.1 `guest-info` Capability Contract
 
@@ -126,7 +126,7 @@ Only the commands in the following table are implemented. All other commands rec
 
 Every command in §3 appears exactly once. `guest-suspend-ram` remains listed with `"enabled": false` when its Cargo feature is absent or its runtime setting is off; `guest-fstrim` similarly remains listed when disabled at runtime. The remaining implemented commands report `"enabled": true` in normal operation. A temporary `Frozen` state does not change these advertised capabilities; it is enforced by the lifecycle gate in §5.3.
 
-`guest-shutdown` is the sole listed command with `"success-response": false`; every other listed command has `"success-response": true`. Denied commands do not appear in `supported_commands`.
+`guest-shutdown` and `guest-suspend-ram` are the listed commands with `"success-response": false` (as upstream declares them; OQ-2); every other listed command has `"success-response": true`. Denied commands do not appear in `supported_commands`.
 
 ---
 
@@ -595,4 +595,4 @@ qeminga is a deliberately constrained replacement for the general-purpose upstre
 | AC16 | Against real libvirt, `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh domshutdown --mode agent` succeed. |
 | AC17 | Freeze succeeds with tmpfs and bind mounts present and can open a mode-0700 local mountpoint; unsupported or duplicate mounts do not turn the operation into a hard failure, and an `EBUSY` mount does not inflate qeminga's freeze count. |
 | AC18 | Channel EOF/reopen during a freeze preserves the recovery marker and frozen state; after reconnection, a thaw request completes successfully. |
-| AC19 | `guest-info` returns `version` and `supported_commands` with `name`, `enabled`, and `success-response`; disabled optional commands remain listed as disabled, `guest-shutdown` reports `success-response: false`, and denied commands are absent. |
+| AC19 | `guest-info` returns `version` and `supported_commands` with `name`, `enabled`, and `success-response`; disabled optional commands remain listed as disabled, `guest-shutdown` and `guest-suspend-ram` report `success-response: false`, and denied commands are absent. |

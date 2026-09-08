@@ -11,7 +11,11 @@
 //! or daemon may be gone (an uninterruptible `statfs` on a hard-mounted
 //! share would block every later command), and `statfs(2)` on an autofs
 //! trigger would mount it; those entries are listed without sizes. The
-//! whole walk is also bounded by [`FSINFO_TIMEOUT`].
+//! whole walk is also bounded by [`FSINFO_TIMEOUT`], and since a walk
+//! that outlives its request cannot be cancelled (a started blocking
+//! task runs to completion), the number of walks alive at once is bounded
+//! by [`MAX_FSINFO_WALKS`] independently of the requests: past it the
+//! command is refused at once rather than adding another stuck thread.
 #![forbid(unsafe_code)]
 
 use std::path::Path;
@@ -97,6 +101,11 @@ pub struct FilesystemInfo {
 /// than holding the session (the blocking thread is abandoned).
 pub const FSINFO_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on the walks alive at once, whatever became of the requests that
+/// started them: a request past it is refused at once instead of adding a
+/// blocking thread to the ones earlier, abandoned walks still hold.
+pub const MAX_FSINFO_WALKS: usize = 2;
+
 /// Filesystem types whose `statfs` may block indefinitely (network
 /// shares, FUSE daemons) or have side effects (autofs triggers). Their
 /// entries are reported without sizes.
@@ -145,9 +154,21 @@ pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<Filesyst
 /// finish in time fails the command and the session moves on.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
+    // The slot is taken before the walk is spawned and belongs to the walk
+    // afterwards: a request that gives up leaves its walk holding the
+    // slot until the closure returns, so abandoned walks never pile up on
+    // the blocking pool that freeze and thaw need (`MAX_FSINFO_WALKS`).
+    let slot = Arc::clone(&ctx.fsinfo_walks)
+        .try_acquire_owned()
+        .map_err(|_| {
+            Error::Internal(format!(
+                "fsinfo: {MAX_FSINFO_WALKS} earlier walks are still running; retry later"
+            ))
+        })?;
     let mounts: Arc<dyn MountSource> = Arc::clone(&ctx.mounts);
     let statfs: Arc<dyn StatfsSource> = Arc::clone(&ctx.statfs);
     let walk = tokio::task::spawn_blocking(move || {
+        let _walk = slot;
         let entries = mounts.mounts()?;
         Ok::<_, Error>(fs_info(&entries, statfs.as_ref()))
     });
@@ -385,6 +406,83 @@ mod tests {
         let err = task.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("did not complete"), "{err}");
         drop(tx);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn abandoned_walks_are_bounded_independently_of_request_timeouts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Every walk blocks in its first `statfs` until the test releases
+        // the gate (a hard-mounted share whose server is gone).
+        struct Gate {
+            released: std::sync::Mutex<bool>,
+            cv: std::sync::Condvar,
+            walks: AtomicUsize,
+        }
+        impl StatfsSource for Gate {
+            fn statfs(&self, _: &Path) -> Result<Statfs, Error> {
+                let mut released = self.released.lock().unwrap();
+                if !*released {
+                    self.walks.fetch_add(1, Ordering::SeqCst);
+                }
+                while !*released {
+                    released = self.cv.wait(released).unwrap();
+                }
+                Err(Error::Internal("EIO".into()))
+            }
+        }
+        let gate = Arc::new(Gate {
+            released: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+            walks: AtomicUsize::new(0),
+        });
+        let ctx = Arc::new(
+            Context::for_tests()
+                .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+                .with_statfs(gate.clone()),
+        );
+        let req = crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+        // The first MAX_FSINFO_WALKS requests each time out and abandon a
+        // stuck walk (the clock is moved by hand, as above).
+        for _ in 0..MAX_FSINFO_WALKS {
+            let task = tokio::spawn({
+                let ctx = Arc::clone(&ctx);
+                let req =
+                    crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+                async move { handle(&ctx, &req).await }
+            });
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(FSINFO_TIMEOUT + Duration::from_secs(1)).await;
+            let err = task.await.unwrap().unwrap_err();
+            assert!(err.to_string().contains("did not complete"), "{err}");
+        }
+        // The bound is on the walks, not on the waits: the next request is
+        // refused before any blocking task is spawned, so the abandoned
+        // walks never outnumber the bound however many requests time out.
+        let err = handle(&ctx, &req).await.unwrap_err();
+        assert!(err.to_string().contains("still running"), "{err}");
+        assert!(gate.walks.load(Ordering::SeqCst) <= MAX_FSINFO_WALKS);
+        // Releasing the walks frees their slots: the permit is owned by
+        // the walk (dropped when its closure returns), never by the
+        // request that gave up on it.
+        *gate.released.lock().unwrap() = true;
+        gate.cv.notify_all();
+        let mut result = handle(&ctx, &req).await;
+        for _ in 0..2000 {
+            if result.is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            tokio::task::yield_now().await;
+            result = handle(&ctx, &req).await;
+        }
+        let list = result.unwrap();
+        assert_eq!(
+            list.as_array().unwrap().len(),
+            5,
+            "sizes omitted, entries listed"
+        );
     }
 
     #[test]

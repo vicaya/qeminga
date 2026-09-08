@@ -104,6 +104,10 @@ pub struct Context {
     pub mounts: Arc<dyn crate::mountinfo::MountSource>,
     /// Source of filesystem sizes (`guest-get-fsinfo`).
     pub statfs: Arc<dyn handlers::fsinfo::StatfsSource>,
+    /// Slots for live `guest-get-fsinfo` walks
+    /// ([`MAX_FSINFO_WALKS`](handlers::fsinfo::MAX_FSINFO_WALKS)); a slot is
+    /// held by the walk itself until it returns, not by its request.
+    pub fsinfo_walks: Arc<tokio::sync::Semaphore>,
     handler_calls: AtomicU64,
 }
 
@@ -128,6 +132,9 @@ impl Context {
             interfaces: Arc::new(handlers::interfaces::SystemInterfaces),
             mounts: Arc::new(crate::mountinfo::ProcMounts),
             statfs: Arc::new(handlers::fsinfo::SystemStatfs),
+            fsinfo_walks: Arc::new(tokio::sync::Semaphore::new(
+                handlers::fsinfo::MAX_FSINFO_WALKS,
+            )),
             handler_calls: AtomicU64::new(0),
         }
     }

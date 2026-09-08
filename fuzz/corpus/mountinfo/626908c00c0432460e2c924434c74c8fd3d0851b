@@ -1,0 +1,5 @@
+27 1 8:1 / / rwv/sda1 rw,relatime shared:1 - ext4 /dev/sda1 rw
+50 27 8:5 / /mnt/with\040space rw,relatime shared:7 - ext4 /dev/sda5 rw
+51 27 8:6 / /mnt/tab\011here rw,relatime shared:8 - xfs /dev/sda6 rw
+52 27 8:7 /sub\040dir /mnt/back\134slash rw,relatime shared:9 - ext4 /dev/disk/by-label/my\040label rw
+53 27 8:8 / /mnt/nl\012insid /dev/sda8 rw

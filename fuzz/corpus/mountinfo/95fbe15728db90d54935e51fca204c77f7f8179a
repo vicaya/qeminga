@@ -1,0 +1,3 @@
+27  exóóóóemount-ro
+40 27 8:1 /srv/www /var/www rw,relatime - ext4 - eı
+80 27 8:1 /srv/www ar/wtime shared:1 - ext4 - eıxt6 /devabe rw,attr1,inode64

@@ -1,0 +1,2 @@
+[rate_limits]
+fstrim_per_min = 0

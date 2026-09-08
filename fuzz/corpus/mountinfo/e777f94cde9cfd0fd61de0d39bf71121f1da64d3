@@ -1,0 +1,8 @@
+27 1 8:1 rsount-ro
+41 27 - xfs /dev/sdb1 rw,attr2,inode64
+43=remount-ro
+40 27 8:1 /sr40 27 8:1 /srv/www /var/www ©ªªªªªª
+rw,relatime shared:1 - ext4 /dev/sda1 rw,ero=remrrsount-ro
+41 27 - xfs /dev/sdb1 rw,attr2ode64
+43 27 8:2 /exp@rtsnt-ro
+41 27 - xfs /dev/sdbsharev/sdb1 rw,attr2,inode64

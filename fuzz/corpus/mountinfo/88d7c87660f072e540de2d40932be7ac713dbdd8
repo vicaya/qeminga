@@ -1,0 +1,4 @@
+21 27 0:19 / /proc rw,noc,relatime shared:12 - proc proc rw
+22 27 0:20 / /sys rw,nosuid,nodev,noexec,ÿ	latime shared:2 - sysfs rw
+23 27 0:5 / /dev rw,nosuid,relatime sre 1d:xe- t4 /dev/sda1 rw,errors=remount-ro
+30 27 8:2 / /home rw,relatime shared:3 - xfs /dev/sda2 rw,attr2,inode64

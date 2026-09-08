@@ -1,0 +1,4 @@
+21 27 0:19 / /proc rw,8:1 / /r heis:dera1m2 - proc proc rw
+22 2w
+50 27 8:5 /0space rw,relatime shared:7 - ext5 /dea5 rw
+51 27 8:6 / /mlatime shared:10 - ext3 e64

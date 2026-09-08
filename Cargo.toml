@@ -11,6 +11,11 @@ keywords = ["qemu", "guest-agent", "virtualization", "fsfreeze", "security"]
 categories = ["command-line-utilities", "os::linux-apis", "virtualization"]
 publish = false
 
+# The fuzz crate (T5.1) is built by cargo-fuzz on nightly, never as part
+# of the workspace.
+[workspace]
+exclude = ["fuzz"]
+
 [lib]
 name = "qeminga"
 path = "src/lib.rs"
@@ -24,7 +29,18 @@ default = []
 # Compile-time half of the two-level feature switch (design §8.1).
 # The runtime half lives in `[features]` of config.toml.
 seccomp = ["dep:seccompiler"]
+# Compatibility builds (design §5.5, C-17): same profile, but an unlisted
+# syscall is logged instead of killing the process. Effective in debug
+# builds only (`seccomp::log_mode`), so a release built with
+# `--all-features` still enforces.
+seccomp-log = ["seccomp"]
 suspend_ram = []
+# End-to-end test support (T4.7): lets the real binary swap `LinuxKernel`
+# for the scripted fake when QEMINGA_TEST_FAKE_KERNEL is set, so the
+# unprivileged E2E suite can observe `guest-shutdown` silence. Never enable
+# it in a release build (build releases with `--features seccomp`, not
+# `--all-features`).
+test-fakes = []
 
 [dependencies]
 # Async runtime (design §7): multi-threaded, hosts the freeze watchdog and
@@ -37,14 +53,21 @@ thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"] }
 governor = "0.10"
+# Audit digest of over-long method names (design §5.2, C-4).
+sha2 = "0.10"
 nix = { version = "0.31", features = ["fs", "ioctl", "user", "reboot", "net", "feature", "process", "signal", "poll"] }
 caps = "0.5"
-seccompiler = { version = "0.5", optional = true }
+# The JSON front-end resolves syscall names for every supported target on
+# any host, so both profiles are built and tested in one place.
+seccompiler = { version = "0.5", optional = true, features = ["json"] }
 
 [dev-dependencies]
 proptest = "1.11"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["test-util"] }
+# Tests drive the channel through a pseudo-terminal (C-15) and lower
+# `RLIMIT_NOFILE` in a child process; production needs neither API.
+nix = { version = "0.31", features = ["resource", "term"] }
 
 [profile.release]
 # Design §5.7: never unwind from an indeterminate state; let the service

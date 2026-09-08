@@ -1,0 +1,61 @@
+# Design §5.2 / AC14: the frame decoder, the bounds scanner and the two
+# text parsers are fuzzed with libFuzzer. Pull requests get 60 s per
+# target; the weekly job runs each target for one hour.
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "src/framing.rs"
+      - "src/proto.rs"
+      - "src/proto/**"
+      - "src/mountinfo.rs"
+      - "src/freeze_plan.rs"
+      - "src/handlers/osinfo.rs"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "43 3 * * 0" # Sundays 03:43 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [frame_decoder, bounds_checker, mountinfo, os_release]
+    # cargo-fuzz needs -Z flags, so every cargo invocation in this job must
+    # use nightly. rust-toolchain.toml pins stable and overrides `rustup
+    # default`, hence the environment variable rather than a default.
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal && rustup show active-toolchain
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Choose duration
+        id: duration
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then echo "secs=3600" >> "$GITHUB_OUTPUT"; else echo "secs=60" >> "$GITHUB_OUTPUT"; fi
+      # The prebuilt cargo-fuzz binary is statically linked against musl and
+      # defaults --target to its own build triple, so name the host triple.
+      - name: Fuzz
+        run: cargo fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -max_total_time=${{ steps.duration.outputs.secs }} -max_len=131072
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts
+          if-no-files-found: ignore

@@ -1,0 +1,51 @@
+# cargo-mutants configuration (T5.6, AC8 test quality, design §5.2).
+#
+# The interesting mutants are in the gate and errno-policy code: the frame
+# decoder, the protocol types, the state machine, the dispatcher gates, and
+# the freeze/thaw algorithm. Run locally with:
+#
+#   cargo install cargo-mutants
+#   cargo mutants --all-features
+#
+# The CI job (mutants in ci.yml) fails on any surviving mutant in these
+# files (it reads mutants.out/missed.txt: the exit status reports timeouts
+# ahead of misses). A timeout counts as a detection, and the job runs the
+# test binaries under a memory cap (scripts/ci/bounded-test.sh) so a mutant
+# that allocates without bound cannot take the runner down.
+examine_globs = [
+    "src/framing.rs",
+    "src/proto.rs",
+    "src/proto/bounds.rs",
+    "src/state.rs",
+    "src/dispatch.rs",
+    "src/dispatch/ratelimit.rs",
+    "src/handlers/fsfreeze.rs",
+    # Lifecycle coordination: the timer loop's deadline/heartbeat order.
+    "src/watchdog.rs",
+]
+# Not examined: src/audit.rs (about 140 mutants, most in formatting and
+# the ring's bookkeeping) would double the job; its lifecycle half (ring
+# entry and flush) is exercised through the fsfreeze hooks above.
+# Test doubles and the privileged/E2E plumbing are not worth mutating.
+exclude_globs = [
+    "src/kernel/fake.rs",
+]
+# Mutants that only change log text or Debug output are noise.
+# (cargo-mutants names a mutant like "replace <impl std::fmt::Debug for
+# Context>::fmt -> std::fmt::Result with Ok(Default::default())".)
+exclude_re = [
+    "Debug for",
+    "Display for",
+    "::fmt ",
+    "::expecting ",
+]
+# The workflow sets RUSTFLAGS="-D warnings"; a mutant that merely warns
+# (an unused variable, unreachable code) must still build, or it is
+# silently skipped as "unviable" instead of being tested.
+cap_lints = true
+# Each mutant runs the unit tests only; the E2E and privileged suites are
+# slow and covered by their own jobs.
+test_tool = "cargo"
+additional_cargo_test_args = ["--lib", "--locked"]
+timeout_multiplier = 3.0
+minimum_test_timeout = 60.0

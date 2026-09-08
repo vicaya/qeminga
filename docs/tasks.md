@@ -49,7 +49,7 @@ Status values: `todo` · `in-progress (who)` · `blocked (why)` · `done`.
   `OsInfoSource`, …) with a fake implementation used by tests.
 - Tests that need root or capabilities are `#[ignore]`d, named with the
   prefix `privileged_`, and run by the privileged CI job (T5.2) via
-  `sudo -E cargo test --all-features -- --ignored privileged_`.
+  `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`).
 - Time-dependent async code is tested with `#[tokio::test(start_paused = true)]`
   and `tokio::time::advance`.
 - Parsers and decoders get a `proptest` property test in addition to examples.
@@ -75,7 +75,7 @@ graph LR
 | 2 | T2.1–T2.5 | read-only (`/proc`, `/etc`, netlink) | all `∥` |
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
-| 5 | T5.1–T5.6 | CI runners with `sudo` | mostly `∥` |
+| 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
 
 ---
 
@@ -89,7 +89,7 @@ disagree, raise it as an open question rather than diverging.
 |---|---|
 | C-1 | **Wire format is QMP/QGA style, not JSON-RPC 2.0.** Requests are `{"execute": "<name>", "arguments": {...}?, "id": <int>?}`; success replies are `{"return": <value>}`; errors are `{"error": {"class": "...", "desc": "..."}}`. The design says "JSON-RPC" loosely; §3's error shape, §3.1's `GuestAgentInfo`, and AC16 (real libvirt) require the QGA format. |
 | C-2 | Only QAPI error classes are used: `CommandNotFound` for non-allowlisted **and** runtime-disabled commands (`desc` `"command <name> has been disabled"` for the latter, matching upstream), `GenericError` for everything else including rate limiting (`desc` `"rate limit exceeded for <class>"`) and the frozen gate (`desc` exactly `"filesystems are frozen; retry after thaw"`). |
-| C-3 | `id` is optional. When present it must be a JSON integer that fits `i64` (design §9) and is echoed verbatim in the reply; any other `id` value yields `GenericError`. Requests must be JSON objects; unknown top-level keys and unknown `arguments` keys are rejected (`serde(deny_unknown_fields)`). |
+| C-3 | `id` is optional. When present it must be a JSON integer that fits `i64` (design §9) and is echoed verbatim in the reply; any other `id` value, an explicit `null` included, yields `GenericError`; likewise `"arguments": null` is rejected rather than read as absent (absent means the key is not sent). Requests must be JSON objects; unknown top-level keys and unknown `arguments` keys are rejected (`serde(deny_unknown_fields)`). |
 | C-4 | Dependency versions in design §7 were current at design time. The manifest uses the latest compatible releases (`nix` 0.31, `thiserror` 2, `governor` 0.10, `seccompiler` 0.5) plus `toml` 1.x for configuration and `sha2` (added by T1.4) for the audit digest. T5.5 refreshes §7. |
 | C-5 | Response field names follow the upstream QAPI schema so libvirt parses them: `GuestOSInfo` (`kernel-release`, `kernel-version`, `machine`, `id`, `name`, `pretty-name`, `version`, `version-id`, `variant`, `variant-id`), `GuestNetworkInterface` (`name`, `hardware-address`, `ip-addresses[{ip-address, ip-address-type, prefix}]`), `GuestFilesystemInfo` (`name`, `mountpoint`, `type`, `used-bytes`, `total-bytes`, `disk: []`), `GuestFilesystemTrimResponse` (`paths[{path, trimmed?, minimum?, error?}]`). |
 | C-6 | "Mutex-guarded singleton" (§6, `state.rs`) means one `Arc<FreezeStateMachine>` created in `main` and handed to everything that needs it; there is no global static, so tests can create their own. |
@@ -106,8 +106,8 @@ disagree, raise it as an open question rather than diverging.
 | C-17 | "Compatibility builds" for seccomp (§5.5) are a Cargo feature `seccomp-log` (implies `seccomp`) that switches the default action from kill-process to log. It is never used in release builds. |
 | C-18 | If the process is not started as root, `main` skips the capability drop and logs a warning that freeze/trim/shutdown will fail with `EPERM`. This is what makes the unprivileged end-to-end tests (T4.7) possible without changing production behaviour. |
 | C-19 | Shared parsers that two handlers need (`/proc/self/mountinfo`) live in a new leaf module `src/mountinfo.rs`; the §6 module list is a minimum, not a maximum. |
-| C-20 | The recovery marker's directory must survive service stops: the unit sets `RuntimeDirectoryPreserve=yes` (otherwise systemd deletes `/run/qeminga` on stop and defeats §5.7). |
-| C-21 | A `SIGTERM`/`SIGINT` received while not `Thawed` is always deferred: the agent keeps serving the frozen-safe set and exits after the thaw completes. Whether that deferral finishes before systemd escalates to `SIGKILL` is a packaging property (`TimeoutStopSec`, §8.4), not a runtime decision. |
+| C-20 | The recovery marker's directory must survive service stops and belong to the service account: `/run/qeminga` is provisioned by `tmpfiles.d/qeminga.conf` at boot and by the unit's privileged `ExecStartPre` lines before every start, and nothing removes it on stop. `RuntimeDirectory=` is deliberately not used: with no `User=` systemd re-applies root ownership before every `ExecStart`, which undid the hand-over and left the dropped daemon unable to create or remove its marker (found by the installed-unit tests). |
+| C-21 | A `SIGTERM`/`SIGINT` received while not `Thawed` is always deferred: the agent keeps serving the frozen-safe set and exits after the thaw completes. Whether that deferral finishes before systemd escalates to `SIGKILL` is a packaging property (`TimeoutStopSec`, §8.4), not a runtime decision. The rule protects the command, not the delivery of its reply: a stop that is allowed (`Thawed`) ends the session even while a reply is still being written to a host that has stopped reading; the partial frame is abandoned with the session and no other reply is ever appended to it. A terminal channel error (`EBUSY` on a reopen, §8.4) is not a stop request but obeys the same exit rule: serving ends, the process exits once `Thawed`, and the watchdog is what bounds the wait. |
 
 ## 4. Open questions (need the design owner)
 
@@ -117,10 +117,14 @@ the answer is a one-line change, and leave the question here.
 
 | Id | Question | Affects | Interim behaviour |
 |---|---|---|---|
-| OQ-1 | `reboot(2)` with `LINUX_REBOOT_CMD_POWER_OFF`/`RESTART`/`HALT` is an immediate kernel action, not the "graceful"/"clean" shutdown G1 and §3 describe: no units are stopped and no filesystems are unmounted. A graceful path under systemd is `kill(1, SIGRTMIN+4/+5/+3)`, which needs `CAP_KILL` (changing AC3) and `kill` in the seccomp profile, or a D-Bus call (much larger syscall surface). | T4.2, T4.4, T4.5, AC3 | Implement §4.1/§5.4 as written (`sync` + `reboot(2)`) behind `KernelOps::reboot`. |
-| OQ-2 | Upstream declares `guest-suspend-ram` with `success-response: false`; design §3.1 says `guest-shutdown` is the *sole* such command. A reply sent after resume is unexpected by libvirt (it waits for the QMP `SUSPEND` event instead). | T2.2, T4.3, AC19 | Follow the design (`success-response: true`, reply `{}`) until answered. |
-| OQ-3 | What counts as an "unrecoverable thaw failure" (§4.2 `Thawing → Frozen`)? `FITHAW` returning `EINVAL` is the normal end of a drain. | T3.4 | Treat a failure to remove the marker, or a **first** `FITHAW` on a planned mountpoint failing with `EPERM`/`EACCES`, as unrecoverable; everything else ends the drain for that mountpoint only. |
+| OQ-1 | `reboot(2)` with `LINUX_REBOOT_CMD_POWER_OFF`/`RESTART`/`HALT` is an immediate kernel action, not the "graceful"/"clean" shutdown G1 and §3 described: no units are stopped and no filesystems are unmounted. A graceful path under systemd is `kill(1, SIGRTMIN+4/+5/+3)`, which needs `CAP_KILL` (changing AC3) and `kill` in the seccomp profile, or a D-Bus call (much larger syscall surface). **Release decision pending:** the current behaviour is the hard semantics, documented as such in §3, the handler and the README; a service-manager shutdown is a design change (capability set, seccomp profile) that must not be implied by the release notes. | T4.2, T4.4, T4.5, AC3 | Implement §4.1/§5.4 as written (`sync` + `reboot(2)`) behind `KernelOps::reboot`; describe it as a hard shutdown, never as graceful. |
+| OQ-2 | Upstream declares `guest-suspend-ram` with `success-response: false`; design §3.1 said `guest-shutdown` is the *sole* such command. A reply sent after resume is unexpected by libvirt (it waits for the QMP `SUSPEND` event instead). **Resolved (review):** follow upstream. `guest-suspend-ram` is advertised with `success-response: false` and a successful suspend sends no reply; errors are still reported. §3 and §3.1 updated. | T2.2, T4.3, AC19 | Follow upstream (`success-response: false`, no reply on success). |
+| OQ-3 | What counts as an "unrecoverable thaw failure" (§4.2 `Thawing → Frozen`)? `FITHAW` returning `EINVAL` is the normal end of a drain. | T3.4 | **Resolved (review, tightened):** a drain of one target is complete only when the kernel's answer is a documented end, `EINVAL` (the filesystem is not frozen) or `EOPNOTSUPP`/`ENOTTY` (it cannot freeze at all). Everything else leaves the target possibly frozen and is unrecoverable: a denied `FITHAW` (first or later), a mountpoint that cannot be opened (no `FITHAW` issued, reported apart as `KernelError::Open`), any other errno (Linux keeps a filesystem frozen when its unfreeze fails), a drain that never converges, or a marker that cannot be removed. Later targets are still drained after such a failure (everything that can be thawed is thawed, then the first failure is reported with the marker and the frozen gate retained), and the rollback of a failed freeze applies the same rule. `Thawing → Frozen` applies only to a thaw claimed from `Frozen`; a failed recovery drain claimed from `Thawed` returns to `Thawed` and reports the error, since nothing was frozen by this agent. |
 | OQ-4 | The freeze-plan filesystem allowlist beyond ext4/XFS (§8.5 "eligible only when tested"). | T3.2 | `FREEZABLE_FS_TYPES = ["ext4", "xfs"]`; extending it requires a privileged test in T5.2 for that filesystem. |
+| OQ-5 | `guest-get-fsinfo` liveness vs. upstream parity: upstream calls `statfs(2)` on every mount, but on a hard-mounted NFS/CIFS share whose server is gone the call blocks in D state and the sequential session loop would never answer another command; `statfs` also resolves through autofs triggers. | T2.5 | Skip `statfs` for network, FUSE and autofs types (entries listed without `used-bytes`/`total-bytes`), bound the walk at 10 s and the walks alive at once at 2 (a timed-out walk keeps its slot until it returns); revisit if a consumer needs sizes for those types. |
+| OQ-6 | `/sys/power/state` is `0644 root:root`, and after the §5.4 drop the process is uid 600 with only `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and `CAP_DAC_READ_SEARCH`, none of which bypasses a write check: with the feature built in and `[features] suspend_ram = true`, the write fails with `EACCES` and every `guest-suspend-ram` answers `GenericError`. Which mechanism should grant the service account write access (a tmpfiles.d rule, a udev rule, or is the feature root-only)? | T4.3, T5.2, T5.3 | Ship `packaging/tmpfiles.d/qeminga-suspend.conf` (`z /sys/power/state 0664 root qeminga -`), to be installed only when the operator enables the feature; a privileged test applies it and checks the account can open the file for writing. Not installed by default: the default configuration has the command disabled, and a compromised handler must not be able to suspend the guest. |
+| OQ-7 | C-14 says recovery mode arms the watchdog "immediately", but `main` opened the channel before the runtime existed and retried a non-`EBUSY` open failure (device missing) with a blocking sleep, so `start_recovery` ran only once the channel was open: filesystems left frozen by a previous instance stayed frozen for as long as the port was missing. **Resolved (review):** the privileged open is a single attempt; a missing device is logged (`channel_open_deferred`) and left to the runtime's reopen loop, which runs after the drop (the udev rule gives the service account the port), so the drop, the seccomp filter and the recovery watchdog never wait for the channel. §5.4 step 1 and §5.7 updated. | T4.6 | One privileged open attempt, then drop, seccomp, runtime; recovery is armed before and independently of the channel. |
+| OQ-8 | The watchdog bounds the `Frozen` state only (§4.4 "Scope of the bound"): a freeze walk blocked inside `FIFREEZE` on one target (the kernel waits for writers and syncs; the call cannot be interrupted, and abandoning its `spawn_blocking` handle would let a late completion freeze another target) leaves the targets frozen earlier in the walk without an autonomous release until the call returns, and a blocked `FITHAW` does the same to a thaw. Should the coordinator publish each completed target during the walk, enforce an operation deadline independently of the blocked call, and once it expires stop scheduling further freezes, release the completed ones, retain the marker and absorb a late success? A deterministic test would freeze A, block B behind a barrier and advance past the maximum. | T3.4, T3.5, §4.4 | Implement §4.4 as written (arm on `Frozen`); the marker-driven restart recovery and the unit's `TimeoutStopSec` cover the case meanwhile, and the scope of the guarantee is stated in §4.4. |
 
 ---
 
@@ -153,7 +157,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 1 — Protocol core (pure Rust, no OS access)
 
 #### T1.1 — `proto`: QGA wire types and error model
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §4.3, §5.1 (error classes), §9 (`id`), C-1, C-2, C-3.
 - **Depends on:** T0.*
 - **Files:** `src/proto.rs`, `src/lib.rs` (`pub mod proto`), `tests/fixtures/qga/*.json`.
@@ -174,7 +178,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** fixtures round-trip; `cargo doc` has no missing-docs warnings for the module.
 
 #### T1.2 — `framing`: newline frame decoder/encoder with `0xFF` resync ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 Frame Decoder, §5.2 item 1, §3 (`guest-sync-delimited`), §5.7 (clean decoder after reconnect), AC4, AC14, C-10.
 - **Depends on:** T0.*
 - **Files:** `src/framing.rs`.
@@ -198,7 +202,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** property tests pass with `PROPTEST_CASES=2000`; this module is the first fuzz target (T5.1).
 
 #### T1.3 — `proto::bounds`: nesting-depth and string-length limits ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.2 items 2–3, AC14.
 - **Depends on:** T1.1
 - **Files:** `src/proto.rs` (submodule `bounds`) or `src/proto/bounds.rs`.
@@ -214,7 +218,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the scanner is a fuzz target in T5.1 alongside the decoder.
 
 #### T1.4 — `audit`: records, method projection, freeze-safe ring ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 Logging, §5.2 (method projection), §9, §9.1, G7, AC13 (in-process part).
 - **Depends on:** T0.*
 - **Files:** `src/audit.rs`, `Cargo.toml` (add `sha2`).
@@ -234,7 +238,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** T3.6 can drive the mode switch from the freeze lifecycle without touching this module's internals.
 
 #### T1.5 — `state`: freeze state machine ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.2 diagram, §4.4 (atomic claim of `Thawing`), C-6, C-7.
 - **Depends on:** T0.*
 - **Files:** `src/state.rs`.
@@ -251,14 +255,14 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the watchdog (T3.5) and the thaw handler (T3.4) can both call `claim_thaw` and rely on exactly one winning.
 
 #### T1.6 — `config`: TOML schema, defaults, validation ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §8.1, §8.2, D1, D2, D4, C-17.
 - **Depends on:** T0.*
 - **Files:** `src/config.rs`, `tests/fixtures/config/{default,minimal,invalid_*}.toml`.
 - **Tests first (red):**
   - `example_from_design_parses` — the exact TOML block in §8.2 round-trips.
   - `empty_file_yields_documented_defaults` — every default in §8.2 (`channel_path`, `log_level = info`, `state_path`, `30`, `300`, quotas `120/30/10/5/2`, `suspend_ram = false`, `fstrim = true`, `seccomp = true`).
-  - `unknown_key_is_an_error`, `unknown_log_level_is_an_error`, `config_version_other_than_1_is_an_error`, `relative_state_path_is_an_error`, `idle_timeout_zero_is_an_error`, `max_timeout_below_idle_is_an_error`, `zero_quota_is_an_error`.
+  - `unknown_key_is_an_error`, `unknown_log_level_is_an_error`, `config_version_other_than_1_is_an_error`, `relative_state_path_is_an_error`, `idle_timeout_zero_is_an_error`, `max_timeout_below_idle_is_an_error`, `timeouts_above_the_cap_are_an_error` (both freeze timeouts are capped at 86 400 s, `MAX_FSFREEZE_TIMEOUT_SECS`: the watchdog adds them to an `Instant`, which would overflow near `u64::MAX`), `zero_quota_is_an_error`.
   - `runtime_feature_without_compile_feature_is_a_warning_not_an_error` — `Config::warnings()` lists `seccomp` when `cfg!(feature = "seccomp")` is false, likewise `suspend_ram`.
   - `effective_flags_combine_both_layers` — `fstrim_enabled()`, `suspend_ram_enabled()`, `seccomp_enabled()`.
   - `load_reports_path_in_error`.
@@ -266,7 +270,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `main` can load `/etc/qeminga/config.toml` or a `--config` path and print validation errors with the offending key.
 
 #### T1.7 — `dispatch::ratelimit`: per-class token buckets ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.3 table and prose, AC5, C-9.
 - **Depends on:** T1.6
 - **Files:** `src/dispatch/ratelimit.rs` (or inside `src/dispatch.rs`).
@@ -281,7 +285,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the limiter is `Send + Sync` and cheap to call from the dispatcher on every request.
 
 #### T1.8 — `dispatch`: static allowlist, gates, and the `guest-ping` handler
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.1 (match arms only, no table), §5.3 (frozen-safe set, `GenericError` text), §4.3, §9 (audit on every request), AC1, AC9, C-2, C-7.
 - **Depends on:** T1.1, T1.2, T1.3, T1.4, T1.5, T1.6, T1.7
 - **Files:** `src/dispatch.rs` (or `src/dispatch/mod.rs`), `src/handlers/mod.rs`, `src/handlers/ping.rs`.
@@ -309,7 +313,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 2 — Read-only handlers
 
 #### T2.1 — `guest-sync` and `guest-sync-delimited` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, C-10.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/sync.rs` (add to `handlers/mod.rs`).
@@ -322,14 +326,14 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `tests/fixtures/qga/sync*.json` cover the cases.
 
 #### T2.2 — `guest-info` capability contract ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3.1, AC19, D1, D2, OQ-2.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/info.rs`.
 - **Tests first (red):**
   - `info_returns_version_and_supported_commands` — `version == qeminga::VERSION`; key spelled `supported_commands` (underscore).
   - `each_listed_command_appears_exactly_once`, `entries_have_name_enabled_success_response` (hyphenated `success-response`).
-  - `shutdown_is_the_only_success_response_false`.
+  - `shutdown_and_suspend_ram_are_the_only_success_response_false` (OQ-2, resolved: upstream contract).
   - `suspend_ram_listed_disabled_when_feature_absent_or_runtime_off` — cover the three combinations reachable in one build.
   - `fstrim_listed_disabled_when_runtime_off`.
   - `denied_commands_are_absent` — none of the §2.3 names appear.
@@ -338,7 +342,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** AC19 is fully covered by unit tests.
 
 #### T2.3 — `guest-get-osinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (field list, **no** `machine-id`), §5.5 (`uname`), C-5.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/osinfo.rs`, `tests/fixtures/os-release/{debian,fedora,quoted,escaped,empty}.txt`.
@@ -348,11 +352,11 @@ the answer is a one-line change, and leave the question here.
   - `missing_file_falls_back_to_usr_lib` then `missing_both_yields_kernel_fields_only`.
   - `output_uses_qapi_field_names` and `omits_absent_fields` (no `null`s).
   - `uname_fields_are_mapped` — `kernel-release` ← release, `kernel-version` ← version, `machine` ← machine.
-- **Implement (green):** `OsInfoSource` trait (`uname()`, `os_release()`), production impl via `nix::sys::utsname::uname` and file reads; pure `parse_os_release(&str) -> BTreeMap<String, String>`.
+- **Implement (green):** `OsInfoSource` trait (`uname()`, `os_release()`), production impl via `nix::sys::utsname::uname` and file reads; pure `parse_os_release(&str) -> BTreeMap<String, String>`. The file read is bounded (`OS_RELEASE_MAX_BYTES`, 64 KiB); per os-release(5) `/usr/lib/os-release` is tried only when `/etc/os-release` is *missing*, and any other failure (permissions, size, encoding) is logged (`os_release_unreadable`) and answered with the kernel fields only. Inside double quotes a backslash escapes only `$`, `` ` ``, `"` and `\` (shell rules).
 - **Done when:** a fixture-driven proptest shows the parser never panics on arbitrary text.
 
 #### T2.4 — `guest-network-get-interfaces` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (loopback and link-local filtered), G4, §5.5 (netlink syscalls), C-5.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/interfaces.rs`.
@@ -367,7 +371,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the seccomp profile task (T4.5) lists exactly the syscalls this handler needs, verified with `strace -f -c`.
 
 #### T2.5 — `mountinfo` parser and `guest-get-fsinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (`guest-get-fsinfo`), §4.2 (mount plan needs the same parser), C-5, C-19.
 - **Depends on:** T1.8
 - **Files:** `src/mountinfo.rs`, `src/handlers/fsinfo.rs`, `tests/fixtures/mountinfo/{simple,bind_mounts,nested,escaped_paths,tmpfs_and_nfs,btrfs_subvols}.txt`.
@@ -378,7 +382,7 @@ the answer is a one-line change, and leave the question here.
   - `fsinfo_reports_name_type_mountpoint_and_sizes` via a fake `Statfs` source; `used-bytes = (blocks - bfree) * bsize`, `total-bytes = blocks * bsize`.
   - `fsinfo_includes_pseudo_filesystems` (upstream lists everything mounted) and `disk_is_empty_array`.
   - `fsinfo_statfs_failure_omits_size_fields_not_the_entry`.
-- **Implement (green):** `MountEntry` struct, `parse_mountinfo(&str) -> Vec<MountEntry>`, `MountSource` trait (`read_mountinfo()`), `StatfsSource` trait; handler composes them.
+- **Implement (green):** `MountEntry` struct, `parse_mountinfo(&str) -> Vec<MountEntry>`, `MountSource` trait (`read_mountinfo()`), `StatfsSource` trait; handler composes them. `mount_point` and `root` are byte-exact `PathBuf`s (the kernel escapes every non-printable byte, and a non-UTF-8 name must reach `open(2)` unchanged; the wire `mountpoint` is converted lossily). The table read is bounded (`MOUNTINFO_MAX_BYTES`, 32 MiB). Liveness: `statfs` is not issued on network, FUSE and autofs types (`sizes_are_queried`; those entries are listed without sizes, a deviation from upstream, see OQ-5) and the whole walk is bounded by `FSINFO_TIMEOUT` (10 s), after which the command fails and the session moves on. A walk that outlives its request cannot be cancelled, so the walks alive at once are bounded too (`MAX_FSINFO_WALKS`, 2): the slot is owned by the blocking closure until it returns, not by the request, and a request past the bound is refused at once instead of adding another stuck thread to the pool freeze and thaw need (review follow-up; test `abandoned_walks_are_bounded_independently_of_request_timeouts`).
 - **Done when:** the parser is a fuzz target (T5.1) and is reused unchanged by T3.2.
 
 ---
@@ -386,7 +390,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 3 — Kernel shim, freeze plan, marker, freeze/thaw, watchdog
 
 #### T3.1 — `kernel`: the single `unsafe` module and `KernelOps` trait
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.6, §4.1 Kernel Interface, §6 (`kernel/{mod,ioctl,shutdown}.rs`), G8, §7 (`nix`).
 - **Depends on:** T0.2
 - **Files:** `src/kernel/mod.rs`, `src/kernel/ioctl.rs`, `src/kernel/shutdown.rs`, `src/kernel/fake.rs` (`#[cfg(any(test, feature = "test-fakes"))]` or under `src/kernel/mod.rs` behind `cfg(test)` plus a `pub mod testing` for integration tests).
@@ -397,30 +401,32 @@ the answer is a one-line change, and leave the question here.
   - `kernel_error_classifies_errno` — `is_not_supported()`, `is_busy()`, `is_permission()`.
   - `privileged_fifreeze_then_fithaw_on_loop_mounted_ext4` (`#[ignore]`, root; CI T5.2) — real ioctls succeed and `FITHAW` returns `EINVAL` once fully thawed.
   - `check_unsafe_script_passes_with_kernel_module_present` — run `scripts/check-unsafe.sh` from a test or keep it in CI only (CI is enough; do not shell out from unit tests).
+  - `open_mount_verifies_the_device_of_the_opened_directory`, `the_production_kernel_refuses_a_handle_it_did_not_open`, `fake_open_mount_is_scripted_per_path` — a pathname names whatever is mounted there *now*, so the ioctls take a handle (`Mount`) that `open_mount` opened and `fstat`-verified against the planned `(major, minor)`; a mount placed over the planned one is `KernelError::WrongFilesystem`, an open failure `KernelError::Open`, and neither errno ever reads as the filesystem's answer to an ioctl (review follow-up).
 - **Implement (green):**
-  - `pub trait KernelOps: Send + Sync { fn fifreeze(&self, mountpoint: &Path) -> Result<(), KernelError>; fn fithaw(...); fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<u64, KernelError>; fn sync(&self); fn reboot(&self, cmd: RebootCommand) -> Result<(), KernelError>; }` (`Ok(())` from `reboot` is only reachable through fakes).
+  - `pub trait KernelOps: Send + Sync { fn open_mount(&self, mountpoint: &Path, dev: (u32, u32)) -> Result<Mount, KernelError>; fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError>; fn fithaw(...); fn fitrim(&self, mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError>; fn sync(&self); fn reboot(&self, cmd: RebootCommand) -> Result<(), KernelError>; }` (`Ok(())` from `reboot` is only reachable through fakes). `Mount` holds the verified descriptor; the fake hands out unopened handles, which the production kernel refuses (`EBADF`).
   - `LinuxKernel` implementation: open the mountpoint with `O_RDONLY | O_DIRECTORY | O_CLOEXEC`, then `FIFREEZE`/`FITHAW` (`nix::ioctl_write_int_bad!`/`ioctl_none!` with request numbers `0xC0045877`/`0xC0045878`) and `FITRIM` (`ioctl_readwrite!` on `fstrim_range { start: 0, len: u64::MAX, minlen }`); `reboot` via `nix::sys::reboot::reboot`.
   - `#![allow(unsafe_code)]` only in `src/kernel/mod.rs`; every `unsafe` block carries a `// SAFETY:` comment; `#[cfg(target_os = "linux")]` on the module.
-  - `KernelError::Errno(nix::errno::Errno)` via `thiserror`.
+  - `KernelError::{Errno, Open, WrongFilesystem}` via `thiserror`; only `Errno` is an ioctl's answer (`is_ioctl_answer`), and `is_invalid`/`is_not_supported`/`is_busy` match nothing else.
 - **Done when:** `scripts/check-unsafe.sh` passes and clippy's `undocumented_unsafe_blocks` is clean.
 
 #### T3.2 — Freeze plan from `/proc/self/mountinfo` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.2 (plan rules, ordering), §8.2 (`state_path` validation), §8.5 (excluded mounts), AC17, OQ-4, C-12.
 - **Depends on:** T2.5
 - **Files:** `src/handlers/fsfreeze/plan.rs` (or `src/freeze_plan.rs`), reusing `tests/fixtures/mountinfo/*`.
 - **Tests first (red):**
   - `includes_only_freezable_local_device_backed_types` — ext4/xfs on `/dev/*` in; `tmpfs`, `proc`, `sysfs`, `cgroup2`, `nfs`, `cifs`, `fuse.*`, `overlay` out.
-  - `dedupes_bind_mounts_by_device_identity` — two mounts with the same `major:minor` keep the **first in mount order** only, regardless of `root`.
+  - `dedupes_bind_mounts_by_device_identity` — two mounts with the same `major:minor` keep the **first in mount order** as the target's name, regardless of `root`; the others stay as its `aliases`.
+  - `a_hidden_first_mount_keeps_its_accessible_alias` (fixture `hidden_mount.txt`) — a mount placed over a target's first pathname does not discard its bind alias, which is how the superblock is still reached; the freeze-list intersection matches aliases too (review follow-up).
   - `freeze_order_is_reverse_mount_order_and_thaw_order_is_forward` — nested `/`, `/home`, `/home/data`.
   - `freeze_list_intersection_ignores_unknown_paths` (C-12) and matches on the unescaped mountpoint string exactly.
-  - `state_path_on_tmpfs_is_not_covered`, `state_path_on_root_ext4_is_covered` — longest-prefix mount lookup.
+  - `state_path_on_tmpfs_is_not_covered`, `state_path_on_root_ext4_is_covered` — longest-prefix mount lookup (`covers`, messages only) and the device check (`covers_device`, what startup applies to the opened marker directory).
   - `empty_plan_is_valid` (VM with no eligible filesystems freezes zero, thaws zero).
-- **Implement (green):** `FreezePlan { targets: Vec<Target { mountpoint, dev, fs_type }> }`, `FreezePlan::build(&[MountEntry]) -> FreezePlan`, `freeze_order()`, `thaw_order()`, `restrict_to(&[String])`, `covers(&Path) -> bool`, constant `FREEZABLE_FS_TYPES`.
-- **Done when:** T4.6 uses `covers` to reject a freezable `state_path` at startup with a clear error.
+- **Implement (green):** `FreezePlan { targets: Vec<Target { mountpoint, aliases, dev, fs_type }> }`, `FreezePlan::build(&[MountEntry]) -> FreezePlan`, `freeze_order()`, `thaw_order()`, `restrict_to(&[String])`, `covers(&Path) -> bool`, `covers_device((u32, u32)) -> bool`, constant `FREEZABLE_FS_TYPES`.
+- **Done when:** T4.6 uses `covers_device` on the marker directory's device to reject a freezable `state_path` at startup with a clear error.
 
 #### T3.3 — Recovery marker ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.4 Recovery marker, §5.5 (`openat` `O_CREAT|O_EXCL`, `fsync`, `unlinkat`), §5.7, D5, AC10, C-20.
 - **Depends on:** T3.1 (only for the trait style; the marker itself needs no `unsafe`)
 - **Files:** `src/marker.rs` (new leaf module, C-19) or inside `src/handlers/fsfreeze/`.
@@ -430,11 +436,12 @@ the answer is a one-line change, and leave the question here.
   - `create_fails_if_parent_missing` — no `mkdir` is ever attempted (`ENOENT` surfaces; parent still absent).
   - `create_fsyncs_before_returning` — observable via a fake `Fs` trait if you introduce one, otherwise document and rely on the privileged strace check in T5.2.
   - `remove_unlinks_and_is_error_if_absent`, `exists_reports_presence`.
-- **Implement (green):** `Marker::new(path)`, `create()`, `remove()`, `exists()`, using `nix::fcntl::openat`, `nix::unistd::fsync`, `nix::unistd::unlinkat`; never `mkdirat`.
+  - `open_pins_the_parent_directory_and_reports_its_device`, `the_device_is_that_of_the_resolved_directory_not_of_the_pathname` (`..` and a symlinked parent), `marker_operations_follow_the_pinned_directory_not_the_pathname` (the directory renamed away and a symlink put in its place after `open`: create/exists/remove stay in the pinned directory) — review follow-up.
+- **Implement (green):** `Marker::open(path)` opens the directory of `path` once (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`, resolved as the kernel does) and records its device (`dev()`, what T4.6 checks against the plan); `create()`, `remove()`, `exists()` are `openat`/`unlinkat`/`fstatat` relative to that descriptor, plus `fsync`; never `mkdirat`.
 - **Done when:** T3.4 creates it before the first `FIFREEZE` and removes it only after a complete drain.
 
 #### T3.4 — `guest-fsfreeze-{freeze,freeze-list,thaw,status}`
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §4.2 (errno policy, rollback, drain semantics, non-idempotent thaw), §4.4 (blocking rules), AC2, AC9, AC10, AC17, OQ-3, C-12.
 - **Depends on:** T1.8, T3.1, T3.2, T3.3
 - **Files:** `src/handlers/fsfreeze.rs` (or `src/handlers/fsfreeze/mod.rs`).
@@ -443,22 +450,26 @@ the answer is a one-line change, and leave the question here.
   - `freeze_calls_fifreeze_in_reverse_mount_order_and_counts_successes`.
   - `freeze_creates_marker_before_first_fifreeze` (fake records marker creation order by checking `exists()` inside the first `fifreeze` call, or by an ordered event log shared between fake kernel and marker).
   - `freeze_without_marker_performs_no_ioctl` — marker creation failure → zero `Fifreeze` calls, state back to `Thawed`, `GenericError`.
-  - `eopnotsupp_is_skipped_not_counted_and_not_thawed_later`.
+  - `eopnotsupp_is_skipped_not_counted_and_not_rolled_back` (named `…_and_not_thawed_later` in the original contract: the thaw plan is rebuilt from the mount table, so a later thaw does re-issue `FITHAW` on an unsupported target, which merely fails; what must hold is that a rollback never touches it).
   - `ebusy_is_not_counted_but_is_retained_in_thaw_plan` (AC17).
   - `hard_error_rolls_back_processed_in_forward_order_and_reports_error` — `EIO` on the second target → `fithaw` drains on the first, marker removed only after drain, state `Thawed`, response `GenericError`.
   - `freeze_while_not_thawed_is_generic_error`.
   - `freeze_list_restricts_to_requested_mountpoints` and `freeze_list_with_unknown_paths_freezes_nothing_and_returns_0`.
   - `thaw_drains_each_mountpoint_until_error_and_counts_once` — fake thaw succeeds 3× on `/`, 1× on `/home`; result `2`; call log shows 4 + 2 `Fithaw`.
-  - `thaw_from_thawed_state_still_drains` (recovery drain).
-  - `thaw_removes_marker_only_after_all_drains`, `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (OQ-3 interim rule).
+  - `thaw_from_thawed_state_still_drains` (recovery drain), `recovery_drain_failure_returns_to_thawed` (OQ-3), `a_denied_thaw_still_drains_the_later_targets` (OQ-3), `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (the `frozen` hook fires again so the watchdog is re-armed, §4.4).
+  - `thaw_removes_marker_only_after_all_drains`, `thaw_keeps_marker_and_returns_frozen_on_unrecoverable_failure` (OQ-3: a denied `FITHAW`, any other errno such as `EIO`, or a mountpoint that cannot be opened all keep the marker and the frozen gate; `EINVAL`/`EOPNOTSUPP` complete the drain), `a_drain_is_complete_only_when_the_kernel_says_not_frozen_or_unsupported`, `rollback_with_an_uncertain_thaw_error_keeps_the_frozen_state_and_marker` (review follow-up).
+  - `rollback_drains_every_processed_target_even_after_a_denied_one` — the rollback, like the thaw drain, attempts every processed target and reports the first incomplete one afterwards, marker retained (review follow-up).
+  - `a_thaw_drains_through_the_handles_its_freeze_opened`, `handles_whose_drain_is_incomplete_are_held_for_the_next_thaw`, `a_recovery_thaw_reaches_a_hidden_superblock_through_an_alias`, `an_unreachable_planned_superblock_keeps_the_marker_and_the_frozen_gate`, `a_freeze_reaches_a_hidden_superblock_through_an_alias_and_rolls_back_through_handles`, `an_open_failure_at_freeze_is_a_hard_error_not_a_skip` — the ioctls go through descriptors verified against the planned device (T3.1): a freeze holds them in the `Context` until their drain completes, a thaw or rollback drains through them without consulting a pathname, recovery falls back to the aliases (T3.2), a superblock none of whose mountpoints opens on it is reported unreachable with the marker and the frozen gate retained, and an error from before an ioctl (`Open`, `WrongFilesystem`) never reads as the filesystem's answer, on the freeze side as on the thaw side (review follow-up).
+  - `thaw_drains_held_mounts_when_mountinfo_read_fails`, `an_incomplete_held_drain_is_reported_before_the_read_failure`, `a_recovery_thaw_that_cannot_read_the_mount_table_stays_frozen`, `a_thaw_under_descriptor_pressure_drains_its_held_targets` (a child process under a small `RLIMIT_NOFILE`, the real `/proc/self/mountinfo` reader failing with `EMFILE`) — discovery and drain are separate: the handles the freeze holds are drained and released even when the mount table cannot be read, then the read failure is reported with the marker and the frozen gate retained (review follow-up).
+  - `thawed_is_published_only_after_the_finalisation_hook` — `on_thawed` runs in `Thawing`/`Freezing`, before `Thawed` is published, so a lifecycle completion (the audit flush) can never overlap the setup of a newer freeze window (review follow-up; the hook contract is in the `FreezeHooks` docs).
   - `thaw_cancels_watchdog_and_flushes_audit` (hooks are trait callbacks in `Context`; assert they fired in order).
   - `drain_has_a_defensive_upper_bound` — a fake that never fails stops after `MAX_THAW_ITERATIONS` (e.g. 1024) with a logged warning.
   - `privileged_freeze_thaw_cycle_on_ext4_and_xfs` (`#[ignore]`, T5.2; AC2).
-- **Implement (green):** algorithm as in §4.2; ioctls via `tokio::task::spawn_blocking` on the `Arc<dyn KernelOps>`; the async part never holds the state mutex across an `await`; the freeze result is the number of successful `FIFREEZE` calls only.
+- **Implement (green):** algorithm as in §4.2; ioctls via `tokio::task::spawn_blocking` on the `Arc<dyn KernelOps>`, each on a `Mount` handle from `open_mount` (first mountpoint of the target that opens on its device); the freeze's handles are held in `Context::frozen_mounts` and taken by the next thaw; the async part never holds the state mutex across an `await`; the freeze result is the number of successful `FIFREEZE` calls only.
 - **Done when:** the state diagram's every edge is exercised by at least one test.
 
 #### T3.5 — Freeze watchdog
-- **Status:** todo
+- **Status:** done (the bound covers the `Frozen` state, not a walk blocked inside an ioctl: OQ-8)
 - **Design:** §4.4 (arming, refreshing, hard cap, cancellation and races, blocking requirement), AC11, C-14.
 - **Depends on:** T1.5, T3.4
 - **Files:** `src/watchdog.rs`.
@@ -470,11 +481,13 @@ the answer is a one-line change, and leave the question here.
   - `manual_thaw_and_deadline_race_produce_exactly_one_drain` — trigger both at the same instant; exactly one `claim_thaw` wins; the loser exits quietly.
   - `watchdog_handle_is_dropped_safely_after_thaw` — no panic, no leaked task (use `tokio::task::JoinHandle::is_finished`).
   - `spawn_blocking_handles_are_not_treated_as_cancellable` — cancellation only affects the timer loop; an in-flight drain runs to completion.
-- **Implement (green):** `Watchdog::arm(cfg, state, thaw: Arc<dyn Fn(ThawToken) -> BoxFuture<()>>) -> WatchdogHandle { refresh(), cancel() }`; loop with `tokio::select!` over `sleep_until(min(idle_deadline, hard_deadline))`, a `watch`/`Notify` for refresh, and a cancellation token; on deadline win call `state.claim_thaw()` first, then hand the drain to `spawn_blocking` via the callback.
+  - `unrecoverable_thaw_failure_rearms_watchdog` — `Thawing → Frozen` (a failed thaw, manual or the watchdog's own) fires `on_frozen` again, so the watchdog is re-armed with idle/max measured from that moment (§4.4).
+  - `a_heartbeat_storm_cannot_defer_the_hard_cap` — a thread refreshes in a busy loop across the hard cap (real time, short cap); the thaw is claimed exactly once, at the cap. The select polls the deadlines ahead of the refresh branch (review follow-up).
+- **Implement (green):** `Watchdog::arm(cfg, state, thaw: Arc<dyn Fn(ThawToken) -> BoxFuture<()>>) -> WatchdogHandle { refresh(), cancel() }`; loop with a `biased` `tokio::select!` over the cancellation token, `sleep_until(hard_deadline)`, `sleep_until(idle_deadline)` and the refresh `Notify`, in that order; on deadline win call `state.claim_thaw()` first, then hand the drain to `spawn_blocking` via the callback.
 - **Done when:** `guest-fsfreeze-status` in T3.4 calls `refresh()` only while the state is `Frozen`.
 
 #### T3.6 — Audit ring lifecycle integration and recovery-mode logging
-- **Status:** todo
+- **Status:** done
 - **Design:** §9.1, §4.2 ("Before the first FIFREEZE, qeminga switches audit output to the freeze-safe ring"), §4.4 (recovery startup keeps the ring), AC13.
 - **Depends on:** T1.4, T3.4
 - **Files:** `src/handlers/fsfreeze.rs`, `src/audit.rs` (hooks only), `tests/audit_freeze_window.rs`.
@@ -485,11 +498,12 @@ the answer is a one-line change, and leave the question here.
   - `rollback_after_hard_error_also_flushes`.
   - `recovery_mode_startup_uses_ring_until_thaw` — construct the runtime pieces with a pre-existing marker; assert mode is `Ring` before and `Normal` after a thaw.
   - `background_flusher_runs_only_while_thawed` (if a background flusher is implemented; otherwise the thaw-triggered flush is the only path and this test asserts no task exists).
+  - `a_thaw_finalisation_cannot_touch_the_logging_of_a_newer_freeze` — the flush runs before `Thawed` is published (gated `LifecycleHooks`): a freeze arriving during the flush is refused, the ring is flushed exactly once, and the next freeze window keeps every record off the sink (review follow-up; the ordering itself is T3.4's hook contract).
 - **Implement (green):** wire `Router::enter_ring()` / `flush_to_normal()` into the freeze/thaw/rollback paths and into recovery-mode startup; keep it synchronous (no I/O) on the freeze side.
 - **Done when:** AC13's in-process half is covered; the journald half is covered by the privileged E2E in T5.2.
 
 #### T3.7 — `guest-fstrim` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §5.3 (5/min), D2, §8.1 (runtime-only switch), C-13.
 - **Depends on:** T1.8, T3.1, T3.2
 - **Files:** `src/handlers/fsfreeze.rs` (design places fstrim here) or `src/handlers/fstrim.rs`.
@@ -499,7 +513,9 @@ the answer is a one-line change, and leave the question here.
   - `per_path_error_is_reported_inline_not_as_command_failure` — `EOPNOTSUPP` on one target yields `{"path": ..., "error": "..."}` while others report `trimmed`.
   - `fstrim_disabled_at_runtime_is_command_not_found` (dispatcher-level, already in T1.8; keep one here that goes through the handler table).
   - `fstrim_is_rejected_while_frozen` (gate).
-- **Implement (green):** `spawn_blocking` per ioctl, output `GuestFilesystemTrimResponse`.
+  - `a_hidden_target_is_trimmed_through_an_alias_and_an_unreachable_one_reports_it` — each target is opened on its planned device like freeze and thaw (T3.1/T3.2): a first pathname that leads elsewhere is retried through an alias and the entry keeps the target's name; a superblock none of its mount points opens on reports that inline (review follow-up).
+  - `fstrim_reports_the_effective_minimum_not_the_requested_one` — the reply's `minimum` is the value `FITRIM` wrote back (rounded up by the kernel), per mount point (review follow-up; T3.1 returns it).
+- **Implement (green):** `spawn_blocking` per ioctl on a verified `Mount` handle (`fsfreeze::open_target`), output `GuestFilesystemTrimResponse`.
 - **Done when:** the privileged job trims a loop-mounted ext4 without error.
 
 ---
@@ -507,7 +523,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 4 — Channel, privilege, and daemon wiring
 
 #### T4.1 — `channel`: virtio-serial open, session loop, EOF/HUP reconnect ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §4.1 I/O layer, §5.7 (reconnect rules), §8.4 (`EBUSY` is terminal `channel_already_open`), AC18, C-15.
 - **Depends on:** T1.2, T1.8
 - **Files:** `src/channel.rs`.
@@ -524,7 +540,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the E2E harness (T4.7) drives the real binary through a pty.
 
 #### T4.2 — `guest-shutdown` ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3 (`mode`, no success reply), §4.1 (`reboot` syscall), §5.3 (2/min), AC12, C-11, OQ-1.
 - **Depends on:** T1.8, T3.1
 - **Files:** `src/handlers/shutdown.rs`, `src/kernel/shutdown.rs`.
@@ -538,7 +554,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the unprivileged E2E test observes silence after `guest-shutdown` with a fake kernel (or a build-time `test-fakes` feature).
 
 #### T4.3 — `guest-suspend-ram` (opt-in) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §3, §8.1, D1, OQ-2.
 - **Depends on:** T1.8
 - **Files:** `src/handlers/suspend.rs`.
@@ -547,11 +563,11 @@ the answer is a one-line change, and leave the question here.
   - `runtime_off_returns_command_not_found_disabled` (`#[cfg(feature = "suspend_ram")]`).
   - `writes_mem_to_sys_power_state_when_supported` via a `SuspendOps` fake; `unsupported_state_file_is_generic_error`.
   - `suspend_is_rejected_while_frozen`.
-- **Implement (green):** `#[cfg(feature = "suspend_ram")]` handler that checks `/sys/power/state` contains `mem` and writes `mem`; reply `{}` (OQ-2 interim).
-- **Done when:** `cargo test --features suspend_ram` and default both pass.
+- **Implement (green):** `#[cfg(feature = "suspend_ram")]` handler that checks `/sys/power/state` contains `mem` and writes `mem`; reply `{}` (OQ-2 interim). The write needs access the dropped process does not have by default (OQ-6): the packaged tmpfiles.d rule grants group `qeminga` write access when the feature is enabled.
+- **Done when:** `cargo test --features suspend_ram` and default both pass; a privileged test (T5.2) shows the service account can open `/sys/power/state` for writing once the rule is applied.
 
 #### T4.4 — Capability drop (`kernel/caps.rs`) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.4 (six ordered steps, final set), G6, D7, AC3, C-18.
 - **Depends on:** T3.1
 - **Files:** `src/kernel/caps.rs` (uses the `caps` crate; may need no `unsafe`, but lives in `kernel/` per §6), `src/main.rs`.
@@ -565,7 +581,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the privileged CI job runs the AC3 test on both architectures.
 
 #### T4.5 — Seccomp profiles (`seccomp` feature) ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §5.5 (per-target profiles, surfaces table, ioctl argument filtering, kill default, compat logging), §8.1, AC15, C-11, C-17.
 - **Depends on:** T2.4, T3.1, T4.1, T4.4 (to know the real syscall set)
 - **Files:** `src/seccomp.rs`, `Cargo.toml` (`seccomp-log = ["seccomp"]`).
@@ -576,28 +592,32 @@ the answer is a one-line change, and leave the question here.
   - `default_action_is_kill_process_unless_seccomp_log` (feature-gated assertions).
   - `sync_and_reboot_are_present` (C-11), `execve_and_mkdirat_are_absent` (§8.5, §1.2).
   - `privileged_install_then_full_command_matrix` (`#[ignore]`) — T5.2 drives every allowed command through the installed filter; first with `seccomp-log`, then enforced (AC15).
-- **Implement (green):** `profile(target: Target) -> SeccompFilter`, `install(filter)` after the capability drop and `PR_SET_NO_NEW_PRIVS`, `Action::KillProcess` default (`Log` under `seccomp-log`); derive the list empirically with `strace -f -c` over the matrix and commit it with per-entry justification comments grouped by the §5.5 surfaces table.
+- **Implement (green):** `profile(target: Target) -> SeccompFilter`, `install(filter)` after the capability drop and `PR_SET_NO_NEW_PRIVS`, `Action::KillProcess` default (`Log` under `seccomp-log`); derive the list empirically with `strace -f -c` over the matrix and commit it with per-entry justification comments grouped by the §5.5 surfaces table. The x86-64-only legacy aliases carry an observed need each (`epoll_wait`: mio's poller); `open`, `stat`, `lstat` and `poll` are not listed because the enforced privileged matrix (T5.2) and the enforced end-to-end suite (T4.7) run without them on glibc 2.39. A guest whose glibc still issues one shows `SECCOMP` audit lines (`type=1326`) under the `seccomp-log` build; that trace is the evidence for re-adding it. `socket(2)` is restricted to `AF_NETLINK` (getifaddrs) the way `ioctl` and `prctl` are restricted by argument.
 - **Done when:** the compatibility run produces zero `SECCOMP` audit lines in `dmesg` for the full matrix on both architectures.
 
 #### T4.6 — `main`: startup sequence, recovery mode, signals
-- **Status:** todo
+- **Status:** done
 - **Design:** §6 (`main.rs`), §5.4/§5.5 order, §4.4 (recovery mode), §5.7 (deferred stop), §8.2 (`state_path` validation), §8.4 (`EBUSY` terminal), C-14, C-18, C-21.
 - **Depends on:** T1.6, T3.2, T3.3, T3.5, T3.6, T4.1, T4.4, T4.5
 - **Files:** `src/main.rs`, `src/lib.rs` (`pub fn run(opts) -> Result<ExitCode>` so the sequence is testable), `tests/startup.rs`.
 - **Tests first (red):**
   - `cli_accepts_config_path_and_version` (extend `tests/cli.rs`).
   - `startup_order_is_config_marker_channel_caps_seccomp_runtime` — ordered fake log through a `Startup` trait; `no ioctl or marker write happens before the channel is open`.
-  - `freezable_state_path_is_rejected_before_opening_channel` with a clear message naming the covering mount.
+  - `freezable_state_path_is_rejected_before_opening_channel` with a clear message naming the covering mount and device: what is judged is the device of the marker's directory as opened at step 2 (`Marker::open`, T3.3), never the pathname's prefix, so `..` components and symlinked parents are seen through; a directory that cannot be opened is `EX_CONFIG` at step 2 (review follow-up).
   - `ebusy_on_channel_exits_with_channel_already_open_and_nonzero_code`.
   - `marker_present_starts_in_frozen_recovery_mode_with_ring_audit_and_watchdog_armed` (C-14).
-  - `sigterm_while_thawed_exits_zero_promptly`, `sigterm_while_frozen_is_deferred_until_thaw` (paused time + fake channel).
+  - `a_terminal_channel_error_while_frozen_waits_for_the_thaw`, `a_terminal_channel_error_during_a_thaw_waits_for_its_completion` (the fake kernel's `FITHAW` held behind a barrier) — a terminal reopen error (`EBUSY`) ends the serving without competing for the port, but the exit obeys the same rule as a requested stop: it waits until `Thawed` (the watchdog is the recovery once no host can reach the process), so `finish_runtime` never runs under a freeze or a thaw in flight (review follow-up).
+  - `sigterm_while_thawed_exits_zero_promptly`, `sigterm_while_frozen_is_deferred_until_thaw` (paused time + fake channel), `cancel_finishes_the_in_flight_command_and_waits_for_may_stop` (`src/channel.rs`: a stop is raced only against the read, never against a handler, and takes effect only when `Handle::may_stop` holds, i.e. the state is `Thawed`; the stopper repeats the request until then).
   - `runtime_is_multi_thread_with_at_least_two_workers` (inspect `tokio::runtime::Handle::current().metrics().num_workers()`).
+  - `runtime_shutdown_is_bounded_by_an_abandoned_blocking_task` — once the loop has stopped the runtime is finished under `RUNTIME_SHUTDOWN_GRACE` (5 s) rather than dropped, since a drop waits for ever for a started blocking task and the only one that can still be running is an abandoned `guest-get-fsinfo` walk (T2.5); freeze, thaw and trim always complete before the stop (C-21) — review follow-up.
   - `feature_warnings_are_logged_once_at_startup`.
+  - `a_stop_is_honoured_while_the_host_is_not_reading_the_reply` and `a_blocked_reply_while_frozen_waits_for_the_thaw_then_stops` (channel: the reply write is raced against an allowed stop; a stop that is not allowed yet resumes the same partial write) — C-21, review follow-up.
+  - `a_missing_channel_never_delays_the_drop_the_filter_or_recovery` (ordered fake log: a non-`EBUSY` open failure is deferred and the sequence continues) and `recovery_thaws_without_the_channel_ever_opening` (in-process: marker present, an opener that always fails, the watchdog drains and the stop is honoured) — OQ-7, review follow-up.
 - **Implement (green):** hand-rolled arg parsing (`--config PATH`, `--version`; no `clap`), `Startup` sequence as a list of steps with tracing spans, `tokio::runtime::Builder::new_multi_thread().worker_threads(max(2, …))`, signal handling with `tokio::signal::unix`.
 - **Done when:** `qeminga --config tests/fixtures/config/default.toml` run unprivileged against a pty behaves per T4.7.
 
 #### T4.7 — End-to-end tests over a pty (unprivileged)
-- **Status:** todo
+- **Status:** done
 - **Design:** AC1, AC4, AC5, AC12, AC18, AC19, C-15, C-18.
 - **Depends on:** T4.6, T2.*, T4.2
 - **Files:** `tests/e2e/mod.rs` (harness: temp config, pty pair, spawn `CARGO_BIN_EXE_qeminga`, line-oriented client with timeouts), `tests/e2e_*.rs`.
@@ -605,12 +625,12 @@ the answer is a one-line change, and leave the question here.
   - `ping_round_trip`, `sync_delimited_resyncs_after_garbage` (send `garbage`, then `0xFF{"execute":"guest-sync-delimited","arguments":{"id":1}}\n`).
   - `guest_exec_and_every_denied_command_return_command_not_found` (AC1).
   - `oversized_frame_then_valid_command` (AC4).
-  - `flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served` (AC5) — send in one write; count `GenericError` replies ≥ 880; then `guest-fsfreeze-status` → `thawed`.
+  - `flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served` (AC5) — send in one write; count `GenericError` replies ≥ 880 (the fake-clock figure of the T1.7 unit test; against the real binary the assertion is `denied == 1000 − ok` with `120 ≤ ok ≤ 120 + elapsed/500 ms + 1`, since a slow runner can legitimately refill more tokens while the 1000 replies are written); then `guest-fsfreeze-status` → `thawed`.
   - `guest_info_matches_capability_contract` (AC19).
   - `guest_get_osinfo_and_interfaces_and_fsinfo_return_well_formed_json` (schema-level assertions; values are host-dependent).
   - `shutdown_emits_no_reply` — requires a way to substitute the kernel ops in the real binary: add a `test-fakes` Cargo feature that swaps `LinuxKernel` for a scripted fake (never enabled in release; CI builds E2E with it) — decide and document in `AGENTS.md`.
   - `channel_eof_then_reopen_preserves_state` (AC18, unprivileged half): close the master, reopen a new pty at the same path (symlink swap), send `guest-fsfreeze-status`.
-- **Implement (green):** harness only; production changes should be limited to the `test-fakes` feature.
+- **Implement (green):** harness only; production changes should be limited to the `test-fakes` feature (the rule this suite relies on, a failed recovery drain from `Thawed` returning to `Thawed`, is T3.4's and is recorded under OQ-3). `kernel::fake` is compiled unconditionally: it performs no kernel operation and only the swap is feature-gated; keeping it out of release binaries would need a self dev-dependency, which is deliberately not done. Root needs the `qeminga` account to run the suite; the harness fails fast with the fix (AGENTS.md).
 - **Done when:** the whole file runs in under 30 s in CI.
 
 ---
@@ -618,7 +638,7 @@ the answer is a one-line change, and leave the question here.
 ### Phase 5 — Hardening, privileged CI, packaging, release
 
 #### T5.1 — Fuzz targets ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** AC14, §5.2.
 - **Depends on:** T1.2, T1.3, T2.3, T2.5
 - **Files:** `fuzz/Cargo.toml`, `fuzz/fuzz_targets/{frame_decoder,bounds_checker,mountinfo,os_release}.rs`, `.github/workflows/fuzz.yml`, `Cargo.toml` (`[workspace] exclude = ["fuzz"]`).
@@ -627,7 +647,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the weekly job has one green run recorded in the PR description.
 
 #### T5.2 — Privileged CI job (loop-mounted ext4/xfs, caps, seccomp matrix, SIGKILL recovery)
-- **Status:** todo
+- **Status:** done (x86-64); arm64 pending a runner, see §7
 - **Design:** AC2, AC3, AC10, AC11, AC13, AC15, AC17, AC18, D6.
 - **Depends on:** T3.4, T3.5, T3.6, T4.4, T4.5, T4.7
 - **Files:** `.github/workflows/ci.yml` (new `privileged` job), `scripts/ci/mk-loop-fs.sh`, `tests/privileged_*.rs`.
@@ -636,31 +656,33 @@ the answer is a one-line change, and leave the question here.
   - `privileged_watchdog_idle_and_hard_cap_on_real_fs` with short configured timeouts (AC11).
   - `privileged_freeze_with_tmpfs_bind_and_0700_mountpoint` (AC17).
   - `privileged_channel_eof_during_freeze_preserves_marker` (AC18).
-  - `privileged_journald_pipe_full_does_not_deadlock_thaw` (AC13): point stderr at a full pipe.
+  - `privileged_journald_pipe_full_does_not_deadlock_thaw` (AC13): stderr is a pipe the test fills to capacity (a dup of the write end) before sending the thaw and does not drain; the thaw is proved from the filesystem side (a write to the mount, blocked while frozen, completes within the deadline) while the daemon's flush and reply stay blocked; only then is the pipe drained and the reply read.
   - `privileged_seccomp_matrix_log_then_enforce` (AC15).
-- **Implement (green):** `sudo -E cargo test --all-features -- --ignored privileged_` on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
-- **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here.
+  - `privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount` — the loop ext4 gets a bind alias, is frozen, and a tmpfs is mounted over its original pathname (a superblock that would answer "not frozen"); the thaw must reach the ext4, and the marker may only go once it did: in the same process through the handle the freeze opened, after a SIGKILL and a restart through the alias, and with every pathname of the device covered not at all (unreachable, marker and frozen gate retained) until one leads there again. Each phase proves the ext4 writable through a bounded write. The alias is a *private* bind mount: under shared mount propagation (systemd's default for `/`, and the CI runner) an overmount on a mount point propagates onto its peer bind mounts too, so a plain bind alias is hidden together with its source, which is the unreachable case, not the alias one (review follow-up).
+  - `privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze` — a bind mount of the loop ext4 at a directory whose name carries a raw non-UTF-8 byte: the table is not UTF-8, the entry is parsed byte-exact, the ioctls take the raw path, the daemon starts, lists it lossily in `guest-get-fsinfo` and freezes/thaws with it present (review follow-up for the byte-oriented parser of T2.5).
+- **Implement (green):** `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`) on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
+- **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here. Every freezing test holds a `ThawGuard` that repeats `FITHAW` on drop, the job has `timeout-minutes`, and `mk-loop-fs.sh teardown` unfreezes before unmounting, so one failed assertion cannot leave the loop filesystem frozen for the rest of the job; both privileged steps run the whole `privileged_` set.
 
 #### T5.3 — Packaging: systemd unit, udev rule, sysusers, example config ∥
-- **Status:** todo
+- **Status:** done
 - **Design:** §8.2–§8.4, §5.7, §8.5, C-20.
 - **Depends on:** T4.6
-- **Files:** `packaging/systemd/qeminga.service`, `packaging/udev/99-qeminga.rules`, `packaging/sysusers.d/qeminga.conf`, `packaging/config.toml`, `packaging/README.md`.
-- **Tests first (red):** `tests/packaging.rs` parses the shipped files and asserts: `Conflicts=qemu-guest-agent.service` and `After=qemu-guest-agent.service`; `BindsTo=`/`After=` the `dev-virtio\x2dports-org.qemu.guest_agent.0.device` unit; `RuntimeDirectory=qeminga`, `RuntimeDirectoryPreserve=yes`; `TimeoutStopSec=330s` ≥ `fsfreeze_max_timeout_secs + 30`; `Restart=always`; the udev rule matches §8.3 byte-for-byte; sysusers creates `qeminga` with uid/gid 600 and no login shell; the example config equals the §8.2 block and parses with T1.6.
+- **Files:** `packaging/systemd/qeminga.service`, `packaging/tmpfiles.d/qeminga.conf`, `packaging/udev/99-qeminga.rules`, `packaging/sysusers.d/qeminga.conf`, `packaging/tmpfiles.d/qeminga-suspend.conf` (OQ-6; installed only with the suspend feature), `packaging/config.toml`, `packaging/README.md`.
+- **Tests first (red):** `tests/packaging.rs` parses the shipped files and asserts: `Conflicts=qemu-guest-agent.service` and `After=qemu-guest-agent.service`; no `BindsTo=`/`After=` on the `dev-virtio\x2dports-org.qemu.guest_agent.0.device` unit (review follow-up: a crash while frozen must be recovered whether or not the port is there, OQ-7; the daemon retries the open itself), checked against the running service manager by `privileged_installed_unit_recovers_without_the_channel_device` (the shipped unit installed under `/run/systemd/system`, a marker present, no device: the service is active, the open deferred, the marker recovered, the stop honoured); the three privileged `ExecStartPre` lines that provision `/run/qeminga` for the service account and no `RuntimeDirectory=` (C-20), plus `tmpfiles.d/qeminga.conf`; `privileged_installed_unit_freezes_and_thaws_over_a_pty` (the daemon started by systemd, dropped to `qeminga`, creates and removes its marker); `TimeoutStopSec=330s` ≥ `fsfreeze_max_timeout_secs + 30`; `Restart=always`; the udev rule matches §8.3 byte-for-byte; sysusers creates `qeminga` with uid/gid 600 and no login shell; the example config equals the §8.2 block and parses with T1.6.
 - **Implement (green):** the files; `systemd-analyze verify` in CI when available.
-- **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit).
+- **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit) and the suspend rule; `tests/packaging.rs` checks the tmpfiles line and `privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account` applies it (T5.2 job).
 
 #### T5.4 — libvirt interoperability script (manual) ∥
-- **Status:** todo
+- **Status:** in-progress (script, VM recipe and a scripted-`virsh` test of the script landed; the run log from a real libvirt host is still to be attached, see §7)
 - **Design:** AC16, §3.
 - **Depends on:** T4.6, T5.3
 - **Files:** `scripts/e2e-libvirt.sh`, `docs/testing.md`.
-- **Tests first (red):** the script exits non-zero unless `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh domshutdown --mode agent` all succeed against a named domain running qeminga.
+- **Tests first (red):** the script exits non-zero unless `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh shutdown --mode agent` all succeed against a named domain running qeminga (review follow-up: the command is `shutdown`, `domshutdown` does not exist; the script checks every command name against `virsh help` first and requires a successful `domstate` query answering exactly `shut off`).
 - **Implement (green):** script plus a documented VM recipe (cloud image, `virtio-serial` channel XML, package install).
 - **Done when:** a run log is attached to the PR; the job stays manual (no nested virtualisation in hosted CI).
 
 #### T5.5 — Documentation and release readiness ∥
-- **Status:** todo
+- **Status:** in-progress (documentation and §7 refreshed; the release itself waits on T5.4's run log and T5.7's first publication on `main`, both in-progress, and on the `v0.1.0` tag, which the maintainer applies after the merge; open items in §7)
 - **Design:** §7 (C-4), §12.
 - **Depends on:** everything above
 - **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done, record arm64 gap).
@@ -668,34 +690,53 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
 #### T5.6 — Mutation testing (optional) ∥
-- **Status:** todo
+- **Status:** done (`cargo mutants --all-features`: 194 mutants, **0 missed**; the CI job is a gate). Review follow-ups: the gate reads `mutants.out/missed.txt` (the exit status reports timeouts ahead of misses, which hid one survivor in `Drained::incomplete`, killed by the tests added on T3.4); `FrameDecoder::push` is an indexed loop bounded by its input, so no mutant of it can loop (one re-scanned a delimiter forever, allocated without bound, and got the CI runner shut down); the channel session tests run under a real-time bound so a broken decoder fails them instead of hanging the binary; the job runs test binaries under a 4 GiB memory cap (`scripts/ci/bounded-test.sh`); `src/watchdog.rs` is examined too (lifecycle coordination), `src/audit.rs` is not (about 140 mostly formatting mutants would double the job).
 - **Design:** AC8 (test quality), §5.2.
 - **Depends on:** T1.*, T3.4
-- **Files:** `.cargo/mutants.toml`, CI job (allowed to fail initially).
+- **Files:** `.cargo/mutants.toml`, CI job `mutants` (advisory until the baseline survivors were killed).
 - **Done when:** `cargo mutants` on `framing`, `proto`, `state`, and `fsfreeze` reports no surviving mutants in the errno-policy and gate code paths.
+
+#### T5.7 — Coverage floor and status badges ∥
+- **Status:** in-progress (coverage job, floor and badge publication landed and exercised by `workflow_dispatch`; remaining: the first push to `main` must show the badges rendering in the README, checked by the publish job, and the maintainer confirms this self-authored task as a gate)
+- **Design:** AC8 (test quality), §12 (the check list).
+- **Depends on:** T4.7
+- **Files:** `.github/workflows/ci.yml` (`coverage` and `publish-badges` jobs), `scripts/ci/coverage.sh`, `scripts/ci/coverage-gate.py`, `scripts/ci/badge.sh`, `scripts/ci/publish-badges.sh`, `scripts/ci/verify-badges-render.sh`, `tests/badges.rs`, `tests/badges_publish.rs`, `tests/badges_verify.rs`, `tests/coverage_gate.rs`, `README.md`, `docs/testing.md`, `AGENTS.md`.
+- **Tests:** `tests/badges.rs` (rendering, escaping, colour validation, well-formed XML), `tests/badges_publish.rs` (first publication, unchanged output, updates, separate branches, concurrent publication, attempt budget, failed `git add`, superseded source commit before and during a retry, missing source branch), `tests/coverage_gate.rs` (inline test lines and test doubles excluded, function records dropped, branch totals recomputed, floor on production lines, layout check), `tests/badges_verify.rs` (both badges once, unexpected URL, not served as SVG).
+- **Done when:** CI fails under 85 % coverage of production lines (90.1 % measured locally at introduction; inline test modules and `src/kernel/fake.rs` excluded), the reports survive a failed gate, badge publication is ordered by source commit (a superseded run publishes nothing) and write access is confined to the publish job, and the README shows CI, tests and coverage badges that render in this private repository.
 
 ---
 
 ## 6. Acceptance-criteria traceability
 
-| AC | Covered by | Kind |
+Status as of 0.1.0: **green** = automated and passing in CI or verified locally; **manual** = script exists, run log pending.
+
+| AC | Covered by | Kind | Status |
+|---|---|---|---|
+| AC1 denied commands → `CommandNotFound` | T1.8 (`every_denied_command_in_design_table_returns_command_not_found`), T4.7 (`guest_exec_and_every_denied_command_return_command_not_found`) | unit + E2E | green |
+| AC2 freeze/thaw on real ext4/xfs | T3.4 (`privileged_freeze_thaw_cycle_on_ext4_and_xfs`), T5.2 | privileged | green on ext4 (local + CI); xfs in CI |
+| AC3 exact final capability set | T4.4 (`privileged_drop_leaves_exactly_final_caps`), T5.2 | privileged | green (x86-64) |
+| AC4 oversized frame resync | T1.2, T4.7 (`oversized_frame_then_valid_command`), T5.1 corpus | unit + property + E2E + fuzz | green |
+| AC5 1 000-ping flood | T1.7, T4.7 (`flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served`) | unit + E2E | green |
+| AC6 lockfile, deny, audit | T0.1, T0.4 | CI | green |
+| AC7 clippy clean | T0.2 | CI | green |
+| AC8 unit tests pass | all | CI | green |
+| AC9 frozen gate, thaw never limited | T1.8, T3.4 | unit | green |
+| AC10 SIGKILL recovery | T3.3, T3.4, T4.6, T5.2 (`privileged_freeze_sigkill_restart_recovery_thaw`) | unit + privileged | green |
+| AC11 watchdog idle and hard cap | T3.5, T5.2 (`privileged_watchdog_idle_and_hard_cap_on_real_fs`) | unit (paused time) + privileged | green |
+| AC12 shutdown has no success reply | T4.2, T4.7 (`shutdown_emits_no_reply`) | unit + E2E | green |
+| AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 (`privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + privileged | green |
+| AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | pending: the 60 s run is green on every PR; the one-hour weekly run has not executed yet, so AC14 as written is not yet demonstrated |
+| AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64; arm64 pending runner (§7) |
+| AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`) | manual | manual, run log pending (§7) |
+| AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 (`privileged_freeze_with_tmpfs_bind_and_0700_mountpoint`) | unit + privileged | green |
+| AC18 EOF/reopen during freeze | T4.1, T4.7 (`channel_eof_then_reopen_preserves_state`), T5.2 (`privileged_channel_eof_during_freeze_preserves_marker`) | unit + E2E + privileged | green |
+| AC19 `guest-info` contract | T2.2, T4.7 (`guest_info_matches_capability_contract`) | unit + E2E | green |
+
+---
+
+## 7. Known gaps
+
+| Gap | Detail | Owner |
 |---|---|---|
-| AC1 denied commands → `CommandNotFound` | T1.8, T4.7 | unit + E2E |
-| AC2 freeze/thaw on real ext4/xfs | T3.4, T5.2 | privileged |
-| AC3 exact final capability set | T4.4, T5.2 | privileged |
-| AC4 oversized frame resync | T1.2, T4.7 | unit + property + E2E |
-| AC5 1 000-ping flood | T1.7, T4.7 | unit + E2E |
-| AC6 lockfile, deny, audit | T0.1, T0.4 | CI |
-| AC7 clippy clean | T0.2 | CI |
-| AC8 unit tests pass | all | CI |
-| AC9 frozen gate, thaw never limited | T1.8, T3.4 | unit |
-| AC10 SIGKILL recovery | T3.3, T3.4, T4.6, T5.2 | unit + privileged |
-| AC11 watchdog idle and hard cap | T3.5, T5.2 | unit (paused time) + privileged |
-| AC12 shutdown has no success reply | T4.2, T4.7 | unit + E2E |
-| AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 | unit + privileged |
-| AC14 one-hour fuzz | T5.1 | scheduled CI |
-| AC15 seccomp matrix both arches | T4.5, T5.2 | privileged (arm64 pending runner) |
-| AC16 libvirt interop | T5.4 | manual |
-| AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 | unit + privileged |
-| AC18 EOF/reopen during freeze | T4.1, T4.7, T5.2 | unit + E2E + privileged |
-| AC19 `guest-info` contract | T2.2, T4.7 | unit + E2E |
+| libvirt run log | `scripts/e2e-libvirt.sh` and the recipe in `docs/testing.md` exist, but no run against a real libvirt host has been recorded yet (no nested virtualisation in hosted CI or the development container). AC16 stays open until a log is attached to a PR. | T5.4 / T5.5 |
+| arm64 execution | The privileged job (T5.2) and the seccomp matrix (AC15) run on `x86_64` only. The `aarch64` profile is compiled and checked in every CI run (`cross-check-aarch64`, plus unit tests that build both profiles), but no arm64 runner executes it. Needs a public repository, a larger hosted runner, or a self-hosted arm64 machine. | T5.2 / T5.5 |

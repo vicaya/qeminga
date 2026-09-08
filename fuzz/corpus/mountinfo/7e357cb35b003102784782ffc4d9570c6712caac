@@ -1,0 +1,7 @@
+27 1 8:1 / / rw,re- ext4 /dev/sda1 latime shared:0 - 
+42otbind rshared64
+43 27 8:2 /exts t™me shared:o,relatime shared:1 - 
+42 27 8:2 / /data rw,r2elatrme ev/sda1 latime shared:1 - 
+42otbind rshar	ed64
+43 27 8:2 /ex17ts t™me shared:o,rared:1 - 
+42 27 8share7

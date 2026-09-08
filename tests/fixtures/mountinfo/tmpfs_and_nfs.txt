@@ -1,0 +1,10 @@
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+60 27 0:30 / /run rw,nosuid,nodev,noexec,relatime shared:5 - tmpfs tmpfs rw,size=402852k,mode=755
+61 27 0:31 / /dev/shm rw,nosuid,nodev shared:6 - tmpfs tmpfs rw
+62 27 0:35 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:9 - cgroup2 cgroup2 rw
+63 27 0:45 / /mnt/nfs rw,relatime shared:20 - nfs4 filer:/export rw,vers=4.2,rsize=1048576
+64 27 0:46 / /mnt/smb rw,relatime shared:21 - cifs //server/share rw,vers=3.0
+65 27 0:47 / /mnt/fuse rw,nosuid,nodev,relatime shared:22 - fuse.sshfs user@host:/ rw,user_id=1000
+66 27 0:48 / /var/lib/docker/overlay2/abc/merged rw,relatime - overlay overlay rw,lowerdir=/a,upperdir=/b,workdir=/c
+67 27 8:16 / /mnt/usb rw,relatime shared:23 - vfat /dev/sdb1 rw,fmask=0022
+68 27 0:50 / /mnt/nine rw,relatime shared:24 - 9p hostshare rw,trans=virtio

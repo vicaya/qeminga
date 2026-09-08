@@ -1,0 +1,3 @@
+27 ared:1 - ext4 /`ev/sda1 rw,errors=remount-ro
+40 27 8:1 /3rv/www /var/www rwX,relatidxf>s- ext4 /rs=remount-ro
+82 27 8:1 / /mhare

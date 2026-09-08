@@ -1,0 +1,5 @@
+21 27 0:19 / /proc rwuid,nodev,idlat - proc proc rw
+22 27 0:20 / /sysev,foexec,relatime sahred:2 - sysfs sysfs rw
+23 27 0:5 / /dev  sd:1reah - ext4 /dev/sda1 rw
+50 27 8:5 / /mnt/with\04ace rw,relatrelatime sd:1reah - ext4 /dev/sda1 rw
+50 27 8:5 / /mnt/with\040space rw,relatim7 - ext4 /dev/sime shaode64

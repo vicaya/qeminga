@@ -1,46 +1,31 @@
-//! qeminga daemon entry point.
+//! qeminga daemon entry point (design §6): parse the command line, then
+//! hand over to [`qeminga::run`], which loads the configuration, opens the
+//! channel, drops capabilities, installs seccomp, and starts the runtime.
 //!
-//! Responsibilities (design §6): parse configuration, open the channel,
-//! drop capabilities, install seccomp, then start the async runtime and the
-//! dispatcher loop. Only `--version` is implemented so far; the rest is
-//! tracked in `docs/tasks.md`.
-//!
-//! Nothing here may panic (AGENTS.md): arguments are handled as `OsStr` so a
-//! non-UTF-8 argument is a usage error, and output failures are mapped to
-//! exit codes instead of aborting.
+//! Nothing here may panic (AGENTS.md): arguments are handled as `OsString`
+//! so a non-UTF-8 argument is a usage error, and every failure maps to a
+//! sysexits code.
 #![forbid(unsafe_code)]
 
-use std::ffi::OsString;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
-/// Exit status for usage errors (`EX_USAGE` from sysexits).
-const EXIT_USAGE: u8 = 64;
-/// Exit status for an I/O error while writing output (`EX_IOERR` from sysexits).
-const EXIT_IOERR: u8 = 74;
+use qeminga::daemon::{EX_USAGE, USAGE, diag};
 
 fn main() -> ExitCode {
-    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    match args.as_slice() {
-        [flag] if flag.as_os_str() == "--version" || flag.as_os_str() == "-V" => print_version(),
-        [] => {
-            diag("qeminga: daemon mode is not implemented yet (see docs/tasks.md)");
-            ExitCode::from(EXIT_USAGE)
-        }
-        other => {
-            let rendered: Vec<String> = other
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect();
-            diag(&format!(
-                "qeminga: unrecognised arguments: {}",
-                rendered.join(" ")
-            ));
-            diag("usage: qeminga [--version]");
-            ExitCode::from(EXIT_USAGE)
+    match qeminga::parse_args(std::env::args_os().skip(1)) {
+        Ok(opts) if opts.version => print_version(),
+        Ok(opts) => qeminga::run(opts),
+        Err(err) => {
+            diag(&format!("qeminga: {err}"));
+            diag(USAGE);
+            ExitCode::from(EX_USAGE)
         }
     }
 }
+
+/// Exit status for an I/O error while writing output (`EX_IOERR`).
+const EXIT_IOERR: u8 = 74;
 
 /// Writes the version line to stdout, mapping write failures to exit codes.
 fn print_version() -> ExitCode {
@@ -51,11 +36,4 @@ fn print_version() -> ExitCode {
         Err(err) if err.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(_) => ExitCode::from(EXIT_IOERR),
     }
-}
-
-/// Best-effort diagnostic on stderr. A failed write is deliberately ignored:
-/// there is nowhere left to report it, and panicking would be worse.
-fn diag(msg: &str) {
-    let mut err = io::stderr().lock();
-    let _ = writeln!(err, "{msg}");
 }

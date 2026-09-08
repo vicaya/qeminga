@@ -1,0 +1,6 @@
+NAME="Foo \"Bar\""
+PRETTY_NAME="Cost: \$5 and a \\ backslash and a \` backtick"
+ID=escaped\$id
+VERSION='lit\eral'
+VERSION_ID="unterminated
+VARIANT="Foo\Bar 1.0 with \n kept"

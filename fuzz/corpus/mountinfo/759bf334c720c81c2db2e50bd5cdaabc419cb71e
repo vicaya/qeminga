@@ -1,0 +1,4 @@
+27 1 8:1 rsount-ro
+41 27 - xfs /de rw,atnode64
+43 27 8:2 /exp@rtsnt-nattr,inode32
+43 27 8:2 inode64

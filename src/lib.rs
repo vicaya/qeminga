@@ -10,6 +10,26 @@
 //! in CI.
 #![deny(unsafe_code)]
 
+pub mod audit;
+pub mod channel;
+pub mod config;
+pub mod daemon;
+pub mod dispatch;
+pub mod framing;
+pub mod freeze_plan;
+pub mod handlers;
+#[cfg(target_os = "linux")]
+pub mod kernel;
+pub mod marker;
+pub mod mountinfo;
+pub mod proto;
+#[cfg(feature = "seccomp")]
+pub mod seccomp;
+pub mod state;
+pub mod watchdog;
+
+pub use daemon::{Options, parse_args, run};
+
 /// Agent version reported by `guest-info`.
 ///
 /// This is build metadata taken from the Cargo manifest; it cannot be

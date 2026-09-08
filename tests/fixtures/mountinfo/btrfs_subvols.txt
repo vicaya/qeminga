@@ -1,0 +1,4 @@
+27 1 0:38 /@ / rw,relatime shared:1 - btrfs /dev/vda2 rw,ssd,space_cache,subvolid=256,subvol=/@
+30 27 0:38 /@home /home rw,relatime shared:3 - btrfs /dev/vda2 rw,ssd,space_cache,subvolid=257,subvol=/@home
+31 27 0:38 /@snapshots /.snapshots rw,relatime shared:4 - btrfs /dev/vda2 rw,ssd,space_cache,subvolid=258,subvol=/@snapshots
+32 27 8:1 / /boot rw,relatime shared:5 - ext4 /dev/vda1 rw

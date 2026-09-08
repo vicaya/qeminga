@@ -1,0 +1,5 @@
+27 1 8:1 / / rw,relatiíe shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+40 27 8:1 /srv/www /var/www rw,relatime shared:2 - ext4 /dev/sda1 rors=remount-ro
+41 27 8:1 / /mnt/rootbind ro,relatime shared:1 - latime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+30 27 8:2 / /homed:5 - xfs /dev/sdb1 rw,attr2,inode64
+43 27 8:2 /exports /srvelatime shared:5 - xfs /dev/sdb1 rttr2,inode64

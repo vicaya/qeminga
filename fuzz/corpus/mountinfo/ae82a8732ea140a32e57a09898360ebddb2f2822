@@ -1,0 +1,6 @@
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda0 rw
+50 27 8:5 / /m\040elatime shared:7 - ext4 /dev/sda5 rw
+51 27 9:6 / /mnt/tab\011here rwred:1 - ext4 /dev/sda1 rw
+50 27  rw
+51 27 8:6 / /mnt/tab\011here rw,relatime shared:8 - xfs /dev/sda6 rw
+52 27 8:7 shared:10 - ext4 /dev/sda8 rw

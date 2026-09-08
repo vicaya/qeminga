@@ -1,0 +1,5 @@
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+40 27 8:1 /srv/www /var/www rw,relatiro
+42 27 8:2 / /data rw,relatime shared:5 - xfs /dev/sdb1 rw,attrt/rootbind ro,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+42 27 8:2 / /data rw,relatime shared:5 - xfs /dev/sdb1 rw,attr2,inode64
+43 27 8:2 /exports /srv/exports rw,relatime share27 d

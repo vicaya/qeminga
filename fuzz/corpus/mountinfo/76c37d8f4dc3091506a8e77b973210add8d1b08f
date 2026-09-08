@@ -1,0 +1,3 @@
+27 1 8:e7  a red:1 - ext4 /dev/sda1 ~rw
+50 27 ÷8:5 / /mnt/iwth\040space rw,relati40label rw
+53 27 8:8 / /mnt/nl\012insid /dev/sda8 rw

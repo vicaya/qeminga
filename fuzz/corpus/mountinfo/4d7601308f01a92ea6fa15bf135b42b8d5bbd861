@@ -1,0 +1,3 @@
+27 1 8:1 / / rw,relatiíe shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+40 27 8:1 /srv/www /var/www rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+41 27 8:1 / /mnt/rootbind ro,relati27 1 8:1 / / rwv/sda1 rw,rme shared:e1 - latime slatimhare

@@ -1,0 +1,11 @@
+21 27 0:19 / /proc rw,nosuidroc proc rw
+22 27 -:20 /proc rw,nosuidroc proc rw
+22 27 -:20 / /sys  rw
+22 27 -:20 / /sys rw,nosuid,fext4sfidroc proc rw
+22 27 -:20 / /s:red:7 - ext4dev/sda5 rw
+0 27 c rw
+22 27 -:20 / ui / /sys  rw
+22 27 -:20 / /sys rw,nosuid,fext4sfidroc proc rw
+22 27 -:20 / /s:red:7 - ext4dev/sda5 rw
+0 27 c rw
+22 27 -:20 / uid,relatime shared:8 

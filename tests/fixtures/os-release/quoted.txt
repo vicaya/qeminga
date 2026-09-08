@@ -1,0 +1,10 @@
+# Comment lines and blank lines are ignored (os-release(5)).
+
+NAME='Single Quoted "Name"'
+   ID  =  spaced   
+PRETTY_NAME="Double Quoted 'Name' # not a comment"
+VERSION="12 (bookworm)" trailing garbage after the closing quote
+VERSION_ID=12
+VARIANT=unquoted value with spaces
+MACHINE_ID="must-never-be-emitted"
+VARIANT_ID='server

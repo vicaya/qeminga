@@ -1,0 +1,59 @@
+# qeminga: minimum secure subset of the QEMU guest agent (design §8.4, C-20).
+#
+# The daemon starts as root to open the channel, then drops to the
+# `qeminga` account and installs seccomp itself (design §5.4, §5.5), so
+# no User= or NoNewPrivileges= here.
+#
+# /run/qeminga holds the recovery marker (§4.4). It is provisioned at boot
+# by tmpfiles.d/qeminga.conf and, belt and braces, by the privileged
+# ExecStartPre lines below, owned by the service account: the marker is
+# created and removed after the drop, by uid 600. RuntimeDirectory= is
+# deliberately not used: with no User= systemd would (re)apply root
+# ownership to the directory before every ExecStart, undoing any hand-over
+# and leaving the dropped daemon unable to create or remove the marker.
+# Nothing removes the directory on stop, so a marker left by a forced stop
+# makes the next start enter recovery mode (C-20, §5.7); a reboot clears
+# /run and the kernel's freeze state together. TimeoutStopSec must exceed
+# fsfreeze_max_timeout_secs plus a thaw-drain margin (300 + 30).
+#
+[Unit]
+Description=qeminga QEMU guest agent (minimum secure subset)
+Documentation=https://github.com/vicaya/qeminga
+Conflicts=qemu-guest-agent.service
+After=qemu-guest-agent.service
+Before=multi-user.target
+
+[Service]
+Type=simple
+ExecStartPre=+/usr/bin/mkdir -p /run/qeminga
+ExecStartPre=+/usr/bin/chown qeminga:qeminga /run/qeminga
+ExecStartPre=+/usr/bin/chmod 0700 /run/qeminga
+ExecStart=/usr/bin/qeminga --config /etc/qeminga/config.toml
+Restart=always
+RestartSec=1s
+TimeoutStopSec=330s
+StandardOutput=null
+StandardError=journal
+# Only what the startup sequence needs before its own drop (§5.4): open
+# the 0600 qeminga-owned channel as root (DAC_OVERRIDE), change identity
+# (SETUID/SETGID), trim the bounding set (SETPCAP), and the final three.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_BOOT CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP
+AmbientCapabilities=
+# Hardening that does not interfere with FIFREEZE on the real mount table.
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+PrivateTmp=no
+ProtectHome=no
+ProtectSystem=no
+
+[Install]
+WantedBy=multi-user.target

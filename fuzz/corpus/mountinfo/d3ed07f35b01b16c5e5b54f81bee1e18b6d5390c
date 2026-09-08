@@ -1,0 +1,5 @@
+27 1 8:1 / / rw,relatime sharw,relatime shared:5 - xfs /deme shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+42 emount-ro
+42 27 8:2 / /data rwelatime shared:5 - xfs /dev/sdb0 rw,attr2.inode64
+43 27 8:2 /exports /s27 8:relatime shared:5 - xfs /dev/sdb1 rw,attr2.ide64
+43 27 8:2 /exports /srv/exports rw,relatime shared:5 - xfs /dev/sdb1 rw,attr2,inode64

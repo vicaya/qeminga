@@ -121,7 +121,7 @@ fn fixture(name: &str) -> String {
 
 fn rig(state: FreezeState) -> Rig {
     let dir = tempfile::tempdir().unwrap();
-    let marker = Marker::new(dir.path().join("frozen"));
+    let marker = Marker::open(dir.path().join("frozen")).unwrap();
     let sink = CountingSink::default();
     let router = Router::new(Box::new(sink.clone()));
     let kernel = Arc::new(FakeKernel::new());
@@ -135,10 +135,10 @@ fn rig(state: FreezeState) -> Rig {
         Arc::new(Config::default()),
         Arc::new(FreezeStateMachine::starting_in(state)),
         router,
+        marker,
     )
     .with_kernel(kernel.clone())
     .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
-    .with_marker(marker)
     .with_hooks(Arc::new(hooks));
     // The fake kernel logs the router mode and marker presence at every
     // ioctl so ordering against the ring switch is provable.
@@ -149,6 +149,9 @@ fn rig(state: FreezeState) -> Rig {
         let what = match call {
             Call::Fifreeze(p) => format!("fifreeze {}", p.display()),
             Call::Fithaw(p) => format!("fithaw {}", p.display()),
+            // Opening a target is not an ioctl; only the ioctls are ordered
+            // against the ring switch here.
+            Call::Open(..) => return,
             other => format!("{other:?}"),
         };
         log2.push(format!(

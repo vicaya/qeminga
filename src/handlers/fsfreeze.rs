@@ -1946,10 +1946,10 @@ mod tests {
                 Arc::new(Config::default()),
                 Arc::new(FreezeStateMachine::new()),
                 Router::new(Box::new(sink.clone())),
+                Marker::open(dir.path().join("frozen")).unwrap(),
             )
             .with_kernel(Arc::new(FakeKernel::new()))
             .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
-            .with_marker(Marker::new(dir.path().join("frozen")))
             .with_hooks(hooks.clone()),
         );
         freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))

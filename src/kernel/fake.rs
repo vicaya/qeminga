@@ -80,7 +80,9 @@ impl Gate {
         ReleaseOnDrop(self.clone())
     }
 
-    fn wait(&self) {
+    /// Blocks the calling thread until the gate is released (what the
+    /// scripted calls do; test doubles of other traits can use it too).
+    pub fn wait(&self) {
         self.inner.waiting.fetch_add(1, Ordering::SeqCst);
         let mut released = self.lock();
         while !*released {

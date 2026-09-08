@@ -120,6 +120,10 @@ fn fixture(name: &str) -> String {
 }
 
 fn rig(state: FreezeState) -> Rig {
+    rig_with_operation_timeout(state, std::time::Duration::from_secs(60))
+}
+
+fn rig_with_operation_timeout(state: FreezeState, timeout: std::time::Duration) -> Rig {
     let dir = tempfile::tempdir().unwrap();
     let marker = Marker::open(dir.path().join("frozen")).unwrap();
     let sink = CountingSink::default();
@@ -139,7 +143,8 @@ fn rig(state: FreezeState) -> Rig {
     )
     .with_kernel(kernel.clone())
     .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
-    .with_hooks(Arc::new(hooks));
+    .with_hooks(Arc::new(hooks))
+    .with_freeze_operation_timeout(timeout);
     // The fake kernel logs the router mode and marker presence at every
     // ioctl so ordering against the ring switch is provable.
     let ctx = Arc::new(ctx);
@@ -396,4 +401,46 @@ async fn background_flusher_runs_only_while_thawed() {
     .await;
     assert!(rig.sink.len() > after, "write-through while thawed");
     assert_eq!(rig.ctx.audit.lost(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ring_stays_until_an_aborted_freeze_has_settled() {
+    // An aborted freeze (deadline with a FIFREEZE in flight) keeps the
+    // freeze-safe ring while the blocked call can still freeze a target;
+    // the flush happens exactly once, when the operation settles.
+    let rig =
+        rig_with_operation_timeout(FreezeState::Thawed, std::time::Duration::from_millis(200));
+    let ctx = rig.ctx.clone();
+    let gate = rig.kernel.script_freeze_gate("/");
+    let _release = gate.release_on_drop();
+    let req = qeminga::proto::parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+    let err = async { fsfreeze::freeze(&ctx, &req).await }
+        .with_subscriber(audit::subscriber(Level::TRACE, ctx.audit.clone()))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("freeze aborted"), "{err}");
+    assert_eq!(ctx.audit.mode(), Mode::Ring, "still unresolved");
+    assert_eq!(ctx.state.current(), FreezeState::Thawing);
+    let before = rig.sink.len();
+    tracing::subscriber::with_default(audit::subscriber(Level::TRACE, ctx.audit.clone()), || {
+        tracing::info!(event = "while_unresolved", "buffered")
+    });
+    assert_eq!(rig.sink.len(), before, "nothing reaches the normal sink");
+    gate.release();
+    let start = std::time::Instant::now();
+    while ctx.state.current() != FreezeState::Thawed {
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(ctx.audit.mode(), Mode::Normal);
+    assert!(
+        rig.log
+            .events()
+            .iter()
+            .filter(|e| e.starts_with("thawed"))
+            .count()
+            == 1,
+        "{:?}",
+        rig.log.events()
+    );
 }

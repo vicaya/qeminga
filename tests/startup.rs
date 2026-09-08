@@ -766,6 +766,59 @@ async fn a_terminal_channel_error_during_a_thaw_waits_for_its_completion() {
     assert!(!ctx.marker.exists());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stop_during_an_unresolved_freeze_waits_for_its_settlement() {
+    // The freeze aborts on its deadline with a FIFREEZE still in flight;
+    // the request has failed, but the process may not exit until the
+    // in-flight call has returned and the recovery settled (C-21): the
+    // stop is deferred, then honoured once `Thawed`.
+    let sink = SharedSink::default();
+    let rig = rig(false, &sink);
+    let kernel = Arc::new(FakeKernel::new());
+    let gate = kernel.script_freeze_gate("/");
+    let _release = gate.release_on_drop();
+    let ctx = Arc::new(
+        Arc::try_unwrap(rig.ctx)
+            .unwrap_or_else(|_| panic!("unshared"))
+            .with_kernel(kernel)
+            .with_freeze_operation_timeout(Duration::from_millis(300)),
+    );
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let initial = take_initial();
+    let server_ctx = Arc::clone(&ctx);
+    let server = tokio::spawn(async move {
+        daemon::serve_until_signal(
+            server_ctx,
+            Path::new("/dev/virtio-ports/fake"),
+            never_open(),
+            Some(initial),
+            false,
+            async move { signal_rx.await.unwrap_or("closed") },
+            Duration::from_millis(20),
+        )
+        .await
+    });
+    let mut peer = Channel::from_fd(rig.peer).unwrap();
+    // simple.txt freezes /home first, then / (blocked at the gate).
+    let reply = request(&mut peer, r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert!(reply.contains("freeze aborted"), "{reply}");
+    assert_eq!(ctx.state.current(), FreezeState::Thawing);
+    assert!(ctx.marker.exists());
+    signal_tx.send("SIGTERM").unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!server.is_finished(), "stop deferred while unresolved");
+    let reply = request(&mut peer, r#"{"execute":"guest-fsfreeze-status"}"#).await;
+    assert_eq!(reply, "{\"return\":\"frozen\"}\n");
+    gate.release();
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("exits once the operation has settled")
+        .unwrap();
+    assert!(result.is_ok());
+    assert_eq!(ctx.state.current(), FreezeState::Thawed);
+    assert!(!ctx.marker.exists());
+}
+
 #[test]
 fn runtime_is_multi_thread_with_at_least_two_workers() {
     let rt = daemon::build_runtime().unwrap();

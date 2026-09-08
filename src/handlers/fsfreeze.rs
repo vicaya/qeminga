@@ -2826,4 +2826,274 @@ mod tests {
             .unwrap();
         assert_eq!(value, json!(4));
     }
+
+    /// A mount table whose read blocks at a gate (a slow `/proc` read).
+    struct GatedMounts {
+        table: String,
+        gate: crate::kernel::fake::Gate,
+    }
+
+    impl MountSource for GatedMounts {
+        fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+            self.gate.wait();
+            Ok(self.table.clone().into_bytes())
+        }
+    }
+
+    /// Freezes nested.txt with B (`/home/data`) blocked at a gate and the
+    /// operation deadline at 200 ms; returns the rig, B's gate and the
+    /// request's error once the abort has replied.
+    async fn aborted_at_b() -> (Rig, crate::kernel::fake::Gate, Error) {
+        let rig = Rig::nested().with_operation_timeout(Duration::from_millis(200));
+        let gate = rig.kernel.script_freeze_gate("/home/data");
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(err.class(), ErrorClass::GenericError);
+        rig.wait_for("A drained", |r| {
+            r.fithaws() == paths(&["/home/data/deep", "/home/data/deep"])
+        })
+        .await;
+        (rig, gate, err)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_error_after_the_abort_needs_no_recovery_and_ebusy_is_drained() {
+        // B fails after the abort: nothing of B is frozen, so nothing is
+        // drained for it, and the operation settles `Thawed`.
+        let (rig, gate, _) = aborted_at_b().await;
+        let _release = gate.release_on_drop();
+        rig.kernel.script_freeze_error("/home/data", Errno::EIO);
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep", "/home/data/deep"])
+        );
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
+        // B answers EBUSY after the abort: retained and drained like any
+        // EBUSY target (§4.2), then `Thawed`.
+        let (rig, gate, _) = aborted_at_b().await;
+        let _release = gate.release_on_drop();
+        rig.kernel.script_freeze_error("/home/data", Errno::EBUSY);
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/home/data/deep",
+                "/home/data/deep",
+                "/home/data",
+                "/home/data"
+            ])
+        );
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.held(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn expiry_during_preparation_freezes_nothing_and_leaves_no_marker() {
+        // The deadline expires while the mount table is still being read:
+        // the preparation stays owned to its end, no target is ever
+        // authorised, the marker it created is removed, and `Thawed` is
+        // published after the finalisation hook.
+        let gate = crate::kernel::fake::Gate::new();
+        let _release = gate.release_on_drop();
+        let mounts = Arc::new(GatedMounts {
+            table: fixture("nested.txt"),
+            gate: gate.clone(),
+        });
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts)
+            .with_operation_timeout(Duration::from_millis(100));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("(preparing)"), "{err}");
+        assert_eq!(gate.waiting(), 1, "the preparation is still running");
+        assert_eq!(rig.state(), FreezeState::Thawing);
+        assert!(rig.kernel.calls().is_empty());
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert!(rig.kernel.calls().is_empty(), "no ioctl at all");
+        assert!(!rig.marker().exists(), "the late marker was removed");
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
+        assert!(rig.ctx.freeze_op().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_blocked_recovery_drain_keeps_status_served_and_spawns_nothing_more() {
+        // A's FITHAW blocks during the recovery pass: status is still
+        // answered, a thaw joins the same pass (no second drain), a freeze
+        // is refused, and once the drain returns the joined thaw reports
+        // the in-flight target. Resource use stays at one worker and one
+        // drain.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_millis(200));
+        let b = rig.kernel.script_freeze_gate("/home/data");
+        let _release_b = b.release_on_drop();
+        let a_thaw = rig.kernel.script_thaw_gate("/home/data/deep");
+        let _release_a = a_thaw.release_on_drop();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        rig.wait_for("drain blocked", |_| a_thaw.waiting() == 1)
+            .await;
+        let value = status(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!("frozen"));
+        let joined = {
+            let ctx = Arc::clone(&rig.ctx);
+            tokio::spawn(
+                async move { thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#)).await },
+            )
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!joined.is_finished(), "the joined thaw waits for the pass");
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot freeze"), "{err}");
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep"]),
+            "one drain, blocked"
+        );
+        assert_eq!(rig.fifreezes().len(), 2, "no new worker");
+        a_thaw.release();
+        let err = joined.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("FIFREEZE of /home/data still in flight")
+                && err.to_string().contains("1 target(s) thawed"),
+            "{err}"
+        );
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep", "/home/data/deep"])
+        );
+        assert_eq!(b.waiting(), 1);
+        b.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_thaw_during_the_walk_aborts_it_and_joins_the_recovery() {
+        // No deadline pressure (10 s): the host gives up and sends a thaw
+        // while B is still inside FIFREEZE. The thaw aborts the walk, A is
+        // drained once, C is never authorised, and both requests report
+        // the outcome; a second thaw joins without draining anything again.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_secs(10));
+        let b = rig.kernel.script_freeze_gate("/home/data");
+        let _release_b = b.release_on_drop();
+        let freezing = {
+            let ctx = Arc::clone(&rig.ctx);
+            tokio::spawn(async move {
+                freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#)).await
+            })
+        };
+        rig.wait_for("B blocked", |_| b.waiting() == 1).await;
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("still in flight"), "{err}");
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("thaw requested"), "{err}");
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep", "/home/data/deep"])
+        );
+        assert_eq!(rig.opens(), paths(&["/home/data/deep", "/home/data"]));
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("still in flight"), "{err}");
+        assert_eq!(rig.fithaws().len(), 2, "no duplicate drain");
+        assert!(rig.marker().exists());
+        b.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(rig.fithaws().len(), 4);
+        assert!(!rig.marker().exists());
+        // Once settled, a thaw is an ordinary recovery drain again (by
+        // pathname over the whole plan; the fake answers one success on
+        // the two targets that were never frozen).
+        thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.state(), FreezeState::Thawed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incomplete_recovery_drain_settles_frozen_with_the_marker_and_the_watchdog() {
+        // A's FITHAW is denied: the recovery is incomplete, so when B
+        // settles the operation publishes `Frozen` (the watchdog hook
+        // fires), keeps the marker, and keeps A's handle for the next
+        // drain; B itself was thawed.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_millis(200));
+        let b = rig.kernel.script_freeze_gate("/home/data");
+        let _release_b = b.release_on_drop();
+        rig.kernel
+            .script_thaw_error("/home/data/deep", Errno::EACCES);
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        rig.wait_for("A's drain attempted", |r| {
+            r.fithaws() == paths(&["/home/data/deep"])
+        })
+        .await;
+        b.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Frozen)
+            .await;
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep", "/home/data", "/home/data"])
+        );
+        assert!(rig.marker().exists());
+        assert_eq!(rig.held(), 1, "A's handle is kept for the next drain");
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "frozen"]);
+        assert!(rig.ctx.freeze_op().is_none());
+        // The next thaw is an ordinary one from `Frozen`: it retries A
+        // through the kept handle (still denied here) and reports it.
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("/home/data/deep"), "{err}");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_commands_during_an_unresolved_operation_add_no_work() {
+        let (rig, gate, _) = aborted_at_b().await;
+        let _release = gate.release_on_drop();
+        let before = rig.kernel.calls().len();
+        for _ in 0..5 {
+            freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+                .await
+                .unwrap_err();
+            freeze_list(
+                &rig.ctx,
+                &req(
+                    r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/"]}}"#,
+                ),
+            )
+            .await
+            .unwrap_err();
+            thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+                .await
+                .unwrap_err();
+            status(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+                .await
+                .unwrap();
+        }
+        assert_eq!(rig.kernel.calls().len(), before, "no ioctl, no open");
+        assert_eq!(gate.waiting(), 1, "still the one worker");
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed"]);
+        assert!(rig.ctx.freeze_op().is_some());
+    }
 }

@@ -433,7 +433,8 @@ the answer is a one-line change, and leave the question here.
   - `create_fails_if_parent_missing` — no `mkdir` is ever attempted (`ENOENT` surfaces; parent still absent).
   - `create_fsyncs_before_returning` — observable via a fake `Fs` trait if you introduce one, otherwise document and rely on the privileged strace check in T5.2.
   - `remove_unlinks_and_is_error_if_absent`, `exists_reports_presence`.
-- **Implement (green):** `Marker::new(path)`, `create()`, `remove()`, `exists()`, using `nix::fcntl::openat`, `nix::unistd::fsync`, `nix::unistd::unlinkat`; never `mkdirat`.
+  - `open_pins_the_parent_directory_and_reports_its_device`, `the_device_is_that_of_the_resolved_directory_not_of_the_pathname` (`..` and a symlinked parent), `marker_operations_follow_the_pinned_directory_not_the_pathname` (the directory renamed away and a symlink put in its place after `open`: create/exists/remove stay in the pinned directory) — review follow-up.
+- **Implement (green):** `Marker::open(path)` opens the directory of `path` once (`O_RDONLY | O_DIRECTORY | O_CLOEXEC`, resolved as the kernel does) and records its device (`dev()`, what T4.6 checks against the plan); `create()`, `remove()`, `exists()` are `openat`/`unlinkat`/`fstatat` relative to that descriptor, plus `fsync`; never `mkdirat`.
 - **Done when:** T3.4 creates it before the first `FIFREEZE` and removes it only after a complete drain.
 
 #### T3.4 — `guest-fsfreeze-{freeze,freeze-list,thaw,status}`

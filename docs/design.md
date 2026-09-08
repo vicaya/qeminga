@@ -264,7 +264,7 @@ A per-freeze watchdog runs as a cancellable async task. It ensures that a hyperv
 
 **Blocking requirement:** only the `FIFREEZE` and `FITHAW` ioctls run through `spawn_blocking`; the timer, refresh, cancellation, and state transition remain on the async runtime. The watchdog hands its thaw drain to `spawn_blocking` only after it wins the state transition.
 
-**Recovery marker:** `state_path` is an atomically-created marker on an unfreezable runtime filesystem (default `/run/qeminga/frozen`). The service manager provisions `/run/qeminga` before startup (§8.4), so qeminga creates the marker with `openat(..., O_CREAT|O_EXCL)`, `fsync`s it before the first `FIFREEZE`, and removes it with `unlinkat` only after a complete thaw drain. A startup that finds the marker enters `Frozen` recovery mode, defers normal log and pid-file creation, keeps using the in-memory audit buffer, and accepts only the frozen-safe command set until thaw succeeds. A reboot clears the default `/run` marker and resets the kernel freeze state together; an external thaw can still leave a stale marker, which qeminga treats pessimistically because an unnecessary thaw is safer than proceeding while a filesystem might be frozen. This also recovers from `SIGKILL`, a seccomp kill, or a panic during freeze.
+**Recovery marker:** `state_path` is an atomically-created marker on an unfreezable runtime filesystem (default `/run/qeminga/frozen`). The service manager provisions `/run/qeminga` before startup (§8.4). qeminga opens that directory once at startup, resolving the configured path as the kernel does, checks the device it is on against the freeze plan (§8.2), and keeps the descriptor: the marker is created with `openat(dirfd, ..., O_CREAT|O_EXCL)`, `fsync`ed before the first `FIFREEZE`, and removed with `unlinkat(dirfd, ...)` only after a complete thaw drain, so a later change to the pathname (a symlink, a rename, a mount placed over it) cannot redirect a marker operation to another filesystem. A startup that finds the marker enters `Frozen` recovery mode, defers normal log and pid-file creation, keeps using the in-memory audit buffer, and accepts only the frozen-safe command set until thaw succeeds. A reboot clears the default `/run` marker and resets the kernel freeze state together; an external thaw can still leave a stale marker, which qeminga treats pessimistically because an unnecessary thaw is safer than proceeding while a filesystem might be frozen. This also recovers from `SIGKILL`, a seccomp kill, or a panic during freeze.
 
 ---
 
@@ -473,7 +473,7 @@ fstrim      = true    # opt-out: discard unused blocks
 seccomp     = true    # no effect if binary not compiled with --features seccomp
 ```
 
-`config_version` versions the configuration schema. The agent version returned by `guest-info` is build metadata and cannot be supplied by a runtime configuration file. `state_path` must be on an unfreezable runtime filesystem; startup rejects a path that is eligible for the freeze plan.
+`config_version` versions the configuration schema. The agent version returned by `guest-info` is build metadata and cannot be supplied by a runtime configuration file. `state_path` must be on an unfreezable runtime filesystem: startup opens the marker's directory (following `..` components and symlinks as the kernel does) and rejects it when the filesystem that directory is on is in the freeze plan; the pathname's prefix alone is never what is judged.
 
 ### 8.3 Device Node Permissions
 

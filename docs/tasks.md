@@ -603,11 +603,12 @@ the answer is a one-line change, and leave the question here.
 - **Tests first (red):**
   - `cli_accepts_config_path_and_version` (extend `tests/cli.rs`).
   - `startup_order_is_config_marker_channel_caps_seccomp_runtime` — ordered fake log through a `Startup` trait; `no ioctl or marker write happens before the channel is open`.
-  - `freezable_state_path_is_rejected_before_opening_channel` with a clear message naming the covering mount.
+  - `freezable_state_path_is_rejected_before_opening_channel` with a clear message naming the covering mount and device: what is judged is the device of the marker's directory as opened at step 2 (`Marker::open`, T3.3), never the pathname's prefix, so `..` components and symlinked parents are seen through; a directory that cannot be opened is `EX_CONFIG` at step 2 (review follow-up).
   - `ebusy_on_channel_exits_with_channel_already_open_and_nonzero_code`.
   - `marker_present_starts_in_frozen_recovery_mode_with_ring_audit_and_watchdog_armed` (C-14).
   - `sigterm_while_thawed_exits_zero_promptly`, `sigterm_while_frozen_is_deferred_until_thaw` (paused time + fake channel), `cancel_finishes_the_in_flight_command_and_waits_for_may_stop` (`src/channel.rs`: a stop is raced only against the read, never against a handler, and takes effect only when `Handle::may_stop` holds, i.e. the state is `Thawed`; the stopper repeats the request until then).
   - `runtime_is_multi_thread_with_at_least_two_workers` (inspect `tokio::runtime::Handle::current().metrics().num_workers()`).
+  - `runtime_shutdown_is_bounded_by_an_abandoned_blocking_task` — once the loop has stopped the runtime is finished under `RUNTIME_SHUTDOWN_GRACE` (5 s) rather than dropped, since a drop waits for ever for a started blocking task and the only one that can still be running is an abandoned `guest-get-fsinfo` walk (T2.5); freeze, thaw and trim always complete before the stop (C-21) — review follow-up.
   - `feature_warnings_are_logged_once_at_startup`.
   - `a_stop_is_honoured_while_the_host_is_not_reading_the_reply` and `a_blocked_reply_while_frozen_waits_for_the_thaw_then_stops` (channel: the reply write is raced against an allowed stop; a stop that is not allowed yet resumes the same partial write) — C-21, review follow-up.
   - `a_missing_channel_never_delays_the_drop_the_filter_or_recovery` (ordered fake log: a non-`EBUSY` open failure is deferred and the sequence continues) and `recovery_thaws_without_the_channel_ever_opening` (in-process: marker present, an opener that always fails, the watchdog drains and the stop is honoured) — OQ-7, review follow-up.

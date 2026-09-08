@@ -65,7 +65,11 @@ impl Write for SharedSink {
 struct FakeStartup {
     steps: RefCell<Vec<String>>,
     config: String,
+    /// Whether the marker exists in `dir` when step 2 looks.
     marker: bool,
+    /// The real directory the fake's marker lives in (tmpfs), whatever
+    /// path the configuration names.
+    dir: tempfile::TempDir,
     mountinfo: String,
     open: Result<(), Errno>,
     sink: SharedSink,
@@ -77,6 +81,7 @@ impl FakeStartup {
             steps: RefCell::new(Vec::new()),
             config: "[agent]\nstate_path = \"/run/qeminga/frozen\"\n".to_owned(),
             marker: false,
+            dir: shm_dir(),
             mountinfo: fixture("tmpfs_and_nfs.txt"),
             open: Ok(()),
             sink: SharedSink::default(),
@@ -95,9 +100,13 @@ impl Startup for FakeStartup {
         self.log(format!("config {}", path.display()));
         Config::parse(&self.config)
     }
-    fn marker_present(&self, path: &Path) -> bool {
+    fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
         self.log(format!("marker {}", path.display()));
-        self.marker
+        let marker = Marker::open(self.dir.path().join("frozen"))?;
+        if self.marker && !marker.exists() {
+            marker.create().unwrap();
+        }
+        Ok(marker)
     }
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
         self.log(format!("logging {} ring={ring}", level.as_str()));
@@ -149,6 +158,7 @@ impl Startup for FakeStartup {
         router: Router,
         recovery: bool,
         channel: Option<OwnedFd>,
+        _marker: Marker,
     ) -> Result<(), RunError> {
         self.log(format!(
             "runtime recovery={recovery} mode={:?} channel={}",
@@ -181,22 +191,44 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
         ]
     );
     // No ioctl and no marker write before the runtime: the fake kernel is
-    // never involved and the marker step is read-only by construction
-    // (`marker_present` returns a bool, nothing else is offered).
+    // never involved and the marker step only opens the directory and
+    // looks (`open_marker` creates nothing).
     let text = startup.sink.text();
     assert!(!text.contains("fifreeze"), "{text}");
     assert!(!text.contains("fithaw"), "{text}");
 }
 
+/// `(major, minor)` of the filesystem holding `path`, as `stat` sees it.
+fn dev_of(path: &Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).unwrap().dev();
+    (
+        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
+        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
+    )
+}
+
 #[test]
 fn freezable_state_path_is_rejected_before_opening_channel() {
+    // What is judged is the device of the marker's directory as opened,
+    // not the configured pathname: the fake's directory is on tmpfs, so
+    // the mount table is made to list that very device as a planned ext4
+    // root (the configured path plays no part).
     let mut startup = FakeStartup::new();
     startup.config = "[agent]\nstate_path = \"/var/lib/qeminga/frozen\"\n".to_owned();
+    let (major, minor) = dev_of(startup.dir.path());
+    startup.mountinfo = format!(
+        "27 1 {major}:{minor} / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+         28 27 0:30 / /run rw,nosuid - tmpfs tmpfs rw\n"
+    );
     let err = daemon::run_with(&Options::default(), &startup).unwrap_err();
     assert_eq!(err.exit_code(), EX_CONFIG);
     let msg = err.to_string();
     assert!(msg.contains("/var/lib/qeminga/frozen"), "{msg}");
-    assert!(msg.contains("is on /,"), "names the covering mount: {msg}");
+    assert!(
+        msg.contains(&format!("is on / ({major}:{minor}),")),
+        "names the covering mount and device: {msg}"
+    );
     assert!(msg.contains("tmpfs"), "{msg}");
     let steps = startup.steps();
     assert_eq!(
@@ -205,9 +237,26 @@ fn freezable_state_path_is_rejected_before_opening_channel() {
         "stopped before the channel: {steps:?}"
     );
     assert!(!steps.iter().any(|s| s.starts_with("channel")));
-    // A tmpfs state_path under an ext4 root passes.
-    let startup = FakeStartup::new();
+    // A pathname under a planned mount is fine when its directory is on
+    // tmpfs: `/var/lib/qeminga/frozen` with the default fixture (where the
+    // fake's tmpfs device is not planned) passes, prefix or no prefix.
+    let mut startup = FakeStartup::new();
+    startup.config = "[agent]\nstate_path = \"/var/lib/qeminga/frozen\"\n".to_owned();
     daemon::run_with(&Options::default(), &startup).unwrap();
+    // A marker directory that cannot be opened stops the sequence at step
+    // 2 with EX_CONFIG.
+    let mut startup = FakeStartup::new();
+    startup.dir = shm_dir();
+    let gone = startup.dir.path().to_path_buf();
+    std::fs::remove_dir(&gone).unwrap();
+    let err = daemon::run_with(&Options::default(), &startup).unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(err.to_string().contains("directory"), "{err}");
+    assert_eq!(
+        startup.steps().last().unwrap(),
+        "marker /run/qeminga/frozen"
+    );
+    std::fs::create_dir(&gone).unwrap();
 }
 
 #[test]
@@ -300,7 +349,7 @@ fn rig(recovery: bool, sink: &SharedSink) -> Rig {
 
 fn rig_with_idle(recovery: bool, sink: &SharedSink, idle_secs: u64) -> Rig {
     let dir = shm_dir();
-    let marker = Marker::new(dir.path().join("frozen"));
+    let marker = Marker::open(dir.path().join("frozen")).unwrap();
     if recovery {
         marker.create().unwrap();
     }
@@ -313,13 +362,12 @@ fn rig_with_idle(recovery: bool, sink: &SharedSink, idle_secs: u64) -> Rig {
         marker.path().display()
     ))
     .unwrap();
-    let ctx = daemon::production_context(Arc::new(config), router, recovery);
+    let ctx = daemon::production_context(Arc::new(config), router, recovery, marker);
     let ctx = Arc::new(
         Arc::try_unwrap(ctx)
             .unwrap_or_else(|_| panic!("unshared"))
             .with_kernel(Arc::new(FakeKernel::new()))
-            .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
-            .with_marker(marker),
+            .with_mounts(Arc::new(StaticMounts(fixture("simple.txt")))),
     );
     let (ours, peer) = nix::sys::socket::socketpair(
         nix::sys::socket::AddressFamily::Unix,

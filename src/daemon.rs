@@ -6,9 +6,13 @@
 //! against a recording fake:
 //!
 //! 1. load and validate the configuration;
-//! 2. look for the recovery marker (read-only) to choose the initial
-//!    state; start logging, in ring mode when recovering (§4.4);
-//! 3. reject a `state_path` that the freeze plan would freeze (§8.2);
+//! 2. open the recovery marker's directory (read-only; the descriptor is
+//!    kept for every later marker operation, §4.4) and look for the
+//!    marker to choose the initial state; start logging, in ring mode
+//!    when recovering (§4.4);
+//! 3. reject a `state_path` whose directory is on a filesystem the freeze
+//!    plan would freeze (§8.2), judged by the device of the opened
+//!    directory, not by the pathname;
 //! 4. open the channel (`EBUSY` is terminal, §8.4);
 //! 5. drop capabilities (skipped with a warning when not root, C-18);
 //! 6. install seccomp when compiled in and enabled;
@@ -16,7 +20,12 @@
 //!
 //! No ioctl and no marker write happens before step 7. A `SIGTERM`/`SIGINT`
 //! while the state is not `Thawed` is deferred until the thaw completes
-//! (C-21).
+//! (C-21). Once the loop has stopped, the runtime is shut down under
+//! [`RUNTIME_SHUTDOWN_GRACE`]: freeze, thaw and trim always run to
+//! completion before that point (the stop waits for them), so the bound
+//! only ever cuts short an abandoned informational walk
+//! (`guest-get-fsinfo`), which a blocked `statfs` could otherwise hold
+//! open for ever.
 #![forbid(unsafe_code)]
 
 use std::ffi::{OsStr, OsString};
@@ -36,6 +45,7 @@ use crate::dispatch::{Context, Dispatcher};
 use crate::freeze_plan::FreezePlan;
 use crate::handlers::fsfreeze;
 use crate::kernel::caps::{Outcome, PrivilegeError};
+use crate::marker::{Marker, MarkerError};
 use crate::mountinfo::{MountEntry, MountSource};
 use crate::state::{FreezeState, FreezeStateMachine};
 
@@ -57,6 +67,13 @@ pub const EX_CONFIG: u8 = 78;
 
 /// How often a deferred stop re-checks the freeze state (C-21).
 pub const STOP_POLL: Duration = Duration::from_millis(250);
+
+/// How long the runtime shutdown waits for blocking work once the loop
+/// has stopped. Every freeze, thaw and trim has completed by then (a stop
+/// is deferred until `Thawed` and the session finishes its command), so
+/// only an abandoned `guest-get-fsinfo` walk stuck in `statfs(2)` can
+/// still be running, and it must not hold the exit.
+pub const RUNTIME_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Usage line.
 pub const USAGE: &str = "usage: qeminga [--config PATH] [--version]";
@@ -120,17 +137,27 @@ pub enum RunError {
     /// Configuration file problem.
     #[error("{0}")]
     Config(#[from] ConfigError),
-    /// `state_path` is on a filesystem the freeze plan would freeze.
+    /// The recovery marker's directory could not be opened, or the path
+    /// has no directory or file name.
+    #[error("{0}")]
+    Marker(#[from] MarkerError),
+    /// `state_path` is on a filesystem the freeze plan would freeze: its
+    /// directory, opened and resolved as the kernel does, is on a planned
+    /// device.
     #[error(
-        "state_path {} is on {}, which the freeze plan would freeze; put it on tmpfs (e.g. /run)",
+        "state_path {} is on {} ({}:{}), which the freeze plan would freeze; put it on tmpfs (e.g. /run)",
         path.display(),
-        mount.display()
+        mount.display(),
+        dev.0,
+        dev.1
     )]
     StatePath {
         /// The configured path.
         path: PathBuf,
-        /// The covering mount point.
+        /// A mount point of the planned filesystem the directory is on.
         mount: PathBuf,
+        /// That filesystem's `(major, minor)`.
+        dev: (u32, u32),
     },
     /// The mount table could not be read for the `state_path` check.
     #[error("cannot read the mount table: {0}")]
@@ -153,7 +180,10 @@ impl RunError {
     /// The sysexits-style code for this error.
     pub fn exit_code(&self) -> u8 {
         match self {
-            RunError::Config(_) | RunError::StatePath { .. } | RunError::MountTable(_) => EX_CONFIG,
+            RunError::Config(_)
+            | RunError::Marker(_)
+            | RunError::StatePath { .. }
+            | RunError::MountTable(_) => EX_CONFIG,
             RunError::Channel(_) => EX_UNAVAILABLE,
             RunError::Privileges(_) => EX_NOPERM,
             RunError::Seccomp(_) | RunError::Runtime(_) => EX_OSERR,
@@ -166,11 +196,14 @@ impl RunError {
 pub trait Startup {
     /// Step 1.
     fn load_config(&self, path: &Path) -> Result<Config, ConfigError>;
-    /// Step 2a: is the recovery marker present? Read-only.
-    fn marker_present(&self, path: &Path) -> bool;
+    /// Step 2a: open the recovery marker's directory, read-only, and keep
+    /// it for every later marker operation (§4.4); the marker's presence
+    /// (`exists`) chooses the initial state. Nothing is created.
+    fn open_marker(&self, path: &Path) -> Result<Marker, RunError>;
     /// Step 2b: start logging; `ring` is `true` in recovery mode.
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError>;
-    /// Step 3: the mount table for the `state_path` check.
+    /// Step 3: the mount table for the `state_path` check (the device of
+    /// the opened marker directory against the freeze plan, §8.2).
     fn mount_table(&self) -> Result<Vec<MountEntry>, String>;
     /// Step 4: one attempt to open the channel while still privileged.
     /// `EBUSY` is terminal; any other failure yields `Ok(None)` and the
@@ -183,13 +216,15 @@ pub trait Startup {
     /// Step 6: `Ok(true)` when a filter was installed.
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError>;
     /// Step 7: run until a signal; `recovery` selects the `Frozen` start;
-    /// `channel` is the descriptor step 4 opened, if it did.
+    /// `channel` is the descriptor step 4 opened, if it did; `marker` is
+    /// the handle step 2 opened.
     fn serve(
         &self,
         config: Arc<Config>,
         router: Router,
         recovery: bool,
         channel: Option<OwnedFd>,
+        marker: Marker,
     ) -> Result<(), RunError>;
 }
 
@@ -211,7 +246,8 @@ pub fn seccomp_mode() -> &'static str {
 /// Runs the startup sequence through `startup`.
 pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     let config = startup.load_config(&opts.config_path)?;
-    let recovery = startup.marker_present(&config.agent.state_path);
+    let marker = startup.open_marker(&config.agent.state_path)?;
+    let recovery = marker.exists();
     let router = startup.init_logging(config.agent.log_level, recovery)?;
     for warning in config.warnings() {
         tracing::warn!(
@@ -229,14 +265,20 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     );
     let mounts = startup.mount_table().map_err(RunError::MountTable)?;
     let plan = FreezePlan::build(&mounts);
-    if plan.covers(&config.agent.state_path) {
-        let mount = plan
-            .mount_of(&config.agent.state_path)
-            .map(|(mp, _)| mp.to_owned())
+    // The device of the directory the kernel resolved the path to, not
+    // the pathname's prefix: `/run/../var/lib/x` and a symlinked parent
+    // both look like `/run` to a prefix match (§8.2).
+    let dev = marker.dev();
+    if plan.covers_device(dev) {
+        let mount = mounts
+            .iter()
+            .find(|entry| entry.dev() == dev)
+            .map(|entry| entry.mount_point.clone())
             .unwrap_or_default();
         return Err(RunError::StatePath {
             path: config.agent.state_path.clone(),
             mount,
+            dev,
         });
     }
     let channel = startup.open_channel(&config.agent.channel_path)?;
@@ -269,7 +311,7 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
             "compatibility build: unlisted syscalls are logged, not killed (never for a release)"
         );
     }
-    startup.serve(Arc::new(config), router, recovery, channel)
+    startup.serve(Arc::new(config), router, recovery, channel, marker)
 }
 
 /// Production entry point: parse, run, map errors to exit codes.
@@ -315,8 +357,8 @@ impl Startup for SystemStartup {
         Config::load(path)
     }
 
-    fn marker_present(&self, path: &Path) -> bool {
-        crate::marker::Marker::new(path).exists()
+    fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
+        Ok(Marker::open(path)?)
     }
 
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
@@ -383,11 +425,12 @@ impl Startup for SystemStartup {
         router: Router,
         recovery: bool,
         channel: Option<OwnedFd>,
+        marker: Marker,
     ) -> Result<(), RunError> {
         let runtime = build_runtime().map_err(|err| RunError::Runtime(err.to_string()))?;
         let path = config.agent.channel_path.clone();
-        let ctx = production_context(config, router, recovery);
-        runtime.block_on(async move {
+        let ctx = production_context(config, router, recovery, marker);
+        let served = runtime.block_on(async move {
             // Register the handlers before serving anything: a SIGTERM that
             // arrives after the first reply must be deferred, not fatal.
             use tokio::signal::unix::{SignalKind, signal};
@@ -412,8 +455,18 @@ impl Startup for SystemStartup {
             )
             .await
             .map_err(RunError::from)
-        })
+        });
+        finish_runtime(runtime, RUNTIME_SHUTDOWN_GRACE);
+        served
     }
+}
+
+/// Shuts the runtime down, waiting at most `grace` for blocking work.
+/// Dropping a runtime would wait for ever for a started blocking task;
+/// by the time the loop has stopped the only such task can be an
+/// abandoned `guest-get-fsinfo` walk (see [`RUNTIME_SHUTDOWN_GRACE`]).
+pub fn finish_runtime(runtime: tokio::runtime::Runtime, grace: Duration) {
+    runtime.shutdown_timeout(grace);
 }
 
 /// The multi-threaded runtime (§7): at least two workers so the watchdog
@@ -430,14 +483,20 @@ pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// The production context: real sources, state chosen by `recovery`.
-pub fn production_context(config: Arc<Config>, router: Router, recovery: bool) -> Arc<Context> {
+/// The production context: real sources, state chosen by `recovery`, the
+/// marker handle opened at startup.
+pub fn production_context(
+    config: Arc<Config>,
+    router: Router,
+    recovery: bool,
+    marker: Marker,
+) -> Arc<Context> {
     let state = if recovery {
         FreezeStateMachine::starting_frozen()
     } else {
         FreezeStateMachine::new()
     };
-    Arc::new(Context::new(config, Arc::new(state), router))
+    Arc::new(Context::new(config, Arc::new(state), router, marker))
 }
 
 /// Serves the channel until `signal` resolves and the state is `Thawed`
@@ -559,7 +618,8 @@ mod tests {
         assert_eq!(
             RunError::StatePath {
                 path: "/x".into(),
-                mount: "/".into()
+                mount: "/".into(),
+                dev: (8, 1)
             }
             .exit_code(),
             EX_CONFIG
@@ -577,7 +637,38 @@ mod tests {
         );
         assert_eq!(RunError::Seccomp("x".into()).exit_code(), EX_OSERR);
         assert_eq!(RunError::Runtime("x".into()).exit_code(), EX_OSERR);
+        assert_eq!(
+            RunError::Marker(MarkerError::InvalidPath { path: "/".into() }).exit_code(),
+            EX_CONFIG
+        );
         assert_eq!(RunError::MountTable("x".into()).exit_code(), EX_CONFIG);
+    }
+
+    #[test]
+    fn runtime_shutdown_is_bounded_by_an_abandoned_blocking_task() {
+        // A blocking task that never returns (a statfs on a dead share):
+        // dropping the runtime would wait for it for ever; the finish is
+        // bounded by the grace, and the task is left behind.
+        let runtime = build_runtime().unwrap();
+        let (release, stuck) = std::sync::mpsc::channel::<()>();
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&started);
+        runtime.spawn_blocking(move || {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = stuck.recv();
+        });
+        while !started.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let clock = std::time::Instant::now();
+        finish_runtime(runtime, Duration::from_millis(200));
+        assert!(
+            clock.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            clock.elapsed()
+        );
+        drop(release);
+        assert!(RUNTIME_SHUTDOWN_GRACE >= Duration::from_secs(1));
     }
 
     #[test]

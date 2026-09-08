@@ -477,7 +477,7 @@ impl From<String> for ThawFailure {
 /// thawed by mistake). When none does, the attempts are reported in
 /// order: `/data: mountpoint is on 8:3, not on the planned 8:2;
 /// /data-alias: cannot open mountpoint: ENOENT`.
-fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mount, String> {
+pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mount, String> {
     let mut attempts = Vec::new();
     for path in target.mountpoints() {
         match kernel.open_mount(path, target.dev) {

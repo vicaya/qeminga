@@ -413,13 +413,14 @@ the answer is a one-line change, and leave the question here.
 - **Files:** `src/handlers/fsfreeze/plan.rs` (or `src/freeze_plan.rs`), reusing `tests/fixtures/mountinfo/*`.
 - **Tests first (red):**
   - `includes_only_freezable_local_device_backed_types` — ext4/xfs on `/dev/*` in; `tmpfs`, `proc`, `sysfs`, `cgroup2`, `nfs`, `cifs`, `fuse.*`, `overlay` out.
-  - `dedupes_bind_mounts_by_device_identity` — two mounts with the same `major:minor` keep the **first in mount order** only, regardless of `root`.
+  - `dedupes_bind_mounts_by_device_identity` — two mounts with the same `major:minor` keep the **first in mount order** as the target's name, regardless of `root`; the others stay as its `aliases`.
+  - `a_hidden_first_mount_keeps_its_accessible_alias` (fixture `hidden_mount.txt`) — a mount placed over a target's first pathname does not discard its bind alias, which is how the superblock is still reached; the freeze-list intersection matches aliases too (review follow-up).
   - `freeze_order_is_reverse_mount_order_and_thaw_order_is_forward` — nested `/`, `/home`, `/home/data`.
   - `freeze_list_intersection_ignores_unknown_paths` (C-12) and matches on the unescaped mountpoint string exactly.
-  - `state_path_on_tmpfs_is_not_covered`, `state_path_on_root_ext4_is_covered` — longest-prefix mount lookup.
+  - `state_path_on_tmpfs_is_not_covered`, `state_path_on_root_ext4_is_covered` — longest-prefix mount lookup (`covers`, messages only) and the device check (`covers_device`, what startup applies to the opened marker directory).
   - `empty_plan_is_valid` (VM with no eligible filesystems freezes zero, thaws zero).
-- **Implement (green):** `FreezePlan { targets: Vec<Target { mountpoint, dev, fs_type }> }`, `FreezePlan::build(&[MountEntry]) -> FreezePlan`, `freeze_order()`, `thaw_order()`, `restrict_to(&[String])`, `covers(&Path) -> bool`, constant `FREEZABLE_FS_TYPES`.
-- **Done when:** T4.6 uses `covers` to reject a freezable `state_path` at startup with a clear error.
+- **Implement (green):** `FreezePlan { targets: Vec<Target { mountpoint, aliases, dev, fs_type }> }`, `FreezePlan::build(&[MountEntry]) -> FreezePlan`, `freeze_order()`, `thaw_order()`, `restrict_to(&[String])`, `covers(&Path) -> bool`, `covers_device((u32, u32)) -> bool`, constant `FREEZABLE_FS_TYPES`.
+- **Done when:** T4.6 uses `covers_device` on the marker directory's device to reject a freezable `state_path` at startup with a clear error.
 
 #### T3.3 — Recovery marker ∥
 - **Status:** todo

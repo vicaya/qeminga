@@ -7,11 +7,14 @@
 //! ([`FREEZABLE_FS_TYPES`]); pseudo and network filesystems, FUSE, overlay
 //! and anything not backed by a `/dev/` node are excluded. Bind mounts
 //! and subvolumes of the same superblock are de-duplicated by `(major,
-//! minor)`, keeping the first mount in mount order. Freeze traverses the
-//! plan in reverse mount order (deepest first), thaw forward.
+//! minor)`: the first mount in mount order names the target and the
+//! others are kept as its aliases, since a later mount placed over the
+//! first pathname leaves the superblock reachable only through them.
+//! Freeze traverses the plan in reverse mount order (deepest first), thaw
+//! forward.
 #![forbid(unsafe_code)]
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::mountinfo::MountEntry;
@@ -24,12 +27,26 @@ pub const FREEZABLE_FS_TYPES: &[&str] = &["ext4", "xfs"];
 /// A filesystem in the plan.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
-    /// The (first, in mount order) mount point of the superblock.
+    /// The (first, in mount order) mount point of the superblock: the
+    /// name the target goes by in replies and audit records.
     pub mountpoint: PathBuf,
+    /// Its other mount points (bind mounts, subvolumes), in mount order.
+    /// A pathname only names whatever is mounted there now, so the
+    /// kernel shim verifies each opened directory against `dev` and the
+    /// handlers fall back to the aliases when `mountpoint` no longer leads
+    /// to this superblock (a mount placed over it).
+    pub aliases: Vec<PathBuf>,
     /// `(major, minor)` of the superblock.
     pub dev: (u32, u32),
     /// Filesystem type.
     pub fs_type: String,
+}
+
+impl Target {
+    /// Every pathname of the superblock, `mountpoint` first.
+    pub fn mountpoints(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.mountpoint.as_path()).chain(self.aliases.iter().map(PathBuf::as_path))
+    }
 }
 
 /// The ordered set of filesystems to freeze, thaw or trim.
@@ -50,17 +67,24 @@ pub fn is_eligible(entry: &MountEntry) -> bool {
 impl FreezePlan {
     /// Builds the plan from a mount table in mount order.
     pub fn build(mounts: &[MountEntry]) -> FreezePlan {
-        let mut seen = HashSet::new();
-        let mut targets = Vec::new();
+        let mut seen: HashMap<(u32, u32), usize> = HashMap::new();
+        let mut targets: Vec<Target> = Vec::new();
         for entry in mounts {
-            if !is_eligible(entry) || !seen.insert(entry.dev()) {
+            if !is_eligible(entry) {
                 continue;
             }
-            targets.push(Target {
-                mountpoint: entry.mount_point.clone(),
-                dev: entry.dev(),
-                fs_type: entry.fs_type.clone(),
-            });
+            match seen.get(&entry.dev()) {
+                Some(&index) => targets[index].aliases.push(entry.mount_point.clone()),
+                None => {
+                    seen.insert(entry.dev(), targets.len());
+                    targets.push(Target {
+                        mountpoint: entry.mount_point.clone(),
+                        aliases: Vec::new(),
+                        dev: entry.dev(),
+                        fs_type: entry.fs_type.clone(),
+                    });
+                }
+            }
         }
         FreezePlan {
             targets,
@@ -98,9 +122,9 @@ impl FreezePlan {
 
     /// The intersection with the requested mount points, matched exactly
     /// on the unescaped mount point (as a path, no normalisation; a mount
-    /// point that is not valid UTF-8 can never be named on the wire);
-    /// unknown paths are ignored, not errors (C-12). Order and the mount
-    /// table are preserved.
+    /// point that is not valid UTF-8 can never be named on the wire) or
+    /// any of its aliases; unknown paths are ignored, not errors (C-12).
+    /// Order and the mount table are preserved.
     pub fn restrict_to(&self, mountpoints: &[String]) -> FreezePlan {
         FreezePlan {
             targets: self
@@ -108,9 +132,8 @@ impl FreezePlan {
                 .iter()
                 .filter(|t| {
                     // Byte-exact (`Path` equality would tolerate `/home/`).
-                    mountpoints
-                        .iter()
-                        .any(|m| m.as_str() == t.mountpoint.as_os_str())
+                    t.mountpoints()
+                        .any(|name| mountpoints.iter().any(|m| m.as_str() == name.as_os_str()))
                 })
                 .cloned()
                 .collect(),
@@ -128,12 +151,21 @@ impl FreezePlan {
             .map(|(mp, dev)| (mp.as_path(), *dev))
     }
 
-    /// `true` when the filesystem holding `path` is in the plan, i.e. a
-    /// freeze would freeze `path` (§8.2: the recovery marker must not be
-    /// on such a filesystem).
+    /// `true` when the filesystem holding `path` is in the plan, going by
+    /// the mount table's pathnames (longest prefix). Startup validates the
+    /// recovery marker with [`covers_device`](Self::covers_device) on the
+    /// device of its opened directory instead: a pathname's prefix says
+    /// nothing about `..` components or symlinks in it.
     pub fn covers(&self, path: &Path) -> bool {
         self.mount_of(path)
-            .is_some_and(|(_, dev)| self.targets.iter().any(|t| t.dev == dev))
+            .is_some_and(|(_, dev)| self.covers_device(dev))
+    }
+
+    /// `true` when the superblock `dev` is in the plan, i.e. a freeze would
+    /// freeze whatever is on it (§8.2: the recovery marker must not be on
+    /// such a filesystem).
+    pub fn covers_device(&self, dev: (u32, u32)) -> bool {
+        self.targets.iter().any(|t| t.dev == dev)
     }
 }
 
@@ -186,12 +218,51 @@ mod tests {
         // /var/www and /mnt/rootbind share 8:1 with /; /srv/exports shares
         // 8:2 with /data. First in mount order wins regardless of `root`.
         assert_eq!(mountpoints(&plan), ["/", "/data"]);
-        // The bind mount appearing *first* is what gets kept.
+        // The other mount points of the superblock are kept as aliases,
+        // in mount order: the ioctls fall back to them when the first
+        // pathname no longer leads to the superblock.
+        assert_eq!(
+            plan.targets()[0].aliases,
+            [PathBuf::from("/var/www"), PathBuf::from("/mnt/rootbind")]
+        );
+        assert_eq!(plan.targets()[1].aliases, [PathBuf::from("/srv/exports")]);
+        // The bind mount appearing *first* is what gets kept as the name.
         let text = "1 0 8:1 /srv/www /var/www rw - ext4 /dev/sda1 rw\n\
                     2 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
         let plan = FreezePlan::build(&parse_mountinfo(text));
         assert_eq!(mountpoints(&plan), ["/var/www"]);
+        assert_eq!(plan.targets()[0].aliases, [PathBuf::from("/")]);
         assert_eq!(plan.len(), 1);
+    }
+
+    #[test]
+    fn a_hidden_first_mount_keeps_its_accessible_alias() {
+        // /data (8:2) has a bind alias /data-alias; a later mount (8:3)
+        // was placed over /data, so the pathname /data now leads to 8:3.
+        // The plan must keep /data-alias for 8:2 rather than discard it as
+        // a duplicate: the alias is how 8:2 is still reached.
+        let plan = plan_from("hidden_mount.txt");
+        assert_eq!(mountpoints(&plan), ["/", "/data", "/data"]);
+        let data = plan.targets().iter().find(|t| t.dev == (8, 2)).unwrap();
+        let names: Vec<&Path> = data.mountpoints().collect();
+        assert_eq!(names, [Path::new("/data"), Path::new("/data-alias")]);
+        assert_eq!(data.aliases, [PathBuf::from("/data-alias")]);
+        let over = plan.targets().iter().find(|t| t.dev == (8, 3)).unwrap();
+        assert!(over.aliases.is_empty());
+        assert_eq!(over.mountpoints().count(), 1);
+        // Both superblocks stay in the plan (each may be frozen), and the
+        // device check knows both.
+        assert!(plan.covers_device((8, 2)));
+        assert!(plan.covers_device((8, 3)));
+        assert!(!plan.covers_device((8, 4)));
+        // A freeze-list naming the alias selects the hidden superblock.
+        let restricted = plan.restrict_to(&["/data-alias".to_owned()]);
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted.targets()[0].dev, (8, 2));
+        // Naming /data selects every superblock that carries the name.
+        let restricted = plan.restrict_to(&["/data".to_owned()]);
+        let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 2), (8, 3)]);
     }
 
     #[test]
@@ -229,6 +300,10 @@ mod tests {
         let none = plan.restrict_to(&["/home/".to_owned(), "/hom".to_owned()]);
         assert!(none.is_empty());
         assert!(plan.restrict_to(&[]).is_empty());
+        // An alias names its superblock too.
+        let plan = plan_from("bind_mounts.txt");
+        let restricted = plan.restrict_to(&["/srv/exports".to_owned()]);
+        assert_eq!(mountpoints(&restricted), ["/data"]);
         let plan = plan_from("escaped_paths.txt");
         let restricted = plan.restrict_to(&["/mnt/with space".to_owned()]);
         assert_eq!(mountpoints(&restricted), ["/mnt/with space"]);
@@ -250,6 +325,9 @@ mod tests {
             plan.mount_of(Path::new("/run/qeminga/frozen")),
             Some((Path::new("/run"), (0, 30)))
         );
+        // The device check (what startup uses, on the opened directory).
+        assert!(!plan.covers_device((0, 30)));
+        assert!(!plan.covers_device((0, 0)));
     }
 
     #[test]
@@ -257,6 +335,7 @@ mod tests {
         let plan = plan_from("tmpfs_and_nfs.txt");
         assert!(plan.covers(Path::new("/var/lib/qeminga/frozen")));
         assert!(plan.covers(Path::new("/frozen")));
+        assert!(plan.covers_device((8, 1)));
         // Longest prefix wins: /home/data is xfs (in plan), /home/data/deep
         // is ext4 (in plan) and /run (tmpfs) beats / for /run/...
         let plan = plan_from("nested.txt");
@@ -286,6 +365,7 @@ mod tests {
         assert_eq!(plan.freeze_order().count(), 0);
         assert_eq!(plan.thaw_order().count(), 0);
         assert!(!plan.covers(Path::new("/run/qeminga/frozen")));
+        assert!(!plan.covers_device((0, 1)));
         assert_eq!(FreezePlan::build(&[]), FreezePlan::default());
         assert!(FreezePlan::default().is_empty());
     }

@@ -7,28 +7,42 @@
 //! 1. Claim `Thawed → Freezing` (a token proves ownership).
 //! 2. [`FreezeHooks::on_freezing`] (T3.6 switches audit output to the
 //!    freeze-safe ring here; synchronous, no I/O).
-//! 3. On the blocking pool: build the plan from `mountinfo`, create the
-//!    recovery marker (`O_EXCL` + `fsync`), then for each target in
-//!    reverse mount order open it on its planned device (the first of its
-//!    mount points that still leads there; the kernel shim verifies the
-//!    descriptor) and `FIFREEZE` it. Marker failure → no ioctl at all.
+//! 3. Start a freeze *operation* (`crate::freeze_op`), which owns the walk
+//!    independently of the request: it builds the plan from `mountinfo`
+//!    and creates the recovery marker (`O_EXCL` + `fsync`) on a tracked
+//!    blocking task (marker failure → no ioctl at all), then for each
+//!    target in reverse mount order opens it on its planned device (the
+//!    first of its mount points that still leads there; the kernel shim
+//!    verifies the descriptor) and issues `FIFREEZE` on a tracked blocking
+//!    task of its own, publishing the handle to the [`Context`] before the
+//!    next target is authorised.
 //!    - `EOPNOTSUPP`: skipped, not counted, not rolled back.
 //!    - `EBUSY`: not counted, but its handle is kept for rollback/thaw.
 //!    - any other errno, or no mount point leading to the target: hard
-//!      error → every processed target is drained through its handle in
-//!      forward order, then the marker is removed.
+//!      error → every published handle is drained in forward order, then
+//!      the marker is removed.
+//!    - the operation deadline expires, or a thaw is requested, while a
+//!      `FIFREEZE` is in flight: the abort commits once (`Freezing →
+//!      Thawing`), the request gets its one error reply, the published
+//!      handles are drained on independent capacity, and the operation
+//!      settles only once the in-flight call has returned and its result
+//!      (a late success is drained too) is accounted for (§4.4).
 //!
 //!    The handles of the frozen targets are held in the [`Context`] until
 //!    their drain completes: a handle names the filesystem it was opened
 //!    on, whatever its pathnames lead to later.
 //! 4. Success: `Freezing → Frozen`, [`FreezeHooks::on_frozen`] (T3.5 arms
 //!    the watchdog). Failure: `Freezing → Thawed`,
-//!    [`FreezeHooks::on_thawed`].
+//!    [`FreezeHooks::on_thawed`]. An aborted operation ends in `Thawed`
+//!    (everything drained, marker removed) or `Frozen` (a drain incomplete
+//!    or the marker retained; the watchdog is armed).
 //!
 //! # Thaw
 //!
-//! `claim_thaw` (from `Frozen`, or from `Thawed` as a recovery drain),
-//! [`FreezeHooks::on_thaw_claimed`] (T3.5 cancels the watchdog), then on
+//! `claim_thaw` (from `Frozen`, or from `Thawed` as a recovery drain;
+//! during an unresolved freeze operation the thaw joins that operation
+//! instead, see [`thaw`]), [`FreezeHooks::on_thaw_claimed`] (T3.5 cancels
+//! the watchdog), then on
 //! the blocking pool: rebuild the plan and, for every target in forward
 //! order, issue `FITHAW` until it fails, counting the target once when at
 //! least one call succeeded; the marker is removed only after every

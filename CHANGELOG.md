@@ -4,6 +4,28 @@ All notable changes to qeminga. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`,
+  default 60 s, at most the hard cap): a `guest-fsfreeze-freeze` whose
+  walk is still inside `FIFREEZE` when the deadline expires is aborted;
+  the targets frozen so far are thawed through their descriptors while
+  the blocked call is still awaited, the request fails with a
+  `GenericError` naming the target in flight, and the marker, the frozen
+  gate and the freeze-safe audit mode stay until the operation settles
+  (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
+
+### Changed
+
+- A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts
+  the walk and joins its recovery instead of being refused.
+- The freeze walk runs one tracked blocking task per target, publishing
+  each completed descriptor before the next target is authorised; a late
+  completion is drained through its own descriptor and is never published
+  as `Frozen`.
+
 ## [0.1.0] - 2026-09-03
 
 First release: the complete command set of `docs/design.md`.

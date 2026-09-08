@@ -28,20 +28,33 @@ pub enum RebootCommand {
     Halt,
 }
 
-/// A failed kernel operation, carrying the errno.
+/// A failed kernel operation, carrying the errno. An ioctl needs the
+/// mountpoint opened first; a failure there is reported apart, because it
+/// means no ioctl was issued at all (the caller must not read it as the
+/// filesystem's answer).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum KernelError {
     /// The syscall or ioctl failed with this errno.
     #[error("{0}")]
     Errno(Errno),
+    /// The mountpoint could not be opened for the ioctl (`EMFILE`,
+    /// `ENOENT`, `EACCES`, ...): the ioctl never ran.
+    #[error("cannot open mountpoint: {0}")]
+    Open(Errno),
 }
 
 impl KernelError {
     /// The underlying errno.
     pub const fn errno(&self) -> Errno {
         match self {
-            KernelError::Errno(errno) => *errno,
+            KernelError::Errno(errno) | KernelError::Open(errno) => *errno,
         }
+    }
+
+    /// `true` when the mountpoint could not be opened, so the ioctl was
+    /// never issued and nothing can be inferred about the filesystem.
+    pub const fn is_open_failure(&self) -> bool {
+        matches!(self, KernelError::Open(_))
     }
 
     /// The filesystem does not implement the operation (`EOPNOTSUPP`, or
@@ -155,6 +168,13 @@ mod tests {
         assert_eq!(e(Errno::EIO).errno(), Errno::EIO);
         assert_eq!(KernelError::from(Errno::EIO), e(Errno::EIO));
         assert_eq!(e(Errno::EIO).to_string(), Errno::EIO.to_string());
+        // An open failure keeps its errno but says the ioctl never ran.
+        let open = KernelError::Open(Errno::EMFILE);
+        assert!(open.is_open_failure());
+        assert!(!e(Errno::EMFILE).is_open_failure());
+        assert_eq!(open.errno(), Errno::EMFILE);
+        assert!(open.to_string().starts_with("cannot open mountpoint: "));
+        assert!(KernelError::Open(Errno::EACCES).is_permission());
     }
 
     #[test]
@@ -162,20 +182,20 @@ mod tests {
         let missing = Path::new("/nonexistent/qeminga-test-mountpoint");
         assert_eq!(
             LinuxKernel.fifreeze(missing),
-            Err(KernelError::Errno(Errno::ENOENT))
+            Err(KernelError::Open(Errno::ENOENT))
         );
         assert_eq!(
             LinuxKernel.fithaw(missing),
-            Err(KernelError::Errno(Errno::ENOENT))
+            Err(KernelError::Open(Errno::ENOENT))
         );
         assert_eq!(
             LinuxKernel.fitrim(missing, 0),
-            Err(KernelError::Errno(Errno::ENOENT))
+            Err(KernelError::Open(Errno::ENOENT))
         );
-        // A file (not a directory) is rejected by O_DIRECTORY.
+        // A file (not a directory) is rejected by O_DIRECTORY at open time.
         assert_eq!(
             LinuxKernel.fifreeze(Path::new("/proc/self/status")),
-            Err(KernelError::Errno(Errno::ENOTDIR))
+            Err(KernelError::Open(Errno::ENOTDIR))
         );
     }
 

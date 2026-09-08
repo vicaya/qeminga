@@ -38,6 +38,7 @@ struct Inner {
     freeze_errors: HashMap<PathBuf, Errno>,
     thaw_successes: HashMap<PathBuf, u32>,
     thaw_errors: HashMap<PathBuf, Errno>,
+    thaw_open_errors: HashMap<PathBuf, Errno>,
     trim_results: HashMap<PathBuf, Result<(u64, Option<u64>), Errno>>,
     reboot_error: Option<Errno>,
     hook: Option<Hook>,
@@ -104,6 +105,14 @@ impl FakeKernel {
             .insert(path.as_ref().to_owned(), errno);
     }
 
+    /// Makes every `fithaw(path)` fail to open the mountpoint with `errno`
+    /// ([`KernelError::Open`]: no ioctl issued).
+    pub fn script_thaw_open_error(&self, path: impl AsRef<Path>, errno: Errno) {
+        self.lock()
+            .thaw_open_errors
+            .insert(path.as_ref().to_owned(), errno);
+    }
+
     /// Scripts the result of `fitrim(path, _)`: the bytes trimmed (the
     /// effective minimum is the requested one) or an errno.
     pub fn script_trim(&self, path: impl AsRef<Path>, result: Result<u64, Errno>) {
@@ -152,6 +161,9 @@ impl KernelOps for FakeKernel {
     fn fithaw(&self, mountpoint: &Path) -> Result<(), KernelError> {
         self.record(Call::Fithaw(mountpoint.to_owned()));
         let mut inner = self.lock();
+        if let Some(errno) = inner.thaw_open_errors.get(mountpoint) {
+            return Err(KernelError::Open(*errno));
+        }
         if let Some(errno) = inner.thaw_errors.get(mountpoint) {
             return Err(KernelError::Errno(*errno));
         }
@@ -238,6 +250,11 @@ mod tests {
         assert_eq!(
             k.fifreeze(Path::new("/mnt/bad")),
             Err(KernelError::Errno(Errno::EIO))
+        );
+        k.script_thaw_open_error("/mnt/full", Errno::EMFILE);
+        assert_eq!(
+            k.fithaw(Path::new("/mnt/full")),
+            Err(KernelError::Open(Errno::EMFILE))
         );
         k.script_trim("/mnt/a", Ok(123));
         k.script_trim("/mnt/bad", Err(Errno::EOPNOTSUPP));

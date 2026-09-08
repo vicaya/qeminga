@@ -57,7 +57,7 @@ nix::ioctl_readwrite!(
 /// Opens a mountpoint directory for an ioctl.
 fn open_dir(mountpoint: &Path) -> Result<std::os::fd::OwnedFd, KernelError> {
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
-    open(mountpoint, flags, Mode::empty()).map_err(KernelError::from)
+    open(mountpoint, flags, Mode::empty()).map_err(KernelError::Open)
 }
 
 /// `FIFREEZE` on the filesystem mounted at `mountpoint`.

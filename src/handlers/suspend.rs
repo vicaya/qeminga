@@ -112,6 +112,7 @@ mod tests {
             Arc::new(Config::parse(config).unwrap()),
             Arc::new(FreezeStateMachine::starting_in(state)),
             Router::new(Box::new(std::io::sink())),
+            crate::marker::Marker::for_tests(),
         )
         .with_kernel(Arc::new(FakeKernel::new()))
         .with_suspend(suspend.clone());

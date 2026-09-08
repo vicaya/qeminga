@@ -287,25 +287,16 @@ pub enum ThawFailure {
     /// The mount table could not be read.
     #[error("cannot build thaw plan: {0}")]
     Plan(String),
-    /// A first `FITHAW` on a planned mountpoint was denied (OQ-3).
-    #[error("thaw of {mountpoint} denied: {errno}; marker retained")]
-    Denied {
-        /// The target that failed.
+    /// A target may still be frozen after its drain (OQ-3): a denied or
+    /// failed `FITHAW`, a mountpoint that could not be opened (no `FITHAW`
+    /// issued), or a drain that never converged. The marker and the
+    /// frozen gate are retained.
+    #[error("thaw of {mountpoint} incomplete: {reason}; marker retained")]
+    Incomplete {
+        /// The target that may still be frozen.
         mountpoint: String,
-        /// The errno.
-        errno: KernelError,
-    },
-    /// `FITHAW` still succeeded at the defensive bound: the nesting depth
-    /// is unknown and at least one hold may remain, so the drain is
-    /// incomplete and the marker is retained.
-    #[error(
-        "thaw of {mountpoint} did not converge after {iterations} FITHAW calls; marker retained"
-    )]
-    Unbounded {
-        /// The target that kept accepting `FITHAW`.
-        mountpoint: String,
-        /// The bound that was reached.
-        iterations: u32,
+        /// Why the drain did not complete.
+        reason: String,
     },
     /// The marker could not be removed after the drain.
     #[error("drain complete but cannot remove recovery marker: {0}")]
@@ -424,10 +415,11 @@ fn freeze_blocking(
 /// Drains every target in forward order, then removes the marker. Returns
 /// the number of targets on which at least one `FITHAW` succeeded.
 ///
-/// An unrecoverable failure on one target (OQ-3: a denied first `FITHAW`,
-/// or a drain that never converges) does not stop the drain of the later
-/// targets: everything that can be thawed is thawed first (§4.2), then
-/// the first such failure is reported and the marker is retained.
+/// An unrecoverable failure on one target (OQ-3: anything but the
+/// kernel's "not frozen" answer, see [`Drained::incomplete`]) does not
+/// stop the drain of the later targets: everything that can be thawed is
+/// thawed first (§4.2), then the first such failure is reported and the
+/// marker is retained.
 fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
@@ -441,22 +433,10 @@ fn thaw_blocking(
         if drained.successes > 0 {
             thawed += 1;
         }
-        let failure = if drained.capped {
-            Some(ThawFailure::Unbounded {
-                mountpoint: lossy(mountpoint),
-                iterations: MAX_THAW_ITERATIONS,
-            })
-        } else if drained.successes == 0 {
-            drained
-                .first_error
-                .filter(KernelError::is_permission)
-                .map(|errno| ThawFailure::Denied {
-                    mountpoint: lossy(mountpoint),
-                    errno,
-                })
-        } else {
-            None
-        };
+        let failure = drained.incomplete().map(|reason| ThawFailure::Incomplete {
+            mountpoint: lossy(mountpoint),
+            reason,
+        });
         if let Some(failure) = failure {
             tracing::error!(
                 event = "fsfreeze_thaw_target_failed",
@@ -522,20 +502,34 @@ struct Drained {
 }
 
 impl Drained {
-    /// Why the target may still be frozen, if it may: a first `FITHAW`
-    /// that was denied, or a drain that never converged.
+    /// Why the target may still be frozen, if it may.
+    ///
+    /// A drain is complete only when the kernel's answer is one of the
+    /// documented ends: `EINVAL` (the filesystem is not frozen) or the
+    /// filesystem does not support freezing at all. Anything else is
+    /// uncertain and keeps the marker and the frozen gate (OQ-3): a
+    /// denied `FITHAW`, a mountpoint that could not be opened (so no
+    /// `FITHAW` ran at all), any other errno (Linux keeps a filesystem
+    /// frozen when its unfreeze fails), or a drain that never converged.
     fn incomplete(&self) -> Option<String> {
         if self.capped {
             return Some(format!(
-                "FITHAW still succeeding after {MAX_THAW_ITERATIONS} calls"
+                "drain did not converge after {MAX_THAW_ITERATIONS} FITHAW calls (still succeeding)"
             ));
         }
-        match &self.first_error {
-            Some(err) if self.successes == 0 && err.is_permission() => {
-                Some(format!("first FITHAW denied: {err}"))
-            }
-            _ => None,
+        let err = self.first_error.as_ref()?;
+        if err.is_invalid() || err.is_not_supported() {
+            return None;
         }
+        Some(if err.is_open_failure() {
+            format!("{err}: no FITHAW issued")
+        } else if err.is_permission() && self.successes == 0 {
+            format!("first FITHAW denied: {err}")
+        } else if err.is_permission() {
+            format!("FITHAW denied after {} successes: {err}", self.successes)
+        } else {
+            format!("FITHAW failed: {err}; the filesystem may still be frozen")
+        })
     }
 }
 
@@ -880,33 +874,69 @@ mod tests {
     }
 
     #[test]
-    fn a_drain_is_incomplete_only_when_denied_at_once_or_never_converging() {
-        let drained = |successes, errno: Option<Errno>, capped| Drained {
+    fn a_drain_is_complete_only_when_the_kernel_says_not_frozen_or_unsupported() {
+        let drained = |successes, err: Option<KernelError>, capped| Drained {
             successes,
-            first_error: errno.map(KernelError::from),
+            first_error: err,
             capped,
         };
-        // The normal end of a drain: EINVAL after the successes.
-        assert_eq!(drained(3, Some(Errno::EINVAL), false).incomplete(), None);
-        // A first FITHAW that is denied leaves the target frozen (OQ-3)...
-        let denied = drained(0, Some(Errno::EPERM), false).incomplete();
-        assert!(denied.unwrap().contains("first FITHAW denied"));
+        let e = |errno| Some(KernelError::Errno(errno));
+        // The documented ends of a drain: EINVAL (not frozen), after any
+        // number of successes, or a filesystem that cannot freeze at all.
+        assert_eq!(drained(3, e(Errno::EINVAL), false).incomplete(), None);
+        assert_eq!(drained(0, e(Errno::EINVAL), false).incomplete(), None);
+        assert_eq!(drained(0, e(Errno::EOPNOTSUPP), false).incomplete(), None);
+        assert_eq!(drained(0, e(Errno::ENOTTY), false).incomplete(), None);
+        // A denied FITHAW leaves the target frozen (OQ-3), whether first...
+        let denied = drained(0, e(Errno::EPERM), false).incomplete().unwrap();
+        assert!(denied.starts_with("first FITHAW denied: EPERM"), "{denied}");
+        // ...or after successes: the remaining depth is unknown.
+        let denied = drained(2, e(Errno::EACCES), false).incomplete().unwrap();
+        assert!(denied.contains("denied after 2 successes"), "{denied}");
+        // Any other errno is uncertain: Linux keeps a filesystem frozen
+        // when its unfreeze fails.
+        let failed = drained(0, e(Errno::EIO), false).incomplete().unwrap();
+        assert!(failed.contains("FITHAW failed: EIO"), "{failed}");
+        assert!(drained(1, e(Errno::ENOSPC), false).incomplete().is_some());
+        // A mountpoint that could not be opened never got a FITHAW.
+        let unopened = drained(0, Some(KernelError::Open(Errno::EMFILE)), false)
+            .incomplete()
+            .unwrap();
         assert!(
-            drained(0, Some(Errno::EACCES), false)
-                .incomplete()
-                .is_some()
+            unopened.contains("cannot open mountpoint: EMFILE"),
+            "{unopened}"
         );
-        // ...but a denial after a success does not: the target was thawed.
-        assert_eq!(drained(2, Some(Errno::EACCES), false).incomplete(), None);
-        // Nor does any other first error (EINVAL, EIO) with no successes:
-        // it is not a permission problem, so the drain is reported through
-        // its errno, never as "still frozen".
-        assert_eq!(drained(0, Some(Errno::EINVAL), false).incomplete(), None);
-        assert_eq!(drained(0, Some(Errno::EIO), false).incomplete(), None);
-        assert_eq!(drained(0, None, false).incomplete(), None);
+        assert!(unopened.contains("no FITHAW issued"), "{unopened}");
         // A drain that never converged is incomplete whatever else happened.
-        let capped = drained(u32::MAX, None, true).incomplete();
-        assert!(capped.unwrap().contains("still succeeding"));
+        let capped = drained(u32::MAX, None, true).incomplete().unwrap();
+        assert!(capped.contains("did not converge"), "{capped}");
+        assert!(capped.contains("still succeeding"), "{capped}");
+    }
+
+    #[tokio::test]
+    async fn rollback_with_an_uncertain_thaw_error_keeps_the_frozen_state_and_marker() {
+        // deep and data were frozen, home fails hard; the rollback's
+        // FITHAW on data fails with EIO. That is not the kernel's "not
+        // frozen" answer: data may still be frozen, so the marker and the
+        // frozen gate stay, and deep is still drained.
+        let rig = Rig::nested();
+        rig.kernel.script_freeze_error("/home", Errno::EIO);
+        rig.kernel.script_thaw_error("/home/data", Errno::EIO);
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("rollback of /home/data incomplete (FITHAW failed: EIO"),
+            "{err}"
+        );
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data", "/home/data/deep", "/home/data/deep"])
+        );
+        assert!(rig.marker().exists(), "marker retained");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
     }
 
     #[tokio::test]
@@ -1076,24 +1106,56 @@ mod tests {
             .unwrap();
         assert_eq!(value, json!(2));
 
-        // Any other errno on a first FITHAW just ends that target's drain.
+        // Any other errno on a FITHAW is uncertain, not a completed drain:
+        // Linux keeps a filesystem frozen when its unfreeze fails, so the
+        // marker and the frozen gate are retained (OQ-3). The later target
+        // is still drained.
         let rig = Rig::new(FreezeState::Frozen, "simple.txt");
         rig.marker().create().unwrap();
-        rig.kernel.script_thaw_error("/home", Errno::EIO);
+        rig.kernel.script_thaw_error("/", Errno::EIO);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("thaw of / incomplete: FITHAW failed: EIO"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("marker retained"), "{err}");
+        assert_eq!(rig.fithaws(), paths(&["/", "/home", "/home"]));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+
+        // A mountpoint that cannot be opened (EMFILE) never received a
+        // FITHAW at all: nothing is known about the filesystem, so it is
+        // treated the same way, and the reason says no ioctl ran.
+        let rig = Rig::new(FreezeState::Frozen, "simple.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_thaw_open_error("/home", Errno::EMFILE);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("cannot open mountpoint: EMFILE"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("no FITHAW issued"), "{err}");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+
+        // The documented end of a drain on a target that was never frozen
+        // (EINVAL at once) completes normally, as does a filesystem that
+        // does not support freezing.
+        let rig = Rig::new(FreezeState::Frozen, "simple.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_thaw_successes("/", 0);
+        rig.kernel.script_thaw_error("/home", Errno::EOPNOTSUPP);
         let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap();
-        assert_eq!(value, json!(1));
+        assert_eq!(value, json!(0));
         assert_eq!(rig.state(), FreezeState::Thawed);
         assert!(!rig.marker().exists());
-
-        // EPERM after at least one success is also just the end of the drain.
-        let rig = Rig::new(FreezeState::Frozen, "simple.txt");
-        rig.marker().create().unwrap();
-        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
-            .await
-            .unwrap();
-        assert_eq!(value, json!(2));
 
         // A marker that cannot be removed is unrecoverable too.
         let dir = tempfile::tempdir().unwrap();
@@ -1145,7 +1207,11 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("thaw of / denied"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("thaw of / incomplete: first FITHAW denied"),
+            "{err}"
+        );
         assert_eq!(
             rig.fithaws(),
             paths(&[

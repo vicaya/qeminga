@@ -122,6 +122,11 @@ pub struct Context {
     /// held until their drain completes: a thaw drains the filesystem
     /// each was opened on, whatever its pathnames lead to by then (§4.2).
     frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
+    /// The freeze operation in progress, from `Freezing` until it settles
+    /// (§4.4 operation deadline).
+    freeze_op: std::sync::Mutex<Option<Arc<crate::freeze_op::FreezeOp>>>,
+    /// The freeze operation deadline (`fsfreeze_operation_timeout_secs`).
+    freeze_operation_timeout: std::time::Duration,
     handler_calls: AtomicU64,
 }
 
@@ -153,6 +158,8 @@ impl Context {
         #[cfg(test)]
         let kernel: Arc<dyn crate::kernel::KernelOps> =
             Arc::new(crate::kernel::fake::FakeKernel::new());
+        let freeze_operation_timeout =
+            std::time::Duration::from_secs(config.agent.fsfreeze_operation_timeout_secs);
         Context {
             config,
             state,
@@ -170,8 +177,38 @@ impl Context {
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
+            freeze_op: std::sync::Mutex::new(None),
+            freeze_operation_timeout,
             handler_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Replaces the freeze operation deadline (tests use short ones).
+    #[must_use]
+    pub fn with_freeze_operation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.freeze_operation_timeout = timeout;
+        self
+    }
+
+    /// The freeze operation deadline, measured from entry into `Freezing`.
+    pub fn freeze_operation_timeout(&self) -> std::time::Duration {
+        self.freeze_operation_timeout
+    }
+
+    /// The freeze operation in progress, if any.
+    pub fn freeze_op(&self) -> Option<Arc<crate::freeze_op::FreezeOp>> {
+        self.freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Installs (or, with `None`, releases) the freeze operation.
+    pub(crate) fn set_freeze_op(&self, op: Option<Arc<crate::freeze_op::FreezeOp>>) {
+        *self
+            .freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = op;
     }
 
     /// Replaces the mount-table source.

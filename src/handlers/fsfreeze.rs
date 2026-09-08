@@ -210,70 +210,66 @@ pub async fn freeze_list(ctx: &Arc<Context>, req: &Request) -> Result<Value, Err
     run_freeze(ctx, args.mountpoints).await
 }
 
-/// `guest-fsfreeze-thaw`: drains every planned filesystem.
+/// `guest-fsfreeze-thaw`: drains every planned filesystem. While a freeze
+/// operation is unresolved (`Freezing`, or the recovery of an aborted one),
+/// the thaw joins it instead of starting a drain of its own: it requests
+/// the abort, waits for the recovery pass over the targets frozen so far,
+/// and reports the operation's outcome (§4.4). No target is ever drained
+/// by two owners.
 pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
-    let token = ctx
-        .state
-        .claim_thaw()
-        .map_err(|err| Error::Internal(format!("cannot thaw: {err}")))?;
+    let token = match ctx.state.claim_thaw() {
+        Ok(token) => token,
+        Err(err) => {
+            let Some(op) = ctx.freeze_op() else {
+                return Err(Error::Internal(format!("cannot thaw: {err}")));
+            };
+            return join_operation(&op).await;
+        }
+    };
     let count = run_thaw(ctx, token).await?;
     Ok(json!(count))
 }
 
-/// The freeze algorithm shared by `freeze` and `freeze-list`.
+/// A thaw that joins the freeze operation in progress.
+async fn join_operation(op: &crate::freeze_op::FreezeOp) -> Result<Value, Error> {
+    op.request_abort();
+    let progress = op.wait_for_recovery_pass().await;
+    match progress.settled {
+        Some(FreezeState::Thawed) => Ok(json!(progress.recovered)),
+        Some(state) => Err(Error::Internal(format!(
+            "thaw joined the aborted freeze: {} target(s) thawed; {}; state {state}, marker retained",
+            progress.recovered,
+            progress
+                .unrecoverable
+                .unwrap_or_else(|| "recovery incomplete".to_owned())
+        ))),
+        None => Err(Error::Internal(format!(
+            "thaw joined the aborted freeze: {} target(s) thawed; FIFREEZE of {} still in flight; marker retained until it returns",
+            progress.recovered,
+            progress.in_flight.unwrap_or_else(|| "a target".to_owned())
+        ))),
+    }
+}
+
+/// The freeze algorithm shared by `freeze` and `freeze-list`: claim
+/// `Thawed → Freezing`, start the operation (`freeze_op`), and relay its
+/// single reply. The operation outlives this request: a deadline or a
+/// thaw request aborts it and the reply is the error, while the recovery
+/// of the targets frozen so far continues on the coordinator.
 async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result<Value, Error> {
     let token = ctx
         .state
         .begin_freeze()
         .map_err(|err| Error::Internal(format!("cannot freeze: {err}")))?;
     ctx.hooks.on_freezing(ctx);
-
-    let kernel = Arc::clone(&ctx.kernel);
-    let mounts = Arc::clone(&ctx.mounts);
-    let marker = ctx.marker.clone();
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let (outcome, held) = tokio::task::spawn_blocking(move || {
-        // Records emitted on the blocking thread go to the same subscriber
-        // as the request that started the freeze.
-        tracing::dispatcher::with_default(&dispatch, || {
-            let mut held = Vec::new();
-            let outcome = build_plan::<FreezeFailure>(mounts.as_ref(), restrict.as_deref())
-                .and_then(|plan| freeze_blocking(kernel.as_ref(), &marker, &plan, &mut held));
-            (outcome, held)
-        })
-    })
-    .await
-    .unwrap_or_else(|err| (Err(FreezeFailure::Task(err.to_string())), Vec::new()));
-    // The handles the freeze opened are what a later thaw drains: each
-    // names the filesystem it was opened on, whatever its pathnames lead
-    // to by then. Kept before any state is published.
-    ctx.hold_frozen_mounts(held);
-
-    match outcome {
-        Ok(frozen) => {
-            ctx.state.freeze_succeeded(token);
-            ctx.hooks.on_frozen(ctx);
-            tracing::info!(event = "fsfreeze_frozen", frozen, "filesystems frozen");
-            Ok(json!(frozen))
-        }
-        Err(failure) if failure.retains_frozen_state() => {
-            // A filesystem may still be frozen (the rollback was denied or
-            // stopped at the drain bound) or the marker could not be
-            // removed: keep the frozen gate and the marker so a later
-            // thaw, the watchdog or a restart in recovery mode drains it.
-            ctx.state.freeze_succeeded(token);
-            ctx.hooks.on_frozen(ctx);
-            tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
-            Err(Error::Internal(failure.to_string()))
-        }
-        Err(failure) => {
-            // Finalise first, publish `Thawed` last (see `on_thawed`).
-            ctx.hooks.on_thawed(ctx);
-            ctx.state.freeze_failed(token);
-            tracing::warn!(event = "fsfreeze_failed", error = %failure, "freeze failed");
-            Err(Error::Internal(failure.to_string()))
-        }
+    let reply = crate::freeze_op::start(Arc::clone(ctx), token, restrict);
+    match reply.await {
+        Ok(Ok(frozen)) => Ok(json!(frozen)),
+        Ok(Err(failure)) => Err(Error::Internal(failure.to_string())),
+        Err(_) => Err(Error::Internal(
+            "freeze operation ended without a result".to_owned(),
+        )),
     }
 }
 
@@ -409,6 +405,24 @@ pub enum FreezeFailure {
     /// The blocking task could not be joined.
     #[error("freeze task failed: {0}")]
     Task(String),
+    /// The operation was aborted (§4.4): its deadline expired or a thaw was
+    /// requested while a `FIFREEZE` was still in flight. The targets frozen
+    /// so far are being thawed by the coordinator; the marker and the
+    /// frozen gate stay until the in-flight call returns.
+    #[error(
+        "freeze aborted: {cause} ({timeout_secs} s){}; {frozen} target(s) frozen so far are being thawed; marker retained",
+        in_flight.as_deref().map(|mp| format!(" with FIFREEZE of {mp} in flight")).unwrap_or_default()
+    )]
+    Aborted {
+        /// What aborted it.
+        cause: crate::freeze_op::AbortCause,
+        /// The operation deadline in seconds.
+        timeout_secs: u64,
+        /// Successful `FIFREEZE` calls before the abort.
+        frozen: u64,
+        /// The target whose call was in flight, if any.
+        in_flight: Option<String>,
+    },
 }
 
 impl FreezeFailure {
@@ -447,7 +461,7 @@ pub enum ThawFailure {
     Task(String),
 }
 
-fn build_plan<E: From<String>>(
+pub(crate) fn build_plan<E: From<String>>(
     mounts: &dyn MountSource,
     restrict: Option<&[String]>,
 ) -> Result<FreezePlan, E> {
@@ -498,93 +512,20 @@ pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mou
     Err(attempts.join("; "))
 }
 
-/// Marker, then `FIFREEZE` in reverse mount order, with rollback on a hard
-/// error. Returns the number of successful `FIFREEZE` calls; `held`
-/// receives the handles of every processed target (successes and
-/// `EBUSY`), which the thaw drains later, or after a rollback only those
-/// whose drain did not complete.
-fn freeze_blocking(
-    kernel: &dyn KernelOps,
-    marker: &Marker,
-    plan: &FreezePlan,
-    held: &mut Vec<Mount>,
-) -> Result<u64, FreezeFailure> {
-    marker.create()?;
-    let mut frozen: u64 = 0;
-    for target in plan.freeze_order() {
-        let mountpoint = target.mountpoint.as_path();
-        let mount = match open_target(kernel, target) {
-            Ok(mount) => mount,
-            Err(attempts) => {
-                let stop = FreezeStop::Unreachable(attempts);
-                return Err(rollback(kernel, marker, held, mountpoint, stop));
-            }
-        };
-        match kernel.fifreeze(&mount) {
-            Ok(()) => {
-                frozen += 1;
-                held.push(mount);
-            }
-            Err(err) if err.is_not_supported() => {
-                tracing::info!(event = "fsfreeze_skipped", mountpoint = %mountpoint.display(), errno = %err, "freeze not supported; skipped");
-            }
-            Err(err) if err.is_busy() => {
-                tracing::warn!(
-                    event = "fsfreeze_busy",
-                    mountpoint = %mountpoint.display(),
-                    "already frozen by another freezer; retained for thaw"
-                );
-                held.push(mount);
-            }
-            Err(err) => {
-                return Err(rollback(
-                    kernel,
-                    marker,
-                    held,
-                    mountpoint,
-                    FreezeStop::Ioctl(err),
-                ));
-            }
-        }
-    }
-    Ok(frozen)
-}
-
 /// Drains every processed target through the handle its freeze opened, in
 /// forward mount order, then removes the marker; `held` keeps the handles
 /// whose drain did not complete. Every processed target gets its drain,
 /// as in [`thaw_blocking`]: one that cannot be thawed is remembered and
 /// reported afterwards, and must not leave the later ones frozen until a
 /// recovery. Returns the failure to report.
-fn rollback(
+pub(crate) fn rollback(
     kernel: &dyn KernelOps,
     marker: &Marker,
     held: &mut Vec<Mount>,
     failed: &Path,
     cause: FreezeStop,
 ) -> FreezeFailure {
-    let mut incomplete: Option<(String, String)> = None;
-    let mut keep = Vec::new();
-    // `held` was filled in reverse mount order, so reverse it back.
-    for mount in std::mem::take(held).into_iter().rev() {
-        let drained = drain(kernel, &mount);
-        tracing::warn!(
-            event = "fsfreeze_rollback",
-            mountpoint = %mount.mountpoint().display(),
-            successes = drained.successes,
-            "rolled back"
-        );
-        if let Some(reason) = drained.incomplete() {
-            tracing::error!(
-                event = "fsfreeze_rollback_incomplete",
-                mountpoint = %mount.mountpoint().display(),
-                reason,
-                "rollback target may still be frozen"
-            );
-            incomplete.get_or_insert((lossy(mount.mountpoint()), reason));
-            keep.push(mount);
-        }
-    }
+    let (_, keep, incomplete) = drain_held(kernel, std::mem::take(held));
     *held = keep;
     let failed = lossy(failed);
     if let Some((mountpoint, reason)) = incomplete {
@@ -606,6 +547,42 @@ fn rollback(
             marker,
         },
     }
+}
+
+/// Drains handles a freeze published, in forward mount order (they were
+/// pushed deepest-first). Returns the number of targets on which at least
+/// one `FITHAW` succeeded, the handles whose drain did not complete (kept
+/// for a later attempt), and the first such target with its reason.
+pub(crate) fn drain_held(
+    kernel: &dyn KernelOps,
+    held: Vec<Mount>,
+) -> (u64, Vec<Mount>, Option<(String, String)>) {
+    let mut recovered = 0;
+    let mut incomplete: Option<(String, String)> = None;
+    let mut keep = Vec::new();
+    for mount in held.into_iter().rev() {
+        let drained = drain(kernel, &mount);
+        if drained.successes > 0 {
+            recovered += 1;
+        }
+        tracing::warn!(
+            event = "fsfreeze_rollback",
+            mountpoint = %mount.mountpoint().display(),
+            successes = drained.successes,
+            "rolled back"
+        );
+        if let Some(reason) = drained.incomplete() {
+            tracing::error!(
+                event = "fsfreeze_rollback_incomplete",
+                mountpoint = %mount.mountpoint().display(),
+                reason,
+                "rollback target may still be frozen"
+            );
+            incomplete.get_or_insert((lossy(mount.mountpoint()), reason));
+            keep.push(mount);
+        }
+    }
+    (recovered, keep, incomplete)
 }
 
 /// Drains every target in forward order, then removes the marker. Returns
@@ -955,6 +932,29 @@ mod tests {
 
         fn nested() -> Self {
             Self::new(FreezeState::Thawed, "nested.txt")
+        }
+
+        /// A rig whose freeze operation deadline is `timeout` (real time).
+        fn with_operation_timeout(self, timeout: Duration) -> Self {
+            let ctx = Arc::try_unwrap(self.ctx)
+                .unwrap_or_else(|_| panic!("unshared"))
+                .with_freeze_operation_timeout(timeout);
+            Rig {
+                ctx: Arc::new(ctx),
+                ..self
+            }
+        }
+
+        /// Polls until `done`, at most ten seconds.
+        async fn wait_for(&self, what: &str, mut done: impl FnMut(&Rig) -> bool) {
+            let start = std::time::Instant::now();
+            while !done(self) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "timed out: {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
 
         fn marker(&self) -> &Marker {
@@ -2745,5 +2745,85 @@ mod tests {
         assert_eq!(value, json!(0));
         assert_eq!(rig.state(), FreezeState::Thawed);
         assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completed_target_is_thawed_while_a_later_fifreeze_is_still_blocked() {
+        // nested.txt freezes deepest-first: /home/data/deep (A), /home/data
+        // (B), /home (C), /. B blocks in the kernel. When the operation
+        // deadline expires, A is drained through its handle while B is
+        // still blocked, C is never authorised, the request fails, and the
+        // marker, the frozen gate and the ring stay until B settles.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_millis(200));
+        let gate = rig.kernel.script_freeze_gate("/home/data");
+        let _release = gate.release_on_drop();
+        let started = std::time::Instant::now();
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(err.class(), ErrorClass::GenericError);
+        assert!(
+            err.to_string().contains("deadline")
+                && err.to_string().contains("/home/data")
+                && err.to_string().contains("marker retained"),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The recovery pass over A runs on independent capacity while B
+        // is still blocked at the gate.
+        rig.wait_for("A drained", |r| {
+            r.fithaws() == paths(&["/home/data/deep", "/home/data/deep"])
+        })
+        .await;
+        assert_eq!(gate.waiting(), 1, "B is still inside FIFREEZE");
+        assert_eq!(rig.fifreezes(), paths(&["/home/data/deep", "/home/data"]));
+        assert_eq!(
+            rig.opens(),
+            paths(&["/home/data/deep", "/home/data"]),
+            "C never authorised"
+        );
+        assert_eq!(rig.held(), 0, "A's handle was released by its drain");
+        assert!(rig.marker().exists(), "unresolved: B may still freeze");
+        assert_eq!(rig.state(), FreezeState::Thawing);
+        assert!(rig.state().is_frozen_for_gate());
+        let value = status(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!("frozen"), "status is served meanwhile");
+        // A second freeze is refused; nothing new is authorised or spawned.
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot freeze"), "{err}");
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed"]);
+        // B completes late, successfully: it is accounted to the aborted
+        // operation and drained through its own handle, then the marker
+        // goes and `Thawed` is published; no `frozen` hook ever fired.
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/home/data/deep",
+                "/home/data/deep",
+                "/home/data",
+                "/home/data"
+            ])
+        );
+        assert_eq!(
+            rig.opens().len(),
+            2,
+            "no pathname was consulted for the drains"
+        );
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
+        assert!(rig.ctx.freeze_op().is_none(), "the operation is released");
+        // And a new freeze is accepted again.
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
     }
 }

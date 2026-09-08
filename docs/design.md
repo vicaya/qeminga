@@ -164,7 +164,7 @@ graph LR
     end
 
     subgraph Kernel["Kernel Interface — FFI shim"]
-        KI["ioctl wrapper — FIFREEZE FITHAW FITRIM"]
+        KI["ioctl wrapper — open and verify the mountpoint; FIFREEZE FITHAW FITRIM on that descriptor"]
         KS["shutdown wrapper — reboot syscall"]
     end
 

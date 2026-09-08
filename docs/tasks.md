@@ -398,11 +398,12 @@ the answer is a one-line change, and leave the question here.
   - `kernel_error_classifies_errno` — `is_not_supported()`, `is_busy()`, `is_permission()`.
   - `privileged_fifreeze_then_fithaw_on_loop_mounted_ext4` (`#[ignore]`, root; CI T5.2) — real ioctls succeed and `FITHAW` returns `EINVAL` once fully thawed.
   - `check_unsafe_script_passes_with_kernel_module_present` — run `scripts/check-unsafe.sh` from a test or keep it in CI only (CI is enough; do not shell out from unit tests).
+  - `open_mount_verifies_the_device_of_the_opened_directory`, `the_production_kernel_refuses_a_handle_it_did_not_open`, `fake_open_mount_is_scripted_per_path` — a pathname names whatever is mounted there *now*, so the ioctls take a handle (`Mount`) that `open_mount` opened and `fstat`-verified against the planned `(major, minor)`; a mount placed over the planned one is `KernelError::WrongFilesystem`, an open failure `KernelError::Open`, and neither errno ever reads as the filesystem's answer to an ioctl (review follow-up).
 - **Implement (green):**
-  - `pub trait KernelOps: Send + Sync { fn fifreeze(&self, mountpoint: &Path) -> Result<(), KernelError>; fn fithaw(...); fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<u64, KernelError>; fn sync(&self); fn reboot(&self, cmd: RebootCommand) -> Result<(), KernelError>; }` (`Ok(())` from `reboot` is only reachable through fakes).
+  - `pub trait KernelOps: Send + Sync { fn open_mount(&self, mountpoint: &Path, dev: (u32, u32)) -> Result<Mount, KernelError>; fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError>; fn fithaw(...); fn fitrim(&self, mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError>; fn sync(&self); fn reboot(&self, cmd: RebootCommand) -> Result<(), KernelError>; }` (`Ok(())` from `reboot` is only reachable through fakes). `Mount` holds the verified descriptor; the fake hands out unopened handles, which the production kernel refuses (`EBADF`).
   - `LinuxKernel` implementation: open the mountpoint with `O_RDONLY | O_DIRECTORY | O_CLOEXEC`, then `FIFREEZE`/`FITHAW` (`nix::ioctl_write_int_bad!`/`ioctl_none!` with request numbers `0xC0045877`/`0xC0045878`) and `FITRIM` (`ioctl_readwrite!` on `fstrim_range { start: 0, len: u64::MAX, minlen }`); `reboot` via `nix::sys::reboot::reboot`.
   - `#![allow(unsafe_code)]` only in `src/kernel/mod.rs`; every `unsafe` block carries a `// SAFETY:` comment; `#[cfg(target_os = "linux")]` on the module.
-  - `KernelError::Errno(nix::errno::Errno)` via `thiserror`.
+  - `KernelError::{Errno, Open, WrongFilesystem}` via `thiserror`; only `Errno` is an ioctl's answer (`is_ioctl_answer`), and `is_invalid`/`is_not_supported`/`is_busy` match nothing else.
 - **Done when:** `scripts/check-unsafe.sh` passes and clippy's `undocumented_unsafe_blocks` is clean.
 
 #### T3.2 — Freeze plan from `/proc/self/mountinfo` ∥

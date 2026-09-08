@@ -11,12 +11,14 @@ use std::sync::Mutex;
 
 use nix::errno::Errno;
 
-use super::{KernelError, KernelOps, RebootCommand, Trimmed};
+use super::{KernelError, KernelOps, Mount, RebootCommand, Trimmed};
 
 /// One recorded call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Call {
-    /// `fifreeze(path)`.
+    /// `open_mount(path, dev)`.
+    Open(PathBuf, (u32, u32)),
+    /// `fifreeze(path)` (the handle's mountpoint).
     Fifreeze(PathBuf),
     /// `fithaw(path)`.
     Fithaw(PathBuf),
@@ -35,10 +37,11 @@ pub type Hook = Box<dyn Fn(&Call) + Send + Sync>;
 #[derive(Default)]
 struct Inner {
     calls: Vec<Call>,
+    open_errors: HashMap<PathBuf, Errno>,
+    devices: HashMap<PathBuf, (u32, u32)>,
     freeze_errors: HashMap<PathBuf, Errno>,
     thaw_successes: HashMap<PathBuf, u32>,
     thaw_errors: HashMap<PathBuf, Errno>,
-    thaw_open_errors: HashMap<PathBuf, Errno>,
     trim_results: HashMap<PathBuf, Result<(u64, Option<u64>), Errno>>,
     reboot_error: Option<Errno>,
     hook: Option<Hook>,
@@ -59,9 +62,9 @@ impl std::fmt::Debug for FakeKernel {
 }
 
 impl FakeKernel {
-    /// A fake where every freeze succeeds, every thaw succeeds once and
-    /// then returns `EINVAL`, every trim reports 0 bytes, and reboot
-    /// succeeds.
+    /// A fake where every mountpoint opens on the device asked for, every
+    /// freeze succeeds, every thaw succeeds once and then returns
+    /// `EINVAL`, every trim reports 0 bytes, and reboot succeeds.
     pub fn new() -> Self {
         Self::default()
     }
@@ -105,12 +108,20 @@ impl FakeKernel {
             .insert(path.as_ref().to_owned(), errno);
     }
 
-    /// Makes every `fithaw(path)` fail to open the mountpoint with `errno`
-    /// ([`KernelError::Open`]: no ioctl issued).
-    pub fn script_thaw_open_error(&self, path: impl AsRef<Path>, errno: Errno) {
+    /// Makes `open_mount(path, _)` fail with `errno`
+    /// ([`KernelError::Open`]: no ioctl issued on that path).
+    pub fn script_open_error(&self, path: impl AsRef<Path>, errno: Errno) {
         self.lock()
-            .thaw_open_errors
+            .open_errors
             .insert(path.as_ref().to_owned(), errno);
+    }
+
+    /// Makes `path` lead to `dev` from now on: `open_mount(path, planned)`
+    /// answers [`KernelError::WrongFilesystem`] unless `planned == dev`
+    /// (models a mount placed over the planned one). Handles opened
+    /// before keep their device, like real descriptors.
+    pub fn script_mount_device(&self, path: impl AsRef<Path>, dev: (u32, u32)) {
+        self.lock().devices.insert(path.as_ref().to_owned(), dev);
     }
 
     /// Scripts the result of `fitrim(path, _)`: the bytes trimmed (the
@@ -150,7 +161,23 @@ impl FakeKernel {
 }
 
 impl KernelOps for FakeKernel {
-    fn fifreeze(&self, mountpoint: &Path) -> Result<(), KernelError> {
+    fn open_mount(&self, mountpoint: &Path, dev: (u32, u32)) -> Result<Mount, KernelError> {
+        self.record(Call::Open(mountpoint.to_owned(), dev));
+        let inner = self.lock();
+        if let Some(errno) = inner.open_errors.get(mountpoint) {
+            return Err(KernelError::Open(*errno));
+        }
+        match inner.devices.get(mountpoint) {
+            Some(found) if *found != dev => Err(KernelError::WrongFilesystem {
+                expected: dev,
+                found: *found,
+            }),
+            _ => Ok(Mount::unopened(mountpoint, dev)),
+        }
+    }
+
+    fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError> {
+        let mountpoint = mount.mountpoint();
         self.record(Call::Fifreeze(mountpoint.to_owned()));
         match self.lock().freeze_errors.get(mountpoint) {
             Some(errno) => Err(KernelError::Errno(*errno)),
@@ -158,12 +185,10 @@ impl KernelOps for FakeKernel {
         }
     }
 
-    fn fithaw(&self, mountpoint: &Path) -> Result<(), KernelError> {
+    fn fithaw(&self, mount: &Mount) -> Result<(), KernelError> {
+        let mountpoint = mount.mountpoint();
         self.record(Call::Fithaw(mountpoint.to_owned()));
         let mut inner = self.lock();
-        if let Some(errno) = inner.thaw_open_errors.get(mountpoint) {
-            return Err(KernelError::Open(*errno));
-        }
         if let Some(errno) = inner.thaw_errors.get(mountpoint) {
             return Err(KernelError::Errno(*errno));
         }
@@ -179,7 +204,8 @@ impl KernelOps for FakeKernel {
         }
     }
 
-    fn fitrim(&self, mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError> {
+    fn fitrim(&self, mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError> {
+        let mountpoint = mount.mountpoint();
         self.record(Call::Fitrim(mountpoint.to_owned(), minimum));
         match self.lock().trim_results.get(mountpoint) {
             Some(Ok((bytes, effective))) => Ok(Trimmed {
@@ -210,18 +236,28 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// An unopened handle, as the fake's `open_mount` hands out.
+    fn at(path: &str) -> Mount {
+        Mount::unopened(path, (8, 1))
+    }
+
     #[test]
     fn fake_records_calls_in_order() {
         let k = FakeKernel::new();
-        k.fifreeze(Path::new("/home")).unwrap();
-        k.fifreeze(Path::new("/")).unwrap();
-        k.fithaw(Path::new("/")).unwrap();
-        k.fitrim(Path::new("/"), 4096).unwrap();
+        let home = k.open_mount(Path::new("/home"), (8, 2)).unwrap();
+        assert!(!home.is_open(), "the fake holds no descriptor");
+        assert_eq!(home.mountpoint(), Path::new("/home"));
+        assert_eq!(home.dev(), (8, 2));
+        k.fifreeze(&home).unwrap();
+        k.fifreeze(&at("/")).unwrap();
+        k.fithaw(&at("/")).unwrap();
+        k.fitrim(&at("/"), 4096).unwrap();
         k.sync();
         k.reboot(RebootCommand::Halt).unwrap();
         assert_eq!(
             k.calls(),
             vec![
+                Call::Open("/home".into(), (8, 2)),
                 Call::Fifreeze("/home".into()),
                 Call::Fifreeze("/".into()),
                 Call::Fithaw("/".into()),
@@ -235,44 +271,60 @@ mod tests {
     }
 
     #[test]
+    fn fake_open_mount_is_scripted_per_path() {
+        let k = FakeKernel::new();
+        // Unscripted: the path is on whatever device is asked for.
+        assert_eq!(
+            k.open_mount(Path::new("/data"), (8, 2)).unwrap().dev(),
+            (8, 2)
+        );
+        // Scripted device: the planned device must match, as a real fstat
+        // on the opened directory would find.
+        k.script_mount_device("/data", (8, 3));
+        let err = k.open_mount(Path::new("/data"), (8, 2)).unwrap_err();
+        assert_eq!(
+            err,
+            KernelError::WrongFilesystem {
+                expected: (8, 2),
+                found: (8, 3)
+            }
+        );
+        assert!(k.open_mount(Path::new("/data"), (8, 3)).is_ok());
+        // Scripted open failure: no handle at all.
+        k.script_open_error("/mnt/full", Errno::EMFILE);
+        assert_eq!(
+            k.open_mount(Path::new("/mnt/full"), (8, 4)).unwrap_err(),
+            KernelError::Open(Errno::EMFILE)
+        );
+        assert_eq!(k.calls().len(), 4);
+    }
+
+    #[test]
     fn fake_returns_scripted_errno_per_path() {
         let k = FakeKernel::new();
         k.script_freeze_error("/proc", Errno::EOPNOTSUPP);
         k.script_freeze_error("/mnt/busy", Errno::EBUSY);
         k.script_freeze_error("/mnt/bad", Errno::EIO);
-        assert_eq!(k.fifreeze(Path::new("/mnt/a")), Ok(()));
-        assert!(
-            k.fifreeze(Path::new("/proc"))
-                .unwrap_err()
-                .is_not_supported()
-        );
-        assert!(k.fifreeze(Path::new("/mnt/busy")).unwrap_err().is_busy());
+        assert_eq!(k.fifreeze(&at("/mnt/a")), Ok(()));
+        assert!(k.fifreeze(&at("/proc")).unwrap_err().is_not_supported());
+        assert!(k.fifreeze(&at("/mnt/busy")).unwrap_err().is_busy());
         assert_eq!(
-            k.fifreeze(Path::new("/mnt/bad")),
+            k.fifreeze(&at("/mnt/bad")),
             Err(KernelError::Errno(Errno::EIO))
-        );
-        k.script_thaw_open_error("/mnt/full", Errno::EMFILE);
-        assert_eq!(
-            k.fithaw(Path::new("/mnt/full")),
-            Err(KernelError::Open(Errno::EMFILE))
         );
         k.script_trim("/mnt/a", Ok(123));
         k.script_trim("/mnt/bad", Err(Errno::EOPNOTSUPP));
         k.script_trim_rounded("/mnt/coarse", 7, 4096);
         let trimmed = |bytes, minimum| Ok(Trimmed { bytes, minimum });
-        assert_eq!(k.fitrim(Path::new("/mnt/a"), 0), trimmed(123, 0));
-        assert_eq!(k.fitrim(Path::new("/mnt/a"), 512), trimmed(123, 512));
-        assert_eq!(k.fitrim(Path::new("/mnt/other"), 0), trimmed(0, 0));
+        assert_eq!(k.fitrim(&at("/mnt/a"), 0), trimmed(123, 0));
+        assert_eq!(k.fitrim(&at("/mnt/a"), 512), trimmed(123, 512));
+        assert_eq!(k.fitrim(&at("/mnt/other"), 0), trimmed(0, 0));
         assert_eq!(
-            k.fitrim(Path::new("/mnt/coarse"), 1),
+            k.fitrim(&at("/mnt/coarse"), 1),
             trimmed(7, 4096),
             "the effective minimum, not the requested one"
         );
-        assert!(
-            k.fitrim(Path::new("/mnt/bad"), 0)
-                .unwrap_err()
-                .is_not_supported()
-        );
+        assert!(k.fitrim(&at("/mnt/bad"), 0).unwrap_err().is_not_supported());
         k.script_reboot_error(Errno::EPERM);
         assert!(
             k.reboot(RebootCommand::PowerOff)
@@ -280,26 +332,26 @@ mod tests {
                 .is_permission()
         );
         k.script_thaw_error("/mnt/bad", Errno::EACCES);
-        assert!(k.fithaw(Path::new("/mnt/bad")).unwrap_err().is_permission());
-        assert!(k.fithaw(Path::new("/mnt/bad")).unwrap_err().is_permission());
+        assert!(k.fithaw(&at("/mnt/bad")).unwrap_err().is_permission());
+        assert!(k.fithaw(&at("/mnt/bad")).unwrap_err().is_permission());
     }
 
     #[test]
     fn fake_thaw_succeeds_n_times_then_einval() {
         let k = FakeKernel::new();
         k.script_thaw_successes("/", 3);
-        let root = Path::new("/");
+        let root = at("/");
         for _ in 0..3 {
-            assert_eq!(k.fithaw(root), Ok(()));
+            assert_eq!(k.fithaw(&root), Ok(()));
         }
-        assert!(k.fithaw(root).unwrap_err().is_invalid());
-        assert!(k.fithaw(root).unwrap_err().is_invalid());
+        assert!(k.fithaw(&root).unwrap_err().is_invalid());
+        assert!(k.fithaw(&root).unwrap_err().is_invalid());
         // Unscripted: exactly once.
-        assert_eq!(k.fithaw(Path::new("/home")), Ok(()));
-        assert!(k.fithaw(Path::new("/home")).unwrap_err().is_invalid());
+        assert_eq!(k.fithaw(&at("/home")), Ok(()));
+        assert!(k.fithaw(&at("/home")).unwrap_err().is_invalid());
         // Zero successes: EINVAL from the start.
         k.script_thaw_successes("/none", 0);
-        assert!(k.fithaw(Path::new("/none")).unwrap_err().is_invalid());
+        assert!(k.fithaw(&at("/none")).unwrap_err().is_invalid());
         assert_eq!(k.calls().len(), 8);
     }
 
@@ -312,7 +364,7 @@ mod tests {
             assert!(matches!(call, Call::Fifreeze(_) | Call::Sync));
             seen2.fetch_add(1, Ordering::SeqCst);
         }));
-        k.fifreeze(Path::new("/")).unwrap();
+        k.fifreeze(&at("/")).unwrap();
         k.sync();
         assert_eq!(seen.load(Ordering::SeqCst), 2);
         assert_eq!(k.calls().len(), 2);

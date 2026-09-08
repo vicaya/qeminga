@@ -1,18 +1,20 @@
 //! `FIFREEZE`, `FITHAW` and `FITRIM` via `nix` (design §4.1, §5.5).
 //!
-//! Each call opens the mountpoint with `O_RDONLY | O_DIRECTORY |
-//! O_CLOEXEC` (never following into a file), issues the ioctl on that
-//! descriptor, and closes it. This file holds every `unsafe` block in the
-//! crate.
+//! [`open_mount`] opens the mountpoint with `O_RDONLY | O_DIRECTORY |
+//! O_CLOEXEC` (never following into a file) and checks with `fstat(2)`
+//! that the descriptor is on the planned device; the ioctls take that
+//! handle, so they can never reach a filesystem that was mounted over the
+//! planned one after the plan was made. This file holds every `unsafe`
+//! block in the crate.
 #![allow(unsafe_code)]
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 
 use nix::fcntl::{OFlag, open};
-use nix::sys::stat::Mode;
+use nix::sys::stat::{Mode, fstat, major, minor};
 
-use super::{KernelError, Trimmed};
+use super::{KernelError, Mount, Trimmed};
 
 /// `_IOWR('X', 119, int)`: freeze the filesystem.
 pub const FIFREEZE: u32 = 0xC004_5877;
@@ -55,43 +57,68 @@ nix::ioctl_readwrite!(
 );
 
 /// Opens a mountpoint directory for an ioctl.
-fn open_dir(mountpoint: &Path) -> Result<std::os::fd::OwnedFd, KernelError> {
+fn open_dir(mountpoint: &Path) -> Result<OwnedFd, KernelError> {
     let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
     open(mountpoint, flags, Mode::empty()).map_err(KernelError::Open)
 }
 
-/// `FIFREEZE` on the filesystem mounted at `mountpoint`.
-pub fn fifreeze(mountpoint: &Path) -> Result<(), KernelError> {
+/// `(major, minor)` of a `st_dev`, as mountinfo spells it.
+fn split_dev(dev: nix::libc::dev_t) -> (u32, u32) {
+    (
+        u32::try_from(major(dev)).unwrap_or(u32::MAX),
+        u32::try_from(minor(dev)).unwrap_or(u32::MAX),
+    )
+}
+
+/// Opens `mountpoint` and verifies, on the descriptor, that it is on
+/// `dev`. A pathname only names whatever is mounted there *now*; the
+/// descriptor names the filesystem it was opened on for as long as it is
+/// held.
+pub fn open_mount(mountpoint: &Path, dev: (u32, u32)) -> Result<Mount, KernelError> {
     let fd = open_dir(mountpoint)?;
-    // SAFETY: `fd` is an open directory descriptor owned by this frame,
-    // and FIFREEZE takes an integer argument the kernel ignores; no memory
-    // is shared with the kernel.
+    let found = split_dev(fstat(&fd).map_err(KernelError::Open)?.st_dev);
+    if found != dev {
+        return Err(KernelError::WrongFilesystem {
+            expected: dev,
+            found,
+        });
+    }
+    Ok(Mount::opened(mountpoint.to_owned(), dev, fd))
+}
+
+/// `FIFREEZE` on the filesystem behind `mount`.
+pub fn fifreeze(mount: &Mount) -> Result<(), KernelError> {
+    let fd = mount.fd()?;
+    // SAFETY: `fd` is an open directory descriptor borrowed from `mount`
+    // for the duration of the call, and FIFREEZE takes an integer argument
+    // the kernel ignores; no memory is shared with the kernel.
     unsafe { fifreeze_raw(fd.as_raw_fd(), 0) }?;
     Ok(())
 }
 
-/// `FITHAW` on the filesystem mounted at `mountpoint`.
-pub fn fithaw(mountpoint: &Path) -> Result<(), KernelError> {
-    let fd = open_dir(mountpoint)?;
-    // SAFETY: as for `fifreeze`: an owned open directory descriptor and an
-    // ignored integer argument.
+/// `FITHAW` on the filesystem behind `mount`.
+pub fn fithaw(mount: &Mount) -> Result<(), KernelError> {
+    let fd = mount.fd()?;
+    // SAFETY: as for `fifreeze`: an open directory descriptor borrowed for
+    // the call and an ignored integer argument.
     unsafe { fithaw_raw(fd.as_raw_fd(), 0) }?;
     Ok(())
 }
 
-/// `FITRIM` over the whole filesystem mounted at `mountpoint` with the
-/// given minimum extent; returns the bytes trimmed and the minimum extent
-/// the kernel applied (it rewrites both fields of the range).
-pub fn fitrim(mountpoint: &Path, minimum: u64) -> Result<Trimmed, KernelError> {
-    let fd = open_dir(mountpoint)?;
+/// `FITRIM` over the whole filesystem behind `mount` with the given
+/// minimum extent; returns the bytes trimmed and the minimum extent the
+/// kernel applied (it rewrites both fields of the range).
+pub fn fitrim(mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError> {
+    let fd = mount.fd()?;
     let mut range = FstrimRange {
         start: 0,
         len: u64::MAX,
         minlen: minimum,
     };
-    // SAFETY: `fd` is an owned open directory descriptor and `range` is a
-    // live, correctly laid out (`repr(C)`) `struct fstrim_range` that
-    // outlives the call; the kernel reads and writes only that struct.
+    // SAFETY: `fd` is an open directory descriptor borrowed for the call
+    // and `range` is a live, correctly laid out (`repr(C)`) `struct
+    // fstrim_range` that outlives the call; the kernel reads and writes
+    // only that struct.
     unsafe { fitrim_raw(fd.as_raw_fd(), &raw mut range) }?;
     Ok(Trimmed {
         bytes: range.len,
@@ -119,23 +146,31 @@ mod tests {
     #[test]
     #[ignore = "needs root and a loop-mounted ext4 (QEMINGA_TEST_EXT4_MOUNT)"]
     fn privileged_fifreeze_then_fithaw_on_loop_mounted_ext4() {
+        use std::os::unix::fs::MetadataExt;
         let mount = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
             .expect("QEMINGA_TEST_EXT4_MOUNT must point at a mounted ext4 filesystem");
-        let mount = Path::new(&mount);
-        fifreeze(mount).expect("FIFREEZE");
+        let path = Path::new(&mount);
+        let dev = split_dev(std::fs::metadata(path).unwrap().dev());
+        let mount = open_mount(path, dev).expect("open and verify the mountpoint");
+        fifreeze(&mount).expect("FIFREEZE");
         // A second freeze reports the superblock is already frozen.
-        assert!(fifreeze(mount).unwrap_err().is_busy());
-        fithaw(mount).expect("FITHAW");
+        assert!(fifreeze(&mount).unwrap_err().is_busy());
+        // A handle opened while frozen verifies and thaws just the same.
+        let again = open_mount(path, dev).expect("open while frozen");
+        fithaw(&again).expect("FITHAW");
         // Fully thawed: FITHAW now returns EINVAL, the end of a drain.
-        assert!(fithaw(mount).unwrap_err().is_invalid());
-        let trimmed = fitrim(mount, 0).expect("FITRIM");
+        assert!(fithaw(&mount).unwrap_err().is_invalid());
+        let trimmed = fitrim(&mount, 0).expect("FITRIM");
         let _ = trimmed.bytes;
         // The kernel rounds the requested minimum up to its block size and
         // the device's discard granularity and writes the value back: a
         // 1-byte request comes back larger, and the effective value is a
         // fixed point (asking for it again yields it again).
-        let effective = fitrim(mount, 1).expect("FITRIM").minimum;
+        let effective = fitrim(&mount, 1).expect("FITRIM").minimum;
         assert!(effective >= 1);
-        assert_eq!(fitrim(mount, effective).expect("FITRIM").minimum, effective);
+        assert_eq!(
+            fitrim(&mount, effective).expect("FITRIM").minimum,
+            effective
+        );
     }
 }

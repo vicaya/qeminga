@@ -1121,6 +1121,41 @@ mod tests {
         assert!(!text.contains("marker_remove_failed"), "{text}");
     }
 
+    #[test]
+    fn an_alias_in_use_is_logged_and_a_first_pathname_that_works_is_not() {
+        // bind_mounts.txt: /data (8:2) has the alias /srv/exports. The
+        // `fsfreeze_alias` record is the operator's only sign that a
+        // pathname no longer leads to its superblock, so it must fire
+        // exactly when an alias was needed.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let quiet = capture_warnings(|| {
+            runtime
+                .block_on(freeze(
+                    &rig.ctx,
+                    &req(r#"{"execute":"guest-fsfreeze-freeze"}"#),
+                ))
+                .unwrap();
+        });
+        assert!(!quiet.contains("fsfreeze_alias"), "{quiet}");
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        rig.kernel.script_mount_device("/data", (8, 9));
+        let text = capture_warnings(|| {
+            runtime
+                .block_on(freeze(
+                    &rig.ctx,
+                    &req(r#"{"execute":"guest-fsfreeze-freeze"}"#),
+                ))
+                .unwrap();
+        });
+        assert!(text.contains("\"event\":\"fsfreeze_alias\""), "{text}");
+        assert!(text.contains("\"alias\":\"/srv/exports\""), "{text}");
+        assert_eq!(rig.fifreezes(), paths(&["/srv/exports", "/"]));
+    }
+
     #[tokio::test]
     async fn status_reports_thawed_or_frozen() {
         for (state, expected, heartbeats) in [

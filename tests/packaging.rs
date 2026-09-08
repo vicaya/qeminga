@@ -81,13 +81,8 @@ fn unit_does_not_bind_to_the_virtio_port_device() {
 }
 
 #[test]
-fn unit_provisions_and_preserves_the_runtime_directory() {
+fn unit_provisions_the_state_directory_for_the_service_account() {
     let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
-    assert_eq!(values(&unit, "Service", "RuntimeDirectory"), ["qeminga"]);
-    assert_eq!(
-        values(&unit, "Service", "RuntimeDirectoryPreserve"),
-        ["yes"]
-    );
     assert_eq!(values(&unit, "Service", "Restart"), ["always"]);
     assert_eq!(
         values(&unit, "Service", "Type"),
@@ -97,14 +92,37 @@ fn unit_provisions_and_preserves_the_runtime_directory() {
     let exec = values(&unit, "Service", "ExecStart");
     assert_eq!(exec[0], "/usr/bin/qeminga");
     assert!(exec.contains(&"/etc/qeminga/config.toml"));
-    // Without User= the runtime directory is created root-owned and 0700;
-    // the marker is created after the drop to `qeminga`, so the directory
-    // must be handed over first, with full privileges (`+`).
+    // The marker is created and removed after the drop to `qeminga`, so
+    // the directory must belong to that account before ExecStart, with
+    // full privileges (`+`). RuntimeDirectory= must not be used: with no
+    // User= systemd re-applies root ownership before every ExecStart and
+    // undoes the hand-over (found by the installed-unit test below).
     let pre = values(&unit, "Service", "ExecStartPre");
-    assert_eq!(pre[0], "+/usr/bin/chown", "{pre:?}");
-    assert_eq!(pre[1], "qeminga:qeminga", "{pre:?}");
-    assert_eq!(pre[2], "/run/qeminga", "{pre:?}");
-    assert_eq!(values(&unit, "Service", "RuntimeDirectoryMode"), ["0700"]);
+    assert_eq!(
+        pre,
+        [
+            "+/usr/bin/mkdir",
+            "-p",
+            "/run/qeminga",
+            "+/usr/bin/chown",
+            "qeminga:qeminga",
+            "/run/qeminga",
+            "+/usr/bin/chmod",
+            "0700",
+            "/run/qeminga",
+        ],
+        "{pre:?}"
+    );
+    for key in [
+        "RuntimeDirectory",
+        "RuntimeDirectoryMode",
+        "RuntimeDirectoryPreserve",
+    ] {
+        assert!(
+            values(&unit, "Service", key).is_empty(),
+            "{key} must not be set"
+        );
+    }
     // The daemon drops privileges itself; systemd must not pre-empt it.
     assert!(values(&unit, "Service", "User").is_empty());
     assert!(values(&unit, "Service", "NoNewPrivileges").is_empty());
@@ -119,6 +137,25 @@ fn unit_provisions_and_preserves_the_runtime_directory() {
     ] {
         assert!(caps.contains(&needed), "{needed}");
     }
+}
+
+#[test]
+fn tmpfiles_rule_provisions_the_state_directory_at_boot() {
+    // C-20: /run is cleared at boot; the directory the dropped daemon
+    // creates its marker in must exist and belong to the service account.
+    let text = read("packaging/tmpfiles.d/qeminga.conf");
+    let rules: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    assert_eq!(rules.len(), 1, "{rules:?}");
+    assert_eq!(
+        rules[0].split_whitespace().collect::<Vec<_>>(),
+        ["d", "/run/qeminga", "0700", "qeminga", "qeminga", "-"]
+    );
+    let readme = read("packaging/README.md");
+    assert!(readme.contains("tmpfiles.d/qeminga.conf"));
 }
 
 #[test]
@@ -287,17 +324,14 @@ fn sh(program: &str, args: &[&str]) -> (bool, String) {
     (output.status.success(), text)
 }
 
-/// The installed unit, not just the binary: a marker from a previous
-/// instance and no channel device at all. systemd must start the service
-/// (nothing binds it to the device), and the daemon must run its
-/// recovery and remove the marker without the port ever appearing
-/// (§4.4, OQ-7). Needs root and a running systemd; the built binary is
-/// installed as /usr/bin/qeminga for the duration (a previous one is put
-/// back), the unit goes under /run/systemd/system.
-#[test]
-#[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
-fn privileged_installed_unit_recovers_without_the_channel_device() {
-    use std::time::{Duration, Instant};
+/// `Some(guard)` once the shipped unit, the built binary, the service
+/// account and a config with `channel_path` are installed for the
+/// duration; `None` when there is no systemd to install into (and CI did
+/// not insist). The unit gets a drop-in for the fake kernel (test-fakes
+/// builds: no real ioctl; a build without the feature ignores the
+/// variable and drains with real FITHAWs, which answer EINVAL on an
+/// unfrozen host) and a short stop timeout.
+fn install_unit(channel_path: &str) -> Option<InstalledUnit> {
     assert!(nix::unistd::geteuid().is_root(), "run as root");
     // A container without systemd cannot run this; CI's privileged job
     // sets QEMINGA_REQUIRE_SYSTEMD so the check can never pass vacuously.
@@ -307,10 +341,9 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
             "systemd is not the running service manager"
         );
         eprintln!("skipped: systemd is not the running service manager");
-        return;
+        return None;
     }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // Install.
     let backup = Path::new(InstalledUnit::BIN)
         .exists()
         .then(|| std::path::PathBuf::from("/usr/bin/qeminga.qeminga-test-backup"));
@@ -335,7 +368,7 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
     std::fs::create_dir_all("/etc/qeminga").unwrap();
     std::fs::write(
         InstalledUnit::CONFIG,
-        "[agent]\nchannel_path = \"/dev/virtio-ports/qeminga-test-no-such-port\"\nfsfreeze_idle_timeout_secs = 1\n",
+        format!("[agent]\nchannel_path = \"{channel_path}\"\nfsfreeze_idle_timeout_secs = 1\n"),
     )
     .unwrap();
     std::fs::copy(
@@ -344,17 +377,11 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
     )
     .unwrap();
     std::fs::create_dir_all(InstalledUnit::DROPIN_DIR).unwrap();
-    // The fake kernel (test-fakes builds): the recovery drain issues no
-    // real ioctl. A build without the feature ignores the variable and
-    // drains with real FITHAWs, which answer EINVAL on an unfrozen host.
     std::fs::write(
         Path::new(InstalledUnit::DROPIN_DIR).join("50-test.conf"),
         "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\nTimeoutStopSec=15s\n",
     )
     .unwrap();
-    // The marker of a previous instance, in the preserved runtime directory.
-    std::fs::create_dir_all("/run/qeminga").unwrap();
-    std::fs::write("/run/qeminga/frozen", b"").unwrap();
     let (ok, text) = sh("systemctl", &["daemon-reload"]);
     assert!(ok, "{text}");
     let (_, fragment) = sh(
@@ -367,6 +394,141 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
         "another qeminga.service shadows the test copy"
     );
     let _ = sh("systemctl", &["reset-failed", "qeminga.service"]);
+    Some(installed)
+}
+
+/// A pty whose slave is the daemon's channel; requests go in and replies
+/// come out through the master.
+struct PtyChannel {
+    master: std::fs::File,
+    slave_path: String,
+}
+
+impl PtyChannel {
+    fn open() -> Self {
+        use nix::fcntl::OFlag;
+        let master =
+            nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY | OFlag::O_CLOEXEC).unwrap();
+        nix::pty::grantpt(&master).unwrap();
+        nix::pty::unlockpt(&master).unwrap();
+        let slave_path = nix::pty::ptsname_r(&master).unwrap();
+        let mut termios = nix::sys::termios::tcgetattr(&master).unwrap();
+        nix::sys::termios::cfmakeraw(&mut termios);
+        nix::sys::termios::tcsetattr(&master, nix::sys::termios::SetArg::TCSANOW, &termios)
+            .unwrap();
+        PtyChannel {
+            master: std::fs::File::from(std::os::fd::OwnedFd::from(master)),
+            slave_path,
+        }
+    }
+
+    /// Sends one request line and returns the reply line, or panics after
+    /// ten seconds.
+    fn request(&mut self, json: &str) -> String {
+        use std::io::{Read, Write};
+        use std::os::fd::AsFd;
+        self.master.write_all(json.as_bytes()).unwrap();
+        self.master.write_all(b"\n").unwrap();
+        let mut line = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(
+                !left.is_zero(),
+                "no reply to {json}: {:?}",
+                String::from_utf8_lossy(&line)
+            );
+            let mut fds = [nix::poll::PollFd::new(
+                self.master.as_fd(),
+                nix::poll::PollFlags::POLLIN,
+            )];
+            let ready =
+                nix::poll::poll(&mut fds, nix::poll::PollTimeout::try_from(left).unwrap()).unwrap();
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = [0u8; 1];
+            assert!(
+                self.master.read(&mut byte).unwrap() != 0,
+                "channel closed before a reply to {json}"
+            );
+            if byte[0] == b'\n' {
+                return String::from_utf8(line).unwrap();
+            }
+            line.push(byte[0]);
+        }
+    }
+}
+
+/// The installed unit, not just the binary, freezes and thaws: the
+/// daemon started by systemd, dropped to `qeminga`, must be able to
+/// create its marker in /run/qeminga and remove it again. (With
+/// RuntimeDirectory= it could not: systemd re-applied root ownership
+/// before ExecStart and every freeze failed on the marker.) The channel
+/// is a pty the test holds the master of.
+#[test]
+#[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
+fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
+    use std::os::unix::fs::MetadataExt;
+    let mut pty = PtyChannel::open();
+    let Some(installed) = install_unit(&pty.slave_path) else {
+        return;
+    };
+    let _ = std::fs::remove_file("/run/qeminga/frozen");
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(ok, "systemctl start: {text}");
+    let reply = pty.request(r#"{"execute":"guest-ping"}"#);
+    assert_eq!(reply, r#"{"return":{}}"#);
+    let reply = pty.request(r#"{"execute":"guest-fsfreeze-freeze"}"#);
+    assert!(
+        reply.starts_with(r#"{"return":"#),
+        "freeze under the unit: {reply}"
+    );
+    let marker = std::fs::metadata("/run/qeminga/frozen")
+        .unwrap_or_else(|e| panic!("marker not created by the dropped daemon: {e}"));
+    assert_eq!(marker.uid(), 600, "created by the service account");
+    let dir = std::fs::metadata("/run/qeminga").unwrap();
+    assert_eq!(
+        (dir.uid(), dir.mode() & 0o777),
+        (600, 0o700),
+        "owned by the service account"
+    );
+    assert_eq!(
+        pty.request(r#"{"execute":"guest-fsfreeze-status"}"#),
+        r#"{"return":"frozen"}"#
+    );
+    let reply = pty.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
+    assert!(
+        reply.starts_with(r#"{"return":"#),
+        "thaw under the unit: {reply}"
+    );
+    assert!(
+        !Path::new("/run/qeminga/frozen").exists(),
+        "marker removed by the dropped daemon"
+    );
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    drop(installed);
+}
+
+/// The installed unit, not just the binary: a marker from a previous
+/// instance and no channel device at all. systemd must start the service
+/// (nothing binds it to the device), and the daemon must run its
+/// recovery and remove the marker without the port ever appearing
+/// (§4.4, OQ-7). Needs root and a running systemd; the built binary is
+/// installed as /usr/bin/qeminga for the duration (a previous one is put
+/// back), the unit goes under /run/systemd/system.
+#[test]
+#[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
+fn privileged_installed_unit_recovers_without_the_channel_device() {
+    use std::time::{Duration, Instant};
+    let Some(installed) = install_unit("/dev/virtio-ports/qeminga-test-no-such-port") else {
+        return;
+    };
+    // The marker of a previous instance, in a directory provisioned as the
+    // tmpfiles rule would at boot.
+    std::fs::create_dir_all("/run/qeminga").unwrap();
+    std::fs::write("/run/qeminga/frozen", b"").unwrap();
     let started = Instant::now();
     let (ok, text) = sh("systemctl", &["start", "--no-block", "qeminga.service"]);
     assert!(ok, "systemctl start: {text}");

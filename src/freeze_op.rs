@@ -78,13 +78,28 @@ pub enum AbortCause {
     Deadline,
     /// A `guest-fsfreeze-thaw` arrived while the walk was under way.
     ThawRequested,
+    /// A freeze worker was lost (it panicked): its target is uncertain,
+    /// so the walk stops and the operation settles `Frozen`.
+    WorkerLost,
+}
+
+impl AbortCause {
+    /// The cause for a reply, with the deadline where it applies.
+    pub fn describe(self, timeout_secs: u64) -> String {
+        match self {
+            AbortCause::Deadline => format!("operation deadline of {timeout_secs} s expired"),
+            AbortCause::ThawRequested => "thaw requested".to_owned(),
+            AbortCause::WorkerLost => "freeze worker lost".to_owned(),
+        }
+    }
 }
 
 impl std::fmt::Display for AbortCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            AbortCause::Deadline => "operation deadline expired",
-            AbortCause::ThawRequested => "thaw requested",
+            AbortCause::Deadline => "deadline",
+            AbortCause::ThawRequested => "thaw_requested",
+            AbortCause::WorkerLost => "worker_lost",
         })
     }
 }
@@ -351,7 +366,7 @@ impl Driver {
                         format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
                     ));
                     if self.abort.is_none() {
-                        self.commit_abort(AbortCause::Deadline);
+                        self.commit_abort(AbortCause::WorkerLost);
                         break;
                     }
                 }

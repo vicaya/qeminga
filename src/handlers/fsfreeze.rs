@@ -234,12 +234,15 @@ pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
     let token = match ctx.state.claim_thaw() {
         Ok(token) => token,
-        Err(err) => {
-            let Some(op) = ctx.freeze_op() else {
-                return Err(Error::Internal(format!("cannot thaw: {err}")));
-            };
-            return join_operation(&op).await;
-        }
+        Err(err) => match ctx.freeze_op() {
+            Some(op) => return join_operation(&op).await,
+            // The operation may have settled between the claim and the
+            // look-up: one more claim before refusing.
+            None => ctx
+                .state
+                .claim_thaw()
+                .map_err(|_| Error::Internal(format!("cannot thaw: {err}")))?,
+        },
     };
     let count = run_thaw(ctx, token).await?;
     Ok(json!(count))
@@ -424,7 +427,8 @@ pub enum FreezeFailure {
     /// so far are being thawed by the coordinator; the marker and the
     /// frozen gate stay until the in-flight call returns.
     #[error(
-        "freeze aborted: {cause} ({timeout_secs} s){}; {frozen} target(s) frozen so far are being thawed; marker retained",
+        "freeze aborted: {}{}; {frozen} target(s) frozen so far are being thawed; marker retained",
+        cause.describe(*timeout_secs),
         in_flight.as_deref().map(|mp| format!(" with FIFREEZE of {mp} in flight")).unwrap_or_default()
     )]
     Aborted {
@@ -959,12 +963,13 @@ mod tests {
             }
         }
 
-        /// Polls until `done`, at most ten seconds.
+        /// Polls until `done`; the bound only matters on failure and is
+        /// generous for a loaded runner (the mutants job).
         async fn wait_for(&self, what: &str, mut done: impl FnMut(&Rig) -> bool) {
             let start = std::time::Instant::now();
             while !done(self) {
                 assert!(
-                    start.elapsed() < Duration::from_secs(10),
+                    start.elapsed() < Duration::from_secs(30),
                     "timed out: {what}"
                 );
                 tokio::time::sleep(Duration::from_millis(5)).await;

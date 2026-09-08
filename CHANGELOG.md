@@ -29,8 +29,11 @@ First release: the complete command set of `docs/design.md`.
   bytes so a mount point that is not UTF-8 is kept byte-exact (ext4/xfs on
   `/dev` nodes, bind mounts de-duplicated, reverse mount order), recovery
   marker created with `O_EXCL` + `fsync` before the first `FIFREEZE`, thaw
-  drains each target until its first error (bounded at 1024 calls; a denied
-  first `FITHAW` or a drain that never converges keeps the state `Frozen`),
+  drains each target until its first error (bounded at 1024 calls) and
+  counts it complete only on the kernel's "not frozen" answer (`EINVAL`,
+  or `EOPNOTSUPP` for a filesystem that cannot freeze): a denied or failed
+  `FITHAW`, a mountpoint that cannot be opened, or a drain that never
+  converges keeps the marker and the state `Frozen`,
   a failed freeze rolls back every processed target before reporting the
   first one it could not thaw, the audit flush of a thaw completes before
   the state is published as thawed, watchdog with idle timeout and hard cap
@@ -45,8 +48,11 @@ First release: the complete command set of `docs/design.md`.
   aarch64) with `ioctl` restricted to `FIFREEZE`/`FITHAW`/`FITRIM`.
 - Channel handling: non-blocking virtio-serial I/O, EOF/HUP reconnect with
   bounded backoff, `EBUSY` as the terminal `channel_already_open` error,
-  deferred `SIGTERM` while frozen.
-- Packaging: systemd unit, udev rule, sysusers entry, example config.
+  deferred `SIGTERM` while frozen (and, once thawed, honoured even while a
+  reply is stuck on a host that has stopped reading).
+- Packaging: systemd unit (not bound to the port's device unit, so a crash
+  while frozen is recovered whether or not the port is there), udev rule,
+  sysusers entry, example config.
 - Tests: property tests, fuzz targets, an unprivileged end-to-end suite
   over a pty, privileged tests on loop-mounted filesystems, and a manual
   libvirt interoperability script.

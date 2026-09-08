@@ -463,8 +463,10 @@ impl Startup for SystemStartup {
 
 /// Shuts the runtime down, waiting at most `grace` for blocking work.
 /// Dropping a runtime would wait for ever for a started blocking task;
-/// by the time the loop has stopped the only such task can be an
-/// abandoned `guest-get-fsinfo` walk (see [`RUNTIME_SHUTDOWN_GRACE`]).
+/// by the time [`serve_until_signal`] has returned, on a stop or on a
+/// terminal channel error alike, the state is `Thawed`, so the only such
+/// task can be an abandoned `guest-get-fsinfo` walk (see
+/// [`RUNTIME_SHUTDOWN_GRACE`]).
 pub fn finish_runtime(runtime: tokio::runtime::Runtime, grace: Duration) {
     runtime.shutdown_timeout(grace);
 }
@@ -506,6 +508,14 @@ pub fn production_context(
 /// open `path` with backoff while the watchdog runs, so an abandoned
 /// freeze is bounded even if the host never connects (OQ-7). Returns the
 /// terminal channel error, if any.
+///
+/// Every way out obeys the same rule: a terminal channel error (`EBUSY`,
+/// §8.4: the port is not competed for) ends the serving, but not the
+/// process while a filesystem may be frozen or a thaw is in flight. The
+/// exit is deferred until the state is `Thawed`, which the watchdog
+/// bounds since no host can reach this process any more, so the runtime
+/// is only ever torn down (`finish_runtime`) once every destructive
+/// operation has completed.
 pub async fn serve_until_signal<S>(
     ctx: Arc<Context>,
     path: &Path,
@@ -528,14 +538,7 @@ where
         let name = signal.await;
         tracing::info!(event = "signal", signal = name, "stop requested");
         loop {
-            let mut warned = false;
-            while stop_ctx.state.current() != FreezeState::Thawed {
-                if !warned {
-                    tracing::warn!(event = "stop_deferred", state = %stop_ctx.state.current(), "stop deferred until thaw completes");
-                    warned = true;
-                }
-                tokio::time::sleep(stop_poll).await;
-            }
+            wait_until_thawed(&stop_ctx, stop_poll).await;
             // Ask the loop to stop. A session finishes the command it is
             // handling first and stops only if the state is still
             // `Thawed`; a freeze that slipped in between this check and
@@ -550,12 +553,33 @@ where
     let served = channel::serve_with_initial(path, open, &dispatcher, cancel_rx, initial);
     tokio::pin!(served);
     tokio::pin!(stopper);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut served => result,
         () = &mut stopper => {
             // Cancellation was sent; let the loop observe it and return.
             served.await
         }
+    };
+    if let Err(err) = &result {
+        tracing::error!(event = "channel_lost", error = %err, "channel lost for good; exiting once thawed");
+    }
+    // A stop honoured by the loop is already thawed; a terminal error is
+    // not necessarily.
+    wait_until_thawed(&ctx, stop_poll).await;
+    result
+}
+
+/// Returns once the state is `Thawed`, polling every `poll`; logs the
+/// deferral once. The watchdog (§4.4) bounds the wait for a freeze this
+/// process holds, and a thaw in flight completes on the blocking pool.
+async fn wait_until_thawed(ctx: &Context, poll: Duration) {
+    let mut warned = false;
+    while ctx.state.current() != FreezeState::Thawed {
+        if !warned {
+            tracing::warn!(event = "stop_deferred", state = %ctx.state.current(), "stop deferred until thaw completes");
+            warned = true;
+        }
+        tokio::time::sleep(poll).await;
     }
 }
 

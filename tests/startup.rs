@@ -605,6 +605,167 @@ async fn sigterm_while_frozen_is_deferred_until_thaw() {
     );
 }
 
+/// An opener that answers `EBUSY` (another process took the port) and
+/// counts its calls.
+fn busy_open(calls: &Arc<std::sync::atomic::AtomicUsize>) -> OpenFn {
+    let calls = Arc::clone(calls);
+    Arc::new(move |_| {
+        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(std::io::Error::from_raw_os_error(Errno::EBUSY as i32))
+    })
+}
+
+async fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_channel_error_while_frozen_waits_for_the_thaw() {
+    // The host froze the guest, the session ended, and the reopen finds
+    // the port held by another process (EBUSY): serving stops for good,
+    // but the exit is deferred like a requested stop (C-21) until the
+    // filesystems are thawed, here by the watchdog, since no host can
+    // reach this process any more. The terminal error is still reported.
+    let sink = SharedSink::default();
+    let rig = rig_with_idle(false, &sink, 3);
+    let ctx = rig.ctx.clone();
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let initial = take_initial();
+    let router = rig.ctx.audit.clone();
+    let open = busy_open(&opens);
+    let server = tokio::spawn(
+        async move {
+            daemon::serve_until_signal(
+                ctx,
+                Path::new("/dev/virtio-ports/fake"),
+                open,
+                Some(initial),
+                false,
+                async move { signal_rx.await.unwrap_or("closed") },
+                Duration::from_millis(20),
+            )
+            .await
+        }
+        .with_subscriber(qeminga::audit::subscriber(tracing::Level::INFO, router)),
+    );
+    let mut peer = Channel::from_fd(rig.peer).unwrap();
+    let reply = request(&mut peer, r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert_eq!(reply, "{\"return\":2}\n");
+    assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+    drop(peer);
+    let opens_seen = || opens.load(std::sync::atomic::Ordering::SeqCst) >= 1;
+    wait_for("the reopen attempt", opens_seen).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !server.is_finished(),
+        "the terminal error must not bypass the thaw"
+    );
+    assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+    assert!(rig.ctx.marker.exists());
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("exits once the watchdog has thawed")
+        .unwrap();
+    let err = result.unwrap_err();
+    assert!(err.is_terminal(), "{err}");
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+    assert!(!rig.ctx.marker.exists());
+    assert_eq!(
+        opens.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "no competing for the port"
+    );
+    let text = sink.text();
+    assert!(text.contains("\"event\":\"channel_lost\""), "{text}");
+    assert!(text.contains("\"event\":\"stop_deferred\""), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_channel_error_during_a_thaw_waits_for_its_completion() {
+    // The watchdog's thaw is in flight (its first FITHAW is held behind a
+    // barrier) when the reopen hits EBUSY: serving ends only after that
+    // thaw has completed, so the runtime is never torn down under a
+    // destructive operation.
+    let sink = SharedSink::default();
+    let rig = rig_with_idle(false, &sink, 1);
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    /// Releases the barrier when dropped, so a failed assertion never
+    /// leaves the thaw (and the runtime's shutdown) blocked.
+    struct Release(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let (open, released) = &*self.0;
+            *open.lock().unwrap() = true;
+            released.notify_all();
+        }
+    }
+    let release = Release(Arc::clone(&gate));
+    let kernel = Arc::new(FakeKernel::new());
+    let hook_gate = Arc::clone(&gate);
+    kernel.set_hook(Box::new(move |call| {
+        if matches!(call, qeminga::kernel::fake::Call::Fithaw(_)) {
+            let (open, released) = &*hook_gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = released.wait(open).unwrap();
+            }
+        }
+    }));
+    let ctx = Arc::new(
+        Arc::try_unwrap(rig.ctx)
+            .unwrap_or_else(|_| panic!("unshared"))
+            .with_kernel(kernel),
+    );
+    let opens = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (_signal_tx, signal_rx) = tokio::sync::oneshot::channel::<&'static str>();
+    let initial = take_initial();
+    let open = busy_open(&opens);
+    let server_ctx = Arc::clone(&ctx);
+    let server = tokio::spawn(async move {
+        daemon::serve_until_signal(
+            server_ctx,
+            Path::new("/dev/virtio-ports/fake"),
+            open,
+            Some(initial),
+            false,
+            async move { signal_rx.await.unwrap_or("closed") },
+            Duration::from_millis(20),
+        )
+        .await
+    });
+    let mut peer = Channel::from_fd(rig.peer).unwrap();
+    let reply = request(&mut peer, r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert_eq!(reply, "{\"return\":2}\n");
+    wait_for("the watchdog's thaw", || {
+        ctx.state.current() == FreezeState::Thawing
+    })
+    .await;
+    drop(peer);
+    wait_for("the reopen attempt", || {
+        opens.load(std::sync::atomic::Ordering::SeqCst) >= 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!server.is_finished(), "a thaw is in flight");
+    assert_eq!(ctx.state.current(), FreezeState::Thawing);
+    drop(release);
+    let result = tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("exits once the thaw has completed")
+        .unwrap();
+    assert!(result.unwrap_err().is_terminal());
+    assert_eq!(ctx.state.current(), FreezeState::Thawed);
+    assert!(!ctx.marker.exists());
+}
+
 #[test]
 fn runtime_is_multi_thread_with_at_least_two_workers() {
     let rt = daemon::build_runtime().unwrap();

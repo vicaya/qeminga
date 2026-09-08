@@ -318,11 +318,70 @@ where
         received += n as u64;
         for event in decoder.push(&buf[..n]) {
             if let Some(reply) = handler.handle(event).await {
-                if let Err(err) = writer.write_all(&reply).await {
-                    return report(SessionEnd::WriteError(err), received);
+                match deliver(&mut writer, &reply, handler, cancel, &mut cancel_live).await {
+                    Delivery::Done => {}
+                    Delivery::Cancelled => return report(SessionEnd::Cancelled, received),
+                    Delivery::Failed(err) => return report(SessionEnd::WriteError(err), received),
                 }
-                if let Err(err) = writer.flush().await {
-                    return report(SessionEnd::WriteError(err), received);
+            }
+        }
+    }
+}
+
+/// How writing a reply ended.
+enum Delivery {
+    /// Written and flushed.
+    Done,
+    /// A stop was requested and allowed before the host accepted the
+    /// reply; the frame may be partially written, so the session ends.
+    Cancelled,
+    /// The write failed.
+    Failed(io::Error),
+}
+
+/// Writes and flushes one reply, racing the wait for the host against a
+/// stop. The command's side effects are complete by now; only the host's
+/// acceptance of its reply remains, and a host that keeps the port open
+/// but stops reading must not hold the agent's shutdown (C-21 protects
+/// the command, not the delivery). The write is pinned across the race:
+/// a stop that the handler does not allow yet (not `Thawed`) resumes the
+/// same partial write rather than starting the frame again, and a later
+/// allowed stop abandons it, which ends the session so no other reply is
+/// ever appended to the partial frame.
+async fn deliver<W, H>(
+    writer: &mut W,
+    reply: &[u8],
+    handler: &H,
+    cancel: &mut Cancel,
+    cancel_live: &mut bool,
+) -> Delivery
+where
+    W: AsyncWrite + Unpin,
+    H: Handle,
+{
+    let mut io = std::pin::pin!(async {
+        writer.write_all(reply).await?;
+        writer.flush().await
+    });
+    loop {
+        if !*cancel_live {
+            return match io.await {
+                Ok(()) => Delivery::Done,
+                Err(err) => Delivery::Failed(err),
+            };
+        }
+        tokio::select! {
+            biased;
+            result = &mut io => {
+                return match result {
+                    Ok(()) => Delivery::Done,
+                    Err(err) => Delivery::Failed(err),
+                };
+            }
+            changed = cancel.changed() => {
+                *cancel_live = changed.is_ok();
+                if stop_now(cancel, handler) {
+                    return Delivery::Cancelled;
                 }
             }
         }
@@ -693,6 +752,119 @@ mod tests {
         drop(peer);
         session.await.unwrap();
         assert_eq!(handler.seen.lock().unwrap().len(), 2);
+    }
+
+    /// Replies with a frame far larger than a tiny duplex buffer and
+    /// allows a stop only when told to.
+    struct BigReplyHandler {
+        allow_stop: std::sync::atomic::AtomicBool,
+    }
+
+    impl Handle for BigReplyHandler {
+        async fn handle(&self, _event: DecodeEvent) -> Option<Vec<u8>> {
+            let mut reply = vec![b'x'; 4096];
+            reply.push(b'\n');
+            Some(reply)
+        }
+        fn may_stop(&self) -> bool {
+            self.allow_stop.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A session over a 16-byte duplex whose peer never reads: the reply
+    /// write blocks after the first bytes. Returns the peer (kept alive,
+    /// unread) and the session task.
+    fn blocked_reply_session(
+        handler: Arc<BigReplyHandler>,
+    ) -> (
+        tokio::io::DuplexStream,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<SessionReport>,
+    ) {
+        let (peer, ours) = duplex(16);
+        let (reader, writer) = tokio::io::split(ours);
+        let (cancel_tx, mut cancel_rx) = cancel_pair();
+        let session = tokio::spawn(async move {
+            let mut decoder = FrameDecoder::new();
+            run_session_until(
+                reader,
+                writer,
+                handler.as_ref(),
+                &mut decoder,
+                &mut cancel_rx,
+            )
+            .await
+        });
+        (peer, cancel_tx, session)
+    }
+
+    #[tokio::test]
+    async fn a_stop_is_honoured_while_the_host_is_not_reading_the_reply() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let handler = Arc::new(BigReplyHandler {
+                allow_stop: std::sync::atomic::AtomicBool::new(true),
+            });
+            let (mut peer, cancel_tx, session) = blocked_reply_session(handler);
+            peer.write_all(b"ping\n").await.unwrap();
+            // The handler ran and the reply write is stuck on the full
+            // buffer; the peer keeps the port open but reads nothing.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(!session.is_finished(), "blocked on the unread reply");
+            cancel_tx.send(true).unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(2), session)
+                .await
+                .expect("the stop ends the session without the host draining")
+                .unwrap();
+            assert!(
+                matches!(report.end, SessionEnd::Cancelled),
+                "{}",
+                report.end
+            );
+            assert_eq!(report.received, 5);
+            drop(peer);
+        })
+        .await
+        .expect("test hung");
+    }
+
+    #[tokio::test]
+    async fn a_blocked_reply_while_frozen_waits_for_the_thaw_then_stops() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            use std::sync::atomic::Ordering;
+            // Frozen: the stop is not allowed, so the blocked write is
+            // kept (not restarted) and the session goes on. Once the
+            // watchdog or the host thaws, the repeated stop request ends
+            // the session even though the host still reads nothing.
+            let handler = Arc::new(BigReplyHandler {
+                allow_stop: std::sync::atomic::AtomicBool::new(false),
+            });
+            let (mut peer, cancel_tx, session) = blocked_reply_session(Arc::clone(&handler));
+            peer.write_all(b"ping\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel_tx.send(true).unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!session.is_finished(), "not allowed to stop while frozen");
+            // Thawed: the daemon's stopper re-sends the request each poll.
+            handler.allow_stop.store(true, Ordering::SeqCst);
+            cancel_tx.send(true).unwrap();
+            let report = tokio::time::timeout(Duration::from_secs(2), session)
+                .await
+                .expect("the stop ends the session once allowed")
+                .unwrap();
+            assert!(
+                matches!(report.end, SessionEnd::Cancelled),
+                "{}",
+                report.end
+            );
+            // The peer sees the partial frame that was written before the
+            // buffer filled: at most the buffer's worth, never a second
+            // reply appended to it.
+            let mut out = vec![0u8; 64];
+            let n = peer.read(&mut out).await.unwrap();
+            assert!(n <= 16 && out[..n].iter().all(|&b| b == b'x'), "{n}");
+        })
+        .await
+        .expect("test hung");
     }
 
     #[tokio::test]

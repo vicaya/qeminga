@@ -107,7 +107,7 @@ disagree, raise it as an open question rather than diverging.
 | C-18 | If the process is not started as root, `main` skips the capability drop and logs a warning that freeze/trim/shutdown will fail with `EPERM`. This is what makes the unprivileged end-to-end tests (T4.7) possible without changing production behaviour. |
 | C-19 | Shared parsers that two handlers need (`/proc/self/mountinfo`) live in a new leaf module `src/mountinfo.rs`; the §6 module list is a minimum, not a maximum. |
 | C-20 | The recovery marker's directory must survive service stops: the unit sets `RuntimeDirectoryPreserve=yes` (otherwise systemd deletes `/run/qeminga` on stop and defeats §5.7). |
-| C-21 | A `SIGTERM`/`SIGINT` received while not `Thawed` is always deferred: the agent keeps serving the frozen-safe set and exits after the thaw completes. Whether that deferral finishes before systemd escalates to `SIGKILL` is a packaging property (`TimeoutStopSec`, §8.4), not a runtime decision. |
+| C-21 | A `SIGTERM`/`SIGINT` received while not `Thawed` is always deferred: the agent keeps serving the frozen-safe set and exits after the thaw completes. Whether that deferral finishes before systemd escalates to `SIGKILL` is a packaging property (`TimeoutStopSec`, §8.4), not a runtime decision. The rule protects the command, not the delivery of its reply: a stop that is allowed (`Thawed`) ends the session even while a reply is still being written to a host that has stopped reading; the partial frame is abandoned with the session and no other reply is ever appended to it. |
 
 ## 4. Open questions (need the design owner)
 
@@ -609,6 +609,7 @@ the answer is a one-line change, and leave the question here.
   - `sigterm_while_thawed_exits_zero_promptly`, `sigterm_while_frozen_is_deferred_until_thaw` (paused time + fake channel), `cancel_finishes_the_in_flight_command_and_waits_for_may_stop` (`src/channel.rs`: a stop is raced only against the read, never against a handler, and takes effect only when `Handle::may_stop` holds, i.e. the state is `Thawed`; the stopper repeats the request until then).
   - `runtime_is_multi_thread_with_at_least_two_workers` (inspect `tokio::runtime::Handle::current().metrics().num_workers()`).
   - `feature_warnings_are_logged_once_at_startup`.
+  - `a_stop_is_honoured_while_the_host_is_not_reading_the_reply` and `a_blocked_reply_while_frozen_waits_for_the_thaw_then_stops` (channel: the reply write is raced against an allowed stop; a stop that is not allowed yet resumes the same partial write) — C-21, review follow-up.
   - `a_missing_channel_never_delays_the_drop_the_filter_or_recovery` (ordered fake log: a non-`EBUSY` open failure is deferred and the sequence continues) and `recovery_thaws_without_the_channel_ever_opening` (in-process: marker present, an opener that always fails, the watchdog drains and the stop is honoured) — OQ-7, review follow-up.
 - **Implement (green):** hand-rolled arg parsing (`--config PATH`, `--version`; no `clap`), `Startup` sequence as a list of steps with tracing spans, `tokio::runtime::Builder::new_multi_thread().worker_threads(max(2, …))`, signal handling with `tokio::signal::unix`.
 - **Done when:** `qeminga --config tests/fixtures/config/default.toml` run unprivileged against a pty behaves per T4.7.

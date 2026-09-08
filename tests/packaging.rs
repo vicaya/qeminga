@@ -293,10 +293,16 @@ fn sh(program: &str, args: &[&str]) -> (bool, String) {
 fn privileged_installed_unit_recovers_without_the_channel_device() {
     use std::time::{Duration, Instant};
     assert!(nix::unistd::geteuid().is_root(), "run as root");
-    assert!(
-        Path::new("/run/systemd/system").is_dir(),
-        "systemd is not the running service manager"
-    );
+    // A container without systemd cannot run this; CI's privileged job
+    // sets QEMINGA_REQUIRE_SYSTEMD so the check can never pass vacuously.
+    if !Path::new("/run/systemd/system").is_dir() {
+        assert!(
+            std::env::var_os("QEMINGA_REQUIRE_SYSTEMD").is_none(),
+            "systemd is not the running service manager"
+        );
+        eprintln!("skipped: systemd is not the running service manager");
+        return;
+    }
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     // Install.
     let backup = Path::new(InstalledUnit::BIN)

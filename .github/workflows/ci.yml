@@ -184,11 +184,11 @@ jobs:
       - name: Privileged tests, seccomp-log build (compatibility run)
         run: |
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_
+          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_
       - name: Privileged tests, enforced build
         run: |
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" cargo test --features "$ENFORCED_FEATURES" --locked -- --ignored --test-threads=1 privileged_
+          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 cargo test --features "$ENFORCED_FEATURES" --locked -- --ignored --test-threads=1 privileged_
       - name: Tear down loop devices
         if: always()
         run: sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh teardown

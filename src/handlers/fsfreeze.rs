@@ -1040,6 +1040,7 @@ mod tests {
             Arc::new(Config::default()),
             Arc::new(FreezeStateMachine::new()),
             router.clone(),
+            Marker::for_tests(),
         );
         (Arc::new(ctx), router)
     }

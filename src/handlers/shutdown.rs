@@ -111,6 +111,7 @@ mod tests {
             Arc::new(Config::default()),
             Arc::new(FreezeStateMachine::starting_in(state)),
             Router::new(Box::new(sink.clone())),
+            crate::marker::Marker::for_tests(),
         )
         .with_kernel(kernel.clone());
         (Arc::new(ctx), kernel, sink)

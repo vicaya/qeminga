@@ -34,11 +34,15 @@
 //! least one call succeeded; the marker is removed only after every
 //! drain. A target is drained through the handle its freeze opened when
 //! this process holds one, otherwise (recovery after a restart) through
-//! the first of its mount points that still opens on its device. Any
-//! drain that does not end on the kernel's "not frozen" answer, a target
-//! that cannot be reached, or a marker removal failure is unrecoverable
-//! (OQ-3): `Thawing → Frozen`, marker kept. Otherwise `Thawing → Thawed`
-//! and [`FreezeHooks::on_thawed`] (T3.6 flushes the ring).
+//! the first of its mount points that still opens on its device. The
+//! held handles are drained even when the mount table cannot be read
+//! (`EMFILE`, possibly caused by those very handles): discovery is not a
+//! prerequisite of the drain, only of a complete recovery. Any drain
+//! that does not end on the kernel's "not frozen" answer, a target that
+//! cannot be reached, a mount table that could not be read, or a marker
+//! removal failure is unrecoverable (OQ-3): `Thawing → Frozen`, marker
+//! kept. Otherwise `Thawing → Thawed` and [`FreezeHooks::on_thawed`]
+//! (T3.6 flushes the ring).
 //!
 //! The state mutex is never held across an `.await`; all ioctls run under
 //! `spawn_blocking`.
@@ -205,8 +209,11 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     let (outcome, held) = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             let mut held = held;
-            let outcome = build_plan::<ThawFailure>(mounts.as_ref(), None)
-                .and_then(|plan| thaw_blocking(kernel.as_ref(), &marker, &plan, &mut held));
+            // Discovery and drain are separate: the handles this process
+            // holds are drained whether or not the mount table can be
+            // read (`thaw_blocking`).
+            let plan = build_plan::<ThawFailure>(mounts.as_ref(), None);
+            let outcome = thaw_blocking(kernel.as_ref(), &marker, plan, &mut held);
             (outcome, held)
         })
     })
@@ -531,6 +538,14 @@ fn rollback(
 /// the plan no longer lists are drained too: this process froze them.
 /// On return `held` keeps the handles whose drain did not complete.
 ///
+/// Discovery is not a prerequisite of the drain: when the mount table
+/// could not be read (`plan` is the failure; `EMFILE`, which the held
+/// handles themselves may have caused, is the typical case), every held
+/// handle is still drained and released, and the read failure is then
+/// reported as unrecoverable, since targets frozen by an earlier
+/// instance could not be discovered: the marker is retained and the next
+/// attempt (the watchdog, the host, or a restart) completes the recovery.
+///
 /// An unrecoverable failure on one target (OQ-3: anything but the
 /// kernel's "not frozen" answer, see [`Drained::incomplete`], or a
 /// superblock that cannot be reached at all) does not stop the drain of
@@ -540,43 +555,61 @@ fn rollback(
 fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
-    plan: &FreezePlan,
+    plan: Result<FreezePlan, ThawFailure>,
     held: &mut Vec<Mount>,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
     let mut retained = std::mem::take(held);
-    for target in plan.thaw_order() {
-        let mount = match retained.iter().position(|m| m.dev() == target.dev) {
-            Some(index) => retained.remove(index),
-            None => match open_target(kernel, target) {
-                Ok(mount) => mount,
-                Err(attempts) => {
-                    let failure = ThawFailure::Incomplete {
-                        mountpoint: lossy(&target.mountpoint),
-                        reason: format!(
-                            "no mount point leads to {}:{} ({attempts}); no FITHAW issued",
-                            target.dev.0, target.dev.1
-                        ),
-                    };
-                    tracing::error!(
-                        event = "fsfreeze_thaw_target_failed",
-                        mountpoint = %target.mountpoint.display(),
-                        error = %failure,
-                        "target cannot be reached; draining the remaining targets"
-                    );
-                    state.unrecoverable.get_or_insert(failure);
-                    continue;
-                }
-            },
-        };
-        state.drain(kernel, mount);
-    }
-    for mount in retained {
-        tracing::warn!(
-            event = "fsfreeze_unplanned_drain",
-            mountpoint = %mount.mountpoint().display(),
-            "frozen by this process but no longer in the plan; drained"
-        );
+    let discovery = match plan {
+        Ok(plan) => {
+            for target in plan.thaw_order() {
+                let mount = match retained.iter().position(|m| m.dev() == target.dev) {
+                    Some(index) => retained.remove(index),
+                    None => match open_target(kernel, target) {
+                        Ok(mount) => mount,
+                        Err(attempts) => {
+                            let failure = ThawFailure::Incomplete {
+                                mountpoint: lossy(&target.mountpoint),
+                                reason: format!(
+                                    "no mount point leads to {}:{} ({attempts}); no FITHAW issued",
+                                    target.dev.0, target.dev.1
+                                ),
+                            };
+                            tracing::error!(
+                                event = "fsfreeze_thaw_target_failed",
+                                mountpoint = %target.mountpoint.display(),
+                                error = %failure,
+                                "target cannot be reached; draining the remaining targets"
+                            );
+                            state.unrecoverable.get_or_insert(failure);
+                            continue;
+                        }
+                    },
+                };
+                state.drain(kernel, mount);
+            }
+            None
+        }
+        Err(failure) => {
+            tracing::error!(
+                event = "fsfreeze_thaw_plan_failed",
+                error = %failure,
+                held = retained.len(),
+                "cannot read the mount table; draining the handles this process holds"
+            );
+            Some(failure)
+        }
+    };
+    // `held` was filled in reverse mount order (deepest first): drain the
+    // leftovers forward, as the plan and the rollback do.
+    for mount in retained.into_iter().rev() {
+        if discovery.is_none() {
+            tracing::warn!(
+                event = "fsfreeze_unplanned_drain",
+                mountpoint = %mount.mountpoint().display(),
+                "frozen by this process but no longer in the plan; drained"
+            );
+        }
         state.drain(kernel, mount);
     }
     let ThawState {
@@ -586,6 +619,9 @@ fn thaw_blocking(
     } = state;
     *held = keep;
     if let Some(failure) = unrecoverable {
+        return Err(failure);
+    }
+    if let Some(failure) = discovery {
         return Err(failure);
     }
     match marker.remove() {
@@ -779,8 +815,43 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
+    /// A mount table whose read can be made to fail (`EMFILE`, as when
+    /// the retained handles exhausted the descriptors) and to work again.
+    struct SwitchableMounts {
+        table: String,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl SwitchableMounts {
+        fn new(table: String) -> Self {
+            SwitchableMounts {
+                table,
+                fail: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn fail_reads(&self, fail: bool) {
+            self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl MountSource for SwitchableMounts {
+        fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(Error::Internal(
+                    "cannot read /proc/self/mountinfo: Too many open files (os error 24)".into(),
+                ));
+            }
+            Ok(self.table.clone().into_bytes())
+        }
+    }
+
     impl Rig {
         fn new(state: FreezeState, mountinfo: &str) -> Self {
+            Self::with_mounts(state, Arc::new(StaticMounts(fixture(mountinfo))))
+        }
+
+        fn with_mounts(state: FreezeState, mounts: Arc<dyn MountSource>) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let kernel = Arc::new(FakeKernel::new());
             let hooks = Arc::new(Recorder::default());
@@ -791,7 +862,7 @@ mod tests {
                 Marker::open(dir.path().join("frozen")).unwrap(),
             )
             .with_kernel(kernel.clone())
-            .with_mounts(Arc::new(StaticMounts(fixture(mountinfo))))
+            .with_mounts(mounts)
             .with_hooks(hooks.clone());
             Rig {
                 ctx: Arc::new(ctx),
@@ -1940,5 +2011,206 @@ mod tests {
         assert!(thawed.as_u64().unwrap() >= wanted.len() as u64);
         assert_eq!(ctx.state.current(), FreezeState::Thawed);
         assert!(!ctx.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn thaw_drains_held_mounts_when_mountinfo_read_fails() {
+        // The freeze holds one handle per processed target. A thaw whose
+        // mount-table read fails (EMFILE: the retained handles may be what
+        // exhausted the descriptors) still drains every held handle and
+        // releases it, and only then reports the read failure: the marker
+        // and the frozen gate are retained, since targets frozen by an
+        // earlier instance could not be discovered.
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts.clone());
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+        assert_eq!(rig.held(), 4);
+        mounts.fail_reads(true);
+        rig.kernel.clear_calls();
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("cannot build thaw plan: ")
+                && err.to_string().contains("Too many open files"),
+            "{err}"
+        );
+        assert!(rig.opens().is_empty(), "no pathname was consulted");
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/",
+                "/",
+                "/home",
+                "/home",
+                "/home/data",
+                "/home/data",
+                "/home/data/deep",
+                "/home/data/deep"
+            ]),
+            "every held target is drained, in forward mount order"
+        );
+        assert_eq!(rig.held(), 0, "drained handles are released");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists(), "conservative: discovery failed");
+        assert_eq!(
+            rig.hooks.events(),
+            ["freezing", "frozen", "thaw_claimed", "frozen"],
+            "the watchdog is re-armed"
+        );
+        // Discovery works again: nothing is held any more, the drain goes
+        // by pathnames and finds every target already thawed.
+        mounts.fail_reads(false);
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert_eq!(rig.opens().len(), 4);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn a_recovery_thaw_that_cannot_read_the_mount_table_stays_frozen() {
+        // After a restart nothing is held: a failed read leaves nothing
+        // to drain, and the marker and the frozen gate are retained.
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Frozen, mounts.clone());
+        rig.marker().create().unwrap();
+        mounts.fail_reads(true);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().starts_with("cannot build thaw plan: "),
+            "{err}"
+        );
+        assert!(rig.kernel.calls().is_empty());
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn an_incomplete_held_drain_is_reported_before_the_read_failure() {
+        // Both retain the marker; the target that may still be frozen is
+        // the more specific report, and its handle is kept.
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts.clone());
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        mounts.fail_reads(true);
+        rig.kernel.script_thaw_error("/home", Errno::EACCES);
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("thaw of /home incomplete: first FITHAW denied: EACCES"),
+            "{err}"
+        );
+        assert_eq!(rig.held(), 1, "only the incomplete handle is kept");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+    }
+
+    /// Set in the child of
+    /// `a_thaw_under_descriptor_pressure_drains_its_held_targets`.
+    const FD_PRESSURE_CHILD: &str = "QEMINGA_TEST_FD_PRESSURE_CHILD";
+
+    /// The production reader of `/proc/self/mountinfo` (subject to
+    /// `EMFILE`), whose content is replaced by a fixture.
+    struct RealReadThenFixture(String);
+
+    impl MountSource for RealReadThenFixture {
+        fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+            crate::mountinfo::read_mountinfo_bounded(Path::new(crate::mountinfo::MOUNTINFO_PATH))?;
+            Ok(self.0.clone().into_bytes())
+        }
+    }
+
+    #[test]
+    fn a_thaw_under_descriptor_pressure_drains_its_held_targets() {
+        // The descriptor limit is process-wide: the scenario runs in a
+        // child process (this binary, one ignored test) so the rest of
+        // the suite is unaffected.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "handlers::fsfreeze::tests::descriptor_pressure_child",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(FD_PRESSURE_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+    }
+
+    #[tokio::test]
+    #[ignore = "child of a_thaw_under_descriptor_pressure_drains_its_held_targets"]
+    async fn descriptor_pressure_child() {
+        use nix::sys::resource::{Resource, getrlimit, setrlimit};
+        use std::fs::File;
+        if std::env::var_os(FD_PRESSURE_CHILD).is_none() {
+            return;
+        }
+        // A small soft limit keeps the hoard small; everything the rig
+        // needs (runtime, marker directory) is open already.
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        setrlimit(Resource::RLIMIT_NOFILE, hard.min(64), hard).unwrap();
+        let mounts = Arc::new(RealReadThenFixture(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts);
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+        // Exhaust the descriptors, as retained handles on a busy agent
+        // could: the mount table can no longer be opened.
+        let mut hoard = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => hoard.push(file),
+                Err(err) => {
+                    assert_eq!(err.raw_os_error(), Some(Errno::EMFILE as i32), "{err}");
+                    break;
+                }
+            }
+        }
+        rig.kernel.clear_calls();
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("cannot build thaw plan: cannot read /proc/self/mountinfo:")
+                && err.to_string().contains("os error 24"),
+            "{err}"
+        );
+        assert_eq!(rig.fithaws().len(), 8, "every held target is drained");
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+        // The drained handles freed their descriptors (here: the hoard);
+        // the next attempt discovers the plan and completes.
+        drop(hoard);
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
     }
 }

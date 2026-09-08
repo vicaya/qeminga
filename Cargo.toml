@@ -47,6 +47,7 @@ seccompiler = { version = "0.5", optional = true }
 proptest = "1.11"
 tempfile = "3.27"
 tokio = { version = "1.53", features = ["test-util"] }
+nix = { version = "0.31", features = ["resource"] }
 
 [profile.release]
 # Design §5.7: never unwind from an indeterminate state; let the service

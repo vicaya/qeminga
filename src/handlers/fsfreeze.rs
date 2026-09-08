@@ -290,9 +290,9 @@ pub enum FreezeFailure {
         cause: FreezeStop,
     },
     /// A target stopped the freeze and the rollback could not thaw
-    /// `mountpoint` (see [`Drained::incomplete`]): the filesystem may
-    /// still be frozen, so the state stays `Frozen` and the marker is
-    /// retained.
+    /// `mountpoint` (its drain did not end on the kernel's "not frozen"
+    /// answer): the filesystem may still be frozen, so the state stays
+    /// `Frozen` and the marker is retained.
     #[error(
         "freeze of {failed} failed: {cause}; rollback of {mountpoint} incomplete ({reason}); marker retained"
     )]

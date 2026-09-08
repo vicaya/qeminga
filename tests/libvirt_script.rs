@@ -15,11 +15,20 @@ state="${FAKE_STATE:?}"
 cmd=$1; shift
 case "$cmd" in
     version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    help)
+        # Only the commands real virsh has (`virsh help domshutdown` fails
+        # on the real CLI, and so does this stand-in).
+        case "$1" in
+            domfsfreeze|domfsthaw|domifaddr|domfsinfo|domstate|qemu-agent-command|shutdown) echo "  NAME"; exit 0 ;;
+            *) echo "error: command '$1' doesn't exist" >&2; exit 1 ;;
+        esac ;;
     domfsfreeze) echo frozen > "$state"; echo "Froze 1 filesystem(s)"; exit 0 ;;
     domfsthaw) echo thawed > "$state"; echo "Thawed 1 filesystem(s)"; exit 0 ;;
     domifaddr) printf ' Name       MAC address          Protocol     Address\n lo         00:00:00:00:00:00    ipv4         127.0.0.1/8\n'; exit 0 ;;
     domfsinfo) printf 'Mountpoint   Name   Type   Target\n/            vda1   ext4   vda\n'; exit 0 ;;
-    domshutdown) echo shutoff > "$state"; echo "Domain 'dom' is being shutdown"; exit 0 ;;
+    shutdown)
+        [ "$2" = "--mode" ] && [ "$3" = "agent" ] || { echo "error: expected --mode agent" >&2; exit 1; }
+        echo shutoff > "$state"; echo "Domain 'dom' is being shutdown"; exit 0 ;;
     domstate) if [ "$(cat "$state")" = shutoff ]; then echo "shut off"; else echo running; fi; exit 0 ;;
     qemu-agent-command)
         json=$2
@@ -87,7 +96,7 @@ fn script_passes_when_every_libvirt_step_behaves() {
         "-- ok: domfsthaw",
         "-- ok: guest-fsfreeze-status is thawed",
         "-- ok: domifaddr --source agent",
-        "-- ok: domshutdown --mode agent",
+        "-- ok: shutdown --mode agent",
         "-- ok: domain stopped",
     ] {
         assert!(text.contains(step), "{step} missing in {text}");

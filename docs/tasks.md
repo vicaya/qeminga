@@ -677,7 +677,7 @@ the answer is a one-line change, and leave the question here.
 - **Design:** AC16, §3.
 - **Depends on:** T4.6, T5.3
 - **Files:** `scripts/e2e-libvirt.sh`, `docs/testing.md`.
-- **Tests first (red):** the script exits non-zero unless `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh domshutdown --mode agent` all succeed against a named domain running qeminga.
+- **Tests first (red):** the script exits non-zero unless `virsh domfsfreeze`, `virsh domfsthaw`, `virsh domifaddr --source agent`, and `virsh shutdown --mode agent` all succeed against a named domain running qeminga (review follow-up: the command is `shutdown`, `domshutdown` does not exist; the script checks every command name against `virsh help` first and requires a successful `domstate` query answering exactly `shut off`).
 - **Implement (green):** script plus a documented VM recipe (cloud image, `virtio-serial` channel XML, package install).
 - **Done when:** a run log is attached to the PR; the job stays manual (no nested virtualisation in hosted CI).
 

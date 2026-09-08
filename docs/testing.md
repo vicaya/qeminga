@@ -49,7 +49,7 @@ runners have no nested virtualisation.
    ```
 
    It exits non-zero unless `virsh domfsfreeze`, `virsh domfsthaw`,
-   `virsh domifaddr --source agent` and `virsh domshutdown --mode agent`
+   `virsh domifaddr --source agent` and `virsh shutdown --mode agent`
    all succeed (plus `guest-info`, `guest-ping`, `guest-get-osinfo`,
    `domfsinfo`, and a check that `guest-exec` is refused). Attach its
    output to the pull request that changes protocol-facing code.

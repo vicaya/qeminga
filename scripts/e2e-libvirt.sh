@@ -4,7 +4,7 @@
 # Runs, against a named domain that has qeminga installed and running:
 #   virsh domfsfreeze, virsh domfsthaw, virsh domifaddr --source agent,
 #   virsh qemu-agent-command guest-info / guest-ping, and finally
-#   virsh domshutdown --mode agent (unless --no-shutdown).
+#   virsh shutdown --mode agent (unless --no-shutdown).
 # Exits non-zero unless every step succeeds. Writes a log to stdout that
 # can be attached to the pull request.
 #
@@ -28,8 +28,19 @@ done
 [ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] DOMAIN" >&2; exit 64; }
 domain="$1"
 
+# Predictable command output whatever the caller's locale (domstate is
+# parsed below).
+export LC_ALL=C LANG=C
+
 v() { virsh ${connect:+"$connect"} "$@"; }
 agent() { v qemu-agent-command "$domain" "$1"; }
+
+# The command names below are checked against the installed virsh before
+# anything runs, so a stand-in that accepts a command real virsh has not
+# got cannot make this script pass (`virsh help <cmd>` needs no domain).
+for cmd in domfsfreeze domfsthaw domifaddr domfsinfo domstate qemu-agent-command shutdown; do
+    v help "$cmd" >/dev/null 2>&1 || { echo "virsh has no '$cmd' command" >&2; exit 69; }
+done
 
 # Every check runs in this shell (a `bash -c` child would not see `v`).
 refused_exec() {
@@ -53,6 +64,15 @@ status_is() {
         *"\"$1\""*) return 0 ;;
         *) echo "expected status $1"; return 1 ;;
     esac
+}
+# The domain's state is exactly $1 ("running", "shut off", ...): the
+# query itself must succeed, and its first line is compared whole, so a
+# failed query or any other state never passes as "stopped".
+domain_state_is() {
+    local out
+    out="$(v domstate "$domain" 2>&1)" || { echo "$out"; echo "domstate failed"; return 1; }
+    echo "$out"
+    [ "$(printf '%s\n' "$out" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" = "$1" ]
 }
 
 fail=0
@@ -95,18 +115,13 @@ step "guest-get-osinfo" agent '{"execute":"guest-get-osinfo"}'
 step "domfsinfo" v domfsinfo "$domain"
 
 if [ "$shutdown" -eq 1 ]; then
-    step "domshutdown --mode agent" v domshutdown "$domain" --mode agent
+    step "shutdown --mode agent" v shutdown "$domain" --mode agent
     echo "== waiting up to 120 s for the domain to stop"
     for _ in $(seq 1 120); do
-        if ! v domstate "$domain" | grep -q running; then break; fi
+        if domain_state_is "shut off" >/dev/null 2>&1; then break; fi
         sleep 1
     done
-    if v domstate "$domain" | grep -q running; then
-        echo "-- FAILED: domain still running after domshutdown --mode agent"
-        fail=1
-    else
-        echo "-- ok: domain stopped"
-    fi
+    step "domain stopped" domain_state_is "shut off"
 fi
 
 if [ "$fail" -eq 0 ]; then

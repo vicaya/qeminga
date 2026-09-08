@@ -67,12 +67,17 @@ fn unit_conflicts_with_and_orders_after_qemu_guest_agent() {
 }
 
 #[test]
-fn unit_binds_to_the_virtio_port_device() {
+fn unit_does_not_bind_to_the_virtio_port_device() {
+    // A crash while frozen must be recovered whether or not the port is
+    // there (OQ-7): the daemon retries the open itself, so the unit must
+    // not be held by the device unit.
     let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
     let device = "dev-virtio\\x2dports-org.qemu.guest_agent.0.device";
-    assert!(values(&unit, "Unit", "BindsTo").contains(&device));
-    assert!(values(&unit, "Unit", "After").contains(&device));
+    assert!(values(&unit, "Unit", "BindsTo").is_empty());
+    assert!(values(&unit, "Unit", "Requires").is_empty());
+    assert!(!values(&unit, "Unit", "After").contains(&device));
     assert!(values(&unit, "Unit", "Before").contains(&"multi-user.target"));
+    assert_eq!(values(&unit, "Service", "Restart"), ["always"]);
 }
 
 #[test]
@@ -225,4 +230,185 @@ fn systemd_analyze_verify_accepts_the_unit_when_available() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// The files the privileged unit test installs, removed on drop (the
+/// service stopped first) whatever happened.
+struct InstalledUnit {
+    backup: Option<std::path::PathBuf>,
+}
+
+impl InstalledUnit {
+    const UNIT: &'static str = "/run/systemd/system/qeminga.service";
+    const DROPIN_DIR: &'static str = "/run/systemd/system/qeminga.service.d";
+    const CONFIG: &'static str = "/etc/qeminga/config.toml";
+    const BIN: &'static str = "/usr/bin/qeminga";
+}
+
+impl Drop for InstalledUnit {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("systemctl")
+            .args(["stop", "qeminga.service"])
+            .status();
+        let _ = std::fs::remove_file(Self::UNIT);
+        let _ = std::fs::remove_dir_all(Self::DROPIN_DIR);
+        let _ = std::fs::remove_file(Self::CONFIG);
+        let _ = std::fs::remove_file("/run/qeminga/frozen");
+        match &self.backup {
+            Some(backup) => {
+                let _ = std::fs::rename(backup, Self::BIN);
+            }
+            None => {
+                let _ = std::fs::remove_file(Self::BIN);
+            }
+        }
+        let _ = std::process::Command::new("systemctl")
+            .args(["daemon-reload"])
+            .status();
+    }
+}
+
+fn sh(program: &str, args: &[&str]) -> (bool, String) {
+    let output = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("{program}: {e}"));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+/// The installed unit, not just the binary: a marker from a previous
+/// instance and no channel device at all. systemd must start the service
+/// (nothing binds it to the device), and the daemon must run its
+/// recovery and remove the marker without the port ever appearing
+/// (§4.4, OQ-7). Needs root and a running systemd; the built binary is
+/// installed as /usr/bin/qeminga for the duration (a previous one is put
+/// back), the unit goes under /run/systemd/system.
+#[test]
+#[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
+fn privileged_installed_unit_recovers_without_the_channel_device() {
+    use std::time::{Duration, Instant};
+    assert!(nix::unistd::geteuid().is_root(), "run as root");
+    assert!(
+        Path::new("/run/systemd/system").is_dir(),
+        "systemd is not the running service manager"
+    );
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Install.
+    let backup = Path::new(InstalledUnit::BIN)
+        .exists()
+        .then(|| std::path::PathBuf::from("/usr/bin/qeminga.qeminga-test-backup"));
+    if let Some(backup) = &backup {
+        std::fs::rename(InstalledUnit::BIN, backup).unwrap();
+    }
+    let installed = InstalledUnit { backup };
+    std::fs::copy(env!("CARGO_BIN_EXE_qeminga"), InstalledUnit::BIN).unwrap();
+    std::fs::set_permissions(
+        InstalledUnit::BIN,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let (ok, text) = sh(
+        "systemd-sysusers",
+        &[repo
+            .join("packaging/sysusers.d/qeminga.conf")
+            .to_str()
+            .unwrap()],
+    );
+    assert!(ok, "{text}");
+    std::fs::create_dir_all("/etc/qeminga").unwrap();
+    std::fs::write(
+        InstalledUnit::CONFIG,
+        "[agent]\nchannel_path = \"/dev/virtio-ports/qeminga-test-no-such-port\"\nfsfreeze_idle_timeout_secs = 1\n",
+    )
+    .unwrap();
+    std::fs::copy(
+        repo.join("packaging/systemd/qeminga.service"),
+        InstalledUnit::UNIT,
+    )
+    .unwrap();
+    std::fs::create_dir_all(InstalledUnit::DROPIN_DIR).unwrap();
+    // The fake kernel (test-fakes builds): the recovery drain issues no
+    // real ioctl. A build without the feature ignores the variable and
+    // drains with real FITHAWs, which answer EINVAL on an unfrozen host.
+    std::fs::write(
+        Path::new(InstalledUnit::DROPIN_DIR).join("50-test.conf"),
+        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\n",
+    )
+    .unwrap();
+    // The marker of a previous instance, in the preserved runtime directory.
+    std::fs::create_dir_all("/run/qeminga").unwrap();
+    std::fs::write("/run/qeminga/frozen", b"").unwrap();
+    let (ok, text) = sh("systemctl", &["daemon-reload"]);
+    assert!(ok, "{text}");
+    let (_, fragment) = sh(
+        "systemctl",
+        &["show", "-p", "FragmentPath", "--value", "qeminga.service"],
+    );
+    assert_eq!(
+        fragment.trim(),
+        InstalledUnit::UNIT,
+        "another qeminga.service shadows the test copy"
+    );
+    let _ = sh("systemctl", &["reset-failed", "qeminga.service"]);
+    let started = Instant::now();
+    let (ok, text) = sh("systemctl", &["start", "--no-block", "qeminga.service"]);
+    assert!(ok, "systemctl start: {text}");
+    // Recovery: the service is active with no device, the open was
+    // deferred, the watchdog drained and the marker is gone.
+    let journal = || {
+        sh(
+            "journalctl",
+            &[
+                "-u",
+                "qeminga.service",
+                "--no-pager",
+                "-o",
+                "cat",
+                "--since",
+                "-2min",
+            ],
+        )
+        .1
+    };
+    let deadline = started + Duration::from_secs(30);
+    let mut log = String::new();
+    while Instant::now() < deadline {
+        log = journal();
+        if !Path::new("/run/qeminga/frozen").exists()
+            && log.contains("\"event\":\"channel_open_deferred\"")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+    assert_eq!(active.trim(), "active", "the service is held back: {log}");
+    assert!(
+        log.contains("\"event\":\"channel_open_deferred\""),
+        "no deferred open in the journal: {log}"
+    );
+    assert!(
+        log.contains("\"recovery\":true"),
+        "not started in recovery mode: {log}"
+    );
+    assert!(
+        !Path::new("/run/qeminga/frozen").exists(),
+        "the marker was not recovered with no channel: {log}"
+    );
+    assert!(
+        log.contains("\"event\":\"watchdog_thaw\"")
+            || log.contains("\"event\":\"fsfreeze_thawed\""),
+        "no drain in the journal: {log}"
+    );
+    // And it stops while the port is still missing.
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+    assert_ne!(active.trim(), "active");
+    drop(installed);
 }

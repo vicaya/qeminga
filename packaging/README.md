@@ -4,7 +4,7 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 
 | File | Installs to | Purpose |
 |---|---|---|
-| `systemd/qeminga.service` | `/usr/lib/systemd/system/` | The unit: conflicts with `qemu-guest-agent.service`, binds to the virtio port device, provisions `/run/qeminga` (`RuntimeDirectory=`, preserved across stops), `TimeoutStopSec=330s` for the default 300 s freeze cap. |
+| `systemd/qeminga.service` | `/usr/lib/systemd/system/` | The unit: conflicts with `qemu-guest-agent.service`, deliberately does not bind to the virtio port device (a crash while frozen is recovered whether or not the port is there; the daemon retries the open), provisions `/run/qeminga` (`RuntimeDirectory=`, preserved across stops), `TimeoutStopSec=330s` for the default 300 s freeze cap. |
 | `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
 | `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
 | `config.toml` | `/etc/qeminga/config.toml` | The documented defaults (§8.2); every key is optional. |

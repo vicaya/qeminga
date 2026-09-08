@@ -9,14 +9,19 @@
 # RuntimeDirectoryPreserve=yes keeps it across stops so a marker survives
 # (§5.7). TimeoutStopSec must exceed fsfreeze_max_timeout_secs plus a
 # thaw-drain margin (300 + 30).
+#
+# The unit deliberately does not bind to the virtio port's device unit:
+# recovery after a crash while frozen must not wait for the channel
+# (§4.4, §5.7, OQ-7). The daemon makes one privileged open attempt, and
+# its reopen loop retries with backoff once the device appears; with a
+# BindsTo=/After= on the device, systemd would hold the whole service, and
+# the recovery watchdog with it, for as long as the device is missing.
 
 [Unit]
 Description=qeminga QEMU guest agent (minimum secure subset)
 Documentation=https://github.com/vicaya/qeminga
 Conflicts=qemu-guest-agent.service
 After=qemu-guest-agent.service
-BindsTo=dev-virtio\x2dports-org.qemu.guest_agent.0.device
-After=dev-virtio\x2dports-org.qemu.guest_agent.0.device
 Before=multi-user.target
 
 [Service]

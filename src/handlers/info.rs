@@ -81,6 +81,7 @@ mod tests {
             Arc::new(config),
             Arc::new(FreezeStateMachine::starting_in(state)),
             Router::new(Box::new(std::io::sink())),
+            crate::marker::Marker::for_tests(),
         )
     }
 

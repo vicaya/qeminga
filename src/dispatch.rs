@@ -114,6 +114,10 @@ pub struct Context {
     pub marker: crate::marker::Marker,
     /// Freeze lifecycle callbacks (watchdog, audit ring).
     pub hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>,
+    /// Handles of the filesystems this process froze (or found frozen),
+    /// held until their drain completes: a thaw drains the filesystem
+    /// each was opened on, whatever its pathnames lead to by then (§4.2).
+    frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
     handler_calls: AtomicU64,
 }
 
@@ -134,8 +138,12 @@ impl Context {
     /// to the scripted fake, so no unit test can reach `FIFREEZE`, `FITHAW`,
     /// `FITRIM` or `reboot(2)` by omission; integration tests must install
     /// the fake explicitly with [`Context::with_kernel`].
-    pub fn new(config: Arc<Config>, state: Arc<FreezeStateMachine>, audit: Router) -> Self {
-        let marker = crate::marker::Marker::new(&config.agent.state_path);
+    pub fn new(
+        config: Arc<Config>,
+        state: Arc<FreezeStateMachine>,
+        audit: Router,
+        marker: crate::marker::Marker,
+    ) -> Self {
         #[cfg(not(test))]
         let kernel: Arc<dyn crate::kernel::KernelOps> = Arc::new(crate::kernel::LinuxKernel);
         #[cfg(test)]
@@ -155,6 +163,7 @@ impl Context {
             fsinfo_walks: Arc::new(tokio::sync::Semaphore::new(
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
+            frozen_mounts: std::sync::Mutex::new(Vec::new()),
             handler_calls: AtomicU64::new(0),
         }
     }
@@ -211,19 +220,44 @@ impl Context {
         self
     }
 
+    /// Takes the held handles of frozen filesystems for a drain; the
+    /// guard is short-lived and never held across an `.await`.
+    pub fn take_frozen_mounts(&self) -> Vec<crate::kernel::Mount> {
+        std::mem::take(&mut *self.frozen_mounts_slot())
+    }
+
+    /// Holds handles of filesystems frozen by this process (added to any
+    /// already held) until a drain completes them.
+    pub fn hold_frozen_mounts(&self, mounts: Vec<crate::kernel::Mount>) {
+        self.frozen_mounts_slot().extend(mounts);
+    }
+
+    /// Number of handles currently held.
+    pub fn frozen_mount_count(&self) -> usize {
+        self.frozen_mounts_slot().len()
+    }
+
+    fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
+        self.frozen_mounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Number of times a handler was invoked (gates passed).
     pub fn handler_calls(&self) -> u64 {
         self.handler_calls.load(Ordering::SeqCst)
     }
 
-    /// A context with default configuration, a thawed state machine, and
-    /// an audit router that discards output.
+    /// A context with default configuration, a thawed state machine, an
+    /// audit router that discards output, and a marker in the temporary
+    /// directory that nothing creates unless a test freezes.
     #[cfg(test)]
     pub(crate) fn for_tests() -> Self {
         Context::new(
             Arc::new(Config::default()),
             Arc::new(FreezeStateMachine::new()),
             Router::new(Box::new(std::io::sink())),
+            crate::marker::Marker::for_tests(),
         )
     }
 }
@@ -482,10 +516,10 @@ mod tests {
                 Arc::new(config),
                 Arc::new(FreezeStateMachine::starting_in(state)),
                 router,
+                crate::marker::Marker::open(dir.path().join("frozen")).unwrap(),
             )
             .with_kernel(Arc::new(crate::kernel::fake::FakeKernel::new()))
-            .with_mounts(Arc::new(crate::mountinfo::StaticMounts(mountinfo)))
-            .with_marker(crate::marker::Marker::new(dir.path().join("frozen")));
+            .with_mounts(Arc::new(crate::mountinfo::StaticMounts(mountinfo)));
             Harness {
                 dispatcher: Dispatcher::new(Arc::new(ctx)),
                 sink,
@@ -549,12 +583,13 @@ mod tests {
             Arc::new(Config::default()),
             Arc::new(FreezeStateMachine::new()),
             Router::new(Box::new(std::io::sink())),
+            crate::marker::Marker::for_tests(),
         );
-        assert!(
-            ctx.kernel
-                .fifreeze(std::path::Path::new("/definitely/not/a/mountpoint"))
-                .is_ok()
-        );
+        let mount = ctx
+            .kernel
+            .open_mount(std::path::Path::new("/definitely/not/a/mountpoint"), (0, 0))
+            .unwrap();
+        assert!(ctx.kernel.fifreeze(&mount).is_ok());
     }
 
     #[tokio::test]

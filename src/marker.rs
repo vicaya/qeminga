@@ -175,6 +175,21 @@ impl Marker {
         fstatat(self.dir.as_fd(), &self.name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
     }
 
+    /// A marker in the temporary directory under a name unique to this
+    /// process and call, for unit tests that never freeze (a test that
+    /// does creates and removes only that file).
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "qeminga-test-{}-{}.frozen",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        Marker::open(std::env::temp_dir().join(name)).expect("temp_dir opens")
+    }
+
     fn io(&self, op: &'static str, errno: Errno) -> MarkerError {
         MarkerError::Io {
             path: self.path.clone(),

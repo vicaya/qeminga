@@ -33,10 +33,10 @@ fn dispatcher() -> Dispatcher {
         Arc::new(Config::default()),
         Arc::new(FreezeStateMachine::new()),
         Router::new(Box::new(std::io::sink())),
+        Marker::open(dir.keep().join("frozen")).unwrap(),
     )
     .with_kernel(Arc::new(FakeKernel::new()))
-    .with_mounts(Arc::new(StaticMounts(String::new())))
-    .with_marker(Marker::new(dir.keep().join("frozen")));
+    .with_mounts(Arc::new(StaticMounts(String::new())));
     Dispatcher::new(Arc::new(ctx))
 }
 

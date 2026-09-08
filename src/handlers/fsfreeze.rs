@@ -1811,10 +1811,10 @@ mod tests {
             Arc::new(config),
             Arc::new(FreezeStateMachine::new()),
             Router::new(Box::new(std::io::sink())),
+            Marker::open(dir.path().join("frozen")).unwrap(),
         )
         .with_kernel(kernel.clone())
         .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
-        .with_marker(Marker::new(dir.path().join("frozen")))
         .with_hooks(Arc::new(LifecycleHooks));
         (Arc::new(ctx), kernel)
     }

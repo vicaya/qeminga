@@ -25,6 +25,25 @@ fn ext4_mount() -> String {
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup")
 }
 
+/// `(major, minor)` of the filesystem `path` currently leads to.
+fn dev_of(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).unwrap().dev();
+    (
+        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
+        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
+    )
+}
+
+/// A verified handle on whatever filesystem `path` leads to now (the
+/// test's own view, with `CAP_SYS_ADMIN`).
+fn handle(path: &std::path::Path) -> qeminga::kernel::Mount {
+    use qeminga::kernel::KernelOps;
+    qeminga::kernel::LinuxKernel
+        .open_mount(path, dev_of(path))
+        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
+}
+
 /// Thaws the named mounts when dropped, whatever happened in between: a
 /// failed assertion between freeze and thaw would otherwise leave the
 /// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
@@ -44,8 +63,11 @@ impl Drop for ThawGuard {
         use qeminga::kernel::KernelOps;
         for mount in &self.0 {
             let path = std::path::Path::new(mount);
+            let Ok(handle) = qeminga::kernel::LinuxKernel.open_mount(path, dev_of(path)) else {
+                continue;
+            };
             for _ in 0..64 {
-                if qeminga::kernel::LinuxKernel.fithaw(path).is_err() {
+                if qeminga::kernel::LinuxKernel.fithaw(&handle).is_err() {
                     break;
                 }
                 eprintln!("ThawGuard: thawed {mount} left frozen by the test");
@@ -223,11 +245,14 @@ fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
         .unwrap();
     assert_eq!(entry.dev(), origin.dev(), "same superblock as its origin");
     // The kernel accepts the byte-exact path for the freeze ioctls.
+    let raw = LinuxKernel
+        .open_mount(&dir, entry.dev())
+        .expect("open the raw-byte path on its device");
     LinuxKernel
-        .fifreeze(&dir)
+        .fifreeze(&raw)
         .expect("FIFREEZE on the raw-byte path");
     LinuxKernel
-        .fithaw(&dir)
+        .fithaw(&raw)
         .expect("FITHAW on the raw-byte path");
     // The daemon: startup, fsinfo (lossy name), freeze-list, thaw.
     let mut agent = Agent::spawn_with(real_kernel(""));
@@ -285,12 +310,193 @@ fn privileged_freeze_with_tmpfs_bind_and_0700_mountpoint() {
     // proving the superblock really is frozen.
     use qeminga::kernel::KernelOps;
     let err = qeminga::kernel::LinuxKernel
-        .fifreeze(std::path::Path::new(&mount))
+        .fifreeze(&handle(std::path::Path::new(&mount)))
         .unwrap_err();
     assert!(err.is_busy(), "{err}");
     let thawed = agent.execute("guest-fsfreeze-thaw");
     assert!(thawed["return"].as_u64().unwrap() >= 1, "{thawed}");
     std::fs::write(format!("{mount}/after"), b"ok").unwrap();
+    assert!(agent.stop().success());
+}
+
+/// A tmpfs mounted over an existing pathname, unmounted on drop: what
+/// the pathname leads to is then a different superblock that answers
+/// "not frozen" to any thaw.
+struct OverMount(std::path::PathBuf);
+
+impl OverMount {
+    fn tmpfs_at(path: &str) -> Self {
+        let status = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "none", path])
+            .status()
+            .unwrap();
+        assert!(status.success(), "mount -t tmpfs over {path} failed");
+        OverMount(std::path::PathBuf::from(path))
+    }
+}
+
+impl Drop for OverMount {
+    fn drop(&mut self) {
+        let status = std::process::Command::new("umount").arg(&self.0).status();
+        assert!(
+            matches!(status, Ok(s) if s.success()),
+            "umount {}",
+            self.0.display()
+        );
+    }
+}
+
+/// `true` when a write under `dir` completes within `timeout`; a write on
+/// a frozen filesystem blocks in D state instead (the thread is left to
+/// complete once the guard thaws).
+fn writable_within(dir: &std::path::Path, name: &str, timeout: Duration) -> bool {
+    let path = dir.join(name);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let ok = std::fs::write(&path, b"ok").is_ok();
+        let _ = tx.send(ok);
+    });
+    rx.recv_timeout(timeout).unwrap_or(false)
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
+    // The loop ext4 has a bind alias; after each freeze a tmpfs is mounted
+    // over the original pathname, so that pathname leads to a filesystem
+    // that is not frozen and would answer EINVAL to a thaw. The thaw must
+    // reach the ext4 all the same, and the marker may only disappear once
+    // it did: (1) in the same process, through the handle the freeze
+    // opened; (2) after a SIGKILL and a restart, through the alias; (3)
+    // with the alias gone too, not at all: the marker and the frozen gate
+    // are retained until a pathname leads there again.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let base = std::path::Path::new(&mount).parent().unwrap().to_path_buf();
+    let alias = BindMount::of(&mount, base.join("ext4-alias"));
+    let ext4 = dev_of(std::path::Path::new(&mount));
+    let frozen = |dir: &std::path::Path| {
+        use qeminga::kernel::KernelOps;
+        // A concurrent FIFREEZE on a frozen superblock answers EBUSY.
+        let h = qeminga::kernel::LinuxKernel.open_mount(dir, ext4).unwrap();
+        qeminga::kernel::LinuxKernel
+            .fifreeze(&h)
+            .unwrap_err()
+            .is_busy()
+    };
+
+    // (1) Same process: the handle the freeze opened.
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    let over = OverMount::tmpfs_at(&mount);
+    assert_ne!(
+        dev_of(std::path::Path::new(&mount)),
+        ext4,
+        "the pathname leads elsewhere"
+    );
+    assert!(
+        writable_within(
+            std::path::Path::new(&mount),
+            "on-tmpfs",
+            Duration::from_secs(5)
+        ),
+        "the tmpfs over the pathname is not frozen"
+    );
+    assert!(frozen(&alias.0), "the ext4 is frozen");
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert_eq!(thawed, json!({"return": 1}), "{thawed}");
+    assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
+    assert!(
+        writable_within(&alias.0, "after-handle-thaw", Duration::from_secs(10)),
+        "the ext4 is thawed, not the tmpfs in its place"
+    );
+    assert!(
+        agent
+            .stderr_text()
+            .contains("\"event\":\"fsfreeze_thawed\"")
+    );
+
+    // (2) Restart: nothing held, the alias is how the ext4 is reached.
+    drop(over);
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    let dir = agent.kill();
+    assert!(
+        dir.path().join("frozen").exists(),
+        "marker survives SIGKILL"
+    );
+    let over = OverMount::tmpfs_at(&mount);
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        state_dir: Some(dir),
+        ..real_kernel("")
+    });
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert_eq!(thawed, json!({"return": 1}), "{thawed}");
+    assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
+    assert!(
+        writable_within(&alias.0, "after-alias-thaw", Duration::from_secs(10)),
+        "recovery thawed the ext4 through its alias"
+    );
+    let stderr = agent.stderr_text();
+    assert!(stderr.contains("\"event\":\"fsfreeze_alias\""), "{stderr}");
+
+    // (3) Restart with no pathname leading to the ext4 at all (every
+    // mount of its device is covered, the loop script's own bind mount
+    // included): the thaw reports it unreachable and keeps the recovery
+    // state; once a pathname leads there again, the next thaw completes.
+    drop(over);
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    let dir = agent.kill();
+    drop(alias);
+    let hidden: Vec<OverMount> = {
+        use qeminga::mountinfo::MountSource;
+        qeminga::mountinfo::ProcMounts
+            .mounts()
+            .unwrap()
+            .iter()
+            .filter(|e| e.dev() == ext4)
+            .map(|e| OverMount::tmpfs_at(e.mount_point.to_str().unwrap()))
+            .collect()
+    };
+    assert!(!hidden.is_empty());
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        state_dir: Some(dir),
+        ..real_kernel("")
+    });
+    let reply = agent.execute("guest-fsfreeze-thaw");
+    let desc = reply["error"]["desc"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert!(desc.contains("no mount point leads to"), "{desc}");
+    assert!(desc.contains("not on the planned"), "{desc}");
+    assert!(desc.contains("marker retained"), "{desc}");
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    assert!(agent.state_dir().join("frozen").exists(), "marker retained");
+    drop(hidden);
+    assert!(
+        frozen(std::path::Path::new(&mount)),
+        "still frozen meanwhile"
+    );
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert_eq!(thawed, json!({"return": 1}), "{thawed}");
+    assert!(!agent.state_dir().join("frozen").exists());
+    assert!(
+        writable_within(
+            std::path::Path::new(&mount),
+            "after-reachable",
+            Duration::from_secs(10)
+        ),
+        "thawed once reachable"
+    );
     assert!(agent.stop().success());
 }
 

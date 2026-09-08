@@ -247,6 +247,12 @@ impl InstalledUnit {
 
 impl Drop for InstalledUnit {
     fn drop(&mut self) {
+        // A daemon that never thawed defers SIGTERM (C-21) and the unit's
+        // TimeoutStopSec is 330 s: kill first, then stop, so a failed run
+        // does not hold the job.
+        let _ = std::process::Command::new("systemctl")
+            .args(["kill", "--signal=SIGKILL", "qeminga.service"])
+            .status();
         let _ = std::process::Command::new("systemctl")
             .args(["stop", "qeminga.service"])
             .status();
@@ -343,7 +349,7 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
     // drains with real FITHAWs, which answer EINVAL on an unfrozen host.
     std::fs::write(
         Path::new(InstalledUnit::DROPIN_DIR).join("50-test.conf"),
-        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\n",
+        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\nTimeoutStopSec=15s\n",
     )
     .unwrap();
     // The marker of a previous instance, in the preserved runtime directory.
@@ -392,11 +398,80 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    // Everything a failure needs to be understood from the CI log: the
+    // unit's view, the process's capabilities and where it is blocked,
+    // the runtime directory, and the journal with its metadata.
+    let diagnose = || {
+        let (_, status) = sh(
+            "systemctl",
+            &["status", "--no-pager", "-l", "qeminga.service"],
+        );
+        let (_, show) = sh(
+            "systemctl",
+            &[
+                "show",
+                "-p",
+                "ExecMainPID,Environment,CapabilityBoundingSet,Result,NRestarts",
+                "qeminga.service",
+            ],
+        );
+        let (_, pid) = sh(
+            "systemctl",
+            &["show", "-p", "MainPID", "--value", "qeminga.service"],
+        );
+        let pid = pid.trim().to_owned();
+        let proc_ =
+            |name: &str| std::fs::read_to_string(format!("/proc/{pid}/{name}")).unwrap_or_default();
+        let tasks = std::fs::read_dir(format!("/proc/{pid}/task"))
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .map(|t| {
+                        let tid = t.file_name().to_string_lossy().into_owned();
+                        let stack =
+                            std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/stack"))
+                                .unwrap_or_default();
+                        let wchan =
+                            std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/wchan"))
+                                .unwrap_or_default();
+                        format!("task {tid} wchan={wchan}\n{stack}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let (_, journal_full) = sh(
+            "journalctl",
+            &[
+                "-u",
+                "qeminga.service",
+                "--no-pager",
+                "-o",
+                "short-precise",
+                "--since",
+                "-2min",
+            ],
+        );
+        let (_, runtime_dir) = sh("ls", &["-la", "/run/qeminga"]);
+        format!(
+            "== systemctl status\n{status}\n== systemctl show\n{show}\n== /proc/{pid}/status\n{}\n== stderr target\n{}\n== tasks\n{tasks}\n== /run/qeminga\n{runtime_dir}\n== journal\n{journal_full}",
+            proc_("status"),
+            std::fs::read_link(format!("/proc/{pid}/fd/2"))
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        )
+    };
     let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
-    assert_eq!(active.trim(), "active", "the service is held back: {log}");
+    assert_eq!(
+        active.trim(),
+        "active",
+        "the service is held back:\n{}",
+        diagnose()
+    );
     assert!(
         log.contains("\"event\":\"channel_open_deferred\""),
-        "no deferred open in the journal: {log}"
+        "no deferred open in the journal (marker present: {}):\n{}",
+        Path::new("/run/qeminga/frozen").exists(),
+        diagnose()
     );
     assert!(
         log.contains("\"recovery\":true"),

@@ -198,6 +198,23 @@ impl BindMount {
         assert!(status.success(), "mount --bind failed");
         BindMount(at)
     }
+
+    /// A bind mount taken out of its source's peer group: a mount placed
+    /// over the source afterwards does not propagate onto it. On a host
+    /// whose mounts are shared (systemd's default for `/`, and the CI
+    /// runner) a plain bind mount is a peer of its source, so an
+    /// overmount on the source covers the bind too and the superblock is
+    /// hidden under every pathname at once.
+    fn private_of(source: &str, at: std::path::PathBuf) -> Self {
+        let bind = Self::of(source, at);
+        let status = std::process::Command::new("mount")
+            .arg("--make-private")
+            .arg(&bind.0)
+            .status()
+            .unwrap();
+        assert!(status.success(), "mount --make-private failed");
+        bind
+    }
 }
 
 impl Drop for BindMount {
@@ -370,10 +387,15 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
     // opened; (2) after a SIGKILL and a restart, through the alias; (3)
     // with the alias gone too, not at all: the marker and the frozen gate
     // are retained until a pathname leads there again.
+    //
+    // The alias is a private mount: with shared propagation (the default
+    // on a systemd host and on the CI runner) the overmount would
+    // propagate onto a peer bind mount and hide the ext4 under the alias
+    // as well, which is case (3), not case (2).
     let mount = ext4_mount();
     let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
     let base = std::path::Path::new(&mount).parent().unwrap().to_path_buf();
-    let alias = BindMount::of(&mount, base.join("ext4-alias"));
+    let alias = BindMount::private_of(&mount, base.join("ext4-alias"));
     let ext4 = dev_of(std::path::Path::new(&mount));
     let frozen = |dir: &std::path::Path| {
         use qeminga::kernel::KernelOps;

@@ -577,9 +577,9 @@ mod tests {
                     std::sync::Arc::new(crate::config::Config::default()),
                     std::sync::Arc::new(crate::state::FreezeStateMachine::new()),
                     crate::audit::Router::stderr(),
+                    crate::marker::Marker::open(dir.path().join("frozen")).unwrap(),
                 )
-                .with_kernel(std::sync::Arc::new(crate::kernel::fake::FakeKernel::new()))
-                .with_marker(crate::marker::Marker::new(dir.path().join("frozen")));
+                .with_kernel(std::sync::Arc::new(crate::kernel::fake::FakeKernel::new()));
                 let dispatcher = Dispatcher::new(std::sync::Arc::new(ctx));
                 for request in [
                     r#"{"execute":"guest-ping"}"#,

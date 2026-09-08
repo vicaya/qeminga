@@ -69,6 +69,12 @@ sha=$(git rev-parse --short "$source_sha")
 # Every attempt gets a worktree of its own: reusing one path would reuse
 # its `.git/worktrees/<name>` entry, and a `worktree add` racing with
 # the removal of the previous attempt's entry has been seen to fail.
+# Nothing else may prune entries meanwhile either: a fetch can leave a
+# detached auto-maintenance process behind, and `git gc` prunes
+# worktrees, so maintenance is off for this script's fetches; and since a
+# `worktree add` that still lost its fresh entry has been seen once on a
+# CI runner ("could not open .git/worktrees/<name>/locked"), the add is
+# retried after a prune before the attempt is given up.
 work=
 cleanup() {
     if [ -n "$work" ]; then
@@ -78,17 +84,38 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# `add_worktree NAME [COMMIT]`: `git worktree add --detach`, retried.
+add_worktree() {
+    tries=0
+    while :; do
+        tries=$((tries + 1))
+        if git worktree add -q --detach "$@" 2>"$work.err"; then
+            rm -f "$work.err"
+            return 0
+        fi
+        if [ "$tries" -ge 3 ]; then
+            cat "$work.err" >&2
+            rm -f "$work.err"
+            return 1
+        fi
+        echo "publish-badges: worktree add failed ($(tr '\n' ' ' < "$work.err")); retrying" >&2
+        git worktree remove --force "$1" 2>/dev/null || rm -rf "$1"
+        git worktree prune 2>/dev/null || true
+        sleep 1
+    done
+}
+
 n=0
 while :; do
     n=$((n + 1))
     cleanup
     work=$(mktemp -d)
     rmdir "$work"
-    if git fetch -q "$remote" "$badges_branch" 2>/dev/null; then
-        git worktree add -q --detach "$work" FETCH_HEAD
+    if git -c maintenance.auto=false -c gc.auto=0 fetch -q "$remote" "$badges_branch" 2>/dev/null; then
+        add_worktree "$work" FETCH_HEAD
     else
         # First publication: an empty orphan branch.
-        git worktree add -q --detach "$work"
+        add_worktree "$work"
         (cd "$work" && git checkout -q --orphan "$badges_branch" && git rm -rfq . >/dev/null)
     fi
 

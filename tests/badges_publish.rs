@@ -115,6 +115,19 @@ impl Rig {
         passed: u32,
         hook: Option<&str>,
     ) -> (bool, String) {
+        self.publish_env(branch, sha, percent, passed, hook, &[])
+    }
+
+    /// `publish_sha` with extra environment for the script.
+    fn publish_env(
+        &self,
+        branch: &str,
+        sha: &str,
+        percent: f64,
+        passed: u32,
+        hook: Option<&str>,
+        env: &[(&str, String)],
+    ) -> (bool, String) {
         let (json, log) = self.inputs(percent, passed);
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/publish-badges.sh");
         let mut cmd = Command::new("sh");
@@ -131,6 +144,9 @@ impl Rig {
             .env("BADGES_ATTEMPTS", "3");
         if let Some(hook) = hook {
             cmd.env("BADGES_BEFORE_PUSH", hook);
+        }
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         let out = cmd.output().unwrap();
         let text = format!(
@@ -239,6 +255,48 @@ fn existing_branch_directory_is_updated_and_branches_are_separate() {
         rig.show("task/t9.9-x/coverage.svg").contains("#a4a61d"),
         "yellowgreen"
     );
+}
+
+#[test]
+fn a_failed_worktree_add_is_retried_after_a_prune() {
+    // A `git` on PATH that fails the first `worktree add` the way a
+    // pruned-from-under-it entry does; the script prunes, retries and
+    // publishes. Only that one call is faked: everything else is real git.
+    let rig = Rig::new();
+    let real = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    let bin = rig._dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let mark = rig._dir.path().join("failed-once");
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = worktree ] && [ \"$2\" = add ] && [ ! -e '{mark}' ]; then\n  touch '{mark}'\n  echo 'fatal: could not open .git/worktrees/x/locked for writing: No such file or directory' >&2\n  exit 128\nfi\nexec '{real}' \"$@\"\n",
+            mark = mark.display(),
+            real = real.trim()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    rig.push_source("main");
+    let sha = rig.head();
+    let (ok, text) = rig.publish_env("main", &sha, 80.0, 100, None, &[("PATH", path)]);
+    assert!(ok, "{text}");
+    assert!(text.contains("worktree add failed"), "{text}");
+    assert!(text.contains("retrying"), "{text}");
+    assert!(mark.exists(), "the fake failure was consumed");
+    assert!(text.contains("attempt 1)"), "one push attempt: {text}");
+    assert_eq!(rig.commits(), 1);
+    assert!(rig.show("main/coverage.svg").contains(">80.0%</text>"));
 }
 
 #[test]

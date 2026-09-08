@@ -18,7 +18,10 @@ First release: the complete command set of `docs/design.md`.
   gate, per-class token-bucket rate limiting (120/30/10/5/2 per minute,
   thaw and status unlimited), and the frozen gate.
 - Handlers: `guest-ping`, `guest-info`, `guest-sync`, `guest-sync-delimited`,
-  `guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`,
+  `guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`
+  (sizes skipped on network, FUSE and autofs mounts; the walk bounded at
+  10 s and at most two walks alive at once, so a share whose server is
+  gone cannot pile up stuck threads),
   `guest-fsfreeze-status/freeze/freeze-list/thaw`, `guest-fstrim` (reports
   the minimum extent the kernel applied, not the requested one),
   `guest-shutdown` (`sync(2)` then `reboot(2)`: a hard shutdown, no
@@ -27,13 +30,23 @@ First release: the complete command set of `docs/design.md`.
   QMP `SUSPEND`/`WAKEUP` events).
 - Freeze lifecycle: mount plan from `/proc/self/mountinfo`, parsed as
   bytes so a mount point that is not UTF-8 is kept byte-exact (ext4/xfs on
-  `/dev` nodes, bind mounts de-duplicated, reverse mount order), recovery
-  marker created with `O_EXCL` + `fsync` before the first `FIFREEZE`, thaw
-  drains each target until its first error (bounded at 1024 calls) and
-  counts it complete only on the kernel's "not frozen" answer (`EINVAL`,
-  or `EOPNOTSUPP` for a filesystem that cannot freeze): a denied or failed
-  `FITHAW`, a mountpoint that cannot be opened, or a drain that never
-  converges keeps the marker and the state `Frozen`,
+  `/dev` nodes, bind mounts de-duplicated with every mount point of a
+  superblock kept as an alias, reverse mount order); every `FIFREEZE`,
+  `FITHAW` and `FITRIM` goes through a descriptor opened on one of the
+  target's mount points and verified with `fstat(2)` against the planned
+  device, so a mount placed over a planned mountpoint is never frozen or
+  thawed in its place (a hidden first pathname is retried through an
+  alias, the descriptors a freeze opened are held until their drain
+  completes, and a superblock no pathname leads to is reported unreachable
+  with the recovery state retained); recovery marker created with
+  `O_EXCL` + `fsync` before the first `FIFREEZE`, in a directory opened
+  once at startup and judged by its device against the plan (never by the
+  pathname, which sees neither `..` nor a symlinked parent); thaw drains
+  each target until its first error (bounded at 1024 calls) and counts it
+  complete only on the kernel's own "not frozen" answer (`EINVAL`, or
+  `EOPNOTSUPP` for a filesystem that cannot freeze): a denied or failed
+  `FITHAW`, an error from before the ioctl whatever its errno, or a drain
+  that never converges keeps the marker and the state `Frozen`,
   a failed freeze rolls back every processed target before reporting the
   first one it could not thaw, the audit flush of a thaw completes before
   the state is published as thawed, watchdog with idle timeout and hard cap
@@ -49,7 +62,9 @@ First release: the complete command set of `docs/design.md`.
 - Channel handling: non-blocking virtio-serial I/O, EOF/HUP reconnect with
   bounded backoff, `EBUSY` as the terminal `channel_already_open` error,
   deferred `SIGTERM` while frozen (and, once thawed, honoured even while a
-  reply is stuck on a host that has stopped reading).
+  reply is stuck on a host that has stopped reading); the runtime is shut
+  down under a 5 s bound once the loop has stopped, so an abandoned
+  `statfs` cannot hold the exit.
 - Packaging: systemd unit (not bound to the port's device unit, so a crash
   while frozen is recovered whether or not the port is there), udev rule,
   sysusers entry, example config.

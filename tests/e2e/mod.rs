@@ -45,6 +45,11 @@ pub struct SpawnOptions {
     /// Give the daemon a pipe as stderr instead of a file; the read end is
     /// returned by [`Agent::take_stderr_pipe`] (AC13).
     pub stderr_pipe: bool,
+    /// Leave a recovery marker in the state directory before the spawn,
+    /// so the daemon starts in recovery mode (`Frozen`, the ring holding
+    /// its records) without any ioctl: the way to a frozen agent that
+    /// works unprivileged and without fakes.
+    pub recovery_marker: bool,
 }
 
 impl Default for SpawnOptions {
@@ -55,6 +60,7 @@ impl Default for SpawnOptions {
             features_extra: String::new(),
             state_dir: None,
             stderr_pipe: false,
+            recovery_marker: false,
         }
     }
 }
@@ -164,10 +170,17 @@ impl Agent {
             ),
         )
         .unwrap();
+        if opts.recovery_marker {
+            std::fs::write(dir.path().join("frozen"), b"").unwrap();
+        }
         if nix::unistd::geteuid().is_root()
             && let Some(user) = nix::unistd::User::from_name("qeminga").unwrap()
         {
             nix::unistd::chown(dir.path(), Some(user.uid), Some(user.gid)).unwrap();
+            if opts.recovery_marker {
+                nix::unistd::chown(&dir.path().join("frozen"), Some(user.uid), Some(user.gid))
+                    .unwrap();
+            }
         }
         let stderr_path = dir.path().join("stderr.log");
         let mut stderr_pipe = None;
@@ -209,7 +222,16 @@ impl Agent {
             stderr_writer,
             pending: Vec::new(),
         };
-        if agent.stderr_pipe.is_none() {
+        if opts.recovery_marker {
+            // Recovery mode writes nothing to stderr until a thaw (§4.4):
+            // the channel is proved open by a reply instead.
+            let reply = agent.request_timeout(r#"{"execute":"guest-ping"}"#, REPLY_TIMEOUT);
+            assert_eq!(
+                reply,
+                serde_json::json!({"return": {}}),
+                "recovery-mode start"
+            );
+        } else if agent.stderr_pipe.is_none() {
             agent.wait_for_stderr("\"event\":\"channel_open\"", Duration::from_secs(10));
         } else {
             // Give the daemon time to open the channel; the caller drains

@@ -5,7 +5,7 @@
 
 mod e2e;
 
-use e2e::Agent;
+use e2e::{Agent, SpawnOptions};
 use serde_json::json;
 use std::time::Duration;
 
@@ -40,14 +40,25 @@ fn shutdown_emits_no_reply() {
 
 #[test]
 fn channel_eof_then_reopen_preserves_state() {
-    let mut agent = Agent::spawn();
-    // Freeze zero filesystems: no ioctl needed, but the state becomes
-    // Frozen and the marker exists (works unprivileged and without fakes).
-    let frozen =
-        agent.request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":[]}}"#);
-    assert_eq!(frozen, json!({"return": 0}));
+    // A frozen agent without any ioctl (works unprivileged and without
+    // fakes): the daemon starts in recovery mode behind a marker left by
+    // a previous instance (§4.4). A freeze of zero filesystems would not
+    // do: it is a zero-work operation and settles `Thawed` (#43 §2). The
+    // idle timeout is raised so the watchdog cannot thaw during the
+    // reopen backoff.
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        recovery_marker: true,
+        agent_extra: "fsfreeze_idle_timeout_secs = 300\n".to_owned(),
+        ..SpawnOptions::default()
+    });
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
     assert!(agent.state_dir().join("frozen").exists(), "marker present");
+    let zero =
+        agent.request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":[]}}"#);
+    assert_eq!(
+        zero["error"]["desc"], "filesystems are frozen; retry after thaw",
+        "no second freeze while recovering"
+    );
     let osinfo = agent.execute("guest-get-osinfo");
     assert_eq!(
         osinfo["error"]["desc"],
@@ -82,10 +93,16 @@ fn channel_eof_then_reopen_preserves_state() {
     if thawed.get("return").is_some() {
         assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "thawed");
         assert!(!agent.state_dir().join("frozen").exists());
-        // The thaw flushed the audit ring, so both channel events are visible.
+        // The thaw flushed the audit ring, so both channel events are
+        // visible, and a zero-work freeze now settles thawed at once.
         let stderr = agent.stderr_text();
         assert!(stderr.contains("\"event\":\"channel_closed\""));
         assert_eq!(stderr.matches("\"event\":\"channel_open\"").count(), 2);
+        let zero = agent
+            .request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":[]}}"#);
+        assert_eq!(zero, json!({"return": 0}));
+        assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "thawed");
+        assert!(!agent.state_dir().join("frozen").exists(), "no marker left");
         assert!(agent.stop().success());
     } else {
         let desc = thawed["error"]["desc"].as_str().unwrap_or_default();

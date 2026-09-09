@@ -36,7 +36,9 @@
 //!    drained: complete → marker removed, finalisation hook, `Thawed`; a
 //!    drain incomplete or the marker not removable → `Frozen`, marker
 //!    retained, the watchdog armed as on any entry into that state, the
-//!    incomplete handles kept for it. The operation retires its
+//!    incomplete handles kept for it; nothing frozen and nothing held
+//!    (an empty or entirely skipped plan) → marker removed, `Thawed`,
+//!    reply `0` (#43 §2). The operation retires its
 //!    registration (by identity: a successor is never touched) before the
 //!    state is published, so whoever observes the terminal state finds
 //!    the slot released; the settlement is announced and the reply sent
@@ -618,6 +620,15 @@ impl Driver {
             self.commit_abort(AbortCause::ThawRequested);
             return self.settle_aborted().await;
         }
+        // Zero work (#43 §2): nothing frozen, nothing held for a drain
+        // (no `EBUSY` target), nothing uncertain and no worker
+        // outstanding leaves nothing to recover, so the operation settles
+        // `Thawed` with the marker removed, never `Frozen` with an armed
+        // watchdog and a gate closed on nothing. `frozen == 0` alone is
+        // not the test: a held handle keeps the conservative state.
+        if self.frozen == 0 && self.ctx.frozen_mount_count() == 0 && self.unrecoverable.is_none() {
+            return self.settle_nothing_frozen().await;
+        }
         tracing::info!(
             event = "fsfreeze_frozen",
             frozen = self.frozen,
@@ -625,6 +636,40 @@ impl Driver {
         );
         let frozen = self.frozen;
         self.conclude(Terminal::Frozen, Ok(frozen));
+    }
+
+    /// The operation committed with nothing frozen and nothing held: the
+    /// marker is removed (tracked) and the operation settles `Thawed`
+    /// with the reply `0`; a marker that cannot be removed keeps the
+    /// conservative state and the reply is an error.
+    async fn settle_nothing_frozen(mut self) {
+        let marker = self.marker.clone();
+        let removed = self
+            .await_tracked(self.spawn_blocking(move || marker.remove()), false)
+            .await;
+        match removed {
+            Ok(Ok(())) | Ok(Err(MarkerError::Absent { .. })) => {
+                tracing::info!(
+                    event = "fsfreeze_nothing_frozen",
+                    "no target frozen (empty or entirely skipped plan); thawed"
+                );
+                self.conclude(Terminal::Thawed, Ok(0));
+            }
+            Ok(Err(err)) => {
+                tracing::error!(event = "fsfreeze_marker_retained", error = %err, "nothing frozen but the marker cannot be removed; staying frozen");
+                self.conclude(
+                    Terminal::Frozen,
+                    Err(FreezeFailure::NothingFrozenMarkerRetained(err)),
+                );
+            }
+            Err(err) => {
+                tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
+                self.conclude(
+                    Terminal::Frozen,
+                    Err(FreezeFailure::Task(format!("marker removal lost: {err}"))),
+                );
+            }
+        }
     }
 
     /// Takes the abort decision at a boundary (no-op once committed).

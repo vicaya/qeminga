@@ -76,7 +76,7 @@ graph LR
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
 | 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
-| 6 | T6.1 | fakes (privileged late completion not reproducible) | post-release follow-ups from review |
+| 6 | T6.1–T6.2 | fakes (privileged late completion not reproducible) | post-release follow-ups from review and #43 |
 
 ---
 
@@ -110,6 +110,7 @@ disagree, raise it as an open question rather than diverging.
 | C-20 | The recovery marker's directory must survive service stops and belong to the service account: `/run/qeminga` is provisioned by `tmpfiles.d/qeminga.conf` at boot and by the unit's privileged `ExecStartPre` lines before every start, and nothing removes it on stop. `RuntimeDirectory=` is deliberately not used: with no `User=` systemd re-applies root ownership before every `ExecStart`, which undid the hand-over and left the dropped daemon unable to create or remove its marker (found by the installed-unit tests). |
 | C-21 | A `SIGTERM`/`SIGINT` received while not `Thawed` is always deferred: the agent keeps serving the frozen-safe set and exits after the thaw completes. Whether that deferral finishes before systemd escalates to `SIGKILL` is a packaging property (`TimeoutStopSec`, §8.4), not a runtime decision. The rule protects the command, not the delivery of its reply: a stop that is allowed (`Thawed`) ends the session even while a reply is still being written to a host that has stopped reading; the partial frame is abandoned with the session and no other reply is ever appended to it. A terminal channel error (`EBUSY` on a reopen, §8.4) is not a stop request but obeys the same exit rule: serving ends, the process exits once `Thawed`, and the watchdog is what bounds the wait. |
 | C-23 | The freeze operation deadline (§4.4, #39) is `[agent] fsfreeze_operation_timeout_secs`. Omitted, the effective value is `min(60, fsfreeze_max_timeout_secs)` (libvirt gives up on a freeze after a few seconds, while a legitimate walk that must sync a large dirty page cache can take tens of seconds; a walk still inside `FIFREEZE` after a minute is treated as stuck), so a configuration written before the key existed keeps starting; an explicit value must be `1..=86400` and at most `fsfreeze_max_timeout_secs`, never clamped, so `TimeoutStopSec` stays coupled to one figure (§8.4). It is measured from entry into `Freezing`; queueing and preparation count, heartbeats do not extend it. A `guest-fsfreeze-thaw` received while the walk is under way aborts the walk (the host has given up) and is answered at once with a `GenericError` describing the recovery as pending, never waiting on a drain and never claiming a complete thaw while a call can still freeze a target; `guest-fsfreeze-status` tells the host when the operation has settled. The reply to an aborted freeze is a `GenericError` naming the cause, the target in flight and the count frozen so far. Chosen when implementing #39; the design owner may retune the default. |
+| C-24 | A freeze operation that ends with nothing frozen and nothing held (an empty plan, a `guest-fsfreeze-freeze-list` matching no mount point, a plan every target of which was skipped; no `EBUSY` handle, nothing uncertain, no worker outstanding) is a zero-work operation (§4.2, #43 §2): its marker is removed and it settles `Thawed` with the reply `0`, never `Frozen` with the watchdog armed. `0` alone is not the criterion; a marker that cannot be removed keeps `Frozen` and is reported as an error. The count of `guest-fsfreeze-freeze-list` is the number of distinct requested superblocks this operation froze (aliases once, unmatched, unsupported and `EBUSY` targets not at all), so a controller requesting one mount point per required superblock accepts the result only when the count equals the number requested (§4.2 "Coverage"); no strict-target mode is added to the agent and no filesystem metadata is disclosed for it. |
 
 ## 4. Open questions (need the design owner)
 
@@ -724,6 +725,21 @@ the answer is a one-line change, and leave the question here.
 - **Not done here:** a privileged test of a real blocked `FIFREEZE` (no deterministic way to hold a real filesystem inside the ioctl on a loop device; the existing privileged cycle exercises the coordinator's normal path), and isolation of several simultaneously stuck `FITHAW` calls (OQ-8, still open).
 - **Done when:** the scenario table of #39 is covered by the tests above, the existing freeze/thaw, rollback, watchdog, descriptor-identity, marker and shutdown suites pass unchanged, and the mutants gate covers the coordinator.
 
+#### T6.2 — Zero-work operations settle `Thawed`; the coverage contract of `guest-fsfreeze-freeze-list` (#43 §2)
+- **Status:** done
+- **Design:** §4.2 "Zero-work operations" and "Coverage", AC17, AC21, C-12, C-24.
+- **Depends on:** T6.1
+- **Files:** `src/freeze_op.rs` (`settle_nothing_frozen`), `src/handlers/fsfreeze.rs` (`FreezeFailure::NothingFrozenMarkerRetained`), `tests/fixtures/mountinfo/no_freezable.txt`, `tests/e2e/mod.rs` (`SpawnOptions::recovery_marker`), `tests/e2e_lifecycle.rs`.
+- **Tests first (red):**
+  - `an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed` — the regression of #43 §2: a plan with no eligible filesystem, and a freeze-list matching nothing, reply `0`, leave no marker, publish `Thawed` (`freezing`, `thawed` hooks only: no watchdog), retire the operation, and the next freeze is admitted.
+  - `an_entirely_skipped_plan_settles_thawed_too` — every target `EOPNOTSUPP`: same rule, no drain issued.
+  - `a_zero_count_with_a_busy_target_keeps_the_conservative_state` — not `successful_freezes == 0` alone: an `EBUSY` handle is held, so `Frozen`, marker, watchdog, and the thaw drains it.
+  - `a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen` — cleanup failed: `Frozen`, marker path retained, the reply an error naming it.
+  - `a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze` — the coverage evidence: three names of one superblock count once; a missing, unsupported (`EOPNOTSUPP`) or busy (`EBUSY`) target lowers the count below the number requested; full coverage is exactly the number of distinct superblocks.
+  - `channel_eof_then_reopen_preserves_state` (`tests/e2e_lifecycle.rs`) no longer relies on the bug: the frozen agent is a recovery-mode start behind a seeded marker, and a zero-work freeze after the thaw settles `Thawed` at once.
+- **Implement (green):** after the commit, `frozen == 0 && held == 0 && unrecoverable.is_none()` (no worker outstanding by construction) takes `settle_nothing_frozen`: a tracked marker removal, then `conclude(Thawed, Ok(0))`; a removal failure other than absence concludes `Frozen` with `NothingFrozenMarkerRetained`. The count semantics of `freeze-list` are unchanged and now pinned; the controller rule is documented in §4.2 (one mount point per required superblock, `count == requested`), the validity half of the contract being T6.3.
+- **Done when:** the scenario rows "Empty or entirely skipped freeze" and "Zero successful freezes with `EBUSY` or uncertainty" of #43 are covered by the tests above and the e2e suite passes unprivileged without fakes.
+
 ---
 
 ## 6. Acceptance-criteria traceability
@@ -752,6 +768,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC18 EOF/reopen during freeze | T4.1, T4.7 (`channel_eof_then_reopen_preserves_state`), T5.2 (`privileged_channel_eof_during_freeze_preserves_marker`) | unit + E2E + privileged | green |
 | AC19 `guest-info` contract | T2.2, T4.7 (`guest_info_matches_capability_contract`) | unit + E2E | green |
 | AC20 freeze operation deadline | T6.1 (`a_completed_target_is_thawed_while_a_later_fifreeze_is_still_blocked` and the scenario tests listed there; `tests/channel_freeze.rs` through the production channel loop; `tests/audit_freeze_window.rs`, `tests/startup.rs`) | unit + transport (manual clock, gated fake) | green; gated-fake evidence only, no real blocked `FIFREEZE` |
+| AC21 zero-work operations settle `Thawed`; freeze-list coverage fails closed | T6.2 (`an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed`, `an_entirely_skipped_plan_settles_thawed_too`, `a_zero_count_with_a_busy_target_keeps_the_conservative_state`, `a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen`, `a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze`; `channel_eof_then_reopen_preserves_state`) | unit + E2E | green |
 
 ---
 

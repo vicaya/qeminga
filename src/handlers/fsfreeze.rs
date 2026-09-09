@@ -33,7 +33,10 @@
 //!    on, whatever its pathnames lead to later.
 //! 4. Success: `Freezing → Frozen`, [`FreezeHooks::on_frozen`] (T3.5 arms
 //!    the watchdog). Failure: `Freezing → Thawed`,
-//!    [`FreezeHooks::on_thawed`]. An aborted operation ends in `Thawed`
+//!    [`FreezeHooks::on_thawed`]. Nothing frozen and nothing held (an
+//!    empty or entirely skipped plan): the marker is removed and the
+//!    operation settles `Freezing → Thawed` with the reply `0`; there is
+//!    nothing to recover, so no watchdog and no closed gate (#43 §2). An aborted operation ends in `Thawed`
 //!    (everything drained, marker removed) or `Frozen` (a drain incomplete
 //!    or the marker retained; the watchdog is armed).
 //!
@@ -450,6 +453,12 @@ pub enum FreezeFailure {
     /// The blocking task could not be joined.
     #[error("freeze task failed: {0}")]
     Task(String),
+    /// Nothing was frozen and nothing is held (an empty or entirely
+    /// skipped plan, #43 §2), but the marker could not be removed: the
+    /// state stays `Frozen` and the marker is retained, so the reply is
+    /// never a `0` that reads as a clean settlement.
+    #[error("nothing was frozen but cannot remove recovery marker: {0}; marker retained")]
+    NothingFrozenMarkerRetained(MarkerError),
     /// The operation was aborted (§4.4): its deadline expired or a thaw was
     /// requested while a `FIFREEZE` was still in flight. The targets frozen
     /// so far are being thawed by the coordinator; the marker and the
@@ -477,7 +486,9 @@ impl FreezeFailure {
     pub fn retains_frozen_state(&self) -> bool {
         matches!(
             self,
-            FreezeFailure::RollbackIncomplete { .. } | FreezeFailure::MarkerRetained { .. }
+            FreezeFailure::RollbackIncomplete { .. }
+                | FreezeFailure::MarkerRetained { .. }
+                | FreezeFailure::NothingFrozenMarkerRetained(_)
         )
     }
 }
@@ -1595,10 +1606,174 @@ mod tests {
         .unwrap();
         assert_eq!(value, json!(0));
         assert!(rig.fifreezes().is_empty());
-        // Zero targets is still a successful freeze: the marker exists
-        // and the state is Frozen until thawed.
+        // Zero targets is a zero-work operation (#43 §2): nothing to
+        // recover, so it settles Thawed with the marker removed.
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed() {
+        // #43 §2: an empty plan leaves no frozen, busy, uncertain or
+        // outstanding target, so there is nothing to recover: the reply
+        // is 0, the marker is gone, the state is Thawed, no `frozen`
+        // hook (no watchdog), and the next freeze is admitted.
+        let rig = Rig::new(FreezeState::Thawed, "no_freezable.txt");
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert!(rig.fifreezes().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists(), "nothing to recover: no marker");
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+        assert!(rig.ctx.freeze_op().is_none());
+        let value = status(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!("thawed"));
+        // A freeze-list that matches nothing is the same case (C-12).
+        let rig = Rig::nested();
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/nope","/proc"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(0));
+        assert!(rig.fifreezes().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        // And the next freeze is admitted at once.
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+    }
+
+    #[tokio::test]
+    async fn a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze() {
+        // The coverage contract (#43 §2, C-24): the reply counts the
+        // distinct superblocks among the requested mount points on which
+        // this operation's FIFREEZE succeeded, and nothing else. A
+        // controller that requests one mount point per required
+        // superblock and demands `count == requested` therefore fails
+        // closed on a missing, unsupported, unmatched or busy target, and
+        // an alias of an already requested superblock never inflates it.
+        let list = |mountpoints: &[&str]| {
+            let json = json!({"execute": "guest-fsfreeze-freeze-list", "arguments": {"mountpoints": mountpoints}});
+            parse_request(json.to_string().as_bytes()).unwrap()
+        };
+        // Duplicate aliases: three names of one ext4 superblock.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/", "/var/www", "/mnt/rootbind"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1), "one superblock, whatever its names");
+        assert_eq!(rig.fifreezes(), paths(&["/"]));
+        // Missing target: a required path outside the plan lowers the
+        // count below the number requested.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/data", "/nope"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        // Mixed supported/unsupported: the unsupported one is skipped, so
+        // the count says the request is not fully covered.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        rig.kernel.script_freeze_error("/data", Errno::EOPNOTSUPP);
+        let value = freeze_list(&rig.ctx, &list(&["/", "/data"])).await.unwrap();
+        assert_eq!(value, json!(1));
+        // EBUSY under the single-freezer assumption is another freezer's
+        // freeze, not this operation's: not counted (AC17), retained for
+        // the drain, and the count again says "not fully covered".
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        rig.kernel.script_freeze_error("/data", Errno::EBUSY);
+        let value = freeze_list(&rig.ctx, &list(&["/", "/data"])).await.unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.held(), 2, "both handles are held for the thaw");
+        // Full coverage: exactly the number of distinct superblocks.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/", "/srv/exports"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(2));
+        assert_eq!(rig.fifreezes(), paths(&["/data", "/"]));
+    }
+
+    #[tokio::test]
+    async fn an_entirely_skipped_plan_settles_thawed_too() {
+        // Every target answers EOPNOTSUPP: nothing was frozen, nothing is
+        // held, nothing is outstanding. Same rule as the empty plan.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EOPNOTSUPP);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert_eq!(rig.fifreezes(), paths(&["/home", "/"]));
+        assert!(rig.fithaws().is_empty(), "nothing to drain");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+    }
+
+    #[tokio::test]
+    async fn a_zero_count_with_a_busy_target_keeps_the_conservative_state() {
+        // Not `successful_freezes == 0` alone: an EBUSY target is held for
+        // the drain (§4.2), so the operation settles Frozen with the
+        // marker and the watchdog, and a thaw drains it.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EBUSY);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        rig.kernel.script_thaw_successes("/home", 0);
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0), "EBUSY is not counted (AC17)");
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
+        assert_eq!(rig.held(), 1, "the busy target's handle is retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1), "the retained target is drained");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen() {
+        // Cleanup failed: the marker path was replaced by a non-empty
+        // directory while the last (skipped) target was being processed,
+        // so unlink fails. The conservative state is kept (the next start
+        // would recover) and the reply is an error, never a 0 that reads
+        // as a clean settlement.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EOPNOTSUPP);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        let marker_path = rig.marker().path().to_path_buf();
+        rig.kernel.set_hook(Box::new(move |call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new("/")) {
+                let _ = std::fs::remove_file(&marker_path);
+                std::fs::create_dir(&marker_path).unwrap();
+                std::fs::write(marker_path.join("child"), b"x").unwrap();
+            }
+        }));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nothing was frozen")
+                && err.to_string().contains("cannot remove recovery marker"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().path().exists(), "marker path retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
     }
 
     #[tokio::test]

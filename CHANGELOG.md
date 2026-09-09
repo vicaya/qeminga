@@ -18,6 +18,16 @@ semantic versioning.
   gate and the freeze-safe audit mode stay until the operation settles
   (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
 
+### Fixed
+
+- A freeze that froze nothing and holds nothing (an empty plan, a
+  `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
+  target of which was skipped) settles `Thawed` with its marker removed
+  and replies `0`, instead of `Frozen` with the watchdog armed and the
+  gate closed on nothing. An `EBUSY` target, an uncertain result or a
+  marker that cannot be removed still keep the conservative state; the
+  last is now reported as an error rather than a `0` (#43 §2).
+
 ### Changed
 
 - A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts

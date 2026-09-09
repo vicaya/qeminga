@@ -76,7 +76,7 @@ graph LR
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
 | 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
-| 6 | T6.1–T6.6 | fakes (privileged late completion not reproducible) | post-release follow-ups from review and #43 |
+| 6 | T6.1–T6.7 | fakes (privileged late completion not reproducible) | post-release follow-ups from review and #43 |
 
 ---
 
@@ -807,6 +807,19 @@ the answer is a one-line change, and leave the question here.
 - **Implement (green):** as §5.9. Recovery is unaffected by any profile: the marker, the drain and the watchdog use only what every profile keeps (`FIFREEZE`/`FITHAW`, `openat`, `unlinkat`, `fsync`).
 - **Done when:** AC25 is green on x86-64 and the residual authority is recorded (§5.9, OQ-10).
 
+#### T6.7 — Resource bounds under adversarial traffic (#43 §6)
+- **Status:** done
+- **Design:** §5.10 (new), §5.2, §5.3, §5.7, §9.1, AC26.
+- **Depends on:** T6.1, T6.4
+- **Files:** `src/handlers/mod.rs` (`bounded_reply`), `src/handlers/fsinfo.rs` (`MAX_FSINFO_REPLY_BYTES`), `src/handlers/interfaces.rs` (`MAX_INTERFACES_REPLY_BYTES`), `tests/channel_freeze.rs`, `tests/audit_freeze_window.rs`, `docs/design.md` §5.10.
+- **Tests first (red):**
+  - `a_mount_table_whose_reply_exceeds_the_bound_is_an_explicit_error` (`fsinfo`: 20 000 overlay mounts → `GenericError` naming the bound, "not truncated"; 2 000 answered whole), `a_reply_beyond_the_bound_is_an_explicit_error_not_a_truncated_list` (`interfaces`).
+  - `repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order` (`tests/channel_freeze.rs`: eight thaws behind a drain gated inside `FITHAW`, a ninth not handled while the places are held, each answered in order from the kernel's state, `FITHAW` calls counted).
+  - `a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue` (`tests/audit_freeze_window.rs`: 4 000 denied and malformed frames with the sink blocked throughout; the queue stays within `SINK_QUEUE_CAPACITY`, the excess is dropped and counted, a ping still answers, the backpressure loss record is delivered when the sink moves).
+  - The remaining rows of §5.10 are pinned by the tests named in their tasks (T1.2, T1.3, T1.4, T1.7, T2.5, T4.1, T6.1, T6.4).
+- **Implement (green):** the two reply bounds through `bounded_reply` (serialise, compare, refuse with the size and the bound); everything else was already bounded and is now inventoried in §5.10 with its behaviour past the bound and the failure model (recovery independent of the host; liveness assumes the runtime is scheduled and the kernel calls progress; no reply can be delivered to a peer that refuses it). Duplicate recovery requests are serialised behind the drain in progress rather than coalesced: each is answered from the kernel's own state at one `FITHAW` per drained target, the session's places bound how many wait, and recovery capacity (the watchdog, the coordinator) is independent of the queue.
+- **Done when:** AC26 is green and every row of §5.10 names its enforcing code and test.
+
 ---
 
 ## 6. Acceptance-criteria traceability
@@ -840,6 +853,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC23 audit delivery never holds recovery | T6.4 (`a_sink_blocked_throughout_never_holds_the_thaw_the_state_or_the_next_operation`, the `audit` writer-thread tests, `privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + integration + privileged | green |
 | AC24 production hardening enforced | T6.5 (`the_binary_refuses_enforced_hardening_it_cannot_provide`, the startup-fake refusals, `privileged_installed_unit_matches_the_advertised_profile`, the CI release build with `test-fakes`) | unit + binary + privileged + CI | green on x86-64; arm64 pending runner (§7) |
 | AC25 data-protection profile | T6.6 (`a_profile_without_shutdown_gives_up_cap_sys_boot_everywhere`, `the_profile_carries_only_the_surfaces_the_configuration_enables`, `a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them`, `privileged_data_protection_profile_holds_no_reboot_authority`, `privileged_data_protection_profile_recovers_without_the_host`) | unit + privileged | green on x86-64 |
+| AC26 resource bounds under adversarial traffic | T6.7 (`a_mount_table_whose_reply_exceeds_the_bound_is_an_explicit_error`, `a_reply_beyond_the_bound_is_an_explicit_error_not_a_truncated_list`, `repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order`, `a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue`; §5.10 rows by their tasks) | unit + integration | green |
 
 ---
 

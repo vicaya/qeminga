@@ -737,3 +737,49 @@ async fn a_lost_connection_leaves_the_operation_owned() {
     assert!(!rig.ctx.marker.exists());
     drop(rig.cancel);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order() {
+    // #43 §6: a host that keeps asking for recovery while a drain is
+    // blocked inside FITHAW adds no work beyond the queue's places: the
+    // thaws behind the running one wait in the serial lane (a thaw runs
+    // beside a freeze only), a frame beyond the places is not read, and
+    // once the drain moves each thaw is answered from the kernel's own
+    // state (the drained targets answer "not frozen" at once), in order.
+    // The watchdog and the coordinator hold their own capacity, so the
+    // ability to request recovery is never rate-limited away.
+    let mut rig = rig();
+    rig.send(r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert_eq!(rig.json_reply().await, json!({"return": 4}));
+    let a = rig.kernel.script_thaw_gate(A);
+    let _release = a.release_on_drop();
+    for i in 1..=MAX_QUEUED as u64 {
+        rig.send(&format!(r#"{{"execute":"guest-fsfreeze-thaw","id":{i}}}"#))
+            .await;
+    }
+    let g = a.clone();
+    rig.wait_for("first thaw blocked", move |_| g.waiting() == 1)
+        .await;
+    assert_eq!(rig.ctx.handler_calls(), 2, "one thaw runs; the rest wait");
+    // The places are taken: a ninth thaw is not read.
+    let ninth = b"{\"execute\":\"guest-fsfreeze-thaw\",\"id\":9}\n";
+    let unread = tokio::time::timeout(Duration::from_millis(200), rig.peer.write_all(ninth)).await;
+    // (an 8 KiB stream takes the bytes; what matters is that no handler
+    // ran for them while the places are held)
+    let _ = unread;
+    assert_eq!(rig.ctx.handler_calls(), 2);
+    a.release();
+    assert_eq!(rig.json_reply().await, json!({"return": 4, "id": 1}));
+    for i in 2..=MAX_QUEUED as u64 {
+        // Each later thaw is a recovery drain from `Thawed`: every target
+        // answers EINVAL at once and the count is 0.
+        assert_eq!(rig.json_reply().await, json!({"return": 0, "id": i}));
+    }
+    assert_eq!(rig.json_reply().await, json!({"return": 0, "id": 9}));
+    // Bounded work: the first drain issues success + EINVAL per target,
+    // every later one a single EINVAL per target.
+    let fithaws = rig.fithaws().len();
+    assert_eq!(fithaws, 4 * 2 + MAX_QUEUED * 4, "{fithaws}");
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+    assert!(!rig.ctx.marker.exists());
+}

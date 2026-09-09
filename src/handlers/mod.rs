@@ -93,6 +93,28 @@ pub fn spec(name: &str) -> Option<&'static CommandSpec> {
     SUPPORTED_COMMANDS.iter().find(|spec| spec.name == name)
 }
 
+/// Serialises an information reply and refuses one larger than `bound`
+/// bytes with an explicit error instead of truncating it (§5.10, #43 §6):
+/// a controller validating coverage must never mistake a partial list
+/// for the whole, and a single reply is what the session keeps whole
+/// past its backpressure threshold (§5.7), so its size is bounded here.
+pub fn bounded_reply<T: serde::Serialize>(
+    what: &str,
+    value: &T,
+    bound: usize,
+) -> Result<serde_json::Value, crate::proto::Error> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))?;
+    if bytes.len() > bound {
+        return Err(crate::proto::Error::Internal(format!(
+            "{what}: the reply would be {} bytes, over the {bound} byte bound; not truncated",
+            bytes.len()
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))
+}
+
 /// Argument type for commands that take no arguments; rejects any key.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]

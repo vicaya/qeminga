@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatch::Context;
 use crate::handlers::NoArgs;
@@ -106,6 +106,13 @@ pub const FSINFO_TIMEOUT: Duration = Duration::from_secs(10);
 /// blocking thread to the ones earlier, abandoned walks still hold.
 pub const MAX_FSINFO_WALKS: usize = 2;
 
+/// Bound on the encoded reply (§5.10): a mount table too large to answer
+/// within it is an explicit error, never a truncated list (#43 §6). One
+/// MiB is several thousand entries, well beyond any table the freeze
+/// plan is meant for, while the 32 MiB the table read allows
+/// (`MOUNTINFO_MAX_BYTES`) could otherwise become a reply of that order.
+pub const MAX_FSINFO_REPLY_BYTES: usize = 1024 * 1024;
+
 /// Filesystem types whose `statfs` may block indefinitely (network
 /// shares, FUSE daemons) or have side effects (autofs triggers). Their
 /// entries are reported without sizes.
@@ -170,7 +177,8 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let walk = tokio::task::spawn_blocking(move || {
         let _walk = slot;
         let entries = mounts.mounts()?;
-        Ok::<_, Error>(fs_info(&entries, statfs.as_ref()))
+        let info = fs_info(&entries, statfs.as_ref());
+        crate::handlers::bounded_reply("fsinfo", &info, MAX_FSINFO_REPLY_BYTES)
     });
     let info = tokio::time::timeout(FSINFO_TIMEOUT, walk)
         .await
@@ -181,13 +189,14 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
             ))
         })?
         .map_err(|err| Error::Internal(format!("fsinfo task failed: {err}")))??;
-    Ok(json!(info))
+    Ok(info)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mountinfo::{StaticMounts, parse_mountinfo};
+    use serde_json::json;
     use std::collections::HashMap;
 
     fn fixture(name: &str) -> String {
@@ -512,6 +521,41 @@ mod tests {
                 .statfs(Path::new("/nonexistent/qeminga"))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn a_mount_table_whose_reply_exceeds_the_bound_is_an_explicit_error() {
+        // #43 §6: a table of tens of thousands of mounts (within the 32 MiB
+        // read bound) would make a reply of megabytes; the command fails
+        // naming the bound and truncates nothing. A large but ordinary
+        // table is answered whole.
+        let table = |n: usize| -> String {
+            (0..n)
+                .map(|i| {
+                    format!(
+                        "{} 1 0:{} / /var/lib/containers/overlay/{i:06}/merged rw,relatime - overlay overlay rw\n",
+                        i + 10,
+                        i + 100
+                    )
+                })
+                .collect()
+        };
+        let ctx = Context::for_tests()
+            .with_mounts(Arc::new(StaticMounts(table(20_000))))
+            .with_statfs(Arc::new(fake()));
+        let req = crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+        let err = handle(&ctx, &req).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("over the 1048576 byte bound") && text.contains("not truncated"),
+            "{text}"
+        );
+        let ctx = Context::for_tests()
+            .with_mounts(Arc::new(StaticMounts(table(2_000))))
+            .with_statfs(Arc::new(fake()));
+        let value = handle(&ctx, &req).await.unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 2_000, "answered whole");
+        assert!(serde_json::to_vec(&value).unwrap().len() <= MAX_FSINFO_REPLY_BYTES);
     }
 
     #[tokio::test]

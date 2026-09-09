@@ -421,6 +421,39 @@ A session keeps three concerns apart: admission, completion and delivery. *Admis
 
 **Residual authority, stated honestly.** After the drop the process still holds `CAP_SYS_ADMIN` (freeze, thaw and trim need it; §5.4 says what it covers), can open and read any file its uid and `CAP_DAC_READ_SEARCH` reach (`openat`, `read`, `getdents64` are in every profile: the mount table and `os-release` are read this way, and a compromised parser could read what it likes with the same calls), and can write to the channel, which is an output path to the host. The seccomp filter narrows the syscalls, not the files: it is not a confidentiality boundary for file content after a parser-process compromise, and this design does not claim one. What it does claim is that no configuration enables execution, arbitrary file writes, network egress (`socket` is netlink-only and absent without a consumer) or a reboot the guest did not opt into. Tighter file or descriptor confinement, or a small privileged broker that authorises operations and targets on its own (never an arbitrary-path or arbitrary-syscall proxy), is a separately scoped design (OQ-10 in `docs/tasks.md`) and not a prerequisite for the properties above; nothing here claims an exploitable parser defect exists.
 
+### 5.10 Resource Bounds and the Failure Model
+
+Every input, queue, worker and reply the host can drive has an explicit limit; past it the agent drops, refuses or fails with an error, never grows (#43 §6). The table is the inventory; each row is enforced in code and pinned by a test.
+
+| Bound | Value | Past it |
+|---|---|---|
+| Frame length (§5.2) | 64 KiB | discard until the next newline; one audit record |
+| JSON nesting depth, string length (§5.2) | 32 levels, 4096 bytes | the frame is rejected with `GenericError` |
+| Audit method field (§5.2) | 64 bytes verbatim | prefix, length and digest |
+| Audit records per frame (§9) | exactly one | n/a |
+| Freeze-safe ring (§9.1) | 64 KiB | oldest records evicted, counted, reported after thaw |
+| Audit delivery queue (§9.1) | 256 KiB | newest records dropped, counted, reported where the gap is |
+| Session places (§5.7) | 8 commands from decoding to delivery | nothing more is read |
+| Controls beside the command in progress (§5.7) | 3 | the next control waits for a place |
+| Undelivered replies (§5.7) | 64 KiB backpressure threshold | nothing more is started or read; started commands finish and their replies are kept whole |
+| Rate limits (§5.3) | 120/30/10/5/2 per minute per class | `GenericError`; status and thaw never limited |
+| Freeze operations (§4.4) | 1, with 1 freeze worker, 1 recovery drain, 1 preparation task | a second freeze is refused; a thaw joins |
+| Freeze walk (§4.4) | `fsfreeze_operation_timeout_secs` | aborted; completed targets recovered on independent capacity |
+| `Frozen` state (§4.4) | idle and hard-cap watchdog | thawed by the agent |
+| `FITHAW` drain per target (§4.2) | 1024 calls | reported unrecoverable, marker retained |
+| Recovery requests | serialised behind the drain in progress, at most the session's 8 places | a further thaw waits unread; each is answered from the kernel's own state, so a drained target costs one call |
+| `guest-get-fsinfo` walks (OQ-5) | 2 alive at once, 10 s each | refused at once; a stuck walk fails its command |
+| Mount table read (§4.2) | 32 MiB | the read fails; freeze, thaw and fsinfo report it |
+| `guest-get-fsinfo` reply | 1 MiB encoded | `GenericError` naming the bound; never truncated |
+| `guest-network-get-interfaces` reply | 256 KiB encoded | `GenericError` naming the bound; never truncated |
+| `os-release` read | 64 KiB | kernel fields only, the read failure logged |
+| Reopen backoff (§5.7) | 1 s doubling to 30 s | n/a: a reconnect storm is paced by the agent, and each session starts with a clean decoder and nothing retained |
+| Retained validity records (§4.5) | none: the contract needs no state in the agent | n/a |
+| Runtime shutdown (§5.7) | 5 s for an abandoned informational walk | the runtime is torn down |
+| `guest-shutdown` audit delivery (§9.1) | 2 s | `reboot(2)` proceeds |
+
+**The failure model, stated honestly.** Recovery (the watchdog's drain, the coordinator's settlement, the marker's finalisation) depends on nothing the host does: it runs on the agent's own tasks, writes no audit record synchronously, and needs no reply delivered. It does depend on the runtime being scheduled and on the kernel calls it issues (`FITHAW`, `unlinkat`) making progress; a `FITHAW` that never returns holds its drain (OQ-8), and no wall-clock deadline can make an unresponsive device writable. Replies are delivered in request order to a peer that reads them; no protocol can deliver a reply to a peer that refuses to receive it, and the agent does not try to: a host that stops reading is stopped being read, its commands already started finish, and the memory it can pin is the threshold above plus the replies of the commands that had a place. The bounds hold back new work only, never the completion of what runs.
+
 ---
 
 ## 6. Module Structure
@@ -654,5 +687,6 @@ qeminga is a deliberately constrained replacement for the general-purpose upstre
 | AC21 | A freeze operation that ends with nothing frozen and nothing held (an empty plan, a `guest-fsfreeze-freeze-list` matching nothing, a plan every target of which was skipped) replies `0`, removes its marker and settles `Thawed` with no watchdog armed; an `EBUSY` target, an uncertain result or a marker that cannot be removed keeps `Frozen` with the marker, the last reported as an error. The count of `guest-fsfreeze-freeze-list` names the distinct requested superblocks this operation froze and nothing else, so a controller requesting one mount point per required superblock and demanding `count == requested` fails closed on a missing, unsupported, unmatched or busy target (§4.2 "Coverage"). |
 | AC22 | The snapshot controller contract (§4.5): a controller following the protocol accepts a cycle as quiesced only when the freeze covered every required superblock and the thaw found every one of them still frozen; a lease expiring before or during the cut or between two volumes, a delayed or aborted freeze reply, a crash before the reply, a guest reboot, an external thaw, an uncovered request (a required mount point that leads nowhere, one under an ancestor a mount covers, or one whose name a hidden superblock also carries: a name selects the superblock the pathname leads to by the mount graph, never two, and the freeze opens it on that name only) and a thaw reply arriving past the cycle budget (whatever its count: a restarted agent's recovery re-arms the cap) are all rejected, an agent restart while frozen is not, and a verdict is never revisited because a later upload ran long. The single-controller assumption behind the thaw count is stated and its limit is pinned by a test. |
 | AC23 | With the audit sink blocked throughout (never drained during the assertion), a freeze/thaw cycle finalises its marker and publishes `Thawed`, `guest-fsfreeze-status` and `guest-ping` answer, and a further freeze/thaw cycle completes; records are delivered in order once the sink moves, with losses (queue full, sink error, ring overflow) reported by a loss record at the position of the gap. No sink write ever happens on a caller's thread, under the router's lock, or while the ring is in use. |
+| AC26 | Every bound of §5.10 is enforced and tested: sustained malformed and denied traffic with the audit sink blocked keeps the delivery queue within its capacity (excess dropped and counted) while the dispatcher keeps answering; repeated thaws behind a blocked drain are held to the session's places and each answered from the kernel's state; a mount table or an interface list whose reply would exceed its bound is an explicit error, never a truncated list; a slow or non-reading host and a blocked log sink do not prevent autonomous recovery. |
 | AC25 | With `[features] shutdown`, `information` and `fstrim` off, the daemon runs with exactly `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` in every set (`CAP_SYS_BOOT` not in the bounding set), under a profile without `reboot`, `sync`, `uname`, `statfs`, the netlink syscalls or `socket`, and with `FITRIM` not an allowed ioctl; the disabled commands answer `CommandNotFound` "has been disabled" in every state and `guest-info` lists them disabled; freeze, thaw, status and the controls work and recovery is unaffected; no host request changes the profile. |
 | AC24 | Under the default `[agent] hardening = "enforced"`, startup is refused with `EX_CONFIG` and a recovery marker untouched when the seccomp filter is disabled, not compiled in, logging-only or not installed, when the capability drop did not run, or when a test-kernel substitution is requested; the installed artifact under the shipped unit runs as uid 600 with exactly the AC3 capability sets, `NoNewPrivs` set and `Seccomp` in filter mode, refuses a denied command, freezes and thaws a real filesystem, and refuses a test-kernel request; a release build cannot carry the substitution. |

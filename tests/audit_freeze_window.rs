@@ -603,3 +603,66 @@ async fn a_sink_blocked_throughout_never_holds_the_thaw_the_state_or_the_next_op
 fn rig_ctx(ctx: &Arc<Context>) -> Arc<Context> {
     Arc::clone(ctx)
 }
+
+#[tokio::test]
+async fn a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue() {
+    // #43 §6: sustained denied and malformed traffic with the sink
+    // blocked throughout produces one audit record per frame, and the
+    // records beyond the bounded delivery queue are dropped and counted
+    // rather than retained; the dispatcher keeps answering.
+    let flood_dir = tempfile::tempdir().unwrap();
+    let sink = BlockedSink::default();
+    let router = Router::new(Box::new(sink.clone()));
+    let ctx = Arc::new(
+        Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            router,
+            Marker::open(flood_dir.path().join("frozen")).unwrap(),
+        )
+        .with_kernel(Arc::new(FakeKernel::new()))
+        .with_mounts(Arc::new(StaticMounts(fixture("simple.txt")))),
+    );
+    let dispatcher = qeminga::dispatch::Dispatcher::new(Arc::clone(&ctx));
+    let mut denied = 0;
+    for i in 0..4000 {
+        let frame = if i % 2 == 0 {
+            format!(r#"{{"execute":"guest-exec","arguments":{{"path":"/bin/sh"}},"id":{i}}}"#)
+        } else {
+            format!("garbage-{i} {{ not json")
+        };
+        let reply = dispatcher
+            .handle(request(&frame))
+            .with_subscriber(audit::subscriber(Level::TRACE, ctx.audit.clone()))
+            .await
+            .unwrap();
+        let reply: Value = serde_json::from_slice(&reply[..reply.len() - 1]).unwrap();
+        assert!(reply.get("error").is_some(), "{reply}");
+        denied += 1;
+    }
+    assert_eq!(denied, 4000);
+    assert!(
+        ctx.audit.queued_bytes() <= audit::SINK_QUEUE_CAPACITY + 1024,
+        "queued {} bytes",
+        ctx.audit.queued_bytes()
+    );
+    assert!(
+        ctx.audit.unreported_losses() > 0,
+        "the excess was dropped, not retained"
+    );
+    assert!(sink.text().is_empty(), "the sink never moved");
+    let reply = dispatcher
+        .handle(request(r#"{"execute":"guest-ping"}"#))
+        .with_subscriber(audit::subscriber(Level::TRACE, ctx.audit.clone()))
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8(reply).unwrap(), "{\"return\":{}}\n");
+    sink.release();
+    assert!(ctx.audit.settle(std::time::Duration::from_secs(10)));
+    let text = sink.text();
+    assert!(
+        text.contains("\"reason\":\"sink_backpressure\""),
+        "{}",
+        &text[..text.len().min(500)]
+    );
+}

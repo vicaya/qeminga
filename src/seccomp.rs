@@ -132,6 +132,12 @@ pub const COMMON: &[&str] = &[
     "ppoll",
     "pipe2",
     "socketpair",
+    // The signal driver's socketpair is written with send(2) and read
+    // with recv(2), which are sendto/recvfrom on Linux: needed to stop the
+    // daemon whatever the profile (observed under the data-protection
+    // profile as SECCOMP audit lines for syscalls 44 and 45 on x86-64).
+    "sendto",
+    "recvfrom",
     // Signals.
     "rt_sigaction",
     "rt_sigprocmask",
@@ -156,7 +162,8 @@ pub const COMMON: &[&str] = &[
 /// Syscalls only the information commands need (§5.5, §5.9): `uname` for
 /// `guest-get-osinfo`, `statfs`/`fstatfs` for `guest-get-fsinfo`, and the
 /// netlink exchange of getifaddrs(3) for `guest-network-get-interfaces`
-/// (`socket` is listed separately, restricted to AF_NETLINK). Absent from
+/// (`socket` is listed separately, restricted to AF_NETLINK; `sendto` and
+/// `recvfrom` are common, the signal driver needs them too). Absent from
 /// the profile when `[features] information = false`.
 pub const INFORMATION: &[&str] = &[
     "uname",
@@ -164,10 +171,8 @@ pub const INFORMATION: &[&str] = &[
     "fstatfs",
     "bind",
     "getsockname",
-    "sendto",
     "sendmsg",
     "recvmsg",
-    "recvfrom",
     "setsockopt",
 ];
 

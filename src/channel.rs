@@ -306,13 +306,14 @@ pub enum Kind {
 /// from being answered; they are read-only, so they overlap nothing.
 pub const MAX_CONTROLS: usize = 3;
 
-/// Commands the session holds at once, from the frame's decoding to its
-/// reply's delivery: waiting for a lane, running, finished with the reply
-/// waiting behind an earlier one, or with the reply in the outbox but
-/// not yet accepted by the host. A reply counts until the host has taken
-/// it, so a peer that stops reading stops being read. The channel is not
-/// read while this many are held; one read's worth of frames may be
-/// decoded beyond it.
+/// Places in the session's queue. A command owns one from its frame's
+/// decoding to its reply's delivery: waiting for a lane, running,
+/// finished with the reply waiting behind an earlier one, or with the
+/// reply in the outbox but not yet accepted by the host. A reply keeps
+/// its place until the host has taken it, so a peer that stops reading
+/// stops being read. The channel is not read while every place is
+/// taken; one read's worth of frames may be decoded beyond that, and
+/// waits for a place.
 ///
 /// This bounds the host's interruption of a freeze: a
 /// `guest-fsfreeze-thaw` sent behind a pending freeze reply is read, and
@@ -398,23 +399,25 @@ impl Lanes {
     }
 }
 
-/// Starts up to `capacity` waiting commands whose lane is free (§5.7).
-/// The serial lane is first come, first served: a freeze or an ordinary
-/// command starts only when nothing exclusive is running and no earlier
-/// serial command is still waiting, so side effects happen in the order
-/// the host asked for them. A control, or a thaw while nothing but a
-/// freeze runs, is not held back by a serial command waiting ahead of
-/// it: the host's `guest-fsfreeze-thaw` must reach the freeze under way
-/// even when a walk the freeze gate would refuse anyway is queued
-/// between them. Replies still leave in request order, whatever the
-/// order of admission.
-fn admit<'a, H: Handle>(slots: &mut VecDeque<Slot<'a>>, handler: &'a H, mut capacity: usize) {
+/// Starts the waiting commands among the oldest `window` whose lane is
+/// free (§5.7). The window is the queue's capacity not taken by
+/// undelivered replies: each of the oldest commands owns its place from
+/// its decoding to its delivery, waiting or not, so a later command that
+/// overtakes it can never use up the capacity it needs to start once its
+/// lane frees; frames decoded beyond the window stay in staging until
+/// the window reaches them. The serial lane is first come, first served:
+/// a freeze or an ordinary command starts only when nothing exclusive is
+/// running and no earlier serial command is still waiting, so side
+/// effects happen in the order the host asked for them. A control, or a
+/// thaw while nothing but a freeze runs, is not held back by a serial
+/// command waiting ahead of it: the host's `guest-fsfreeze-thaw` must
+/// reach the freeze under way even when a walk the freeze gate would
+/// refuse anyway is queued between them. Replies still leave in request
+/// order, whatever the order of admission.
+fn admit<'a, H: Handle>(slots: &mut VecDeque<Slot<'a>>, handler: &'a H, window: usize) {
     let mut lanes = Lanes::of(slots);
     let mut serial_waiting = false;
-    for slot in slots.iter_mut() {
-        if capacity == 0 {
-            break;
-        }
+    for slot in slots.iter_mut().take(window) {
         let Slot::Waiting(kind, _) = slot else {
             continue;
         };
@@ -433,7 +436,6 @@ fn admit<'a, H: Handle>(slots: &mut VecDeque<Slot<'a>>, handler: &'a H, mut capa
         if let Slot::Waiting(_, event) = std::mem::replace(slot, Slot::Done(None)) {
             *slot = Slot::Pending(kind, Box::pin(handler.handle(event)));
             lanes.take(kind);
-            capacity -= 1;
         }
     }
 }
@@ -522,13 +524,15 @@ impl Outbox {
 ///   that may change the guest at a time, in request order among
 ///   themselves; the frozen-safe controls (up to [`MAX_CONTROLS`]) and a
 ///   thaw aimed at a freeze under way beside it, not held back by a
-///   serial command waiting ahead of them. At most [`MAX_QUEUED`]
-///   commands are started or held with their reply undelivered, a reply
-///   counting until the host has taken it, and at most
-///   [`MAX_REPLY_BYTES`] of replies are kept for a host that is not
-///   reading: past either bound nothing more is started, and nothing
-///   more is read. The bounds hold back new work only; what runs is
-///   always polled to its end.
+///   serial command waiting ahead of them. The queue has [`MAX_QUEUED`]
+///   places, each owned by one command from its decoding to its reply's
+///   delivery (an undelivered reply keeps its place), in request order:
+///   a command without a place waits for one, and a command that
+///   overtakes an earlier one can never use up the place the earlier
+///   one needs to start. Past [`MAX_REPLY_BYTES`] of undelivered replies
+///   nothing more is started; past either bound nothing more is read.
+///   The bounds hold back new work only; what runs is always polled to
+///   its end.
 /// * **Completion.** Every command that started is polled until it
 ///   finishes, whatever the writer or the stop are doing: a command is
 ///   never dropped mid-way (a freeze abandoned at its `.await` would
@@ -617,15 +621,14 @@ where
             // withdrawn until the thaw (C-21).
             draining = false;
         }
-        // Started commands and undelivered replies fill the queue; the
-        // frames decoded beyond it wait their turn.
-        let started = slots
-            .iter()
-            .filter(|slot| !matches!(slot, Slot::Waiting(..)))
-            .count()
-            + outbox.count();
+        // The oldest commands own the queue's places, from decoding to
+        // delivery; frames decoded beyond them wait for a place.
         if !draining && outbox.pending_bytes() < MAX_REPLY_BYTES {
-            admit(&mut slots, handler, MAX_QUEUED.saturating_sub(started));
+            admit(
+                &mut slots,
+                handler,
+                MAX_QUEUED.saturating_sub(outbox.count()),
+            );
         }
         let running = slots.iter().any(|slot| matches!(slot, Slot::Pending(..)));
         if !running
@@ -1031,7 +1034,8 @@ mod tests {
     }
 
     /// Blocks every command whose frame does not contain `quick` until
-    /// released, counts how many run at once and records the order they
+    /// released (`release`, or `release_b` for a frame containing
+    /// `holdb`), counts how many run at once and records the order they
     /// started in; replies name the frame (a frame containing `big`
     /// gets a 4 KiB reply, `huge` a 40 KiB one). The lane is the frame's prefix: `ctl-` is a
     /// control, `thaw-` a thaw, `freeze-` a freeze, anything else
@@ -1039,6 +1043,8 @@ mod tests {
     /// it again.
     struct CountingHandler {
         release: tokio::sync::Notify,
+        /// Releases the frames containing `holdb` instead.
+        release_b: tokio::sync::Notify,
         running: AtomicUsize,
         peak: AtomicUsize,
         started: Mutex<Vec<String>>,
@@ -1049,6 +1055,7 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(CountingHandler {
                 release: tokio::sync::Notify::new(),
+                release_b: tokio::sync::Notify::new(),
                 running: AtomicUsize::new(0),
                 peak: AtomicUsize::new(0),
                 started: Mutex::new(Vec::new()),
@@ -1097,7 +1104,9 @@ mod tests {
             self.started.lock().unwrap().push(name.clone());
             let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            if !name.contains("quick") {
+            if name.contains("holdb") {
+                self.release_b.notified().await;
+            } else if !name.contains("quick") {
                 self.release.notified().await;
             }
             self.running.fetch_sub(1, Ordering::SeqCst);
@@ -1278,6 +1287,54 @@ mod tests {
             read_exactly(&mut peer, b"slow-2\nthaw-quick-3\n").await;
             drop(peer);
             session.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn bypassed_replies_cannot_consume_the_head_waiters_admission_credit() {
+        // Ten frames in one read: a freeze, an ordinary command that
+        // waits for the serial lane, a thaw that overtakes it and stays
+        // pending beside the freeze, seven quick controls. The freeze
+        // finishes and its reply is read; the thaw finishes last. The
+        // controls that overtook the ordinary command must not have used
+        // up the place it needs: it starts as soon as the thaw is done,
+        // and every reply leaves in request order, the peer reading all
+        // along.
+        bounded(async {
+            let (mut peer, handler, _cancel, session) = counting_session(4096);
+            let mut frames = b"freeze-1\nquick-2\nthaw-holdb-3\n".to_vec();
+            let mut expected = frames.clone();
+            for i in 4..=10 {
+                frames.extend(format!("ctl-quick-{i}\n").into_bytes());
+                expected.extend(format!("ctl-quick-{i}\n").into_bytes());
+            }
+            peer.write_all(&frames).await.unwrap();
+            handler.started_is("thaw-holdb-3").await;
+            handler.started_is("ctl-quick-8").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let started = handler.started();
+            assert!(!started.contains(&"quick-2".to_owned()), "{started:?}");
+            assert_eq!(
+                started.len(),
+                7,
+                "the oldest MAX_QUEUED own the places: {started:?}"
+            );
+            handler.release.notify_waiters();
+            read_exactly(&mut peer, b"freeze-1\n").await;
+            handler.started_is("ctl-quick-9").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !handler.started().contains(&"quick-2".to_owned()),
+                "still behind the pending thaw"
+            );
+            handler.release_b.notify_waiters();
+            handler.started_is("quick-2").await;
+            read_exactly(&mut peer, &expected[b"freeze-1\n".len()..]).await;
+            assert_eq!(handler.started().len(), 10);
+            drop(peer);
+            let report = session.await.unwrap();
+            assert!(matches!(report.end, SessionEnd::Eof), "{}", report.end);
         })
         .await;
     }

@@ -28,9 +28,10 @@ semantic versioning.
   three frozen-safe controls beside it (status is served while a
   recovery drain is blocked) and a thaw beside a running freeze (it
   reaches the operation before the deadline, even behind a queued walk).
-  At most eight commands are held from decoding to delivery and at most
-  64 KiB of undelivered replies are kept, so a peer that stops reading
-  stops being read; replies stay in request order; a reply the host is
+  The queue has eight places owned from decoding to delivery in request
+  order (an overtaking control never takes the place of the command it
+  overtook) and a 64 KiB backpressure threshold on undelivered replies,
+  so a peer that stops reading stops being read; replies stay in request order; a reply the host is
   slow to read stalls neither the commands behind it nor a stop; a stop
   finishes the commands running before the session ends, and so does a
   lost peer.

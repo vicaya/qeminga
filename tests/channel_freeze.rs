@@ -646,6 +646,60 @@ async fn a_thaw_finishes_while_the_outbox_is_saturated() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controls_overtaking_a_waiting_trim_leave_it_its_place() {
+    // Frozen; a thaw is inside FITHAW when the host sends, in one write,
+    // a trim and seven statuses. The trim waits for the serial lane; the
+    // statuses overtake it and are answered behind the thaw's reply.
+    // When the thaw returns, the trim still has its place: it runs, and
+    // every reply leaves in request order with the host reading all
+    // along.
+    let mut rig = rig();
+    rig.send(r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert_eq!(rig.json_reply().await, json!({"return": 4}));
+    let a = rig.kernel.script_thaw_gate(A);
+    let _release = a.release_on_drop();
+    rig.send(r#"{"execute":"guest-fsfreeze-thaw","id":1}"#)
+        .await;
+    let g = a.clone();
+    rig.wait_for("thaw blocked", move |_| g.waiting() == 1)
+        .await;
+    let mut batch = String::from(r#"{"execute":"guest-fstrim","id":2}"#);
+    batch.push('\n');
+    for i in 3..=9 {
+        batch.push_str(&format!(
+            r#"{{"execute":"guest-fsfreeze-status","id":{i}}}"#
+        ));
+        batch.push('\n');
+    }
+    rig.peer.write_all(batch.as_bytes()).await.unwrap();
+    // The freeze, the thaw and the statuses that have a place (the
+    // ninth frame waits for one); the trim has not run.
+    rig.wait_for("statuses handled", |r| r.ctx.handler_calls() >= 8)
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.ctx.handler_calls(), 8, "the trim waits, one status too");
+    assert!(
+        !rig.kernel
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::Fitrim(..))),
+        "no FITRIM while the thaw runs"
+    );
+    a.release();
+    assert_eq!(rig.json_reply().await, json!({"return": 4, "id": 1}));
+    let trimmed = rig.json_reply().await;
+    assert_eq!(trimmed["id"], json!(2));
+    assert!(trimmed["return"]["paths"].is_array(), "{trimmed}");
+    for i in 3..=8 {
+        assert_eq!(rig.json_reply().await, json!({"return": "frozen", "id": i}));
+    }
+    // The ninth frame had no place until the thaw's reply was taken: it
+    // ran after the thaw.
+    assert_eq!(rig.json_reply().await, json!({"return": "thawed", "id": 9}));
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lost_connection_leaves_the_operation_owned() {
     // The peer goes away while the freeze reply is pending and B is
     // inside FIFREEZE. The session ends once the command in flight has

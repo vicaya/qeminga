@@ -3115,4 +3115,86 @@ mod tests {
         assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed"]);
         assert!(rig.ctx.freeze_op().is_some());
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_deadline_expiring_during_the_rollback_does_not_abort_it() {
+        // C (/home) fails hard after A and B froze; the rollback's drain of
+        // A blocks past the operation deadline. The rollback is itself the
+        // recovery, so the deadline must not abort it: the request reports
+        // the hard error once the rollback is complete, the state is
+        // `Thawed`, and no abort ever happened.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_millis(100));
+        rig.kernel.script_freeze_error("/home", Errno::EIO);
+        let a_thaw = rig.kernel.script_thaw_gate("/home/data/deep");
+        let _release = a_thaw.release_on_drop();
+        let freezing = {
+            let ctx = Arc::clone(&rig.ctx);
+            tokio::spawn(async move {
+                freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#)).await
+            })
+        };
+        rig.wait_for("rollback blocked", |_| a_thaw.waiting() == 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!freezing.is_finished(), "the reply waits for the rollback");
+        assert_eq!(rig.state(), FreezeState::Freezing);
+        a_thaw.release();
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(
+            err.to_string().starts_with("freeze of /home failed: EIO")
+                && err.to_string().contains("rolled back"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"], "no abort");
+        assert!(rig.ctx.freeze_op().is_none());
+    }
+
+    /// A mount table whose read panics (a lost preparation task).
+    struct PanickingMounts;
+
+    impl MountSource for PanickingMounts {
+        fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+            panic!("mount table reader lost");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_preparation_reports_the_task_failure_and_ends_thawed() {
+        // The preparation task panics before the marker is created: no
+        // ioctl, the (absent) marker is tolerated, and the operation ends
+        // `Thawed` with the task failure reported.
+        let rig = Rig::with_mounts(FreezeState::Thawed, Arc::new(PanickingMounts));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with("freeze task failed:"), "{err}");
+        assert!(rig.kernel.calls().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_recovered_count_counts_only_targets_a_fithaw_succeeded_on() {
+        // B answers EBUSY late and its drain finds it not frozen (EINVAL at
+        // once): drained, but not counted as recovered; A was.
+        let (rig, gate, _) = aborted_at_b().await;
+        let _release = gate.release_on_drop();
+        let op = rig.ctx.freeze_op().unwrap();
+        rig.kernel.script_freeze_error("/home/data", Errno::EBUSY);
+        rig.kernel.script_thaw_successes("/home/data", 0);
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/home/data/deep", "/home/data/deep", "/home/data"])
+        );
+        let progress = op.progress();
+        assert_eq!(progress.recovered, 1);
+        assert_eq!(progress.settled, Some(FreezeState::Thawed));
+        assert!(progress.recovery_pass_done());
+    }
 }

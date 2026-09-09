@@ -114,10 +114,11 @@ pub struct Progress {
     /// The target whose `FIFREEZE` is outstanding (`"(preparing)"` while
     /// the plan and the marker are being prepared).
     pub in_flight: Option<String>,
-    /// `true` while a recovery drain is running.
-    pub draining: bool,
-    /// Published handles not yet handed to a drain.
-    pub awaiting_drain: usize,
+    /// `true` once the abort has committed and every handle published so
+    /// far has been drained (no drain running, nothing held): the targets
+    /// frozen before the abort are recovered, whatever the in-flight call
+    /// does later. Reset when a late completion publishes another handle.
+    pub recovery_pass_done: bool,
     /// Targets on which a recovery drain succeeded at least once.
     pub recovered: u64,
     /// A drain that did not complete (target and reason).
@@ -132,20 +133,18 @@ impl Progress {
             phase: Phase::Freezing,
             frozen: 0,
             in_flight: Some("(preparing)".to_owned()),
-            draining: false,
-            awaiting_drain: 0,
+            recovery_pass_done: false,
             recovered: 0,
             unrecoverable: None,
             settled: None,
         }
     }
 
-    /// `true` once the completed targets have had their recovery drain
-    /// (nothing held, no drain running) or the operation has settled: what
-    /// a thaw that joins the operation waits for.
+    /// `true` once the completed targets have had their recovery drain or
+    /// the operation has settled: what a thaw that joins the operation
+    /// waits for.
     pub fn recovery_pass_done(&self) -> bool {
-        self.settled.is_some()
-            || (self.phase == Phase::Recovering && !self.draining && self.awaiting_drain == 0)
+        self.settled.is_some() || self.recovery_pass_done
     }
 }
 
@@ -171,11 +170,6 @@ impl FreezeOp {
     /// The latest snapshot.
     pub fn progress(&self) -> Progress {
         self.progress.borrow().clone()
-    }
-
-    /// `true` once the operation has settled and released its slot.
-    pub fn is_settled(&self) -> bool {
-        self.progress.borrow().settled.is_some()
     }
 
     /// Waits until the recovery pass over the completed targets is done
@@ -328,10 +322,8 @@ impl Driver {
                     self.frozen += 1;
                     self.ctx.hold_frozen_mounts(vec![mount]);
                     let frozen = self.frozen;
-                    self.op.publish(|p| {
-                        p.frozen = frozen;
-                        p.awaiting_drain += 1;
-                    });
+                    self.op.publish(|p| p.frozen = frozen);
+                    self.refresh_pass_done();
                 }
                 Ok(TargetOutcome::Busy(mount)) => {
                     tracing::warn!(
@@ -340,7 +332,7 @@ impl Driver {
                         "already frozen by another freezer; retained for thaw"
                     );
                     self.ctx.hold_frozen_mounts(vec![mount]);
-                    self.op.publish(|p| p.awaiting_drain += 1);
+                    self.refresh_pass_done();
                 }
                 Ok(TargetOutcome::Skipped) => {
                     tracing::info!(event = "fsfreeze_skipped", mountpoint = %mountpoint, "freeze not supported; skipped");
@@ -456,6 +448,7 @@ impl Driver {
                     self.recovery = None;
                     self.record_recovery(res);
                     self.start_recovery_if_needed();
+                    self.refresh_pass_done();
                 }
                 Event::Abort(cause) => self.commit_abort(cause),
             }
@@ -489,8 +482,17 @@ impl Driver {
             frozen: self.frozen,
             in_flight,
         }));
-        self.op.publish(|p| p.phase = Phase::Recovering);
         self.start_recovery_if_needed();
+        self.op.publish(|p| p.phase = Phase::Recovering);
+        self.refresh_pass_done();
+    }
+
+    /// Publishes whether the targets frozen before the abort have all been
+    /// drained (see [`Progress::recovery_pass_done`]).
+    fn refresh_pass_done(&mut self) {
+        let done =
+            self.abort.is_some() && self.recovery.is_none() && self.ctx.frozen_mount_count() == 0;
+        self.op.publish(|p| p.recovery_pass_done = done);
     }
 
     /// Starts a recovery drain over the published handles unless one is
@@ -504,10 +506,6 @@ impl Driver {
             return;
         }
         let kernel = Arc::clone(&self.kernel);
-        self.op.publish(|p| {
-            p.draining = true;
-            p.awaiting_drain = 0;
-        });
         self.recovery = Some(self.spawn_blocking(move || {
             let (recovered, keep, incomplete) = drain_held(kernel.as_ref(), held);
             RecoveryPass {
@@ -543,7 +541,6 @@ impl Driver {
             .as_ref()
             .map(|(mountpoint, reason)| format!("{mountpoint}: {reason}"));
         self.op.publish(|p| {
-            p.draining = false;
             p.recovered = recovered;
             p.unrecoverable = unrecoverable;
         });
@@ -652,6 +649,7 @@ impl Driver {
                 self.record_recovery(res);
             }
             self.start_recovery_if_needed();
+            self.refresh_pass_done();
             if self.recovery.is_none() {
                 break;
             }

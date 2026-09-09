@@ -222,6 +222,29 @@ fn example_config_equals_the_design_block_and_parses() {
 }
 
 #[test]
+fn data_protection_example_parses_and_keeps_only_the_snapshot_authority() {
+    // #43 §5: the shipped data-protection configuration is valid, enforced,
+    // and grants no reboot, information or trim authority.
+    let config =
+        qeminga::config::Config::parse(&read("packaging/config-data-protection.toml")).unwrap();
+    assert!(config.agent.hardening.is_enforced());
+    assert!(config.features.seccomp);
+    assert_eq!(
+        config.authority(),
+        qeminga::config::Authority::data_protection()
+    );
+    assert!(!config.shutdown_enabled());
+    assert!(!config.information_enabled());
+    assert!(!config.fstrim_enabled());
+    // Everything not about authority equals the default.
+    let mut expected = qeminga::config::Config::default();
+    expected.features.shutdown = false;
+    expected.features.information = false;
+    expected.features.fstrim = false;
+    assert_eq!(config, expected);
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

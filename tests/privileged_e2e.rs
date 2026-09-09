@@ -1041,3 +1041,101 @@ fn privileged_seccomp_matrix_log_then_enforce() {
         );
     }
 }
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_data_protection_profile_holds_no_reboot_authority() {
+    // #43 §5: with shutdown, information and trim off, the daemon runs
+    // with exactly CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH (no CAP_SYS_BOOT
+    // to regain), under a filter without reboot, uname, statfs or the
+    // netlink syscalls, and still freezes and thaws the real filesystem;
+    // the optional commands answer "disabled" and nothing the host sends
+    // widens the profile.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
+        ..real_kernel("")
+    });
+    let stderr = agent.stderr_text();
+    assert!(
+        stderr.contains(
+            "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false"
+        ),
+        "{stderr}"
+    );
+    let status = std::fs::read_to_string(format!("/proc/{}/status", agent.pid())).unwrap();
+    let field = |name: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing in {status}"))
+            .trim()
+            .to_owned()
+    };
+    if stderr.contains("\"event\":\"privileges_dropped\"") {
+        // CAP_DAC_READ_SEARCH (2) and CAP_SYS_ADMIN (21) only.
+        assert_eq!(field("CapEff:"), "0000000000200004");
+        assert_eq!(field("CapPrm:"), "0000000000200004");
+        assert_eq!(
+            field("CapBnd:"),
+            "0000000000200004",
+            "CAP_SYS_BOOT cannot be regained"
+        );
+    }
+    if cfg!(feature = "seccomp") {
+        assert_eq!(field("Seccomp:"), "2");
+    }
+    for method in [
+        "guest-shutdown",
+        "guest-get-osinfo",
+        "guest-network-get-interfaces",
+        "guest-get-fsinfo",
+        "guest-fstrim",
+    ] {
+        let reply = agent.execute(method);
+        assert_eq!(
+            reply["error"]["class"], "CommandNotFound",
+            "{method}: {reply}"
+        );
+        assert_eq!(
+            reply["error"]["desc"],
+            format!("command {method} has been disabled"),
+            "{method}"
+        );
+    }
+    assert!(agent.is_running(), "a disabled shutdown rebooted nothing");
+    assert_eq!(agent.execute("guest-ping")["return"], json!({}));
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    std::fs::write(format!("{mount}/after-data-protection-thaw"), b"ok").unwrap();
+    let info = agent.execute("guest-info");
+    let disabled: Vec<&str> = info["return"]["supported_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["enabled"] == false)
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        disabled,
+        [
+            "guest-get-osinfo",
+            "guest-network-get-interfaces",
+            "guest-get-fsinfo",
+            "guest-fstrim",
+            "guest-shutdown",
+            "guest-suspend-ram",
+        ]
+    );
+    assert!(agent.stop().success());
+}

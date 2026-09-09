@@ -20,3 +20,5 @@ shutdown_per_min           = 2
 suspend_ram = false   # opt-in: can disrupt security monitoring
 fstrim      = true    # opt-out: discard unused blocks
 seccomp     = true    # required under hardening = "enforced"
+shutdown    = true    # opt-out: guest-shutdown; off, CAP_SYS_BOOT and reboot(2) are given up too (§5.9)
+information = true    # opt-out: guest-get-osinfo, guest-network-get-interfaces, guest-get-fsinfo (§5.9)

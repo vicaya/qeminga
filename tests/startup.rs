@@ -14,7 +14,7 @@ use std::time::Duration;
 use nix::errno::Errno;
 use qeminga::audit::{Mode, Router};
 use qeminga::channel::{Channel, OpenError, OpenFn};
-use qeminga::config::{Config, ConfigError, LogLevel};
+use qeminga::config::{Authority, Config, ConfigError, LogLevel};
 use qeminga::daemon::{self, BuildProfile, EX_CONFIG, EX_UNAVAILABLE, Options, RunError, Startup};
 use qeminga::dispatch::Context;
 use qeminga::kernel::caps::{Outcome, PrivilegeError};
@@ -266,8 +266,8 @@ impl Startup for FakeStartup {
             }
         }
     }
-    fn drop_privileges(&self) -> Result<Outcome, PrivilegeError> {
-        self.log("caps");
+    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError> {
+        self.log(format!("caps reboot={}", authority.reboot));
         Ok(if self.root {
             Outcome::Dropped
         } else {
@@ -322,7 +322,7 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
             "logging info ring=false",
             "mounts",
             "channel /dev/virtio-ports/org.qemu.guest_agent.0",
-            "caps",
+            "caps reboot=true",
             "audit writer",
             "seccomp enabled=true",
             "runtime recovery=false mode=Normal channel=open",
@@ -621,7 +621,7 @@ fn a_missing_channel_never_delays_the_drop_the_filter_or_recovery() {
         [
             "channel /dev/virtio-ports/org.qemu.guest_agent.0",
             "channel deferred",
-            "caps",
+            "caps reboot=true",
             "audit writer",
             "seccomp enabled=true",
             "runtime recovery=true mode=Ring channel=none",

@@ -8,6 +8,7 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 | `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
 | `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
 | `config.toml` | `/etc/qeminga/config.toml` | The documented defaults (§8.2); every key is optional. |
+| `config-data-protection.toml` | `/etc/qeminga/config.toml` (instead of the above) | The data-protection profile (§5.9): freeze, thaw, status and the controls only; `guest-shutdown`, the information commands and `guest-fstrim` disabled, and with them `CAP_SYS_BOOT`, `reboot(2)`, `uname`, `statfs`, netlink and `FITRIM` given up. |
 | `tmpfiles.d/qeminga.conf` | `/usr/lib/tmpfiles.d/` | Creates `/run/qeminga` (0700, owned by `qeminga`) at boot for the recovery marker (C-20). Always install it and run `systemd-tmpfiles --create`. |
 | `tmpfiles.d/qeminga-suspend.conf` | `/usr/lib/tmpfiles.d/` **only with** `[features] suspend_ram = true` | Hands `/sys/power/state` to group `qeminga` (mode 0664) on every boot, without which the dropped daemon cannot write it (OQ-6). Not installed by default. |
 
@@ -62,6 +63,23 @@ waiting for the thaw. `tests/packaging.rs` checks the shipped pair.
 `fsfreeze_operation_timeout_secs` (the freeze walk's own deadline, §4.4)
 is validated to be at most the cap, so it never needs a margin of its
 own.
+
+## Data-protection profile
+
+A guest whose only job for the host is snapshot coordination installs
+`config-data-protection.toml` as `/etc/qeminga/config.toml`: it keeps
+`guest-fsfreeze-*`, `guest-ping`, `guest-sync*` and `guest-info` and
+disables `guest-shutdown`, `guest-get-osinfo`,
+`guest-network-get-interfaces`, `guest-get-fsinfo` and `guest-fstrim`
+(`[features] shutdown`, `information`, `fstrim`; design §5.9). The
+daemon derives its authority from the file before it accepts a host
+request: without `guest-shutdown` it drops `CAP_SYS_BOOT` and the
+`reboot`/`sync` syscalls, without the information commands the netlink,
+`uname` and `statfs` syscalls, without trim the `FITRIM` ioctl. Nothing
+the host sends re-enables any of it; `guest-info` lists the disabled
+commands as disabled. The default `config.toml` keeps every command on,
+as before. What remains after a compromise of the daemon, with either
+file, is stated in design §5.9.
 
 ## Hardening profile and a failed upgrade or configuration
 

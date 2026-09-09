@@ -45,7 +45,7 @@ use std::time::Duration;
 
 use crate::audit::{self, Router};
 use crate::channel::{self, OpenError, OpenFn};
-use crate::config::{Config, ConfigError, DEFAULT_CONFIG_PATH, LogLevel};
+use crate::config::{Authority, Config, ConfigError, DEFAULT_CONFIG_PATH, LogLevel};
 use crate::dispatch::{Context, Dispatcher};
 use crate::freeze_plan::FreezePlan;
 use crate::handlers::fsfreeze;
@@ -284,8 +284,8 @@ pub trait Startup {
     /// device never delays the privilege drop, the seccomp filter or the
     /// recovery watchdog (C-14, OQ-7).
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
-    /// Step 5.
-    fn drop_privileges(&self) -> Result<Outcome, PrivilegeError>;
+    /// Step 5: keep the final set of `authority` (§5.4, §5.9).
+    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError>;
     /// Step 5b: start the audit writer thread, after the drop so that it
     /// is created under the dropped ceiling (§5.4).
     fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
@@ -402,7 +402,16 @@ fn serve_after_logging(
             "channel not open yet; the runtime retries after the privilege drop"
         );
     }
-    match startup.drop_privileges()? {
+    let authority = config.authority();
+    tracing::info!(
+        event = "authority",
+        reboot = authority.reboot,
+        information = authority.information,
+        trim = authority.trim,
+        suspend = authority.suspend,
+        "authority derived from the configuration"
+    );
+    match startup.drop_privileges(&authority)? {
         Outcome::Dropped => tracing::info!(
             event = "privileges_dropped",
             user = SERVICE_USER,
@@ -544,8 +553,12 @@ impl Startup for SystemStartup {
         }
     }
 
-    fn drop_privileges(&self) -> Result<Outcome, PrivilegeError> {
-        crate::kernel::caps::drop_privileges(SERVICE_USER, &crate::kernel::caps::SystemCaps)
+    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError> {
+        crate::kernel::caps::drop_privileges(
+            SERVICE_USER,
+            &crate::kernel::caps::SystemCaps,
+            authority,
+        )
     }
 
     #[cfg(feature = "seccomp")]
@@ -553,8 +566,9 @@ impl Startup for SystemStartup {
         if !config.seccomp_enabled() {
             return Ok(false);
         }
-        let program = crate::seccomp::profile(crate::seccomp::Target::current())
-            .map_err(|err| RunError::Seccomp(err.to_string()))?;
+        let program =
+            crate::seccomp::profile(crate::seccomp::Target::current(), &config.authority())
+                .map_err(|err| RunError::Seccomp(err.to_string()))?;
         crate::seccomp::install(&program).map_err(|err| RunError::Seccomp(err.to_string()))?;
         Ok(true)
     }

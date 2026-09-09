@@ -34,6 +34,16 @@ semantic versioning.
   instance's tasks as a crash would (`Context::abort_tasks`, hidden from
   the documented API; the daemon never calls it).
 
+- The data-protection profile (#43 §5): `[features] shutdown` and
+  `[features] information` (both on by default) switch `guest-shutdown`
+  and the information commands off like `fstrim`; a disabled command
+  answers `CommandNotFound` "has been disabled" and `guest-info` lists
+  it disabled. The capability set and the seccomp profile follow the
+  switches: without `shutdown` the daemon gives up `CAP_SYS_BOOT`,
+  `reboot` and `sync`; without `information` `uname`, `statfs`, the
+  netlink syscalls and `socket`; without `fstrim` the `FITRIM` ioctl.
+  `packaging/config-data-protection.toml` is the profile with all of them
+  off; design §5.9 records the residual authority.
 - `[agent] hardening = "enforced"` (the default): the daemon refuses to
   serve the host (exit 78, one line, the recovery marker untouched)
   unless it was started as root with the seccomp filter compiled in,

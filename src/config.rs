@@ -166,6 +166,13 @@ pub struct Features {
     pub fstrim: bool,
     /// Install the seccomp filter (§5.5); needs the `seccomp` Cargo feature.
     pub seccomp: bool,
+    /// `guest-shutdown` (§5.9, #43 §5). Off, the daemon also gives up
+    /// `CAP_SYS_BOOT` and the `reboot`/`sync` syscalls.
+    pub shutdown: bool,
+    /// `guest-get-osinfo`, `guest-network-get-interfaces` and
+    /// `guest-get-fsinfo` (§5.9). Off, the daemon also gives up the
+    /// netlink, `uname` and `statfs` syscalls.
+    pub information: bool,
 }
 
 impl Default for Features {
@@ -174,6 +181,50 @@ impl Default for Features {
             suspend_ram: false,
             fstrim: true,
             seccomp: true,
+            shutdown: true,
+            information: true,
+        }
+    }
+}
+
+/// The authority a configuration grants the process (§5.9, #43 §5):
+/// derived from trusted guest configuration before any host request is
+/// accepted, it decides the final capability set (§5.4) and the seccomp
+/// profile (§5.5) as well as which commands are enabled. Freeze, thaw,
+/// status and the controls are never optional: recovery is always owned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Authority {
+    /// `reboot(2)` and `sync(2)`, and `CAP_SYS_BOOT` (`guest-shutdown`).
+    pub reboot: bool,
+    /// `uname`, `statfs` and the netlink exchange (the information
+    /// commands).
+    pub information: bool,
+    /// `FITRIM` (`guest-fstrim`).
+    pub trim: bool,
+    /// Writing `/sys/power/state` (`guest-suspend-ram`; no syscall or
+    /// capability of its own beyond `openat`/`write`).
+    pub suspend: bool,
+}
+
+impl Authority {
+    /// Everything the lifecycle-oriented default configuration grants.
+    pub const fn full() -> Self {
+        Authority {
+            reboot: true,
+            information: true,
+            trim: true,
+            suspend: true,
+        }
+    }
+
+    /// The data-protection profile: freeze, thaw, status and the controls
+    /// only.
+    pub const fn data_protection() -> Self {
+        Authority {
+            reboot: false,
+            information: false,
+            trim: false,
+            suspend: false,
         }
     }
 }
@@ -456,6 +507,27 @@ impl Config {
     pub fn seccomp_enabled(&self) -> bool {
         cfg!(feature = "seccomp") && self.features.seccomp
     }
+
+    /// `guest-shutdown` is available (runtime switch only, §5.9).
+    pub fn shutdown_enabled(&self) -> bool {
+        self.features.shutdown
+    }
+
+    /// The information commands are available (runtime switch only, §5.9).
+    pub fn information_enabled(&self) -> bool {
+        self.features.information
+    }
+
+    /// The authority this configuration grants (§5.9): what the
+    /// capability drop keeps and the seccomp profile allows.
+    pub fn authority(&self) -> Authority {
+        Authority {
+            reboot: self.shutdown_enabled(),
+            information: self.information_enabled(),
+            trim: self.fstrim_enabled(),
+            suspend: self.suspend_ram_enabled(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -501,6 +573,17 @@ mod tests {
         assert!(!config.features.suspend_ram);
         assert!(config.features.fstrim);
         assert!(config.features.seccomp);
+        assert!(config.features.shutdown);
+        assert!(config.features.information);
+        assert_eq!(
+            config.authority(),
+            Authority {
+                reboot: true,
+                information: true,
+                trim: true,
+                suspend: cfg!(feature = "suspend_ram") && false,
+            }
+        );
         assert_eq!(Config::parse(&fixture("minimal.toml")).unwrap(), config);
     }
 
@@ -835,6 +918,35 @@ mod tests {
         assert!(!off.fstrim_enabled());
         assert!(!off.suspend_ram_enabled());
         assert!(!off.seccomp_enabled());
+    }
+
+    #[test]
+    fn the_authority_follows_the_feature_switches() {
+        // #43 §5: the default is the lifecycle profile; a data-protection
+        // configuration keeps freeze/thaw and gives up the rest, and the
+        // authority is what the drop and the filter are derived from.
+        assert!(Config::default().authority().reboot);
+        let dp = Config::parse(
+            "[features]\nshutdown = false\ninformation = false\nfstrim = false\nsuspend_ram = false\n",
+        )
+        .unwrap();
+        assert_eq!(dp.authority(), Authority::data_protection());
+        assert!(!dp.shutdown_enabled());
+        assert!(!dp.information_enabled());
+        assert!(!dp.fstrim_enabled());
+        assert!(dp.features.seccomp, "the sandbox stays");
+        let power_only = Config::parse("[features]\ninformation = false\n").unwrap();
+        assert_eq!(
+            power_only.authority(),
+            Authority {
+                reboot: true,
+                information: false,
+                trim: true,
+                suspend: false,
+            }
+        );
+        assert!(Authority::full().reboot);
+        assert!(Authority::full().information);
     }
 
     #[test]

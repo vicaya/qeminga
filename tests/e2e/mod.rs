@@ -408,6 +408,11 @@ impl Agent {
         self.dir.take().unwrap()
     }
 
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// `true` when the binary can fake the kernel.
     pub fn has_fake_kernel() -> bool {
         cfg!(feature = "test-fakes")

@@ -24,16 +24,24 @@
 use caps::{CapSet, Capability, CapsHashSet};
 use nix::unistd::{Gid, Uid};
 
-/// The final effective and permitted set (§5.4).
+use crate::config::Authority;
+
+/// The final effective and permitted set of the lifecycle profile (§5.4).
 pub const FINAL_CAPS: [Capability; 3] = [
     Capability::CAP_SYS_ADMIN,
     Capability::CAP_SYS_BOOT,
     Capability::CAP_DAC_READ_SEARCH,
 ];
 
-/// The final set as a hash set.
-pub fn final_capability_set() -> CapsHashSet {
-    FINAL_CAPS.iter().copied().collect()
+/// The final set for `authority` (§5.4, §5.9): `CAP_SYS_ADMIN` and
+/// `CAP_DAC_READ_SEARCH` always (freeze, thaw and trim need them),
+/// `CAP_SYS_BOOT` only when `guest-shutdown` is enabled.
+pub fn final_capability_set(authority: &Authority) -> CapsHashSet {
+    FINAL_CAPS
+        .iter()
+        .copied()
+        .filter(|cap| authority.reboot || *cap != Capability::CAP_SYS_BOOT)
+        .collect()
 }
 
 /// The service account, resolved from the passwd database.
@@ -207,7 +215,11 @@ fn step(name: &'static str, result: Result<(), String>) -> Result<(), PrivilegeE
 
 /// Runs the §5.4 sequence for the named service account, or skips it
 /// with a warning when not root (C-18).
-pub fn drop_privileges(user: &str, ops: &dyn CapOps) -> Result<Outcome, PrivilegeError> {
+pub fn drop_privileges(
+    user: &str,
+    ops: &dyn CapOps,
+    authority: &Authority,
+) -> Result<Outcome, PrivilegeError> {
     if !ops.is_root() {
         tracing::warn!(
             event = "privilege_drop_skipped",
@@ -222,14 +234,19 @@ pub fn drop_privileges(user: &str, ops: &dyn CapOps) -> Result<Outcome, Privileg
             reason,
         })?
         .ok_or_else(|| PrivilegeError::UnknownUser(user.to_owned()))?;
-    drop_privileges_to(account, ops)?;
+    drop_privileges_to(account, ops, authority)?;
     Ok(Outcome::Dropped)
 }
 
-/// Runs the §5.4 sequence for an already resolved account. Does not check
-/// for root; every step reports its own failure.
-pub fn drop_privileges_to(account: Account, ops: &dyn CapOps) -> Result<(), PrivilegeError> {
-    let finals = final_capability_set();
+/// Runs the §5.4 sequence for an already resolved account, keeping the
+/// final set of `authority`. Does not check for root; every step reports
+/// its own failure.
+pub fn drop_privileges_to(
+    account: Account,
+    ops: &dyn CapOps,
+    authority: &Authority,
+) -> Result<(), PrivilegeError> {
+    let finals = final_capability_set(authority);
     let mut with_setpcap = finals.clone();
     with_setpcap.insert(Capability::CAP_SETPCAP);
 
@@ -368,7 +385,7 @@ mod tests {
 
     #[test]
     fn final_capability_set_is_exactly_three() {
-        let set = final_capability_set();
+        let set = final_capability_set(&Authority::full());
         assert_eq!(set.len(), 3);
         assert!(set.contains(&Capability::CAP_SYS_ADMIN));
         assert!(set.contains(&Capability::CAP_SYS_BOOT));
@@ -378,14 +395,53 @@ mod tests {
     }
 
     #[test]
+    fn a_profile_without_shutdown_gives_up_cap_sys_boot_everywhere() {
+        // #43 §5: with `guest-shutdown` disabled the final set is two
+        // capabilities, CAP_SYS_BOOT is trimmed from the bounding set with
+        // the rest, and nothing re-raises it.
+        let set = final_capability_set(&Authority::data_protection());
+        assert_eq!(
+            sorted(&set),
+            [Capability::CAP_DAC_READ_SEARCH, Capability::CAP_SYS_ADMIN]
+        );
+        let ops = FakeCaps::root();
+        assert_eq!(
+            drop_privileges("qeminga", &ops, &Authority::data_protection()),
+            Ok(Outcome::Dropped)
+        );
+        let steps = ops.steps.borrow().clone();
+        assert!(
+            steps.contains(&Step::Drop(SetKind::Bounding, Capability::CAP_SYS_BOOT)),
+            "{steps:?}"
+        );
+        for step in &steps {
+            if let Step::Set(_, caps) = step {
+                assert!(!caps.contains(&Capability::CAP_SYS_BOOT), "{step:?}");
+            }
+        }
+        // Information and trim have no capability of their own: the set
+        // is the same with or without them.
+        let info_only = Authority {
+            reboot: false,
+            information: true,
+            trim: true,
+            suspend: true,
+        };
+        assert_eq!(final_capability_set(&info_only), set);
+    }
+
+    #[test]
     fn drop_plan_lists_steps_in_design_order() {
         let ops = FakeCaps::root();
-        assert_eq!(drop_privileges("qeminga", &ops), Ok(Outcome::Dropped));
+        assert_eq!(
+            drop_privileges("qeminga", &ops, &Authority::full()),
+            Ok(Outcome::Dropped)
+        );
         let steps = ops.steps.borrow().clone();
         let uid = Uid::from_raw(600);
         let gid = Gid::from_raw(600);
-        let finals = sorted(&final_capability_set());
-        let mut with_setpcap = final_capability_set();
+        let finals = sorted(&final_capability_set(&Authority::full()));
+        let mut with_setpcap = final_capability_set(&Authority::full());
         with_setpcap.insert(Capability::CAP_SETPCAP);
         let with_setpcap = sorted(&with_setpcap);
 
@@ -414,7 +470,7 @@ mod tests {
         let expected: Vec<Capability> = {
             let mut v: Vec<Capability> = caps::all()
                 .into_iter()
-                .filter(|c| !final_capability_set().contains(c))
+                .filter(|c| !final_capability_set(&Authority::full()).contains(c))
                 .collect();
             v.sort_by_key(|c| c.index());
             v
@@ -446,7 +502,7 @@ mod tests {
         let mut ops = FakeCaps::root();
         ops.root = false;
         assert_eq!(
-            drop_privileges("qeminga", &ops),
+            drop_privileges("qeminga", &ops, &Authority::full()),
             Ok(Outcome::SkippedUnprivileged)
         );
         assert!(ops.steps.borrow().is_empty(), "nothing is changed");
@@ -466,7 +522,7 @@ mod tests {
         tracing::subscriber::with_default(
             crate::audit::subscriber(tracing::Level::WARN, router),
             || {
-                drop_privileges("qeminga", &ops).unwrap();
+                drop_privileges("qeminga", &ops, &Authority::full()).unwrap();
             },
         );
         let text = String::from_utf8(sink.lock().unwrap().clone()).unwrap();
@@ -478,13 +534,13 @@ mod tests {
     fn unknown_user_and_step_failures_are_reported() {
         let ops = FakeCaps::root();
         assert_eq!(
-            drop_privileges("nobody-here", &ops),
+            drop_privileges("nobody-here", &ops, &Authority::full()),
             Err(PrivilegeError::UnknownUser("nobody-here".to_owned()))
         );
         assert!(ops.steps.borrow().is_empty());
         let mut ops = FakeCaps::root();
         ops.fail = Some("setresuid");
-        let err = drop_privileges("qeminga", &ops).unwrap_err();
+        let err = drop_privileges("qeminga", &ops, &Authority::full()).unwrap_err();
         assert_eq!(
             err,
             PrivilegeError::Step {
@@ -507,7 +563,7 @@ mod tests {
                 uid: Uid::from_raw(65534),
                 gid: Gid::from_raw(65534),
             };
-            drop_privileges_to(account, &SystemCaps).expect("drop");
+            drop_privileges_to(account, &SystemCaps, &Authority::full()).expect("drop");
             let report = |cset: CapSet| {
                 let mut v: Vec<String> = caps::read(None, cset)
                     .unwrap()

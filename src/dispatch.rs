@@ -580,6 +580,14 @@ impl Dispatcher {
             "guest-suspend-ram" if !config.suspend_ram_enabled() => {
                 Err(Error::Disabled(method.to_owned()))
             }
+            "guest-shutdown" if !config.shutdown_enabled() => {
+                Err(Error::Disabled(method.to_owned()))
+            }
+            "guest-get-osinfo" | "guest-network-get-interfaces" | "guest-get-fsinfo"
+                if !config.information_enabled() =>
+            {
+                Err(Error::Disabled(method.to_owned()))
+            }
             _ => Ok(()),
         }
     }
@@ -1056,6 +1064,78 @@ mod tests {
             error_desc(&reply),
             "command guest-suspend-ram has been disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them()
+     {
+        // #43 §5: with shutdown, information and trim off, those commands
+        // answer `CommandNotFound` "has been disabled" (C-2) without a
+        // handler running or a kernel call, in every state, and freeze,
+        // thaw, status and the controls keep working. The profile comes
+        // from the configuration the daemon was started with; no request
+        // changes it.
+        let config =
+            Config::parse("[features]\nshutdown = false\ninformation = false\nfstrim = false\n")
+                .unwrap();
+        let h = Harness::new(FreezeState::Thawed, config);
+        for method in [
+            "guest-shutdown",
+            "guest-get-osinfo",
+            "guest-network-get-interfaces",
+            "guest-get-fsinfo",
+            "guest-fstrim",
+            "guest-suspend-ram",
+        ] {
+            let reply = h.execute(method).await;
+            assert_eq!(error_class(&reply), "CommandNotFound", "{method}: {reply}");
+            assert_eq!(
+                error_desc(&reply),
+                format!("command {method} has been disabled"),
+                "{method}"
+            );
+        }
+        assert_eq!(h.ctx().handler_calls(), 0, "no handler ran");
+        let kernel = h.ctx().kernel.clone();
+        let _ = kernel;
+        let ping = h.execute("guest-ping").await;
+        assert_eq!(ping["return"], serde_json::json!({}));
+        let status = h.execute("guest-fsfreeze-status").await;
+        assert_eq!(status["return"], "thawed");
+        let frozen = h.execute("guest-fsfreeze-freeze").await;
+        assert_eq!(frozen["return"], 2, "{frozen}");
+        let reply = h.execute("guest-shutdown").await;
+        assert_eq!(
+            error_class(&reply),
+            "CommandNotFound",
+            "disabled beats the frozen gate (C-7)"
+        );
+        let thawed = h.execute("guest-fsfreeze-thaw").await;
+        assert_eq!(thawed["return"], 2, "{thawed}");
+        let records = h.audit_records();
+        assert!(
+            records
+                .iter()
+                .filter(|r| r["reason"] == reason::DISABLED)
+                .count()
+                >= 7,
+            "{records:?}"
+        );
+        // The capability list says the same.
+        let info = h.execute("guest-info").await;
+        for e in info["return"]["supported_commands"].as_array().unwrap() {
+            let name = e["name"].as_str().unwrap();
+            let optional = matches!(
+                name,
+                "guest-shutdown"
+                    | "guest-get-osinfo"
+                    | "guest-network-get-interfaces"
+                    | "guest-get-fsinfo"
+                    | "guest-fstrim"
+                    | "guest-suspend-ram"
+            );
+            assert_eq!(e["enabled"], !optional, "{name}");
+        }
     }
 
     #[tokio::test]

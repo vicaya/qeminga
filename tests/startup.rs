@@ -34,6 +34,15 @@ fn fixture(name: &str) -> String {
     .unwrap()
 }
 
+fn fixture_config(name: &str) -> String {
+    std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/config")
+            .join(name),
+    )
+    .unwrap()
+}
+
 /// A tmpfs-backed directory for markers (never covered by a freeze plan).
 fn shm_dir() -> tempfile::TempDir {
     tempfile::Builder::new()
@@ -257,6 +266,20 @@ fn freezable_state_path_is_rejected_before_opening_channel() {
         "marker /run/qeminga/frozen"
     );
     std::fs::create_dir(&gone).unwrap();
+}
+
+#[test]
+fn a_configuration_without_the_operation_timeout_and_a_short_cap_starts() {
+    // Written before `fsfreeze_operation_timeout_secs` existed: the
+    // deadline is derived under the cap instead of failing startup.
+    let mut startup = FakeStartup::new();
+    startup.config = fixture_config("legacy_short_cap.toml");
+    daemon::run_with(&Options::default(), &startup).unwrap();
+    assert!(
+        startup.steps().last().unwrap().starts_with("runtime"),
+        "{:?}",
+        startup.steps()
+    );
 }
 
 #[test]

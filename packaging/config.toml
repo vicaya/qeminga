@@ -5,7 +5,7 @@ log_level               = "info"   # trace | debug | info | warn | error
 state_path              = "/run/qeminga/frozen"
 fsfreeze_idle_timeout_secs = 30    # auto-thaw if no guest-fsfreeze-status heartbeat received
 fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriving
-fsfreeze_operation_timeout_secs = 60 # a freeze walk still in FIFREEZE after this long is aborted and its frozen targets thawed
+# fsfreeze_operation_timeout_secs = 60  # freeze-walk deadline; omitted: min(60, fsfreeze_max_timeout_secs)
 
 [rate_limits]
 ping_sync_per_min          = 120

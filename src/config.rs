@@ -55,9 +55,26 @@ pub struct AgentConfig {
     /// Deadline of a freeze operation in seconds, measured from the moment
     /// the request enters `Freezing` (§4.4): a walk still inside `FIFREEZE`
     /// after this long is aborted, the targets frozen so far are thawed,
-    /// and the request fails. Heartbeats do not extend it. At most
-    /// `fsfreeze_max_timeout_secs`.
-    pub fsfreeze_operation_timeout_secs: u64,
+    /// and the request fails. Heartbeats do not extend it. An explicit
+    /// value must be positive, at most a day and at most
+    /// `fsfreeze_max_timeout_secs`; when omitted the effective value is
+    /// `min(DEFAULT_FSFREEZE_OPERATION_TIMEOUT_SECS, fsfreeze_max_timeout_secs)`
+    /// (see [`AgentConfig::fsfreeze_operation_timeout_secs`]), so a
+    /// configuration written before the key existed keeps starting.
+    pub fsfreeze_operation_timeout_secs: Option<u64>,
+}
+
+/// The freeze operation deadline applied when
+/// `fsfreeze_operation_timeout_secs` is omitted, capped by the hard cap.
+pub const DEFAULT_FSFREEZE_OPERATION_TIMEOUT_SECS: u64 = 60;
+
+impl AgentConfig {
+    /// The effective freeze operation deadline in seconds: the explicit
+    /// value, or `min(60, fsfreeze_max_timeout_secs)` when omitted.
+    pub fn fsfreeze_operation_timeout_secs(&self) -> u64 {
+        self.fsfreeze_operation_timeout_secs
+            .unwrap_or(DEFAULT_FSFREEZE_OPERATION_TIMEOUT_SECS.min(self.fsfreeze_max_timeout_secs))
+    }
 }
 
 impl Default for AgentConfig {
@@ -69,7 +86,7 @@ impl Default for AgentConfig {
             state_path: PathBuf::from("/run/qeminga/frozen"),
             fsfreeze_idle_timeout_secs: 30,
             fsfreeze_max_timeout_secs: 300,
-            fsfreeze_operation_timeout_secs: 60,
+            fsfreeze_operation_timeout_secs: None,
         }
     }
 }
@@ -279,7 +296,7 @@ impl Config {
                 "must be greater than zero",
             ));
         }
-        if agent.fsfreeze_operation_timeout_secs == 0 {
+        if agent.fsfreeze_operation_timeout_secs == Some(0) {
             return Err(invalid(
                 "agent.fsfreeze_operation_timeout_secs",
                 "must be greater than zero",
@@ -296,7 +313,7 @@ impl Config {
             ),
             (
                 "agent.fsfreeze_operation_timeout_secs",
-                agent.fsfreeze_operation_timeout_secs,
+                agent.fsfreeze_operation_timeout_secs.unwrap_or(0),
             ),
         ] {
             if value > MAX_FSFREEZE_TIMEOUT_SECS {
@@ -315,7 +332,9 @@ impl Config {
                 ),
             ));
         }
-        if agent.fsfreeze_operation_timeout_secs > agent.fsfreeze_max_timeout_secs {
+        // Only an explicit value is judged against the cap: an omitted one
+        // is derived under it.
+        if agent.fsfreeze_operation_timeout_secs.unwrap_or(0) > agent.fsfreeze_max_timeout_secs {
             return Err(invalid(
                 "agent.fsfreeze_operation_timeout_secs",
                 format!(
@@ -421,7 +440,8 @@ mod tests {
         assert_eq!(config.agent.state_path, Path::new("/run/qeminga/frozen"));
         assert_eq!(config.agent.fsfreeze_idle_timeout_secs, 30);
         assert_eq!(config.agent.fsfreeze_max_timeout_secs, 300);
-        assert_eq!(config.agent.fsfreeze_operation_timeout_secs, 60);
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs, None);
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 60);
         assert_eq!(config.rate_limits.ping_sync_per_min, 120);
         assert_eq!(config.rate_limits.get_commands_per_min, 30);
         assert_eq!(config.rate_limits.fsfreeze_freeze_per_min, 10);
@@ -578,10 +598,10 @@ mod tests {
             "{err}"
         );
         let mut config = Config::default();
-        config.agent.fsfreeze_operation_timeout_secs = 0;
+        config.agent.fsfreeze_operation_timeout_secs = Some(0);
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("greater than zero"), "{err}");
-        config.agent.fsfreeze_operation_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS + 1;
+        config.agent.fsfreeze_operation_timeout_secs = Some(MAX_FSFREEZE_TIMEOUT_SECS + 1);
         config.agent.fsfreeze_max_timeout_secs = MAX_FSFREEZE_TIMEOUT_SECS;
         let err = config.validate().unwrap_err();
         assert!(err.to_string().contains("one day"), "{err}");
@@ -590,7 +610,37 @@ mod tests {
             "[agent]\nfsfreeze_idle_timeout_secs = 10\nfsfreeze_max_timeout_secs = 10\nfsfreeze_operation_timeout_secs = 10\n",
         )
         .unwrap();
-        assert_eq!(config.agent.fsfreeze_operation_timeout_secs, 10);
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs, Some(10));
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 10);
+    }
+
+    #[test]
+    fn an_omitted_operation_timeout_is_derived_under_the_hard_cap() {
+        // A configuration written before the key existed, with a short
+        // cap, keeps starting: the effective deadline is min(60, cap).
+        let config = Config::parse(&fixture("legacy_short_cap.toml")).unwrap();
+        assert_eq!(config.agent.fsfreeze_max_timeout_secs, 5);
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs, None);
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 5);
+        // A cap above the default leaves the default.
+        let config = Config::parse("[agent]\nfsfreeze_max_timeout_secs = 600\n").unwrap();
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 60);
+        // An explicit value is never clamped: above the cap is an error.
+        let err = Config::parse(
+            "[agent]\nfsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\nfsfreeze_operation_timeout_secs = 6\n",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("at most fsfreeze_max_timeout_secs (5)"),
+            "{err}"
+        );
+        // And a valid explicit value under a short cap is kept as given.
+        let config = Config::parse(
+            "[agent]\nfsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\nfsfreeze_operation_timeout_secs = 3\n",
+        )
+        .unwrap();
+        assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 3);
     }
 
     #[test]

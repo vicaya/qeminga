@@ -159,7 +159,7 @@ impl Context {
         let kernel: Arc<dyn crate::kernel::KernelOps> =
             Arc::new(crate::kernel::fake::FakeKernel::new());
         let freeze_operation_timeout =
-            std::time::Duration::from_secs(config.agent.fsfreeze_operation_timeout_secs);
+            std::time::Duration::from_secs(config.agent.fsfreeze_operation_timeout_secs());
         Context {
             config,
             state,

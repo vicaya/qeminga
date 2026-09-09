@@ -87,6 +87,11 @@ pub struct SpawnOptions {
     /// Give the daemon a pipe as stderr instead of a file; the read end is
     /// returned by [`Agent::take_stderr_pipe`] (AC13).
     pub stderr_pipe: bool,
+    /// Start under the default (enforced) hardening: root, an enforcing
+    /// filter compiled in, the real kernel. Off by default: the harness
+    /// writes the development opt-out, which is what an unprivileged run
+    /// or a faked kernel needs (#43 §4).
+    pub enforce_hardening: bool,
     /// Leave a recovery marker in the state directory before the spawn,
     /// so the daemon starts in recovery mode (`Frozen`, the ring holding
     /// its records) without any ioctl: the way to a frozen agent that
@@ -102,6 +107,7 @@ impl Default for SpawnOptions {
             features_extra: String::new(),
             state_dir: None,
             stderr_pipe: false,
+            enforce_hardening: false,
             recovery_marker: false,
         }
     }
@@ -204,9 +210,14 @@ impl Agent {
         std::fs::write(
             &config_path,
             format!(
-                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}\n[features]\nseccomp = true\n{}\n",
+                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}\n[features]\nseccomp = true\n{}\n",
                 link.display(),
                 dir.path().join("frozen").display(),
+                if opts.enforce_hardening {
+                    ""
+                } else {
+                    "hardening = \"unenforced-development-only\"\n"
+                },
                 opts.agent_extra,
                 opts.features_extra
             ),

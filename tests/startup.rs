@@ -15,7 +15,7 @@ use nix::errno::Errno;
 use qeminga::audit::{Mode, Router};
 use qeminga::channel::{Channel, OpenError, OpenFn};
 use qeminga::config::{Config, ConfigError, LogLevel};
-use qeminga::daemon::{self, EX_CONFIG, EX_UNAVAILABLE, Options, RunError, Startup};
+use qeminga::daemon::{self, BuildProfile, EX_CONFIG, EX_UNAVAILABLE, Options, RunError, Startup};
 use qeminga::dispatch::Context;
 use qeminga::kernel::caps::{Outcome, PrivilegeError};
 use qeminga::kernel::fake::FakeKernel;
@@ -124,7 +124,20 @@ struct FakeStartup {
     /// The router `init_logging` hands out (over `sink`, possibly slow),
     /// so a test can subscribe the thread to it and read the sink.
     router: Router,
+    /// What the fake build can enforce (a full production build unless a
+    /// test says otherwise).
+    build: BuildProfile,
+    /// Whether the fake capability drop ran (root) or was skipped.
+    root: bool,
+    /// Whether the fake filter installs.
+    filter_installs: bool,
 }
+
+/// The `[agent]` lines every fake configuration starts with: the
+/// development opt-out, since the fake startup is not root and most of
+/// these tests are about the sequence, not the sandbox.
+const DEV_AGENT: &str =
+    "[agent]\nstate_path = \"/run/qeminga/frozen\"\nhardening = \"unenforced-development-only\"\n";
 
 impl FakeStartup {
     fn new() -> Self {
@@ -135,13 +148,20 @@ impl FakeStartup {
     fn over(sink: SharedSink, writer: Box<dyn Write + Send>) -> Self {
         FakeStartup {
             steps: RefCell::new(Vec::new()),
-            config: "[agent]\nstate_path = \"/run/qeminga/frozen\"\n".to_owned(),
+            config: DEV_AGENT.to_owned(),
             marker: false,
             dir: shm_dir(),
             mountinfo: fixture("tmpfs_and_nfs.txt"),
             open: Ok(()),
             sink,
             router: Router::new(writer),
+            build: BuildProfile {
+                seccomp_compiled: true,
+                seccomp_mode: "enforce",
+                fake_kernel_requested: false,
+            },
+            root: false,
+            filter_installs: true,
         }
     }
     /// A fake whose sink takes `delay` over its first write.
@@ -174,6 +194,15 @@ impl FakeStartup {
             || daemon::run_with(&Options::default(), self),
         )
     }
+
+    /// A fake production host: root, a full build, the default
+    /// (enforced) configuration.
+    fn production() -> Self {
+        let mut startup = Self::new();
+        startup.config = "[agent]\nstate_path = \"/run/qeminga/frozen\"\n".to_owned();
+        startup.root = true;
+        startup
+    }
     fn log(&self, s: impl Into<String>) {
         self.steps.borrow_mut().push(s.into());
     }
@@ -186,6 +215,9 @@ impl Startup for FakeStartup {
     fn load_config(&self, path: &Path) -> Result<Config, ConfigError> {
         self.log(format!("config {}", path.display()));
         Config::parse(&self.config)
+    }
+    fn build_profile(&self) -> BuildProfile {
+        self.build
     }
     fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
         self.log(format!("marker {}", path.display()));
@@ -232,7 +264,11 @@ impl Startup for FakeStartup {
     }
     fn drop_privileges(&self) -> Result<Outcome, PrivilegeError> {
         self.log("caps");
-        Ok(Outcome::SkippedUnprivileged)
+        Ok(if self.root {
+            Outcome::Dropped
+        } else {
+            Outcome::SkippedUnprivileged
+        })
     }
     fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
         self.log("audit writer");
@@ -242,7 +278,9 @@ impl Startup for FakeStartup {
     }
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError> {
         self.log(format!("seccomp enabled={}", config.features.seccomp));
-        Ok(false)
+        // The fake models a full build: installed iff enabled (and the
+        // fake installer is not scripted to fail).
+        Ok(config.features.seccomp && self.filter_installs)
     }
     fn serve(
         &self,
@@ -379,7 +417,7 @@ fn freezable_state_path_is_rejected_before_opening_channel() {
     // tmpfs: `/var/lib/qeminga/frozen` with the default fixture (where the
     // fake's tmpfs device is not planned) passes, prefix or no prefix.
     let mut startup = FakeStartup::new();
-    startup.config = "[agent]\nstate_path = \"/var/lib/qeminga/frozen\"\n".to_owned();
+    startup.config = "[agent]\nstate_path = \"/var/lib/qeminga/frozen\"\nhardening = \"unenforced-development-only\"\n".to_owned();
     daemon::run_with(&Options::default(), &startup).unwrap();
     // A marker directory that cannot be opened stops the sequence at step
     // 2 with EX_CONFIG.
@@ -401,7 +439,7 @@ fn freezable_state_path_is_rejected_before_opening_channel() {
 fn a_configuration_without_the_operation_timeout_and_a_short_cap_starts() {
     // Written before `fsfreeze_operation_timeout_secs` existed: the
     // deadline is derived under the cap instead of failing startup.
-    let mut startup = FakeStartup::new();
+    let mut startup = FakeStartup::production();
     startup.config = fixture_config("legacy_short_cap.toml");
     daemon::run_with(&Options::default(), &startup).unwrap();
     assert!(
@@ -409,6 +447,90 @@ fn a_configuration_without_the_operation_timeout_and_a_short_cap_starts() {
         "{:?}",
         startup.steps()
     );
+}
+
+fn hardening_refusal(startup: &FakeStartup) -> String {
+    let err = daemon::run_with(&Options::default(), startup).unwrap_err();
+    assert!(matches!(err, RunError::Hardening(_)), "{err}");
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    let text = err.to_string();
+    assert!(text.contains("refusing to serve the host"), "{text}");
+    assert!(text.contains("unenforced-development-only"), "{text}");
+    text
+}
+
+#[test]
+fn enforced_hardening_refuses_what_the_build_cannot_enforce_before_the_marker_is_touched() {
+    // #43 §4: a production configuration (the default) on a binary
+    // without the filter, or with a logging filter, or asked to fake the
+    // kernel, never gets past step 1: no marker opened, no logging, no
+    // channel, and a marker of a previous instance is left as it was.
+    for (what, build) in [
+        (
+            "without the `seccomp` Cargo feature",
+            BuildProfile {
+                seccomp_compiled: false,
+                seccomp_mode: "unavailable",
+                fake_kernel_requested: false,
+            },
+        ),
+        (
+            "would only log",
+            BuildProfile {
+                seccomp_compiled: true,
+                seccomp_mode: "log",
+                fake_kernel_requested: false,
+            },
+        ),
+        (
+            "test-kernel substitution",
+            BuildProfile {
+                seccomp_compiled: true,
+                seccomp_mode: "enforce",
+                fake_kernel_requested: true,
+            },
+        ),
+    ] {
+        let mut startup = FakeStartup::production();
+        startup.build = build;
+        startup.marker = true;
+        let marker_path = startup.dir.path().join("frozen");
+        std::fs::write(&marker_path, b"").unwrap();
+        let text = hardening_refusal(&startup);
+        assert!(text.contains(what), "{text}");
+        assert_eq!(startup.steps(), ["config /etc/qeminga/config.toml"]);
+        assert!(marker_path.exists(), "the recovery marker is untouched");
+    }
+    // The same builds serve a development host (the warning they get is
+    // observed on the real binary in `feature_warnings_are_logged_once_at_startup`).
+    let mut startup = FakeStartup::new();
+    startup.build = BuildProfile {
+        seccomp_compiled: false,
+        seccomp_mode: "unavailable",
+        fake_kernel_requested: true,
+    };
+    daemon::run_with(&Options::default(), &startup).unwrap();
+    assert!(startup.steps().last().unwrap().starts_with("runtime"));
+}
+
+#[test]
+fn enforced_hardening_refuses_a_start_whose_sandbox_did_not_come_up() {
+    // Steps 5 and 6: not root (the capability drop cannot run) and a
+    // filter that did not install are refusals too, before the runtime.
+    let mut startup = FakeStartup::production();
+    startup.root = false;
+    let text = hardening_refusal(&startup);
+    assert!(text.contains("not started as root"), "{text}");
+    assert!(!startup.steps().iter().any(|s| s.starts_with("runtime")));
+    let mut startup = FakeStartup::production();
+    startup.filter_installs = false;
+    let text = hardening_refusal(&startup);
+    assert!(text.contains("not installed"), "{text}");
+    assert!(!startup.steps().iter().any(|s| s.starts_with("runtime")));
+    // And a production host that has everything serves.
+    let startup = FakeStartup::production();
+    daemon::run_with(&Options::default(), &startup).unwrap();
+    assert!(startup.steps().last().unwrap().starts_with("runtime"));
 }
 
 #[test]
@@ -463,10 +585,13 @@ fn feature_warnings_are_logged_once_at_startup() {
     // Observed on the real binary's stderr (its global subscriber), which is
     // deterministic; scoped test subscribers race with each other under
     // parallel tests.
-    let expected = Config::parse("[features]\nseccomp = true\nsuspend_ram = true\n")
-        .unwrap()
-        .warnings()
-        .len();
+    let expected = Config::parse(
+        "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = true\nsuspend_ram = true\n",
+    )
+    .unwrap()
+    .warnings()
+    .len();
+    assert!(expected >= 1, "the opt-out itself is warned about");
     let (stderr, status) = run_binary_over_pty("seccomp = true\nsuspend_ram = true\n");
     assert!(status.success(), "{status}: {stderr}");
     assert_eq!(
@@ -986,6 +1111,21 @@ fn runtime_is_multi_thread_with_at_least_two_workers() {
 /// `[features]` section: one ping round trip, then SIGTERM. Returns the
 /// daemon's stderr and exit status.
 fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus) {
+    run_binary_over_pty_with(
+        "hardening = \"unenforced-development-only\"\n",
+        features_toml,
+        true,
+    )
+}
+
+/// As [`run_binary_over_pty`], with `agent_toml` appended to `[agent]`;
+/// with `expect_reply` false the daemon is expected to exit on its own
+/// without serving, and its status and stderr are returned.
+fn run_binary_over_pty_with(
+    agent_toml: &str,
+    features_toml: &str,
+    expect_reply: bool,
+) -> (String, std::process::ExitStatus) {
     use nix::fcntl::OFlag;
     // As in tests/e2e/mod.rs: root without the service account cannot run
     // the daemon (exit 77); say so once instead of failing obscurely.
@@ -1026,17 +1166,23 @@ fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus
     std::fs::write(
         &config_path,
         format!(
-            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n[features]\n{features_toml}\n",
+            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{agent_toml}[features]\n{features_toml}\n",
             dir.path().join("frozen").display()
         ),
     )
     .unwrap();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_qeminga"))
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_qeminga"));
+    command
         .arg("--config")
         .arg(&config_path)
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+        .env_remove("QEMINGA_TEST_FAKE_KERNEL")
+        .stderr(std::process::Stdio::piped());
+    ENV_OVERRIDE.with(|cell| {
+        if let Some((name, value)) = cell.borrow().as_ref() {
+            command.env(name, value);
+        }
+    });
+    let mut child = command.spawn().unwrap();
     let master: OwnedFd = master.into();
     let flags = nix::fcntl::fcntl(master.as_fd(), nix::fcntl::FcntlArg::F_GETFL).unwrap();
     nix::fcntl::fcntl(
@@ -1046,6 +1192,14 @@ fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus
     .unwrap();
     let mut master_file = std::fs::File::from(master);
     use std::io::Read;
+    if !expect_reply {
+        let output = child.wait_with_output().unwrap();
+        drop(slave_holder);
+        return (
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status,
+        );
+    }
     master_file
         .write_all(b"{\"execute\":\"guest-ping\",\"id\":1}\n")
         .unwrap();
@@ -1085,6 +1239,89 @@ fn run_binary_over_pty(features_toml: &str) -> (String, std::process::ExitStatus
         String::from_utf8_lossy(&output.stderr).into_owned(),
         output.status,
     )
+}
+
+/// The real binary under the default (enforced) hardening: it serves
+/// only as root with an enforcing filter compiled in and no test-kernel
+/// request; anything else exits 78 before the marker is touched, and says
+/// what was missing (#43 §4).
+#[test]
+fn the_binary_refuses_enforced_hardening_it_cannot_provide() {
+    let root = nix::unistd::geteuid().is_root();
+    let enforcing = cfg!(feature = "seccomp") && daemon::seccomp_mode() == "enforce";
+    if root && enforcing {
+        // A full production start; the fake-kernel request alone is
+        // refused (test-fakes builds honour the variable only under the
+        // development opt-out; other builds refuse it all the same).
+        let (stderr, status) = run_binary_over_pty_with("", "seccomp = true\n", true);
+        assert!(status.success(), "{status}: {stderr}");
+        assert!(
+            stderr.contains("\"event\":\"privileges_dropped\""),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("\"installed\":true,\"mode\":\"enforce\""),
+            "{stderr}"
+        );
+    }
+    let (stderr, status) = {
+        // The variable is what production_context would act on; set for
+        // the child only.
+        let saved = std::env::var_os("QEMINGA_TEST_FAKE_KERNEL");
+        // SAFETY-free: the harness spawns the child with the parent's
+        // environment, so set it around the spawn.
+        unsafe_free_setenv("QEMINGA_TEST_FAKE_KERNEL", Some("1"));
+        let out = run_binary_over_pty_with("", "seccomp = true\n", false);
+        unsafe_free_setenv(
+            "QEMINGA_TEST_FAKE_KERNEL",
+            saved.as_deref().and_then(|s| s.to_str()),
+        );
+        out
+    };
+    assert_eq!(status.code(), Some(i32::from(EX_CONFIG)), "{stderr}");
+    assert!(stderr.contains("refusing to serve the host"), "{stderr}");
+    let expected = if !cfg!(feature = "seccomp") {
+        "without the `seccomp` Cargo feature"
+    } else if daemon::seccomp_mode() != "enforce" {
+        "would only log"
+    } else {
+        "QEMINGA_TEST_FAKE_KERNEL is set"
+    };
+    assert!(
+        stderr.contains(expected),
+        "expected {expected:?} in {stderr}"
+    );
+    assert!(
+        !stderr.contains("\"event\":\"startup\""),
+        "refused before logging: {stderr}"
+    );
+    // A disabled filter is a configuration error under the default.
+    let (stderr, status) = run_binary_over_pty_with("", "seccomp = false\n", false);
+    assert_eq!(status.code(), Some(i32::from(EX_CONFIG)), "{stderr}");
+    assert!(stderr.contains("features.seccomp"), "{stderr}");
+    // Unprivileged, or a build that cannot enforce: refused as such.
+    if !(root && enforcing) {
+        let (stderr, status) = run_binary_over_pty_with("", "seccomp = true\n", false);
+        assert_eq!(status.code(), Some(i32::from(EX_CONFIG)), "{stderr}");
+        assert!(stderr.contains("refusing to serve the host"), "{stderr}");
+    }
+}
+
+/// Sets or removes a process environment variable for the tests' child
+/// processes. Tests in this file run in one process, so the variable is
+/// visible to concurrently spawned children for the duration; the only
+/// other spawn here reads it through `production_context`, which the
+/// development opt-out ignores.
+fn unsafe_free_setenv(name: &str, value: Option<&str>) {
+    // `std::env::set_var` is unsafe in edition 2024; the harness uses a
+    // per-child override instead, so this helper only records the intent.
+    ENV_OVERRIDE.with(|cell| {
+        *cell.borrow_mut() = value.map(|v| (name.to_owned(), v.to_owned()));
+    });
+}
+
+thread_local! {
+    static ENV_OVERRIDE: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 }
 
 /// The real binary, unprivileged config, pty channel: ping round trip, then

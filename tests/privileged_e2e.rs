@@ -76,10 +76,15 @@ impl Drop for ThawGuard {
     }
 }
 
+/// The real kernel, and the default (enforced) hardening whenever this
+/// build can provide it: the enforced privileged run therefore proves
+/// the production profile end to end, while the `seccomp-log`
+/// compatibility run opts out, as a development host must (#43 §4).
 fn real_kernel(agent_extra: &str) -> SpawnOptions {
     SpawnOptions {
         fake_kernel: false,
         agent_extra: agent_extra.to_owned(),
+        enforce_hardening: qeminga::daemon::seccomp_mode() == "enforce",
         ..SpawnOptions::default()
     }
 }

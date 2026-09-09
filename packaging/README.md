@@ -13,7 +13,9 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 
 The binary itself goes to `/usr/bin/qeminga`. Build releases with
 `cargo build --release --locked --features seccomp` (never
-`--all-features`, which includes the test-only `test-fakes` feature).
+`--all-features`: the test-only `test-fakes` feature is a compile error
+in a release build, and `seccomp-log` would fail the enforced hardening
+check at startup).
 
 ## Migration from qemu-guest-agent
 
@@ -60,6 +62,30 @@ waiting for the thaw. `tests/packaging.rs` checks the shipped pair.
 `fsfreeze_operation_timeout_secs` (the freeze walk's own deadline, §4.4)
 is validated to be at most the cap, so it never needs a margin of its
 own.
+
+## Hardening profile and a failed upgrade or configuration
+
+The shipped configuration says `hardening = "enforced"` (design §8.1):
+the daemon refuses to serve the host, exit status 78 and one line in the
+journal (`refusing to serve the host`), unless it was started as root,
+the seccomp filter is compiled in, enabled and installed in its enforcing
+mode, and no test-kernel substitution was requested. `Restart=always`
+then restarts it every second, refusing each time, until the cause is
+fixed; it never falls back to serving without the sandbox. Typical causes
+after an upgrade: a binary built without `--features seccomp` (or with
+`--all-features`, which adds the logging filter), `[features] seccomp =
+false` left in the configuration, or a stray `QEMINGA_TEST_FAKE_KERNEL`
+in the unit's environment.
+
+The refusal happens before the recovery marker is touched. If the
+previous instance was frozen when it died, `/run/qeminga/frozen` is still
+there and the filesystems may still be frozen: fix the cause, then
+`systemctl restart qeminga`; the start that can provide the profile
+enters recovery mode from the marker and thaws (§4.4). Do not remove the
+marker by hand, and do not set `hardening = "unenforced-development-only"`
+to get past the refusal on a production host: that value is for a
+development machine only, where it allows an unprivileged start, a
+missing or logging filter and the faked kernel, with warnings.
 
 ## Recovery marker
 

@@ -332,6 +332,13 @@ fn sh(program: &str, args: &[&str]) -> (bool, String) {
 /// variable and drains with real FITHAWs, which answer EINVAL on an
 /// unfrozen host) and a short stop timeout.
 fn install_unit(channel_path: &str) -> Option<InstalledUnit> {
+    install_unit_with(channel_path, false)
+}
+
+/// As [`install_unit`]; with `production` the shipped defaults apply
+/// (enforced hardening, the real kernel, no drop-in environment), which
+/// is the profile a distributed artifact runs under.
+fn install_unit_with(channel_path: &str, production: bool) -> Option<InstalledUnit> {
     assert!(nix::unistd::geteuid().is_root(), "run as root");
     // A container without systemd cannot run this; CI's privileged job
     // sets QEMINGA_REQUIRE_SYSTEMD so the check can never pass vacuously.
@@ -366,9 +373,16 @@ fn install_unit(channel_path: &str) -> Option<InstalledUnit> {
     );
     assert!(ok, "{text}");
     std::fs::create_dir_all("/etc/qeminga").unwrap();
+    let hardening = if production {
+        ""
+    } else {
+        "hardening = \"unenforced-development-only\"\n"
+    };
     std::fs::write(
         InstalledUnit::CONFIG,
-        format!("[agent]\nchannel_path = \"{channel_path}\"\nfsfreeze_idle_timeout_secs = 1\n"),
+        format!(
+            "[agent]\nchannel_path = \"{channel_path}\"\nfsfreeze_idle_timeout_secs = 1\n{hardening}"
+        ),
     )
     .unwrap();
     std::fs::copy(
@@ -377,9 +391,14 @@ fn install_unit(channel_path: &str) -> Option<InstalledUnit> {
     )
     .unwrap();
     std::fs::create_dir_all(InstalledUnit::DROPIN_DIR).unwrap();
+    let dropin = if production {
+        "[Service]\nTimeoutStopSec=15s\n"
+    } else {
+        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\nTimeoutStopSec=15s\n"
+    };
     std::fs::write(
         Path::new(InstalledUnit::DROPIN_DIR).join("50-test.conf"),
-        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\nTimeoutStopSec=15s\n",
+        dropin,
     )
     .unwrap();
     let (ok, text) = sh("systemctl", &["daemon-reload"]);
@@ -653,5 +672,121 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
     assert!(ok, "systemctl stop: {text}");
     let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
     assert_ne!(active.trim(), "active");
+    drop(installed);
+}
+
+/// The installed artifact under the shipped defaults (enforced
+/// hardening, real kernel): the daemon's effective capabilities,
+/// no-new-privileges, seccomp mode, a prohibited operation and a real
+/// freeze/thaw on the loop ext4 all match the advertised profile, and a
+/// test-kernel request is refused with the marker left alone (#43 §4).
+/// Under the `seccomp-log` compatibility build the same start is refused
+/// outright, which is the negative half of the same property.
+#[test]
+#[ignore = "needs root, a running systemd and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_installed_unit_matches_the_advertised_profile() {
+    use std::io::Write;
+    let mount = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
+        .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup");
+    let mut pty = PtyChannel::open();
+    let Some(installed) = install_unit_with(&pty.slave_path, true) else {
+        return;
+    };
+    let _ = std::fs::remove_file("/run/qeminga/frozen");
+    let journal = || {
+        sh(
+            "journalctl",
+            &[
+                "-u",
+                "qeminga.service",
+                "--no-pager",
+                "-o",
+                "cat",
+                "--since",
+                "-2min",
+            ],
+        )
+        .1
+    };
+    let refused = |what: &str| {
+        let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+        assert!(!ok, "{what}: the start must be refused: {text}");
+        let (_, result) = sh(
+            "systemctl",
+            &["show", "-p", "ExecMainStatus", "--value", "qeminga.service"],
+        );
+        assert_eq!(result.trim(), "78", "{what}: EX_CONFIG:\n{}", journal());
+        assert!(
+            journal().contains("refusing to serve the host"),
+            "{what}: the refusal names itself:\n{}",
+            journal()
+        );
+        assert!(
+            !Path::new("/run/qeminga/frozen").exists(),
+            "{what}: a refusal touches no marker"
+        );
+        let _ = sh("systemctl", &["reset-failed", "qeminga.service"]);
+    };
+    if qeminga::daemon::seccomp_mode() != "enforce" {
+        // The compatibility build cannot provide the profile: it says so
+        // and serves nothing.
+        refused("logging filter under enforced hardening");
+        drop(installed);
+        return;
+    }
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(ok, "systemctl start: {text}\n{}", journal());
+    assert_eq!(
+        pty.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#
+    );
+    let (_, pid) = sh(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", "qeminga.service"],
+    );
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.trim())).unwrap();
+    let field = |name: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing in {status}"))
+            .trim()
+            .to_owned()
+    };
+    // CAP_DAC_READ_SEARCH (2), CAP_SYS_ADMIN (21), CAP_SYS_BOOT (22).
+    const FINAL_CAPS: &str = "0000000000600004";
+    assert_eq!(field("CapEff:"), FINAL_CAPS, "effective set (AC3)");
+    assert_eq!(field("CapPrm:"), FINAL_CAPS, "permitted set (AC3)");
+    assert_eq!(field("CapBnd:"), FINAL_CAPS, "bounding set (AC3)");
+    assert_eq!(field("CapInh:"), "0000000000000000");
+    assert_eq!(field("CapAmb:"), "0000000000000000");
+    assert_eq!(field("NoNewPrivs:"), "1");
+    assert_eq!(field("Seccomp:"), "2", "SECCOMP_MODE_FILTER");
+    assert!(field("Uid:").starts_with("600\t600"), "{}", field("Uid:"));
+    // A prohibited operation is refused; a real freeze/thaw works.
+    let reply = pty.request(r#"{"execute":"guest-exec","arguments":{"path":"/bin/true"}}"#);
+    assert!(reply.contains("CommandNotFound"), "{reply}");
+    let reply = pty.request(&format!(
+        r#"{{"execute":"guest-fsfreeze-freeze-list","arguments":{{"mountpoints":["{mount}"]}}}}"#
+    ));
+    assert_eq!(reply, r#"{"return":1}"#, "freeze under the installed unit");
+    assert!(Path::new("/run/qeminga/frozen").exists());
+    let reply = pty.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
+    assert!(reply.starts_with(r#"{"return":"#), "{reply}");
+    assert!(!Path::new("/run/qeminga/frozen").exists());
+    std::fs::File::create(format!("{mount}/installed-unit-probe"))
+        .and_then(|mut f| f.write_all(b"ok"))
+        .expect("the loop filesystem is thawed");
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    // The distributed profile cannot be talked into faking the kernel.
+    std::fs::write(
+        Path::new(InstalledUnit::DROPIN_DIR).join("60-fake.conf"),
+        "[Service]\nEnvironment=QEMINGA_TEST_FAKE_KERNEL=1\n",
+    )
+    .unwrap();
+    let (ok, text) = sh("systemctl", &["daemon-reload"]);
+    assert!(ok, "{text}");
+    refused("test-kernel request under enforced hardening");
     drop(installed);
 }

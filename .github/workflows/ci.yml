@@ -194,6 +194,12 @@ jobs:
         run: rustup toolchain install && rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --features seccomp
+      - name: A release build cannot carry the test-kernel substitution (#43 §4)
+        run: |
+          if cargo build --release --locked --features seccomp,test-fakes 2>build.log; then
+            echo '::error::a release build with test-fakes compiled'; exit 1
+          fi
+          grep -q 'test-fakes. feature is for debug builds only' build.log
 
   # T5.3: the shipped unit, udev rule, sysusers entry and example config
   # are checked against the design by tests/packaging.rs; systemd-analyze

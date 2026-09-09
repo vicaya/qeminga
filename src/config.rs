@@ -52,6 +52,13 @@ pub struct AgentConfig {
     pub fsfreeze_idle_timeout_secs: u64,
     /// Hard cap on the freeze duration in seconds (§4.4).
     pub fsfreeze_max_timeout_secs: u64,
+    /// Whether the advertised sandbox is required (§8.1, #43 §4).
+    /// `Enforced` (the default) refuses to serve the host unless the
+    /// capability drop ran and the seccomp filter is compiled in, enabled
+    /// and installed in its enforcing mode, and refuses a test-kernel
+    /// substitution; `Development` allows all of those with warnings and
+    /// is never for production packaging.
+    pub hardening: Hardening,
     /// Deadline of a freeze operation in seconds, measured from the moment
     /// the request enters `Freezing` (§4.4): a walk still inside `FIFREEZE`
     /// after this long is aborted, the targets frozen so far are thawed,
@@ -62,6 +69,35 @@ pub struct AgentConfig {
     /// (see [`AgentConfig::fsfreeze_operation_timeout_secs`]), so a
     /// configuration written before the key existed keeps starting.
     pub fsfreeze_operation_timeout_secs: Option<u64>,
+}
+
+/// The hardening profile (`[agent] hardening`, §8.1). The opt-out is
+/// spelled so it cannot be mistaken for a production setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum Hardening {
+    /// Production: the sandbox is required, or the daemon does not serve.
+    #[default]
+    #[serde(rename = "enforced")]
+    Enforced,
+    /// A development host: a missing or logging filter, an unprivileged
+    /// start and a faked kernel are allowed and warned about.
+    #[serde(rename = "unenforced-development-only")]
+    Development,
+}
+
+impl Hardening {
+    /// The configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Hardening::Enforced => "enforced",
+            Hardening::Development => "unenforced-development-only",
+        }
+    }
+
+    /// `true` for [`Hardening::Enforced`].
+    pub const fn is_enforced(self) -> bool {
+        matches!(self, Hardening::Enforced)
+    }
 }
 
 /// The freeze operation deadline applied when
@@ -86,6 +122,7 @@ impl Default for AgentConfig {
             state_path: PathBuf::from("/run/qeminga/frozen"),
             fsfreeze_idle_timeout_secs: 30,
             fsfreeze_max_timeout_secs: 300,
+            hardening: Hardening::Enforced,
             fsfreeze_operation_timeout_secs: None,
         }
     }
@@ -290,6 +327,12 @@ impl Config {
                 ),
             ));
         }
+        if agent.hardening.is_enforced() && !self.features.seccomp {
+            return Err(invalid(
+                "features.seccomp",
+                "false is refused under agent.hardening = \"enforced\"; a development host must say hardening = \"unenforced-development-only\"",
+            ));
+        }
         if agent.fsfreeze_idle_timeout_secs == 0 {
             return Err(invalid(
                 "agent.fsfreeze_idle_timeout_secs",
@@ -373,10 +416,17 @@ impl Config {
         Ok(())
     }
 
-    /// Runtime switches that have no effect in this build (§8.1): a warning,
-    /// not an error.
+    /// Runtime switches that have no effect in this build (§8.1): a warning
+    /// under development hardening (under enforced hardening the missing
+    /// filter is a startup refusal instead, see `daemon::check_hardening`).
     pub fn warnings(&self) -> Vec<String> {
         let mut out = Vec::new();
+        if !self.agent.hardening.is_enforced() {
+            out.push(
+                "agent.hardening = \"unenforced-development-only\": the sandbox is not required; never for a production host"
+                    .to_owned(),
+            );
+        }
         if self.features.seccomp && !cfg!(feature = "seccomp") {
             out.push(
                 "features.seccomp = true has no effect: this binary was built without the `seccomp` Cargo feature"
@@ -440,6 +490,7 @@ mod tests {
         assert_eq!(config.agent.state_path, Path::new("/run/qeminga/frozen"));
         assert_eq!(config.agent.fsfreeze_idle_timeout_secs, 30);
         assert_eq!(config.agent.fsfreeze_max_timeout_secs, 300);
+        assert_eq!(config.agent.hardening, Hardening::Enforced);
         assert_eq!(config.agent.fsfreeze_operation_timeout_secs, None);
         assert_eq!(config.agent.fsfreeze_operation_timeout_secs(), 60);
         assert_eq!(config.rate_limits.ping_sync_per_min, 120);
@@ -692,10 +743,63 @@ mod tests {
     }
 
     #[test]
+    fn hardening_is_enforced_by_default_and_the_opt_out_is_unmistakable() {
+        // #43 §4: the default requires the sandbox; the only other value
+        // says what it is. A typo or any other spelling is a parse error,
+        // so a configuration never falls open by mistake.
+        assert!(Config::parse("").unwrap().agent.hardening.is_enforced());
+        let dev = Config::parse("[agent]\nhardening = \"unenforced-development-only\"\n").unwrap();
+        assert_eq!(dev.agent.hardening, Hardening::Development);
+        assert_eq!(dev.agent.hardening.as_str(), "unenforced-development-only");
+        assert!(
+            dev.warnings()
+                .iter()
+                .any(|w| w.contains("never for a production host")),
+            "{:?}",
+            dev.warnings()
+        );
+        assert_eq!(Hardening::Enforced.as_str(), "enforced");
+        for bad in ["development", "off", "false", "Enforced", "unenforced"] {
+            let err = Config::parse(&format!("[agent]\nhardening = \"{bad}\"\n")).unwrap_err();
+            assert!(matches!(err, ConfigError::Parse { .. }), "{bad}: {err}");
+            assert!(err.to_string().contains("hardening"), "{bad}: {err}");
+        }
+        assert!(Config::parse("[agent]\nhardening = true\n").is_err());
+    }
+
+    #[test]
+    fn a_disabled_filter_is_refused_under_enforced_hardening() {
+        let err = Config::parse("[features]\nseccomp = false\n").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid {
+                    key: "features.seccomp",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("unenforced-development-only"),
+            "{err}"
+        );
+        let err = parse_err("invalid_seccomp_off_enforced.toml");
+        assert!(err.to_string().contains("features.seccomp"), "{err}");
+        // The same file with the opt-out is accepted (and warned about).
+        let dev = Config::parse(
+            "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = false\n",
+        )
+        .unwrap();
+        assert!(!dev.seccomp_enabled());
+    }
+
+    #[test]
     fn runtime_feature_without_compile_feature_is_a_warning_not_an_error() {
-        let config =
-            Config::parse("[features]\nseccomp = true\nsuspend_ram = true\nfstrim = true\n")
-                .unwrap();
+        let config = Config::parse(
+            "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = true\nsuspend_ram = true\nfstrim = true\n",
+        )
+        .unwrap();
         let warnings = config.warnings();
         assert_eq!(
             warnings.iter().any(|w| w.contains("seccomp")),
@@ -708,9 +812,13 @@ mod tests {
             "{warnings:?}"
         );
         assert!(!warnings.iter().any(|w| w.contains("fstrim")));
-        // Switches that are off never warn.
-        let off = Config::parse("[features]\nseccomp = false\nsuspend_ram = false\n").unwrap();
-        assert!(off.warnings().is_empty());
+        // Switches that are off never warn (the opt-out itself does).
+        let off = Config::parse(
+            "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = false\nsuspend_ram = false\n",
+        )
+        .unwrap();
+        assert_eq!(off.warnings().len(), 1, "{:?}", off.warnings());
+        assert!(off.warnings()[0].contains("hardening"));
     }
 
     #[test]
@@ -720,9 +828,10 @@ mod tests {
         assert!(on.fstrim_enabled());
         assert_eq!(on.suspend_ram_enabled(), cfg!(feature = "suspend_ram"));
         assert_eq!(on.seccomp_enabled(), cfg!(feature = "seccomp"));
-        let off =
-            Config::parse("[features]\nseccomp = false\nsuspend_ram = false\nfstrim = false\n")
-                .unwrap();
+        let off = Config::parse(
+            "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = false\nsuspend_ram = false\nfstrim = false\n",
+        )
+        .unwrap();
         assert!(!off.fstrim_enabled());
         assert!(!off.suspend_ram_enabled());
         assert!(!off.seccomp_enabled());

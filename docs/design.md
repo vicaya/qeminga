@@ -379,9 +379,9 @@ Capability sets and the bounding set are per thread, and the drop establishes th
 
 > **Important:** `CAP_SYS_ADMIN` is close to retaining root. It covers `mount`, `pivot_root`, `setns`, `bpf` on older kernels, and ioctls across a wide range of kernel subsystems. Running as UID 600 is defence in depth, but G6's "non-root where possible" should not be read as meaningful privilege reduction while `CAP_SYS_ADMIN` is held. The effective narrowing boundary is the seccomp filter (§5.5), not the capability drop.
 
-### 5.5 Seccomp Filter (optional, recommended)
+### 5.5 Seccomp Filter (required under enforced hardening)
 
-When the `seccomp` Cargo feature is compiled in **and** `[features] seccomp = true` is set in `config.toml`, qeminga installs a `SECCOMP_MODE_FILTER` policy at startup.
+When the `seccomp` Cargo feature is compiled in **and** `[features] seccomp = true` is set in `config.toml`, qeminga installs a `SECCOMP_MODE_FILTER` policy at startup. Under the default hardening profile (§8.1) both are required and the installation must succeed in the enforcing mode, or the daemon does not serve the host.
 
 The policy is generated as a separate, target-specific profile for `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`; it is not one hand-maintained list of syscall spellings. Shared logical operations resolve to syscall numbers valid on the target. In particular, portable profiles use `openat`, `newfstatat`/`statx`, `ppoll`, and `epoll_pwait`; x86-64-only legacy aliases such as `open`, `stat`, `lstat`, `poll`, and `epoll_wait` are included only in the x86-64 profile when an observed runtime need requires them.
 
@@ -481,9 +481,11 @@ There are two independent switches for optional behaviour:
 | Layer | Mechanism | Effect |
 |---|---|---|
 | **Compile-time** | `cargo build --features <name>` | Includes the code in the binary. A binary without a feature cannot enable it at runtime. |
-| **Runtime** | `[features]` in `config.toml` | Enables the compiled-in code. Setting a key whose feature was not compiled in is a warning, not an error. |
+| **Runtime** | `[features]` in `config.toml` | Enables the compiled-in code. Setting a key whose feature was not compiled in is a warning under development hardening and a startup refusal under enforced hardening (below). |
 
 The `seccomp` feature and `suspend_ram` feature both follow this two-level pattern. `fstrim` is always compiled in (no Cargo feature gate) but can be disabled at runtime.
+
+**Hardening profile (#43 §4).** `[agent] hardening` says whether the advertised sandbox is required. The default, `"enforced"`, is the production profile: the daemon refuses to serve the host, with exit status 78 (`EX_CONFIG`) and one line saying why, whenever the seccomp filter is disabled in the configuration, not compiled into the binary, would only log (a `seccomp-log` debug build), was not installed, or the capability drop did not run (not started as root), and whenever a test-kernel substitution is requested (`QEMINGA_TEST_FAKE_KERNEL`), whether or not the build could honour it. The configuration check and the build check run right after the configuration is loaded, before the recovery marker is even opened, so a refusal leaves a marker of a previous instance exactly as it was: the next start that can provide the profile enters recovery from it. The only other value, `"unenforced-development-only"`, allows all of the above with warnings, for an unprivileged run or a faked kernel on a development host; it is never for production packaging, and any other spelling is a configuration error, so a configuration cannot fall open by a typo. Release artifacts cannot carry the test-kernel substitution at all: the `test-fakes` feature is a compile error outside a debug build.
 
 ### 8.2 Configuration File
 
@@ -497,6 +499,7 @@ log_level               = "info"   # trace | debug | info | warn | error
 state_path              = "/run/qeminga/frozen"
 fsfreeze_idle_timeout_secs = 30    # auto-thaw if no guest-fsfreeze-status heartbeat received
 fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriving
+hardening               = "enforced"  # production: refuse to serve without the sandbox (§8.1)
 # fsfreeze_operation_timeout_secs = 60  # freeze-walk deadline; omitted: min(60, fsfreeze_max_timeout_secs)
 
 [rate_limits]
@@ -510,7 +513,7 @@ shutdown_per_min           = 2
 # Runtime half of the two-level feature flag (compile-time half: --features)
 suspend_ram = false   # opt-in: can disrupt security monitoring
 fstrim      = true    # opt-out: discard unused blocks
-seccomp     = true    # no effect if binary not compiled with --features seccomp
+seccomp     = true    # required under hardening = "enforced"
 ```
 
 `config_version` versions the configuration schema. The agent version returned by `guest-info` is build metadata and cannot be supplied by a runtime configuration file. `state_path` must be on an unfreezable runtime filesystem: startup opens the marker's directory (following `..` components and symlinks as the kernel does) and rejects it when the filesystem that directory is on is in the freeze plan; the pathname's prefix alone is never what is judged.
@@ -638,3 +641,4 @@ qeminga is a deliberately constrained replacement for the general-purpose upstre
 | AC21 | A freeze operation that ends with nothing frozen and nothing held (an empty plan, a `guest-fsfreeze-freeze-list` matching nothing, a plan every target of which was skipped) replies `0`, removes its marker and settles `Thawed` with no watchdog armed; an `EBUSY` target, an uncertain result or a marker that cannot be removed keeps `Frozen` with the marker, the last reported as an error. The count of `guest-fsfreeze-freeze-list` names the distinct requested superblocks this operation froze and nothing else, so a controller requesting one mount point per required superblock and demanding `count == requested` fails closed on a missing, unsupported, unmatched or busy target (§4.2 "Coverage"). |
 | AC22 | The snapshot controller contract (§4.5): a controller following the protocol accepts a cycle as quiesced only when the freeze covered every required superblock and the thaw found every one of them still frozen; a lease expiring before or during the cut or between two volumes, a delayed or aborted freeze reply, a crash before the reply, a guest reboot, an external thaw, an uncovered request (a required mount point that leads nowhere, one under an ancestor a mount covers, or one whose name a hidden superblock also carries: a name selects the superblock the pathname leads to by the mount graph, never two, and the freeze opens it on that name only) and a thaw reply arriving past the cycle budget (whatever its count: a restarted agent's recovery re-arms the cap) are all rejected, an agent restart while frozen is not, and a verdict is never revisited because a later upload ran long. The single-controller assumption behind the thaw count is stated and its limit is pinned by a test. |
 | AC23 | With the audit sink blocked throughout (never drained during the assertion), a freeze/thaw cycle finalises its marker and publishes `Thawed`, `guest-fsfreeze-status` and `guest-ping` answer, and a further freeze/thaw cycle completes; records are delivered in order once the sink moves, with losses (queue full, sink error, ring overflow) reported by a loss record at the position of the gap. No sink write ever happens on a caller's thread, under the router's lock, or while the ring is in use. |
+| AC24 | Under the default `[agent] hardening = "enforced"`, startup is refused with `EX_CONFIG` and a recovery marker untouched when the seccomp filter is disabled, not compiled in, logging-only or not installed, when the capability drop did not run, or when a test-kernel substitution is requested; the installed artifact under the shipped unit runs as uid 600 with exactly the AC3 capability sets, `NoNewPrivs` set and `Seccomp` in filter mode, refuses a denied command, freezes and thaws a real filesystem, and refuses a test-kernel request; a release build cannot carry the substitution. |

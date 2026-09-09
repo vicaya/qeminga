@@ -10,6 +10,14 @@
 //! in CI.
 #![deny(unsafe_code)]
 
+// The scripted kernel can only replace the real one in a debug build: a
+// release artifact (`panic = "abort"`, LTO) never carries the swap, so no
+// environment can make a distributed binary fake a freeze (#43 §4).
+#[cfg(all(feature = "test-fakes", not(debug_assertions)))]
+compile_error!(
+    "the `test-fakes` feature is for debug builds only; build releases with `--features seccomp`"
+);
+
 pub mod audit;
 pub mod channel;
 pub mod config;

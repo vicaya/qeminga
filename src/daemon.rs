@@ -175,6 +175,14 @@ pub enum RunError {
     /// The seccomp filter could not be built or installed.
     #[error("seccomp: {0}")]
     Seccomp(String),
+    /// `[agent] hardening = "enforced"` and the advertised sandbox is
+    /// unavailable, disabled or would not be installed (#43 §4): the
+    /// daemon refuses to serve the host. A recovery marker, if any, is
+    /// left in place for the next start.
+    #[error(
+        "hardening: {0}; refusing to serve the host (set [agent] hardening = \"unenforced-development-only\" on a development host only)"
+    )]
+    Hardening(String),
     /// The runtime could not be built or logging could not be initialised.
     #[error("{0}")]
     Runtime(String),
@@ -187,7 +195,8 @@ impl RunError {
             RunError::Config(_)
             | RunError::Marker(_)
             | RunError::StatePath { .. }
-            | RunError::MountTable(_) => EX_CONFIG,
+            | RunError::MountTable(_)
+            | RunError::Hardening(_) => EX_CONFIG,
             RunError::Channel(_) => EX_UNAVAILABLE,
             RunError::Privileges(_) => EX_NOPERM,
             RunError::Seccomp(_) | RunError::Runtime(_) => EX_OSERR,
@@ -195,11 +204,70 @@ impl RunError {
     }
 }
 
+/// What this build can enforce (§8.1, #43 §4): checked against
+/// `[agent] hardening` right after the configuration is loaded, before
+/// the marker is touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildProfile {
+    /// The `seccomp` Cargo feature is compiled in.
+    pub seccomp_compiled: bool,
+    /// The filter's mode: `"enforce"`, `"log"` or `"unavailable"`.
+    pub seccomp_mode: &'static str,
+    /// A test-kernel substitution was requested (`QEMINGA_TEST_FAKE_KERNEL`
+    /// is set), whether or not this build could honour it.
+    pub fake_kernel_requested: bool,
+}
+
+impl BuildProfile {
+    /// The running binary's profile.
+    pub fn current() -> Self {
+        BuildProfile {
+            seccomp_compiled: cfg!(feature = "seccomp"),
+            seccomp_mode: seccomp_mode(),
+            fake_kernel_requested: std::env::var_os(FAKE_KERNEL_ENV).is_some(),
+        }
+    }
+}
+
+/// Refuses, under `hardening = "enforced"`, what this build or this
+/// configuration cannot enforce: a filter that is not compiled in, that is
+/// disabled (already a configuration error), that would only log, or a
+/// requested test-kernel substitution. Nothing here has touched the marker.
+pub fn check_hardening(config: &Config, build: &BuildProfile) -> Result<(), RunError> {
+    if !config.agent.hardening.is_enforced() {
+        return Ok(());
+    }
+    if !config.features.seccomp {
+        return Err(RunError::Hardening(
+            "the seccomp filter is disabled ([features] seccomp = false)".to_owned(),
+        ));
+    }
+    if !build.seccomp_compiled {
+        return Err(RunError::Hardening(
+            "this binary was built without the `seccomp` Cargo feature".to_owned(),
+        ));
+    }
+    if build.seccomp_mode != "enforce" {
+        return Err(RunError::Hardening(format!(
+            "this binary's seccomp filter would only {} (a `seccomp-log` debug build)",
+            build.seccomp_mode
+        )));
+    }
+    if build.fake_kernel_requested {
+        return Err(RunError::Hardening(format!(
+            "{FAKE_KERNEL_ENV} is set: a test-kernel substitution is never honoured under enforced hardening"
+        )));
+    }
+    Ok(())
+}
+
 /// The steps of the startup sequence, in the order [`run_with`] calls
 /// them. Production is [`SystemStartup`]; tests record the calls.
 pub trait Startup {
     /// Step 1.
     fn load_config(&self, path: &Path) -> Result<Config, ConfigError>;
+    /// Step 1b: what this build can enforce, for [`check_hardening`].
+    fn build_profile(&self) -> BuildProfile;
     /// Step 2a: open the recovery marker's directory, read-only, and keep
     /// it for every later marker operation (§4.4); the marker's presence
     /// (`exists`) chooses the initial state. Nothing is created.
@@ -264,6 +332,9 @@ pub fn seccomp_mode() -> &'static str {
 /// the settlement, not the last handle's drop.
 pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     let config = startup.load_config(&opts.config_path)?;
+    // Before the marker is even opened: a refusal leaves a recovery marker
+    // exactly as it was, for the next start to act on.
+    check_hardening(&config, &startup.build_profile())?;
     let marker = startup.open_marker(&config.agent.state_path)?;
     let recovery = marker.exists();
     let router = startup.init_logging(config.agent.log_level, recovery)?;
@@ -336,12 +407,22 @@ fn serve_after_logging(
             user = SERVICE_USER,
             "capabilities dropped"
         ),
+        Outcome::SkippedUnprivileged if config.agent.hardening.is_enforced() => {
+            return Err(RunError::Hardening(
+                "not started as root, so the capability drop did not run".to_owned(),
+            ));
+        }
         Outcome::SkippedUnprivileged => {}
     }
     // Only now a second thread: created by the dropped thread, it inherits
     // the dropped ceiling (uid, capability sets, bounding set).
     startup.start_audit_writer(&router)?;
     let seccomp = startup.install_seccomp(&config)?;
+    if !seccomp && config.agent.hardening.is_enforced() {
+        return Err(RunError::Hardening(
+            "the seccomp filter was not installed".to_owned(),
+        ));
+    }
     let mode = seccomp_mode();
     tracing::info!(
         event = "seccomp",
@@ -394,6 +475,10 @@ pub struct SystemStartup;
 impl Startup for SystemStartup {
     fn load_config(&self, path: &Path) -> Result<Config, ConfigError> {
         Config::load(path)
+    }
+
+    fn build_profile(&self) -> BuildProfile {
+        BuildProfile::current()
     }
 
     fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
@@ -532,9 +617,11 @@ pub const FAKE_KERNEL_ENV: &str = "QEMINGA_TEST_FAKE_KERNEL";
 /// The production context: real sources, state chosen by `recovery`, the
 /// marker handle opened at startup.
 ///
-/// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set, the
-/// kernel shim is the fake: no ioctl, `sync` or `reboot` ever reaches the
-/// kernel. Release builds must not enable that feature.
+/// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set
+/// **and** development hardening, the kernel shim is the fake: no ioctl,
+/// `sync` or `reboot` ever reaches the kernel. A release build cannot
+/// carry the feature (`compile_error!` in the crate root), and enforced
+/// hardening refuses the variable before anything starts.
 pub fn production_context(
     config: Arc<Config>,
     router: Router,
@@ -547,8 +634,12 @@ pub fn production_context(
         FreezeStateMachine::new()
     };
     let ctx = Context::new(config, Arc::new(state), router, marker);
+    // Never under enforced hardening (`check_hardening` refused the start
+    // already; this keeps the swap itself conditional on the profile).
     #[cfg(feature = "test-fakes")]
-    let ctx = if std::env::var_os(FAKE_KERNEL_ENV).is_some() {
+    let ctx = if std::env::var_os(FAKE_KERNEL_ENV).is_some()
+        && !ctx.config.agent.hardening.is_enforced()
+    {
         tracing::warn!(
             event = "fake_kernel",
             "test-fakes: kernel operations are faked; no ioctl, sync or reboot will run"

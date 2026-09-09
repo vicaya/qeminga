@@ -80,8 +80,13 @@ semantic versioning.
   or refused by the sink are counted and reported, like the ring's
   overflow, by an `audit_records_lost` record delivered where the gap
   is, now with a `reason` (`ring_overflow`, `sink_backpressure`,
-  `sink_error`). `guest-shutdown` waits at most 2 s for its own record
-  before `reboot(2)`.
+  `sink_error`); the ring's own overflow is reported as a marker, so a
+  full queue cannot lose the report. `guest-shutdown` waits at most 2 s
+  for its own record before `reboot(2)` and no longer flushes stderr
+  itself (the writer thread may hold the stderr lock while blocked in a
+  write). The daemon's exit paths flush the ring and give delivery the
+  same bounded grace, so a refusal after recovery logging started is
+  reported on the way out.
 - A freeze that froze nothing and holds nothing (an empty plan, a
   `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
   target of which was skipped) settles `Thawed` with its marker removed

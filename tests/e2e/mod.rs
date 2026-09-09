@@ -253,6 +253,43 @@ impl Agent {
         self.stderr_writer.take()
     }
 
+    /// Fills the daemon's stderr pipe to capacity from the test's own
+    /// write end and leaves it full, so the daemon's next write to stderr
+    /// blocks as a journald that stopped reading would make it (§9.1).
+    /// `O_NONBLOCK` is a status flag of the open file description, which
+    /// the dup shares with the daemon's stderr: it is set only while the
+    /// pipe is being filled and cleared before returning. Returns the
+    /// number of bytes it took.
+    pub fn fill_stderr_pipe(&mut self) -> usize {
+        use std::io::Write;
+        let writer = self.stderr_writer.as_ref().expect("a stderr_pipe spawn");
+        let set_nonblock = |writer: &File, on: bool| {
+            use std::os::fd::AsFd;
+            let fd = writer.as_fd();
+            let flags = nix::fcntl::OFlag::from_bits_retain(
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).unwrap(),
+            );
+            let flags = if on {
+                flags | nix::fcntl::OFlag::O_NONBLOCK
+            } else {
+                flags - nix::fcntl::OFlag::O_NONBLOCK
+            };
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).unwrap();
+        };
+        set_nonblock(writer, true);
+        let mut filled = 0usize;
+        loop {
+            match (&*writer).write(&[b'#'; 4096]) {
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the pipe: {err}"),
+            }
+        }
+        set_nonblock(writer, false);
+        assert!(filled > 0, "the pipe was filled to capacity");
+        filled
+    }
+
     /// Kills the daemon with SIGKILL (a crash) and returns the state
     /// directory so a restart can reuse it (AC10).
     pub fn kill(mut self) -> tempfile::TempDir {

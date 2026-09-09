@@ -243,12 +243,38 @@ pub fn seccomp_mode() -> &'static str {
     }
 }
 
-/// Runs the startup sequence through `startup`.
+/// Runs the startup sequence through `startup`. Once logging is up, every
+/// way out, a refusal or the end of serving, is reported to it and then
+/// gives delivery the bounded [`audit::DELIVERY_GRACE`], the ring flushed
+/// first: the process is leaving, so a refusal that came after recovery
+/// logging started (§4.4) is not left in a ring nothing will drain, and a
+/// record queued behind a slow sink is not lost to the exit. The global
+/// subscriber keeps its handle for the life of the process, so this is
+/// the settlement, not the last handle's drop.
 pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     let config = startup.load_config(&opts.config_path)?;
     let marker = startup.open_marker(&config.agent.state_path)?;
     let recovery = marker.exists();
     let router = startup.init_logging(config.agent.log_level, recovery)?;
+    let logging = router.clone();
+    let result = serve_after_logging(opts, startup, config, marker, recovery, router);
+    if let Err(err) = &result {
+        tracing::error!(event = "startup_failed", error = %err, "exiting");
+    }
+    logging.flush_to_normal();
+    logging.settle(audit::DELIVERY_GRACE);
+    result
+}
+
+/// The steps after logging is up (see [`run_with`]).
+fn serve_after_logging(
+    opts: &Options,
+    startup: &dyn Startup,
+    config: Config,
+    marker: Marker,
+    recovery: bool,
+    router: Router,
+) -> Result<(), RunError> {
     for warning in config.warnings() {
         tracing::warn!(
             event = "feature_warning",
@@ -324,15 +350,10 @@ pub fn run(opts: Options) -> ExitCode {
     match run_with(&opts, &SystemStartup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            if tracing::dispatcher::has_been_set() {
-                // Logging is up: the record goes where the router sends
-                // it. In recovery mode that is the ring, never fd 2
-                // (§4.4, §9.1), and in normal mode this is the one line
-                // on stderr.
-                tracing::error!(event = "startup_failed", error = %err, "exiting");
-            } else {
-                // Failed before logging existed (a configuration error):
-                // stderr is the only channel left.
+            // Logging up: `run_with` reported the failure to it and gave
+            // delivery its grace. Failed before logging existed (a
+            // configuration error): stderr is the only channel left.
+            if !tracing::dispatcher::has_been_set() {
                 diag(&format!("qeminga: {err}"));
             }
             ExitCode::from(err.exit_code())

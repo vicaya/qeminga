@@ -70,6 +70,45 @@ impl Write for SharedSink {
     }
 }
 
+/// A sink whose first write takes `delay`: what the writer thread is
+/// doing when the daemon returns is then never a matter of luck.
+#[derive(Clone)]
+struct SlowSink {
+    inner: SharedSink,
+    delay: Duration,
+    slept: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Write for SlowSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if !self.slept.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Installs, once per test process, a global subscriber that enables
+/// every record and delivers it nowhere. Scoped subscribers in a
+/// multi-threaded test binary need it: `tracing` caches a callsite's
+/// interest through the current thread's dispatcher while a single one
+/// is registered, so a callsite first hit on a thread without any (a test
+/// calling `run_with` directly) would be cached as never interesting, and
+/// a parallel test's scoped subscriber would never see that record. With
+/// a global that enables everything, no callsite can be cached that way.
+fn permissive_global_subscriber() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(qeminga::audit::subscriber(
+            tracing::Level::TRACE,
+            Router::new(Box::new(std::io::sink())),
+        ));
+    });
+}
+
 /// Records every step; behaviour is scripted per field.
 struct FakeStartup {
     steps: RefCell<Vec<String>>,
@@ -82,10 +121,18 @@ struct FakeStartup {
     mountinfo: String,
     open: Result<(), Errno>,
     sink: SharedSink,
+    /// The router `init_logging` hands out (over `sink`, possibly slow),
+    /// so a test can subscribe the thread to it and read the sink.
+    router: Router,
 }
 
 impl FakeStartup {
     fn new() -> Self {
+        let sink = SharedSink::default();
+        Self::over(sink.clone(), Box::new(sink))
+    }
+    /// A fake whose router delivers to `writer`, a view of `sink`.
+    fn over(sink: SharedSink, writer: Box<dyn Write + Send>) -> Self {
         FakeStartup {
             steps: RefCell::new(Vec::new()),
             config: "[agent]\nstate_path = \"/run/qeminga/frozen\"\n".to_owned(),
@@ -93,8 +140,39 @@ impl FakeStartup {
             dir: shm_dir(),
             mountinfo: fixture("tmpfs_and_nfs.txt"),
             open: Ok(()),
-            sink: SharedSink::default(),
+            sink,
+            router: Router::new(writer),
         }
+    }
+    /// A fake whose sink takes `delay` over its first write.
+    fn with_slow_sink(delay: Duration) -> Self {
+        let sink = SharedSink::default();
+        let slow = SlowSink {
+            inner: sink.clone(),
+            delay,
+            slept: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        Self::over(sink, Box::new(slow))
+    }
+    /// Makes the marker's directory look like a planned ext4 root, so the
+    /// start fails on the `state_path` check: a failure after logging is
+    /// up, in ring mode when `marker` is set.
+    fn failing_after_logging(mut self) -> Self {
+        let (major, minor) = dev_of(self.dir.path());
+        self.mountinfo = format!(
+            "27 1 {major}:{minor} / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+             28 27 0:30 / /run rw,nosuid - tmpfs tmpfs rw\n"
+        );
+        self
+    }
+    /// Runs the daemon's startup with this thread subscribed to the
+    /// fake's router, as the binary's global subscriber would be.
+    fn run(&self) -> Result<(), RunError> {
+        permissive_global_subscriber();
+        tracing::subscriber::with_default(
+            qeminga::audit::subscriber(tracing::Level::INFO, self.router.clone()),
+            || daemon::run_with(&Options::default(), self),
+        )
     }
     fn log(&self, s: impl Into<String>) {
         self.steps.borrow_mut().push(s.into());
@@ -119,11 +197,10 @@ impl Startup for FakeStartup {
     }
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
         self.log(format!("logging {} ring={ring}", level.as_str()));
-        let router = Router::new(Box::new(self.sink.clone()));
         if ring {
-            router.enter_ring();
+            self.router.enter_ring();
         }
-        Ok(router)
+        Ok(self.router.clone())
     }
     fn mount_table(&self) -> Result<Vec<MountEntry>, String> {
         self.log("mounts");
@@ -205,6 +282,51 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
     let text = startup.sink.text();
     assert!(!text.contains("fifreeze"), "{text}");
     assert!(!text.contains("fithaw"), "{text}");
+}
+
+#[test]
+fn a_failure_after_recovery_logging_started_still_reports_itself() {
+    // A marker is present, so logging is in ring mode when the start is
+    // refused (here by the `state_path` check; #47's hardening refusals
+    // after the capability drop are the same path). The process is
+    // leaving: the ring is flushed and its records, the refusal among
+    // them, are delivered before `run_with` returns, or the journal shows
+    // a restart loop with no reason.
+    let mut startup = FakeStartup::new().failing_after_logging();
+    startup.marker = true;
+    assert_eq!(startup.steps().len(), 0);
+    let err = startup.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        startup
+            .steps()
+            .contains(&"logging info ring=true".to_owned())
+    );
+    // Written in ring mode, delivered anyway: the ring was flushed on the
+    // way out and nothing is left in it.
+    let text = startup.sink.text();
+    assert!(text.contains("\"event\":\"startup_failed\""), "{text}");
+    assert!(text.contains("state_path"), "{text}");
+    assert_eq!(startup.router.mode(), Mode::Normal);
+    assert_eq!(startup.router.lost(), 0);
+}
+
+#[test]
+fn leaving_delivers_the_queued_records_before_returning() {
+    // The global subscriber keeps a handle to the router for the life of
+    // the process, so its last-handle grace never runs: the exit paths
+    // settle the queue themselves, bounded. A sink slow over its first
+    // write shows the difference: the refusal (and, on the other path,
+    // the startup record) is on the sink when `run_with` returns.
+    let startup = FakeStartup::with_slow_sink(Duration::from_millis(300)).failing_after_logging();
+    let err = startup.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    let text = startup.sink.text();
+    assert!(text.contains("\"event\":\"startup_failed\""), "{text}");
+    let startup = FakeStartup::with_slow_sink(Duration::from_millis(300));
+    startup.run().unwrap();
+    let text = startup.sink.text();
+    assert!(text.contains("\"event\":\"startup\""), "{text}");
 }
 
 /// `(major, minor)` of the filesystem holding `path`, as `stat` sees it.

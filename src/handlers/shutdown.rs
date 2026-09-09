@@ -2,10 +2,13 @@
 //! syscall; §5.3 2/min; AC12; C-11; OQ-1).
 //!
 //! `mode` ∈ `{"halt", "powerdown", "reboot"}`, default `"powerdown"`. The
-//! handler flushes stderr, calls `sync(2)` and then `reboot(2)` on the
-//! blocking pool. On success the kernel never returns, and the dispatcher
-//! suppresses the reply anyway (`success-response: false`); errors are
-//! still reported.
+//! handler gives its audit record a bounded chance to be delivered, then
+//! calls `sync(2)` and `reboot(2)` on the blocking pool. On success the
+//! kernel never returns, and the dispatcher suppresses the reply anyway
+//! (`success-response: false`); errors are still reported. Nothing on
+//! this path touches stderr itself: the writer thread may be blocked in
+//! a write to it, holding the process's stderr lock, and a flush would
+//! wait on that lock without bound (#43 §3).
 //!
 //! These are *hard* shutdown semantics: `reboot(2)` is an immediate
 //! kernel action. No service is stopped, no unit is given a chance to
@@ -16,7 +19,6 @@
 //! in one function so it stays a local change.
 #![forbid(unsafe_code)]
 
-use std::io::Write;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -58,7 +60,7 @@ pub const fn reboot_command(mode: ShutdownMode) -> RebootCommand {
 }
 
 /// How long a shutdown waits for its audit record to be delivered.
-pub const AUDIT_DELIVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+pub const AUDIT_DELIVERY_GRACE: std::time::Duration = crate::audit::DELIVERY_GRACE;
 
 /// `guest-shutdown` handler.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
@@ -71,7 +73,6 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     // reading (§9.1) delays the shutdown by this much and no more.
     let audit = ctx.audit.clone();
     let _ = tokio::task::spawn_blocking(move || audit.settle(AUDIT_DELIVERY_GRACE)).await;
-    let _ = std::io::stderr().flush();
     tokio::task::spawn_blocking(move || {
         kernel.sync();
         kernel.reboot(cmd)
@@ -93,6 +94,7 @@ mod tests {
     use crate::proto::{ErrorClass, parse_request};
     use crate::state::{FreezeState, FreezeStateMachine};
     use nix::errno::Errno;
+    use std::io::Write;
     use std::sync::Mutex;
     use tracing::Level;
     use tracing::instrument::WithSubscriber;

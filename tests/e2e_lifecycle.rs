@@ -39,6 +39,61 @@ fn shutdown_emits_no_reply() {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "test-fakes"),
+    ignore = "build with --features test-fakes to observe guest-shutdown without rebooting"
+)]
+fn shutdown_behind_a_full_stderr_pipe_still_reaches_the_kernel() {
+    // journald has stopped reading and the daemon's stderr pipe is full:
+    // the writer thread is blocked inside a write, holding the process's
+    // stderr lock. `guest-shutdown` gives its record the bounded grace
+    // and then must reach `sync`/`reboot` (#43 §3): nothing on its path
+    // may wait on that lock. The fake kernel's reboot returns, so the
+    // proof is the next serial command being answered behind it.
+    assert!(Agent::has_fake_kernel());
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        stderr_pipe: true,
+        ..SpawnOptions::default()
+    });
+    agent.fill_stderr_pipe();
+    // Records queued behind the full pipe: the writer is now blocked in
+    // the sink, not parked.
+    for id in 1..=3 {
+        assert_eq!(
+            agent.request(&format!(r#"{{"execute":"guest-ping","id":{id}}}"#))["id"],
+            id
+        );
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let started = std::time::Instant::now();
+    agent.send_line(r#"{"execute":"guest-shutdown","arguments":{"mode":"reboot"},"id":9}"#);
+    assert!(
+        agent.read_line(Duration::from_millis(500)).is_none(),
+        "AC12: no success reply"
+    );
+    // A serial command waits behind the shutdown for its lane: it is
+    // answered once the shutdown has run, within the grace plus a margin.
+    let reply = agent.request_timeout(
+        r#"{"execute":"guest-get-osinfo","id":10}"#,
+        Duration::from_secs(15),
+    );
+    assert_eq!(reply["id"], 10, "{reply}");
+    assert!(reply.get("return").is_some(), "{reply}");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "the shutdown waited beyond its grace: {:?}",
+        started.elapsed()
+    );
+    // The pipe is still full: the daemon never waited for it (one read
+    // returns what is there; the write end stays open, so never EOF).
+    let mut stderr = agent.take_stderr_pipe().unwrap();
+    let mut buf = vec![0u8; 4096];
+    let n = std::io::Read::read(&mut stderr, &mut buf).unwrap();
+    assert!(n > 0);
+    assert!(agent.stop().success());
+}
+
+#[test]
 fn channel_eof_then_reopen_preserves_state() {
     // A frozen agent without any ioctl (works unprivileged and without
     // fakes): the daemon starts in recovery mode behind a marker left by

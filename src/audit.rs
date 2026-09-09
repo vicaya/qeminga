@@ -289,6 +289,12 @@ pub const SINK_QUEUE_CAPACITY: usize = 256 * 1024;
 /// lives in the global subscriber until the process exits).
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long a path that is about to leave the process (`guest-shutdown`
+/// before `reboot(2)`, the daemon's exit) waits for the writer thread to
+/// deliver what is queued. Bounded: a sink that is not reading delays the
+/// leaving by this much and no more, and is never waited on for a lock.
+pub const DELIVERY_GRACE: Duration = Duration::from_secs(2);
+
 /// Why records were lost, as reported in the loss record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LossReason {
@@ -511,8 +517,9 @@ impl Router {
         let mut state = self.shared.lock();
         let (lost, lines) = state.ring.drain();
         if lost > 0 {
-            let record = loss_record(lost, LossReason::RingOverflow);
-            state.enqueue(record.into_bytes());
+            // A marker, not a line: it takes no queue space, so a queue
+            // that is already full cannot lose the report of the loss.
+            state.lose(lost, LossReason::RingOverflow);
         }
         for line in lines {
             state.enqueue(line);
@@ -1433,6 +1440,45 @@ mod tests {
         settled(&router);
         let loss: Value = serde_json::from_str(&sink.lines()[0]).unwrap();
         assert_eq!(loss["reason"], "ring_overflow");
+    }
+
+    #[test]
+    fn a_ring_loss_is_reported_by_a_marker_even_when_the_queue_is_full() {
+        // The queue is full behind a blocked sink when a window whose
+        // ring overflowed is flushed: the ring's loss is a marker, which
+        // takes no queue space, so it is reported with its own count and
+        // reason; only the ring's lines the queue cannot hold are counted
+        // as backpressure, separately.
+        let sink = BlockingSink::blocked();
+        let router = Router::with_queue_capacity(Box::new(sink.clone()), 64);
+        let mut w = router.make_writer();
+        let line = |n: u8| format!("{{\"n\":{n},\"pad\":\"xxx\"}}\n");
+        for n in 1..=3 {
+            promptly("write", || w.write_all(line(n).as_bytes()).unwrap());
+        }
+        sink.wait_entered(1);
+        assert_eq!(router.queued_bytes(), 60, "the queue is full");
+        router.enter_ring();
+        let filler = line(9);
+        let written = RING_CAPACITY / filler.len() + 4;
+        for _ in 0..written {
+            w.write_all(filler.as_bytes()).unwrap();
+        }
+        let overflowed = router.lost();
+        assert!(overflowed > 0, "the ring overflowed");
+        let kept = written as u64 - overflowed;
+        assert_eq!(router.flush_to_normal(), overflowed);
+        assert_eq!(router.unreported_losses(), overflowed + kept);
+        sink.set_blocked(false);
+        settled(&router);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        let ring_loss: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(ring_loss["reason"], "ring_overflow", "{lines:?}");
+        assert_eq!(ring_loss["lost"], overflowed);
+        let queue_loss: Value = serde_json::from_str(&lines[4]).unwrap();
+        assert_eq!(queue_loss["reason"], "sink_backpressure");
+        assert_eq!(queue_loss["lost"], kept);
     }
 
     #[test]

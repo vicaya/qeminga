@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::audit::{AuditRecord, Disposition, Router, project_method};
+use crate::channel::Kind;
 use crate::config::Config;
 use crate::framing::{DecodeEvent, encode};
 use crate::handlers;
@@ -69,6 +70,19 @@ pub fn is_frozen_safe(method: &str) -> bool {
             | "guest-sync-delimited"
             | "guest-info"
     )
+}
+
+/// The session lane of an allowlisted method (§5.7): the frozen-safe
+/// controls run beside the command in progress, a thaw beside a freeze,
+/// everything else one at a time. Derived from [`is_frozen_safe`] so the
+/// two never disagree.
+pub fn lane(method: &str) -> Kind {
+    match method {
+        "guest-fsfreeze-thaw" => Kind::Thaw,
+        "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => Kind::Freeze,
+        _ if is_frozen_safe(method) => Kind::Control,
+        _ => Kind::Ordinary,
+    }
 }
 
 /// Audit `reason` values for denied frames.
@@ -451,6 +465,22 @@ impl Dispatcher {
         ))
     }
 
+    /// The lane `event` runs in (§5.7), decided by the session before the
+    /// frame is handled. The frame is parsed once more here, without any
+    /// side effect (no audit record, no gate): a frame that cannot be
+    /// parsed, like an oversized one, is answered without running
+    /// anything and counts as a control; an unknown method is treated as
+    /// an ordinary command and rejected in its turn.
+    pub fn classify(&self, event: &DecodeEvent) -> Kind {
+        match event {
+            DecodeEvent::Oversized { .. } => Kind::Control,
+            DecodeEvent::Frame { bytes, .. } => match parse_request(bytes) {
+                Ok(req) => lane(&req.method),
+                Err(_) => Kind::Control,
+            },
+        }
+    }
+
     /// Steps 2–5 of the dispatch order (C-7). On denial returns the audit
     /// reason together with the wire error.
     fn gates(&self, req: &Request) -> Result<(), (&'static str, Error)> {
@@ -796,6 +826,60 @@ mod tests {
                 assert_eq!(record["freeze_state_before"], state.as_str());
             }
         }
+    }
+
+    #[test]
+    fn lanes_follow_the_frozen_safe_set() {
+        // The thaw and the two freezes have lanes of their own; the other
+        // frozen-safe commands are controls; everything else, unknown
+        // methods included, is serial.
+        for spec in handlers::SUPPORTED_COMMANDS {
+            let expected = match spec.name {
+                "guest-fsfreeze-thaw" => Kind::Thaw,
+                "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => Kind::Freeze,
+                name if is_frozen_safe(name) => Kind::Control,
+                _ => Kind::Ordinary,
+            };
+            assert_eq!(lane(spec.name), expected, "{}", spec.name);
+        }
+        assert_eq!(lane("guest-exec"), Kind::Ordinary);
+    }
+
+    #[test]
+    fn classification_parses_without_side_effects() {
+        let ctx = Arc::new(Context::for_tests());
+        let d = Dispatcher::new(Arc::clone(&ctx));
+        let frame = |bytes: &[u8]| DecodeEvent::Frame {
+            bytes: bytes.to_vec(),
+            sentinel: false,
+        };
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-status"}"#)),
+            Kind::Control
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-thaw","id":1}"#)),
+            Kind::Thaw
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-freeze-list"}"#)),
+            Kind::Freeze
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fstrim"}"#)),
+            Kind::Ordinary
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-exec"}"#)),
+            Kind::Ordinary
+        );
+        // Answered without running anything: never in the way of a thaw.
+        assert_eq!(d.classify(&frame(b"not json")), Kind::Control);
+        assert_eq!(
+            d.classify(&DecodeEvent::Oversized { discarded: 1 }),
+            Kind::Control
+        );
+        assert_eq!(ctx.handler_calls(), 0, "classification ran nothing");
     }
 
     #[tokio::test]

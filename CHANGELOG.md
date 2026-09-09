@@ -23,14 +23,17 @@ semantic versioning.
 - A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts
   the walk and is answered at once with the recovery pending, instead of
   being refused.
-- The channel session admits commands in request order by lane: one
-  command that may change the guest at a time, up to three frozen-safe
-  controls beside it (status is served while a recovery drain is
-  blocked) and a thaw beside a running freeze (it reaches the operation
-  before the deadline). At most eight commands are held; replies stay in
-  request order; a reply the host is slow to read stalls neither the
-  commands behind it nor a stop; a stop finishes the commands running
-  before the session ends, and so does a lost peer.
+- The channel session admits commands by lane: one command that may
+  change the guest at a time, in request order among themselves; up to
+  three frozen-safe controls beside it (status is served while a
+  recovery drain is blocked) and a thaw beside a running freeze (it
+  reaches the operation before the deadline, even behind a queued walk).
+  At most eight commands are held from decoding to delivery and at most
+  64 KiB of undelivered replies are kept, so a peer that stops reading
+  stops being read; replies stay in request order; a reply the host is
+  slow to read stalls neither the commands behind it nor a stop; a stop
+  finishes the commands running before the session ends, and so does a
+  lost peer.
 - The freeze walk runs one tracked blocking task per target, publishing
   each completed descriptor before the next target is authorised; a late
   completion is drained through its own descriptor and is never published

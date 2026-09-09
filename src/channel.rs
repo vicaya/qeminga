@@ -306,26 +306,42 @@ pub enum Kind {
 /// from being answered; they are read-only, so they overlap nothing.
 pub const MAX_CONTROLS: usize = 3;
 
-/// Commands the session holds at once: running, or finished with the
-/// reply waiting behind an earlier one. The channel is not read while
-/// this many are held, so nothing queues without limit; one read's worth
-/// of frames may be decoded beyond it.
+/// Commands the session holds at once, from the frame's decoding to its
+/// reply's delivery: waiting for a lane, running, finished with the reply
+/// waiting behind an earlier one, or with the reply in the outbox but
+/// not yet accepted by the host. A reply counts until the host has taken
+/// it, so a peer that stops reading stops being read. The channel is not
+/// read while this many are held; one read's worth of frames may be
+/// decoded beyond it.
 ///
 /// This bounds the host's interruption of a freeze: a
 /// `guest-fsfreeze-thaw` sent behind a pending freeze reply is read, and
-/// aborts the walk, as long as fewer than this many commands are
-/// unanswered. A host that sends `MAX_QUEUED - 1` further commands
-/// without reading a reply has its next frame read only once the freeze
-/// reply is out: at the latest at the operation deadline (§4.4).
+/// aborts the walk, as long as fewer than this many commands are held.
+/// A host that sends `MAX_QUEUED - 1` further commands without reading
+/// a reply has its next frame read only once the freeze reply is out: at
+/// the latest at the operation deadline (§4.4).
 pub const MAX_QUEUED: usize = 8;
 
-/// A command the session holds, in request order: running, or finished
-/// with its reply not yet written.
+/// Bytes of replies the session keeps for a host that has not accepted
+/// them yet. Once the outbox holds this much, nothing more is started;
+/// once the outbox and the finished replies behind earlier ones together
+/// hold this much, nothing more is read. A single reply larger than the
+/// budget is kept whole (it exists already) and pauses the session until
+/// the host has taken it. With [`MAX_QUEUED`] this bounds the session's
+/// memory against a peer that stops reading: the budget, plus the
+/// replies of the commands already started when it was reached.
+pub const MAX_REPLY_BYTES: usize = 64 * 1024;
+
+/// A command the session holds, in request order.
 enum Slot<'a> {
+    /// Decoded; its lane is not free yet, or the reply budget is spent.
+    Waiting(Kind, DecodeEvent),
+    /// Running.
     Pending(
         Kind,
         Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>,
     ),
+    /// Finished; the reply waits for the ones before it.
     Done(Option<Vec<u8>>),
 }
 
@@ -350,81 +366,147 @@ fn drive_any<'a, 'b>(slots: &'b mut VecDeque<Slot<'a>>) -> impl Future<Output = 
     })
 }
 
-/// Whether the frame at the head of the wait queue may start now, given
-/// the commands running (§5.7). Admission is in request order: a frame
-/// whose lane is busy holds every frame behind it, so side effects happen
-/// in the order the host asked for them; only a control or an aborting
-/// thaw ever runs beside another command.
-fn admits(slots: &VecDeque<Slot<'_>>, kind: Kind) -> bool {
-    let running = slots.iter().filter_map(|slot| match slot {
-        Slot::Pending(kind, _) => Some(*kind),
-        Slot::Done(_) => None,
-    });
-    match kind {
-        Kind::Control => running.filter(|k| *k == Kind::Control).count() < MAX_CONTROLS,
-        Kind::Thaw => !running
-            .clone()
-            .any(|k| matches!(k, Kind::Thaw | Kind::Ordinary)),
-        Kind::Freeze | Kind::Ordinary => !running
-            .clone()
-            .any(|k| matches!(k, Kind::Thaw | Kind::Freeze | Kind::Ordinary)),
+/// What is running, by lane.
+#[derive(Default)]
+struct Lanes {
+    controls: usize,
+    freeze: bool,
+    thaw_or_ordinary: bool,
+}
+
+impl Lanes {
+    fn of(slots: &VecDeque<Slot<'_>>) -> Self {
+        let mut lanes = Lanes::default();
+        for slot in slots {
+            if let Slot::Pending(kind, _) = slot {
+                lanes.take(*kind);
+            }
+        }
+        lanes
+    }
+
+    fn take(&mut self, kind: Kind) {
+        match kind {
+            Kind::Control => self.controls += 1,
+            Kind::Freeze => self.freeze = true,
+            Kind::Thaw | Kind::Ordinary => self.thaw_or_ordinary = true,
+        }
+    }
+
+    fn exclusive(&self) -> bool {
+        self.freeze || self.thaw_or_ordinary
     }
 }
 
-/// The one writer's queue: reply bytes in request order and how many of
-/// them the host has accepted. Kept across loop iterations so a write
-/// the host is slow to accept resumes where it stopped, while the loop
-/// keeps polling the commands and the stop; it is never restarted, so
-/// no reply is ever appended to a partial frame except the rest of that
-/// frame.
+/// Starts up to `capacity` waiting commands whose lane is free (§5.7).
+/// The serial lane is first come, first served: a freeze or an ordinary
+/// command starts only when nothing exclusive is running and no earlier
+/// serial command is still waiting, so side effects happen in the order
+/// the host asked for them. A control, or a thaw while nothing but a
+/// freeze runs, is not held back by a serial command waiting ahead of
+/// it: the host's `guest-fsfreeze-thaw` must reach the freeze under way
+/// even when a walk the freeze gate would refuse anyway is queued
+/// between them. Replies still leave in request order, whatever the
+/// order of admission.
+fn admit<'a, H: Handle>(slots: &mut VecDeque<Slot<'a>>, handler: &'a H, mut capacity: usize) {
+    let mut lanes = Lanes::of(slots);
+    let mut serial_waiting = false;
+    for slot in slots.iter_mut() {
+        if capacity == 0 {
+            break;
+        }
+        let Slot::Waiting(kind, _) = slot else {
+            continue;
+        };
+        let kind = *kind;
+        let free = match kind {
+            Kind::Control => lanes.controls < MAX_CONTROLS,
+            Kind::Thaw => !lanes.thaw_or_ordinary,
+            Kind::Freeze | Kind::Ordinary => !lanes.exclusive() && !serial_waiting,
+        };
+        if !free {
+            if kind != Kind::Control {
+                serial_waiting = true;
+            }
+            continue;
+        }
+        if let Slot::Waiting(_, event) = std::mem::replace(slot, Slot::Done(None)) {
+            *slot = Slot::Pending(kind, Box::pin(handler.handle(event)));
+            lanes.take(kind);
+            capacity -= 1;
+        }
+    }
+}
+
+/// The one writer's queue: the replies the host has not accepted yet, in
+/// request order, and how much of the first one it has taken. Kept
+/// across loop iterations so a write the host is slow to accept resumes
+/// where it stopped, while the loop keeps polling the commands and the
+/// stop; a frame is never restarted, and a reply is released as soon as
+/// the host has taken all of it.
 struct Outbox {
-    bytes: Vec<u8>,
+    replies: VecDeque<Vec<u8>>,
+    /// Bytes of the first reply the host has accepted.
     written: usize,
+    /// Bytes not yet accepted, over all replies.
+    pending: usize,
 }
 
 impl Outbox {
     fn new() -> Self {
         Outbox {
-            bytes: Vec::new(),
+            replies: VecDeque::new(),
             written: 0,
+            pending: 0,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.written == self.bytes.len()
+        self.replies.is_empty()
     }
 
-    fn push(&mut self, reply: &[u8]) {
-        if self.is_empty() {
-            self.bytes.clear();
-            self.written = 0;
-        }
-        self.bytes.extend_from_slice(reply);
+    /// Replies not yet fully accepted by the host.
+    fn count(&self) -> usize {
+        self.replies.len()
+    }
+
+    /// Bytes not yet accepted by the host.
+    fn pending_bytes(&self) -> usize {
+        self.pending
+    }
+
+    fn push(&mut self, reply: Vec<u8>) {
+        self.pending += reply.len();
+        self.replies.push_back(reply);
     }
 
     /// Drops whatever the host has not accepted.
     fn abandon(&mut self) {
-        self.bytes.clear();
+        self.replies.clear();
         self.written = 0;
+        self.pending = 0;
     }
 
-    /// Writes and flushes the queued bytes; resolves once the host has
+    /// Writes and flushes the queued replies; resolves once the host has
     /// accepted all of them, or with the write error.
     fn drain<'a, W>(&'a mut self, writer: &'a mut W) -> impl Future<Output = io::Result<()>> + 'a
     where
         W: AsyncWrite + Unpin,
     {
         std::future::poll_fn(move |cx| {
-            while self.written < self.bytes.len() {
-                let n = ready!(Pin::new(&mut *writer).poll_write(cx, &self.bytes[self.written..]))?;
+            while let Some(front) = self.replies.front() {
+                let n = ready!(Pin::new(&mut *writer).poll_write(cx, &front[self.written..]))?;
                 if n == 0 {
                     return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
                 }
                 self.written += n;
+                self.pending -= n;
+                if self.written == front.len() {
+                    self.replies.pop_front();
+                    self.written = 0;
+                }
             }
             ready!(Pin::new(&mut *writer).poll_flush(cx))?;
-            self.bytes.clear();
-            self.written = 0;
             Poll::Ready(Ok(()))
         })
     }
@@ -435,12 +517,18 @@ impl Outbox {
 ///
 /// Three concerns are kept apart (§5.7):
 ///
-/// * **Admission.** Frames start in request order, each when its lane
-///   is free ([`Kind`], `admits`): one command that may change the
-///   guest at a time, the frozen-safe controls (up to [`MAX_CONTROLS`])
-///   and a thaw aimed at a freeze under way beside it. At most
-///   [`MAX_QUEUED`] commands are held; the channel is not read while
-///   that many are.
+/// * **Admission.** Every decoded frame takes a slot in request order
+///   and starts when its lane is free ([`Kind`], `admit`): one command
+///   that may change the guest at a time, in request order among
+///   themselves; the frozen-safe controls (up to [`MAX_CONTROLS`]) and a
+///   thaw aimed at a freeze under way beside it, not held back by a
+///   serial command waiting ahead of them. At most [`MAX_QUEUED`]
+///   commands are started or held with their reply undelivered, a reply
+///   counting until the host has taken it, and at most
+///   [`MAX_REPLY_BYTES`] of replies are kept for a host that is not
+///   reading: past either bound nothing more is started, and nothing
+///   more is read. The bounds hold back new work only; what runs is
+///   always polled to its end.
 /// * **Completion.** Every command that started is polled until it
 ///   finishes, whatever the writer or the stop are doing: a command is
 ///   never dropped mid-way (a freeze abandoned at its `.await` would
@@ -488,11 +576,9 @@ where
     // Once the sender is gone there is nothing left to wait for.
     let mut cancel_live = true;
     let report = |end, received| SessionReport { end, received };
+    // Every frame decoded, in request order, until its reply has left
+    // for the outbox.
     let mut slots: VecDeque<Slot<'_>> = VecDeque::new();
-    // Frames decoded but not started yet (their lane was busy, or the
-    // bound was reached); at most one read's worth beyond the bound,
-    // since nothing is read meanwhile.
-    let mut waiting: VecDeque<DecodeEvent> = VecDeque::new();
     let mut outbox = Outbox::new();
     // The input ended: finish what was received, then report why.
     let mut input_end: Option<SessionEnd> = None;
@@ -507,7 +593,7 @@ where
             if let Some(Slot::Done(Some(reply))) = slots.pop_front()
                 && !write_failed
             {
-                outbox.push(&reply);
+                outbox.push(reply);
             }
         }
         let running = slots.iter().any(|slot| matches!(slot, Slot::Pending(..)));
@@ -531,28 +617,35 @@ where
             // withdrawn until the thaw (C-21).
             draining = false;
         }
-        if !draining {
-            while let Some(event) = waiting.front() {
-                let kind = handler.classify(event);
-                if !admits(&slots, kind) {
-                    break;
-                }
-                if let Some(event) = waiting.pop_front() {
-                    slots.push_back(Slot::Pending(kind, Box::pin(handler.handle(event))));
-                }
-            }
+        // Started commands and undelivered replies fill the queue; the
+        // frames decoded beyond it wait their turn.
+        let started = slots
+            .iter()
+            .filter(|slot| !matches!(slot, Slot::Waiting(..)))
+            .count()
+            + outbox.count();
+        if !draining && outbox.pending_bytes() < MAX_REPLY_BYTES {
+            admit(&mut slots, handler, MAX_QUEUED.saturating_sub(started));
         }
         let running = slots.iter().any(|slot| matches!(slot, Slot::Pending(..)));
         if !running
             && slots.is_empty()
-            && waiting.is_empty()
             && (outbox.is_empty() || write_failed)
             && let Some(end) = input_end.take()
         {
             return report(end, received);
         }
-        let can_read =
-            input_end.is_none() && !draining && waiting.is_empty() && slots.len() < MAX_QUEUED;
+        let finished_bytes: usize = slots
+            .iter()
+            .map(|slot| match slot {
+                Slot::Done(Some(reply)) => reply.len(),
+                _ => 0,
+            })
+            .sum();
+        let can_read = input_end.is_none()
+            && !draining
+            && slots.len() + outbox.count() < MAX_QUEUED
+            && outbox.pending_bytes() + finished_bytes < MAX_REPLY_BYTES;
         let can_write = !outbox.is_empty() && !write_failed;
         tokio::select! {
             biased;
@@ -576,8 +669,11 @@ where
                 Ok(0) => input_end = Some(SessionEnd::Eof),
                 Ok(n) => {
                     received += n as u64;
-                    waiting.extend(decoder.push(&buf[..n]));
-                }
+                    for event in decoder.push(&buf[..n]) {
+                        let kind = handler.classify(&event);
+                        slots.push_back(Slot::Waiting(kind, event));
+                    }
+                },
                 Err(err) => input_end = Some(SessionEnd::ReadError(err)),
             },
             else => {
@@ -937,7 +1033,7 @@ mod tests {
     /// Blocks every command whose frame does not contain `quick` until
     /// released, counts how many run at once and records the order they
     /// started in; replies name the frame (a frame containing `big`
-    /// gets a 4 KiB reply). The lane is the frame's prefix: `ctl-` is a
+    /// gets a 4 KiB reply, `huge` a 40 KiB one). The lane is the frame's prefix: `ctl-` is a
     /// control, `thaw-` a thaw, `freeze-` a freeze, anything else
     /// ordinary. A finished freeze forbids a stop, a finished thaw allows
     /// it again.
@@ -1010,7 +1106,9 @@ mod tests {
             } else if name.starts_with("thaw") {
                 self.allow_stop.store(true, Ordering::SeqCst);
             }
-            let mut reply = if name.contains("big") {
+            let mut reply = if name.contains("huge") {
+                vec![b'x'; 40 * 1024]
+            } else if name.contains("big") {
                 vec![b'x'; 4096]
             } else {
                 bytes
@@ -1060,6 +1158,34 @@ mod tests {
         (peer, handler, cancel_tx, session)
     }
 
+    /// A session whose input and output are separate duplex streams, so
+    /// the peer can keep sending while it reads nothing: `input` bytes
+    /// of request buffer, `output` bytes of reply buffer. Returns the
+    /// peer's writer and reader.
+    fn counting_session_split(
+        input: usize,
+        output: usize,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+        Arc<CountingHandler>,
+        tokio::task::JoinHandle<SessionReport>,
+    ) {
+        let (peer_tx, reader) = duplex(input);
+        let (peer_rx, writer) = duplex(output);
+        let (_cancel_tx, mut cancel_rx) = cancel_pair();
+        let handler = CountingHandler::new();
+        let h = handler.clone();
+        let session = tokio::spawn(async move {
+            let mut decoder = FrameDecoder::new();
+            let report =
+                run_session_until(reader, writer, h.as_ref(), &mut decoder, &mut cancel_rx).await;
+            drop(_cancel_tx);
+            report
+        });
+        (peer_tx, peer_rx, handler, session)
+    }
+
     /// Reads from `peer` until `expected` has arrived.
     async fn read_exactly(peer: &mut tokio::io::DuplexStream, expected: &[u8]) {
         let mut got = Vec::new();
@@ -1101,28 +1227,127 @@ mod tests {
 
     #[tokio::test]
     async fn an_ordinary_command_waits_for_the_one_running_before_it() {
-        // Two ordinary commands: the second is not started while the
-        // first runs, whatever the first is doing; a freeze behind an
-        // ordinary command waits just the same, and a control behind
-        // that freeze waits its turn (admission is in request order).
+        // Two serial commands: the second is not started while the first
+        // runs, whatever the first is doing; a freeze behind an ordinary
+        // command waits just the same. A control behind that freeze is
+        // not held back by it, and its reply still leaves last.
         bounded(async {
             let (mut peer, handler, _cancel, session) = counting_session(1024);
             peer.write_all(b"slow-1\nfreeze-2\nctl-quick-3\n")
                 .await
                 .unwrap();
-            handler.running_is(1).await;
+            handler.started_is("ctl-quick-3").await;
             tokio::time::sleep(Duration::from_millis(50)).await;
-            assert_eq!(handler.started(), ["slow-1"], "nothing overtakes");
+            assert_eq!(
+                handler.started(),
+                ["slow-1", "ctl-quick-3"],
+                "the freeze waits, the control does not"
+            );
+            nothing_to_read(&mut peer).await;
             handler.release.notify_waiters();
             handler.started_is("freeze-2").await;
-            handler.started_is("ctl-quick-3").await;
-            assert_eq!(handler.peak.load(Ordering::SeqCst), 2);
             read_exactly(&mut peer, b"slow-1\n").await;
             nothing_to_read(&mut peer).await;
             handler.release.notify_waiters();
             read_exactly(&mut peer, b"freeze-2\nctl-quick-3\n").await;
-            assert_eq!(handler.started(), ["slow-1", "freeze-2", "ctl-quick-3"]);
+            assert_eq!(handler.peak.load(Ordering::SeqCst), 2);
             drop(peer);
+            session.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_thaw_behind_a_waiting_serial_command_still_reaches_the_freeze() {
+        // A freeze runs; an ordinary command waits for the serial lane;
+        // the thaw behind it is not held back: it runs beside the freeze
+        // at once. The ordinary command runs only once the freeze has
+        // finished, and the replies leave in request order.
+        bounded(async {
+            let (mut peer, handler, _cancel, session) = counting_session(1024);
+            peer.write_all(b"freeze-1\nslow-2\nthaw-quick-3\n")
+                .await
+                .unwrap();
+            handler.started_is("thaw-quick-3").await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(handler.started(), ["freeze-1", "thaw-quick-3"]);
+            handler.release.notify_waiters();
+            handler.started_is("slow-2").await;
+            read_exactly(&mut peer, b"freeze-1\n").await;
+            handler.release.notify_waiters();
+            read_exactly(&mut peer, b"slow-2\nthaw-quick-3\n").await;
+            drop(peer);
+            session.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn undelivered_replies_hold_their_place_until_the_host_takes_them() {
+        // The peer keeps the port open and reads nothing. Each control
+        // finishes at once, but its reply stays undelivered and keeps
+        // counting: after MAX_QUEUED of them nothing more is read, however
+        // many frames the peer sends. Once the peer reads, every reply
+        // arrives once, in order, and the session serves the rest.
+        bounded(async {
+            let (mut tx, mut rx, handler, session) = counting_session_split(4096, 8);
+            let mut expected = Vec::new();
+            for i in 1..=MAX_QUEUED {
+                let frame = format!("ctl-quick-{i}");
+                tx.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+                handler.started_is(&frame).await;
+                expected.extend(format!("{frame}\n").into_bytes());
+            }
+            for i in MAX_QUEUED + 1..=3 * MAX_QUEUED {
+                let frame = format!("ctl-quick-{i}");
+                tx.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+                expected.extend(format!("{frame}\n").into_bytes());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(
+                handler.started().len(),
+                MAX_QUEUED,
+                "nothing is read while MAX_QUEUED replies are undelivered"
+            );
+            read_exactly(&mut rx, &expected).await;
+            handler
+                .started_is(&format!("ctl-quick-{}", 3 * MAX_QUEUED))
+                .await;
+            drop(tx);
+            let report = session.await.unwrap();
+            assert!(matches!(report.end, SessionEnd::Eof), "{}", report.end);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_reply_budget_pauses_the_session_before_the_count_does() {
+        // Two 40 KiB replies exceed MAX_REPLY_BYTES: the third frame is
+        // neither read nor started while the peer reads nothing, well
+        // under MAX_QUEUED commands. Once the peer drains the replies,
+        // in order and unduplicated, the rest are served.
+        bounded(async {
+            const { assert!(2 * 40 * 1024 > MAX_REPLY_BYTES && 40 * 1024 < MAX_REPLY_BYTES) };
+            let (mut tx, mut rx, handler, session) = counting_session_split(4096, 1024);
+            let mut expected = Vec::new();
+            for i in 1..=4 {
+                let frame = format!("ctl-huge-quick-{i}");
+                if i > 2 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                tx.write_all(format!("{frame}\n").as_bytes()).await.unwrap();
+                if i <= 2 {
+                    handler.started_is(&frame).await;
+                }
+                let mut reply = vec![b'x'; 40 * 1024];
+                reply.push(b'\n');
+                expected.extend(reply);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(handler.started().len(), 2, "the budget holds the third");
+            read_exactly(&mut rx, &expected).await;
+            assert_eq!(handler.started().len(), 4);
+            drop(tx);
             session.await.unwrap();
         })
         .await;

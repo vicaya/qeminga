@@ -402,9 +402,10 @@ async fn a_thaw_behind_answered_controls_still_aborts_the_pending_freeze() {
 async fn a_freeze_is_not_started_while_a_trim_is_running() {
     // A trim's FITRIM is blocked when the host sends a freeze: the freeze
     // is not started (no target is opened, nothing is frozen, the state
-    // stays Thawed) until the trim has finished; the status behind the
-    // freeze waits its turn too. Once the trim returns, the trim reply,
-    // the freeze and the status follow in order.
+    // stays Thawed) until the trim has finished. The status behind the
+    // waiting freeze is answered at once; its reply still leaves last.
+    // Once the trim returns, the trim reply, the freeze and the status
+    // follow in order.
     let mut rig = rig();
     let trim = rig.kernel.script_trim_gate(D);
     let _release = trim.release_on_drop();
@@ -416,8 +417,12 @@ async fn a_freeze_is_not_started_while_a_trim_is_running() {
         .await;
     rig.send(r#"{"execute":"guest-fsfreeze-status","id":3}"#)
         .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(rig.ctx.handler_calls(), 1, "only the trim has started");
+    rig.wait_for("status answered beside the trim", |r| {
+        r.ctx.handler_calls() == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.ctx.handler_calls(), 2, "the freeze has not started");
     assert!(
         !rig.kernel
             .calls()
@@ -434,7 +439,11 @@ async fn a_freeze_is_not_started_while_a_trim_is_running() {
     assert_eq!(trimmed["id"], json!(1));
     assert!(trimmed["return"]["paths"].is_array(), "{trimmed}");
     assert_eq!(rig.json_reply().await, json!({"return": 4, "id": 2}));
-    assert_eq!(rig.json_reply().await, json!({"return": "frozen", "id": 3}));
+    assert_eq!(
+        rig.json_reply().await,
+        json!({"return": "thawed", "id": 3}),
+        "answered while the freeze was still waiting"
+    );
     let calls = rig.kernel.calls();
     let last_trim = calls
         .iter()
@@ -530,6 +539,110 @@ async fn a_stop_during_a_blocked_reply_waits_for_the_running_trim() {
         .filter(|c| matches!(c, Call::Fitrim(..)))
         .count();
     assert_eq!(trims, 4, "the trim ran to its end");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thaw_behind_a_waiting_walk_still_aborts_the_pending_freeze() {
+    // B is inside FIFREEZE when the host sends a filesystem walk, then,
+    // in a later read, a thaw. The walk waits for the serial lane (the
+    // freeze gate would refuse it anyway); the thaw is not held back by
+    // it: it reaches the operation with the clock never advanced, A is
+    // recovered, and the walk never starts. Replies keep request order:
+    // the aborted freeze, the walk refused while thawing, the thaw.
+    let mut rig = rig();
+    let (gate, _release) = rig.freeze_blocked_at_b().await;
+    rig.send(r#"{"execute":"guest-get-fsinfo","id":2}"#).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(rig.ctx.handler_calls(), 1, "the walk waits, unstarted");
+    rig.send(r#"{"execute":"guest-fsfreeze-thaw","id":3}"#)
+        .await;
+    let freeze = rig.json_reply().await;
+    assert!(
+        freeze["error"]["desc"]
+            .as_str()
+            .unwrap()
+            .contains("freeze aborted: thaw requested"),
+        "{freeze}"
+    );
+    let walk = rig.json_reply().await;
+    assert_eq!(walk["id"], json!(2));
+    assert_eq!(walk["error"]["class"], json!("GenericError"));
+    assert!(
+        walk["error"]["desc"].as_str().unwrap().contains("frozen"),
+        "{walk}"
+    );
+    let thaw = rig.json_reply().await;
+    assert_eq!(thaw["id"], json!(3));
+    assert!(
+        thaw["error"]["desc"]
+            .as_str()
+            .unwrap()
+            .contains("recovery pending"),
+        "{thaw}"
+    );
+    rig.wait_for("A drained", |r| r.fithaws() == [A, A]).await;
+    assert_eq!(gate.waiting(), 1, "B still inside FIFREEZE");
+    assert_eq!(rig.ctx.handler_calls(), 2, "the walk never ran");
+    gate.release();
+    rig.wait_for("settled", |r| r.ctx.state.current() == FreezeState::Thawed)
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_thaw_finishes_while_the_outbox_is_saturated() {
+    // Frozen; the host stops reading with a `guest-info` reply stuck on
+    // the 16-byte stream, a thaw inside FITHAW behind it, and controls
+    // answered behind the thaw until MAX_QUEUED are held: nothing more
+    // is read. The thaw's kernel work then completes and its lifecycle
+    // still reaches `Thawed` with nothing delivered. Once the host
+    // reads, every reply arrives once, in order, and the session serves
+    // again.
+    let mut rig = rig_with_buffer(16);
+    rig.send(r#"{"execute":"guest-fsfreeze-freeze"}"#).await;
+    assert_eq!(rig.json_reply().await, json!({"return": 4}));
+    let a = rig.kernel.script_thaw_gate(A);
+    let _release = a.release_on_drop();
+    rig.send(r#"{"execute":"guest-info","id":1}"#).await;
+    rig.send(r#"{"execute":"guest-fsfreeze-thaw","id":2}"#)
+        .await;
+    let g = a.clone();
+    rig.wait_for("thaw blocked", move |_| g.waiting() == 1)
+        .await;
+    // The freeze, the info and the thaw ran; each status adds one.
+    for i in 3..=MAX_QUEUED as u64 {
+        rig.send(&format!(
+            r#"{{"execute":"guest-fsfreeze-status","id":{i}}}"#
+        ))
+        .await;
+        rig.wait_for("status handled", move |r| r.ctx.handler_calls() == i + 1)
+            .await;
+    }
+    // MAX_QUEUED held: the info reply in the outbox, the thaw, six
+    // statuses behind it. The next frame is not read: every earlier
+    // frame was consumed whole, so the 16 bytes of the stream take the
+    // ping's first 16 bytes and the write never completes.
+    let ping = b"{\"execute\":\"guest-ping\",\"id\":99}\n";
+    let unread = tokio::time::timeout(Duration::from_millis(200), rig.peer.write_all(ping)).await;
+    assert!(unread.is_err(), "nothing is read while MAX_QUEUED are held");
+    assert_eq!(rig.ctx.handler_calls(), MAX_QUEUED as u64 + 1);
+    a.release();
+    rig.wait_for("thawed with nothing delivered", |r| {
+        r.ctx.state.current() == FreezeState::Thawed
+    })
+    .await;
+    assert!(!rig.ctx.marker.exists());
+    let info = rig.json_reply().await;
+    assert_eq!(info["id"], json!(1));
+    assert!(info["return"]["version"].is_string(), "{info}");
+    let thaw = rig.json_reply().await;
+    assert_eq!(thaw, json!({"return": 4, "id": 2}));
+    for i in 3..=MAX_QUEUED as u64 {
+        assert_eq!(rig.json_reply().await, json!({"return": "frozen", "id": i}));
+    }
+    // Reading freed the queue: the ping's first 16 bytes are read now,
+    // and the rest of the frame follows.
+    rig.peer.write_all(&ping[16..]).await.unwrap();
+    assert_eq!(rig.json_reply().await, json!({"return": {}, "id": 99}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

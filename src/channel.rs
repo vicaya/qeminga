@@ -821,6 +821,22 @@ mod tests {
         }
     }
 
+    impl CountingHandler {
+        /// Waits (yielding) until `n` commands are running; a handshake,
+        /// not a timing assumption.
+        async fn running_is(&self, n: usize) {
+            let start = std::time::Instant::now();
+            while self.running.load(Ordering::SeqCst) != n {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "running={} never reached {n}",
+                    self.running.load(Ordering::SeqCst)
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        }
+    }
+
     impl Handle for CountingHandler {
         async fn handle(&self, event: DecodeEvent) -> Option<Vec<u8>> {
             let DecodeEvent::Frame { bytes, .. } = event else {
@@ -853,7 +869,17 @@ mod tests {
                 run_session(reader, writer, h.as_ref(), &mut decoder).await
             });
             peer.write_all(b"slow-1\nquick-2\n").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // The quick one finishes as soon as it starts; the slow one
+            // stays running: both were started.
+            handler.running_is(1).await;
+            let start = std::time::Instant::now();
+            while handler.peak.load(Ordering::SeqCst) < 2 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "quick-2 never started"
+                );
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
             assert_eq!(handler.peak.load(Ordering::SeqCst), 2, "both were started");
             let mut out = [0u8; 32];
             let pending =
@@ -891,6 +917,8 @@ mod tests {
                 .flat_map(|i| format!("slow-{i}\n").into_bytes())
                 .collect();
             peer.write_all(&frames).await.unwrap();
+            handler.running_is(MAX_IN_FLIGHT).await;
+            // No fifth one appears while the four block.
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert_eq!(handler.peak.load(Ordering::SeqCst), MAX_IN_FLIGHT);
             assert_eq!(handler.running.load(Ordering::SeqCst), MAX_IN_FLIGHT);
@@ -928,7 +956,7 @@ mod tests {
                 run_session(reader, writer, h.as_ref(), &mut decoder).await
             });
             peer.write_all(b"slow-1\n").await.unwrap();
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            handler.running_is(1).await;
             drop(peer);
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!session.is_finished(), "waits for the command in flight");

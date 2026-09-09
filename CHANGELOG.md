@@ -8,8 +8,9 @@ semantic versioning.
 
 ### Added
 
-- Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`,
-  default 60 s, at most the hard cap): a `guest-fsfreeze-freeze` whose
+- Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`;
+  omitted it derives `min(60, fsfreeze_max_timeout_secs)`, an explicit
+  value must be at most the hard cap): a `guest-fsfreeze-freeze` whose
   walk is still inside `FIFREEZE` when the deadline expires is aborted;
   the targets frozen so far are thawed through their descriptors while
   the blocked call is still awaited, the request fails with a
@@ -20,7 +21,13 @@ semantic versioning.
 ### Changed
 
 - A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts
-  the walk and joins its recovery instead of being refused.
+  the walk and is answered at once with the recovery pending, instead of
+  being refused.
+- The channel session handles up to four commands at once while an
+  earlier reply is pending (a thaw reaches a running freeze; status is
+  served while a recovery drain is blocked); replies stay in request
+  order, the channel is not read while the bound is reached, and a lost
+  peer lets the commands in flight finish before the session ends.
 - The freeze walk runs one tracked blocking task per target, publishing
   each completed descriptor before the next target is authorised; a late
   completion is drained through its own descriptor and is never published

@@ -2848,8 +2848,14 @@ mod tests {
         rig.expire();
         let err = freezing.await.unwrap().unwrap_err();
         assert_eq!(err.class(), ErrorClass::GenericError);
-        rig.wait_for("A drained", |r| r.fithaws() == paths(&[A, A]))
-            .await;
+        // The driver's own signal that the pass over A is recorded (the
+        // fake's call log alone would race the driver's bookkeeping).
+        let op = rig.ctx.freeze_op().unwrap();
+        rig.wait_for("A's recovery pass recorded", |_| {
+            op.progress().recovery_pass_done()
+        })
+        .await;
+        assert_eq!(rig.fithaws(), paths(&[A, A]));
         AbortedAtB {
             rig,
             gate,
@@ -3301,10 +3307,8 @@ mod tests {
         rig.kernel.script_freeze_error(B, Errno::EBUSY);
         rig.kernel.script_thaw_successes(B, 0);
         gate.release();
-        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
-            .await;
+        let progress = op.wait_for_settlement().await;
         assert_eq!(rig.fithaws(), paths(&[A, A, B]));
-        let progress = op.progress();
         assert_eq!(progress.recovered, 1);
         assert_eq!(progress.settled, Some(FreezeState::Thawed));
         assert!(progress.recovery_pass_done());

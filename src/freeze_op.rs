@@ -36,11 +36,12 @@
 //!    drained: complete → marker removed, finalisation hook, `Thawed`; a
 //!    drain incomplete or the marker not removable → `Frozen`, marker
 //!    retained, the watchdog armed as on any entry into that state, the
-//!    incomplete handles kept for it. The state is published, then the
-//!    operation retires its registration by identity (a successor admitted
-//!    in between is never touched), then the settlement is announced.
-//!    Until then the marker, the frozen gate and the freeze-safe audit mode
-//!    stay.
+//!    incomplete handles kept for it. The operation retires its
+//!    registration (by identity: a successor is never touched) before the
+//!    state is published, so whoever observes the terminal state finds
+//!    the slot released; the settlement is announced and the reply sent
+//!    after that. Until then the marker, the frozen gate and the
+//!    freeze-safe audit mode stay.
 //!
 //! Capacity is explicit: per operation at most one freeze worker, one
 //! recovery drain and the preparation task exist at any time, and the state
@@ -841,17 +842,21 @@ impl Driver {
         }
     }
 
-    /// The one settlement path: finalise and publish the terminal state
-    /// through whichever token the driver holds, send the reply if none
-    /// went out yet, retire the registration by identity, then announce
-    /// the settlement. Nothing after the retirement touches the context.
+    /// The one settlement path, in this order: finalise (the audit flush
+    /// runs while the state still refuses a new freeze), retire the
+    /// registration by identity, publish the terminal state through
+    /// whichever token the driver holds, announce the settlement, then
+    /// send the reply if none went out yet. Retiring before the state is
+    /// published means whoever observes the terminal state finds the
+    /// slot released and a successor can only be admitted afterwards;
+    /// the identity check keeps the retirement harmless even so.
     fn conclude(mut self, terminal: Terminal, reply: Result<u64, FreezeFailure>) {
+        if matches!(terminal, Terminal::Thawed) {
+            self.ctx.hooks.on_thawed(&self.ctx);
+        }
+        self.ctx.retire_freeze_op(&self.op);
         let state = match terminal {
             Terminal::Thawed => {
-                // Finalise (the audit flush) while still `Freezing` or
-                // `Thawing`, then publish: a freeze admitted afterwards can
-                // never have its logging mode changed by this one.
-                self.ctx.hooks.on_thawed(&self.ctx);
                 if let Some(token) = self.token.take() {
                     self.ctx.state.freeze_failed(token);
                 } else if let Some(thaw) = self.thaw_token.take() {
@@ -869,13 +874,12 @@ impl Driver {
                 FreezeState::Frozen
             }
         };
-        self.reply(reply);
-        self.ctx.retire_freeze_op(&self.op);
         self.op.publish(|p| {
             p.phase = Phase::Settled;
             p.in_flight = None;
             p.settled = Some(state);
         });
+        self.reply(reply);
     }
 
     /// Sends the request's single reply; later calls are no-ops.

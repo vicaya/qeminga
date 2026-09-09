@@ -74,10 +74,14 @@ then restarts it every second, refusing each time, until the cause is
 fixed; it never falls back to serving without the sandbox. Typical causes
 after an upgrade: a binary built without `--features seccomp` (or with
 `--all-features`, which adds the logging filter), `[features] seccomp =
-false` left in the configuration, or a stray `QEMINGA_TEST_FAKE_KERNEL`
-in the unit's environment.
+false` left in the configuration, a stray `QEMINGA_TEST_FAKE_KERNEL` in
+the unit's environment, or a kernel or container runtime that refuses
+the filter (the line names the installer's error).
 
-The refusal happens before the recovery marker is touched. If the
+The refusal happens before the recovery marker is touched (the drop's
+and the installer's outcomes are checked later, but still before the
+runtime, and are reported to the journal even when a marker put logging
+into recovery mode). If the
 previous instance was frozen when it died, `/run/qeminga/frozen` is still
 there and the filesystems may still be frozen: fix the cause, then
 `systemctl restart qeminga`; the start that can provide the profile

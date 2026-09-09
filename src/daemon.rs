@@ -417,7 +417,27 @@ fn serve_after_logging(
     // Only now a second thread: created by the dropped thread, it inherits
     // the dropped ceiling (uid, capability sets, bounding set).
     startup.start_audit_writer(&router)?;
-    let seccomp = startup.install_seccomp(&config)?;
+    // An installer that fails (a kernel or a container policy refusing
+    // the filter) is a hardening outcome like a filter that is absent:
+    // the refusal under the enforced profile, a warning under the
+    // development opt-out. It is never an `EX_OSERR` exit of its own.
+    let seccomp = match startup.install_seccomp(&config) {
+        Ok(installed) => installed,
+        Err(RunError::Seccomp(reason)) if config.agent.hardening.is_enforced() => {
+            return Err(RunError::Hardening(format!(
+                "the seccomp filter could not be installed: {reason}"
+            )));
+        }
+        Err(RunError::Seccomp(reason)) => {
+            tracing::warn!(
+                event = "seccomp_unavailable",
+                reason = %reason,
+                "the seccomp filter could not be installed; running without it (development hardening)"
+            );
+            false
+        }
+        Err(other) => return Err(other),
+    };
     if !seccomp && config.agent.hardening.is_enforced() {
         return Err(RunError::Hardening(
             "the seccomp filter was not installed".to_owned(),

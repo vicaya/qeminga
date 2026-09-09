@@ -131,6 +131,9 @@ struct FakeStartup {
     root: bool,
     /// Whether the fake filter installs.
     filter_installs: bool,
+    /// An error the fake installer fails with (a kernel that refuses the
+    /// filter), instead of installing or not.
+    filter_error: Option<&'static str>,
 }
 
 /// The `[agent]` lines every fake configuration starts with: the
@@ -162,6 +165,7 @@ impl FakeStartup {
             },
             root: false,
             filter_installs: true,
+            filter_error: None,
         }
     }
     /// A fake whose sink takes `delay` over its first write.
@@ -278,6 +282,9 @@ impl Startup for FakeStartup {
     }
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError> {
         self.log(format!("seccomp enabled={}", config.features.seccomp));
+        if let Some(reason) = self.filter_error {
+            return Err(RunError::Seccomp(reason.to_owned()));
+        }
         // The fake models a full build: installed iff enabled (and the
         // fake installer is not scripted to fail).
         Ok(config.features.seccomp && self.filter_installs)
@@ -531,6 +538,57 @@ fn enforced_hardening_refuses_a_start_whose_sandbox_did_not_come_up() {
     let startup = FakeStartup::production();
     daemon::run_with(&Options::default(), &startup).unwrap();
     assert!(startup.steps().last().unwrap().starts_with("runtime"));
+}
+
+#[test]
+fn a_refusal_after_recovery_logging_started_is_reported_on_the_way_out() {
+    // A marker is present (recovery mode: logging in the ring) and the
+    // enforcing build was started unprivileged: the refusal comes after
+    // step 2b, and is delivered on the way out all the same, so the
+    // journal of a restart loop says why (#47 review).
+    let mut startup = FakeStartup::production();
+    startup.marker = true;
+    startup.root = false;
+    let err = startup.run().unwrap_err();
+    assert!(matches!(err, RunError::Hardening(_)), "{err}");
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        startup
+            .steps()
+            .contains(&"logging info ring=true".to_owned())
+    );
+    let text = startup.sink.text();
+    assert!(text.contains("\"event\":\"startup_failed\""), "{text}");
+    assert!(text.contains("not started as root"), "{text}");
+    assert!(text.contains("unenforced-development-only"), "{text}");
+    assert_eq!(startup.router.mode(), Mode::Normal);
+    assert!(
+        startup.dir.path().join("frozen").exists(),
+        "marker untouched"
+    );
+}
+
+#[test]
+fn a_filter_the_kernel_refuses_is_a_hardening_refusal_when_enforced_and_a_warning_otherwise() {
+    // The installer fails (a kernel or container policy that rejects the
+    // filter): under enforced hardening that is the hardening refusal,
+    // exit 78 with the cause and the opt-out named, not EX_OSERR; under
+    // the development opt-out it is a warning and the daemon runs without
+    // the filter, as for a filter that is absent.
+    let mut startup = FakeStartup::production();
+    startup.filter_error = Some("prctl(PR_SET_SECCOMP): EACCES");
+    let text = hardening_refusal(&startup);
+    assert!(text.contains("could not be installed"), "{text}");
+    assert!(text.contains("EACCES"), "{text}");
+    assert!(!startup.steps().iter().any(|s| s.starts_with("runtime")));
+    let mut startup = FakeStartup::new();
+    startup.filter_error = Some("prctl(PR_SET_SECCOMP): EACCES");
+    startup.run().unwrap();
+    assert!(startup.steps().last().unwrap().starts_with("runtime"));
+    let text = startup.sink.text();
+    assert!(text.contains("\"event\":\"seccomp_unavailable\""), "{text}");
+    assert!(text.contains("EACCES"), "{text}");
+    assert!(text.contains("\"installed\":false"), "{text}");
 }
 
 #[test]

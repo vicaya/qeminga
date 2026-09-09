@@ -37,8 +37,10 @@ semantic versioning.
 - `[agent] hardening = "enforced"` (the default): the daemon refuses to
   serve the host (exit 78, one line, the recovery marker untouched)
   unless it was started as root with the seccomp filter compiled in,
-  enabled and installed in its enforcing mode, and refuses a test-kernel
-  request; `"unenforced-development-only"` is the one opt-out, for a
+  enabled and installed in its enforcing mode (an installer the kernel
+  refuses is that refusal, not an `EX_OSERR` exit), and refuses a
+  test-kernel request; a refusal after recovery logging started is still
+  reported on the way out; `"unenforced-development-only"` is the one opt-out, for a
   development host. A release build cannot carry the `test-fakes`
   feature. **Deployments built without `--features seccomp` stop
   starting until rebuilt with it** (#43 §4; recovery procedure in

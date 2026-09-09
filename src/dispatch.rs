@@ -127,6 +127,9 @@ pub struct Context {
     freeze_op: std::sync::Mutex<Option<Arc<crate::freeze_op::FreezeOp>>>,
     /// The freeze operation deadline (`fsfreeze_operation_timeout_secs`).
     freeze_operation_timeout: std::time::Duration,
+    /// The clock the deadline is measured against (tests inject a manual
+    /// one).
+    freeze_clock: Arc<dyn crate::freeze_op::FreezeClock>,
     handler_calls: AtomicU64,
 }
 
@@ -179,6 +182,7 @@ impl Context {
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
             freeze_op: std::sync::Mutex::new(None),
             freeze_operation_timeout,
+            freeze_clock: Arc::new(crate::freeze_op::TokioClock),
             handler_calls: AtomicU64::new(0),
         }
     }
@@ -195,6 +199,19 @@ impl Context {
         self.freeze_operation_timeout
     }
 
+    /// Replaces the clock the freeze operation deadline is measured
+    /// against.
+    #[must_use]
+    pub fn with_freeze_clock(mut self, clock: Arc<dyn crate::freeze_op::FreezeClock>) -> Self {
+        self.freeze_clock = clock;
+        self
+    }
+
+    /// The clock the freeze operation deadline is measured against.
+    pub fn freeze_clock(&self) -> Arc<dyn crate::freeze_op::FreezeClock> {
+        Arc::clone(&self.freeze_clock)
+    }
+
     /// The freeze operation in progress, if any.
     pub fn freeze_op(&self) -> Option<Arc<crate::freeze_op::FreezeOp>> {
         self.freeze_op
@@ -203,12 +220,28 @@ impl Context {
             .clone()
     }
 
-    /// Installs (or, with `None`, releases) the freeze operation.
+    /// Registers the freeze operation (or, with `None`, clears the slot).
     pub(crate) fn set_freeze_op(&self, op: Option<Arc<crate::freeze_op::FreezeOp>>) {
         *self
             .freeze_op
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = op;
+    }
+
+    /// Retires `op`: clears the slot only if it still holds that very
+    /// operation, so a settling operation can never clear a successor
+    /// that was admitted after it published its terminal state.
+    pub(crate) fn retire_freeze_op(&self, op: &Arc<crate::freeze_op::FreezeOp>) {
+        let mut slot = self
+            .freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, op))
+        {
+            *slot = None;
+        }
     }
 
     /// Replaces the mount-table source.
@@ -489,6 +522,25 @@ mod tests {
     use super::*;
     use crate::audit;
     use crate::framing::MAX_FRAME_LEN;
+
+    #[test]
+    fn retiring_an_operation_never_clears_its_successor() {
+        use crate::freeze_op::FreezeOp;
+        let ctx = Context::for_tests();
+        let a = FreezeOp::detached_for_tests();
+        let b = FreezeOp::detached_for_tests();
+        ctx.set_freeze_op(Some(Arc::clone(&a)));
+        assert!(Arc::ptr_eq(&ctx.freeze_op().unwrap(), &a));
+        // A's settlement overlaps B's admission: A's retirement is a no-op.
+        ctx.set_freeze_op(Some(Arc::clone(&b)));
+        ctx.retire_freeze_op(&a);
+        assert!(Arc::ptr_eq(&ctx.freeze_op().unwrap(), &b));
+        // Only B retires B; a repeated retirement is harmless.
+        ctx.retire_freeze_op(&b);
+        assert!(ctx.freeze_op().is_none());
+        ctx.retire_freeze_op(&b);
+        assert!(ctx.freeze_op().is_none());
+    }
     use crate::state::FreezeState;
     use serde_json::json;
     use std::io::Write;

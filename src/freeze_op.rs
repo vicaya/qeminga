@@ -1,35 +1,46 @@
 //! The freeze operation coordinator (design §4.4 "Operation deadline";
 //! OQ-8, T6.1).
 //!
-//! A `guest-fsfreeze-freeze` request no longer runs its whole walk inside
-//! one blocking closure whose result the request waits for. It starts an
+//! A `guest-fsfreeze-freeze` request does not run its walk inside one
+//! blocking closure whose result the request waits for. It starts an
 //! *operation* that owns the walk independently of the request and of the
 //! channel:
 //!
 //! 1. Preparation (mount table, marker) runs as a tracked blocking task.
 //! 2. Targets are frozen one at a time, each `FIFREEZE` on its own tracked
 //!    blocking task; a completed target's verified handle is published to
-//!    the [`Context`] before the next target is authorised. A worker
-//!    re-checks the abort flag right before its ioctl, so work queued at
-//!    the moment of an abort never freezes anything.
+//!    the [`Context`] before the next target is authorised.
 //! 3. The operation has an immutable deadline, `fsfreeze_operation_timeout_secs`
-//!    from the moment the request entered `Freezing`; heartbeats do not
-//!    extend it. When it expires, or when a thaw is requested while the
-//!    walk is under way, the abort commits exactly once: no further
-//!    target is authorised, the freeze token becomes a thaw token
-//!    (`Freezing → Thawing`, so a late completion can never publish
-//!    `Frozen`), the request gets its one reply (an error), and the
-//!    targets frozen so far are drained on a blocking task of their own,
-//!    independent of the worker still blocked in `FIFREEZE`.
-//! 4. Every authorised worker is awaited to its end. A late success (or
+//!    from the moment the request entered `Freezing`, read from an
+//!    injected [`FreezeClock`]; heartbeats do not extend it. The abort
+//!    decision (deadline passed, or a thaw requested) is taken at every
+//!    boundary, not only while waiting: before each target is authorised,
+//!    by the worker right before its ioctl, while a worker is awaited
+//!    (the abort branch is polled ahead of a completion, so a chain of
+//!    ready completions cannot postpone a pending abort), and before a
+//!    successful completion is committed. The worker's check is its last
+//!    opportunity, not a boundary with the syscall: a worker past it is
+//!    owned, and whatever it returns is recovered.
+//! 4. When the abort commits (exactly once): no further target is
+//!    authorised, the freeze token becomes a thaw token (`Freezing →
+//!    Thawing`, so a late completion can never publish `Frozen`), the
+//!    request gets its one reply (an error), and the targets frozen so far
+//!    are drained on a blocking task of their own, independent of the
+//!    worker still blocked in `FIFREEZE`. A thaw that arrives meanwhile
+//!    requests the abort and is answered at once (see the thaw handler).
+//! 5. Every authorised worker is awaited to its end. A late success (or
 //!    `EBUSY`) is drained through the handle it opened; a late error needs
 //!    nothing; a worker that panicked leaves its target uncertain.
-//! 5. The operation settles only when no worker is outstanding and every
-//!    published handle has been drained: complete → marker removed,
-//!    finalisation hook, `Thawed`; a drain incomplete or the marker not
-//!    removable → `Frozen`, marker retained, the watchdog armed as on any
-//!    entry into that state, the incomplete handles kept for it. Until
-//!    then the marker, the frozen gate and the freeze-safe audit mode stay.
+//! 6. The operation settles through one path ([`Driver::conclude`]) only
+//!    when no worker is outstanding and every published handle has been
+//!    drained: complete → marker removed, finalisation hook, `Thawed`; a
+//!    drain incomplete or the marker not removable → `Frozen`, marker
+//!    retained, the watchdog armed as on any entry into that state, the
+//!    incomplete handles kept for it. The state is published, then the
+//!    operation retires its registration by identity (a successor admitted
+//!    in between is never touched), then the settlement is announced.
+//!    Until then the marker, the frozen gate and the freeze-safe audit mode
+//!    stay.
 //!
 //! Capacity is explicit: per operation at most one freeze worker, one
 //! recovery drain and the preparation task exist at any time, and the state
@@ -47,7 +58,7 @@ use std::time::Duration;
 
 use tokio::sync::{Notify, oneshot, watch};
 use tokio::task::{JoinError, JoinHandle};
-use tokio::time::{Instant, sleep_until};
+use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 
 use crate::dispatch::Context;
@@ -58,6 +69,109 @@ use crate::handlers::fsfreeze::{
 use crate::kernel::{KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
 use crate::state::{FreezeState, FreezeToken, ThawToken};
+use crate::watchdog::BoxFuture;
+
+/// The clock the operation deadline is measured against, shared by the
+/// coordinator and its workers so every decision boundary reads the same
+/// time. Production is [`TokioClock`]; tests inject a [`ManualClock`].
+pub trait FreezeClock: Send + Sync + std::fmt::Debug {
+    /// The current time.
+    fn now(&self) -> Instant;
+    /// Resolves once `now() >= deadline`.
+    fn sleep_until(&self, deadline: Instant) -> BoxFuture<'static, ()>;
+}
+
+/// The runtime's clock.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokioClock;
+
+impl FreezeClock for TokioClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> BoxFuture<'static, ()> {
+        Box::pin(tokio::time::sleep_until(deadline))
+    }
+}
+
+/// A clock that only moves when a test moves it, so a deadline expires
+/// exactly where the test puts it and nowhere else.
+#[derive(Debug, Clone)]
+pub struct ManualClock {
+    inner: Arc<ManualClockInner>,
+}
+
+#[derive(Debug)]
+struct ManualClockInner {
+    now: std::sync::Mutex<Instant>,
+    changed: Notify,
+}
+
+impl Default for ManualClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ManualClock {
+    /// A clock stopped at the current runtime time.
+    pub fn new() -> Self {
+        ManualClock {
+            inner: Arc::new(ManualClockInner {
+                now: std::sync::Mutex::new(Instant::now()),
+                changed: Notify::new(),
+            }),
+        }
+    }
+
+    /// Moves the clock forward and wakes every sleeper.
+    pub fn advance(&self, by: Duration) {
+        {
+            let mut now = self
+                .inner
+                .now
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *now += by;
+        }
+        self.inner.changed.notify_waiters();
+    }
+}
+
+impl FreezeClock for ManualClock {
+    fn now(&self) -> Instant {
+        *self
+            .inner
+            .now
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn sleep_until(&self, deadline: Instant) -> BoxFuture<'static, ()> {
+        let inner = Arc::clone(&self.inner);
+        Box::pin(async move {
+            loop {
+                // Register before reading the time, so an advance between
+                // the read and the wait is not missed.
+                let notified = inner.changed.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let now = *inner
+                    .now
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if now >= deadline {
+                    return;
+                }
+                notified.await;
+            }
+        })
+    }
+}
+
+/// The `in_flight` value while the plan and the marker are being prepared.
+pub const PREPARING: &str = "(preparing)";
 
 /// Where an operation stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -105,6 +219,8 @@ impl std::fmt::Display for AbortCause {
 }
 
 /// A snapshot of an operation, published to waiters after every change.
+/// Snapshots describe the driver's state; they are never written by
+/// anyone else.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Progress {
     /// Where the operation stands.
@@ -132,7 +248,7 @@ impl Progress {
         Progress {
             phase: Phase::Freezing,
             frozen: 0,
-            in_flight: Some("(preparing)".to_owned()),
+            in_flight: Some(PREPARING.to_owned()),
             recovery_pass_done: false,
             recovered: 0,
             unrecoverable: None,
@@ -141,21 +257,24 @@ impl Progress {
     }
 
     /// `true` once the completed targets have had their recovery drain or
-    /// the operation has settled: what a thaw that joins the operation
-    /// waits for.
+    /// the operation has settled.
     pub fn recovery_pass_done(&self) -> bool {
         self.settled.is_some() || self.recovery_pass_done
     }
 }
 
 /// One freeze operation, shared between the driver task, the request that
-/// started it and any thaw that joins it. Held in the [`Context`] until it
-/// settles.
+/// started it and any thaw that joins it. Registered in the [`Context`]
+/// until it settles.
 #[derive(Debug)]
 pub struct FreezeOp {
     deadline: Instant,
+    clock: Arc<dyn FreezeClock>,
     abort_requested: Notify,
-    aborted: Arc<AtomicBool>,
+    /// A thaw asked for the abort (read at the decision boundaries).
+    requested: AtomicBool,
+    /// The abort committed (read by workers before their ioctl).
+    aborted: AtomicBool,
     progress: watch::Sender<Progress>,
 }
 
@@ -164,12 +283,18 @@ impl FreezeOp {
     /// ones frozen so far (a thaw request). Idempotent; a request that
     /// arrives before the driver waits is not lost.
     pub fn request_abort(&self) {
+        self.requested.store(true, Ordering::SeqCst);
         self.abort_requested.notify_one();
     }
 
     /// The latest snapshot.
     pub fn progress(&self) -> Progress {
         self.progress.borrow().clone()
+    }
+
+    /// The operation deadline.
+    pub fn deadline(&self) -> Instant {
+        self.deadline
     }
 
     /// Waits until the recovery pass over the completed targets is done
@@ -191,12 +316,44 @@ impl FreezeOp {
         }
     }
 
+    /// The abort decision at a boundary: a pending request, else the
+    /// deadline.
+    fn abort_due(&self) -> Option<AbortCause> {
+        if self.requested.load(Ordering::SeqCst) {
+            Some(AbortCause::ThawRequested)
+        } else if self.clock.now() >= self.deadline {
+            Some(AbortCause::Deadline)
+        } else {
+            None
+        }
+    }
+
+    /// A worker's last check before its destructive call: not aborted and
+    /// not past the deadline. A worker that passed it is owned regardless.
+    fn authorises(&self) -> bool {
+        !self.aborted.load(Ordering::SeqCst) && self.clock.now() < self.deadline
+    }
+
     fn publish(&self, update: impl FnOnce(&mut Progress)) {
         self.progress.send_modify(update);
     }
+
+    /// An operation that is not driven: for registration tests.
+    #[cfg(test)]
+    pub(crate) fn detached_for_tests() -> Arc<FreezeOp> {
+        let (progress, _) = watch::channel(Progress::initial());
+        Arc::new(FreezeOp {
+            deadline: Instant::now() + Duration::from_secs(3600),
+            clock: Arc::new(TokioClock),
+            abort_requested: Notify::new(),
+            requested: AtomicBool::new(false),
+            aborted: AtomicBool::new(false),
+            progress,
+        })
+    }
 }
 
-/// Starts an operation: installs it in `ctx`, spawns the driver, and
+/// Starts an operation: registers it in `ctx`, spawns the driver, and
 /// returns the receiver of the request's single reply. `token` proves the
 /// caller moved the machine into `Freezing`; the driver consumes it.
 pub(crate) fn start(
@@ -206,10 +363,14 @@ pub(crate) fn start(
 ) -> oneshot::Receiver<Result<u64, FreezeFailure>> {
     let (reply_tx, reply_rx) = oneshot::channel();
     let (progress, _) = watch::channel(Progress::initial());
+    let clock = ctx.freeze_clock();
+    let timeout = ctx.freeze_operation_timeout();
     let op = Arc::new(FreezeOp {
-        deadline: Instant::now() + ctx.freeze_operation_timeout(),
+        deadline: clock.now() + timeout,
+        clock,
         abort_requested: Notify::new(),
-        aborted: Arc::new(AtomicBool::new(false)),
+        requested: AtomicBool::new(false),
+        aborted: AtomicBool::new(false),
         progress,
     });
     ctx.set_freeze_op(Some(Arc::clone(&op)));
@@ -229,7 +390,7 @@ pub(crate) fn start(
         kept: Vec::new(),
         unrecoverable: None,
         abort: None,
-        timeout: Duration::ZERO,
+        timeout,
     };
     tokio::spawn(driver.drive(restrict).with_subscriber(dispatch));
     reply_rx
@@ -243,7 +404,8 @@ enum TargetOutcome {
     Busy(Mount),
     /// `EOPNOTSUPP`: skipped.
     Skipped,
-    /// The abort committed before the ioctl: nothing was issued.
+    /// The abort had committed, or the deadline had passed, before the
+    /// ioctl: nothing was issued.
     NotAuthorized,
     /// A hard error, or no mount point leads to the target.
     Failed(FreezeStop),
@@ -261,6 +423,13 @@ enum Event<T> {
     Done(Result<T, JoinError>),
     Recovered(Result<RecoveryPass, JoinError>),
     Abort(AbortCause),
+}
+
+/// The state an operation settles in.
+#[derive(Clone, Copy)]
+enum Terminal {
+    Frozen,
+    Thawed,
 }
 
 struct Driver {
@@ -285,7 +454,6 @@ struct Driver {
 
 impl Driver {
     async fn drive(mut self, restrict: Option<Vec<String>>) {
-        self.timeout = self.ctx.freeze_operation_timeout();
         // Preparation: the plan, then the marker; both tracked.
         let mounts = Arc::clone(&self.ctx.mounts);
         let marker = self.marker.clone();
@@ -299,16 +467,16 @@ impl Driver {
             Ok(Err(failure)) => return self.settle_before_ioctl(failure).await,
             Err(err) => {
                 // Whether the marker was created is unknown; its removal
-                // below tolerates its absence.
+                // tolerates its absence.
                 return self
                     .settle_before_ioctl(FreezeFailure::Task(err.to_string()))
                     .await;
             }
         };
-        if self.abort.is_some() {
-            return self.settle_aborted().await;
-        }
+        self.op.publish(|p| p.in_flight = None);
         for target in plan.freeze_order() {
+            // Decision boundary: authorisation.
+            self.decide();
             if self.abort.is_some() {
                 break;
             }
@@ -338,7 +506,9 @@ impl Driver {
                     tracing::info!(event = "fsfreeze_skipped", mountpoint = %mountpoint, "freeze not supported; skipped");
                 }
                 Ok(TargetOutcome::NotAuthorized) => {
-                    tracing::debug!(event = "fsfreeze_not_authorized", mountpoint = %mountpoint, "abort committed before the ioctl; nothing issued");
+                    tracing::debug!(event = "fsfreeze_not_authorized", mountpoint = %mountpoint, "abort or deadline before the ioctl; nothing issued");
+                    // The worker saw the deadline before the driver did.
+                    self.decide();
                 }
                 Ok(TargetOutcome::Failed(stop)) => {
                     if self.abort.is_none() {
@@ -357,28 +527,33 @@ impl Driver {
                         mountpoint.clone(),
                         format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
                     ));
-                    if self.abort.is_none() {
-                        self.commit_abort(AbortCause::WorkerLost);
-                        break;
-                    }
+                    self.commit_abort(AbortCause::WorkerLost);
+                    break;
                 }
             }
         }
+        // Decision boundary: a completion arriving after the deadline (or
+        // after a request) enters recovery, never a successful `Frozen`.
+        self.decide();
         if self.abort.is_some() {
             return self.settle_aborted().await;
         }
-        // Every target processed without a hard error: `Frozen`.
-        if let Some(token) = self.token.take() {
-            self.ctx.state.freeze_succeeded(token);
-        }
-        self.ctx.hooks.on_frozen(&self.ctx);
         tracing::info!(
             event = "fsfreeze_frozen",
             frozen = self.frozen,
             "filesystems frozen"
         );
-        self.reply(Ok(self.frozen));
-        self.finish(FreezeState::Frozen);
+        let frozen = self.frozen;
+        self.conclude(Terminal::Frozen, Ok(frozen));
+    }
+
+    /// Takes the abort decision at a boundary (no-op once committed).
+    fn decide(&mut self) {
+        if self.abort.is_none()
+            && let Some(cause) = self.op.abort_due()
+        {
+            self.commit_abort(cause);
+        }
     }
 
     /// Spawns a blocking task whose records go to the request's subscriber.
@@ -390,11 +565,11 @@ impl Driver {
         tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, f))
     }
 
-    /// The worker for one target: open it on its planned device, re-check
-    /// the abort flag, then `FIFREEZE`.
+    /// The worker for one target: open it on its planned device, take the
+    /// last check, then `FIFREEZE`.
     fn spawn_freeze(&self, target: Target) -> JoinHandle<TargetOutcome> {
         let kernel = Arc::clone(&self.kernel);
-        let aborted = Arc::clone(&self.op.aborted);
+        let op = Arc::clone(&self.op);
         self.spawn_blocking(move || {
             let mount = match open_target(kernel.as_ref(), &target) {
                 Ok(mount) => mount,
@@ -402,9 +577,7 @@ impl Driver {
                     return TargetOutcome::Failed(FreezeStop::Unreachable(attempts));
                 }
             };
-            // The last check before the destructive call: an abort that
-            // committed while this worker was queued freezes nothing.
-            if aborted.load(Ordering::SeqCst) {
+            if !op.authorises() {
                 return TargetOutcome::NotAuthorized;
             }
             match kernel.fifreeze(&mount) {
@@ -416,10 +589,11 @@ impl Driver {
         })
     }
 
-    /// Awaits a tracked task to its end. Meanwhile, when `abortable`, the
-    /// deadline or a thaw request commits the abort (once), and a running
-    /// recovery drain is collected and, if more handles were published,
-    /// followed by another. The task itself is never abandoned.
+    /// Awaits a tracked task to its end. Meanwhile, when `abortable`, a
+    /// pending abort (request or deadline) commits first, ahead of any
+    /// completion; a running recovery drain is collected and, if more
+    /// handles were published, followed by another. The task itself is
+    /// never abandoned.
     async fn await_tracked<T>(
         &mut self,
         mut task: JoinHandle<T>,
@@ -432,14 +606,14 @@ impl Driver {
                 let armed = abortable && self.abort.is_none();
                 tokio::select! {
                     biased;
-                    res = &mut task => Event::Done(res),
+                    cause = abort_signal(op), if armed => Event::Abort(cause),
                     res = async {
                         match recovery.as_mut() {
                             Some(drain) => drain.await,
                             None => std::future::pending().await,
                         }
                     } => Event::Recovered(res),
-                    cause = abort_signal(op), if armed => Event::Abort(cause),
+                    res = &mut task => Event::Done(res),
                 }
             };
             match event {
@@ -547,8 +721,8 @@ impl Driver {
     }
 
     /// Nothing was frozen (the plan or the marker failed, or the
-    /// preparation was lost): `Thawed` after finalisation, the marker
-    /// removed if it exists; aborted or not.
+    /// preparation was lost): `Thawed`, the marker removed if it exists;
+    /// an aborted operation settles through the aborted path instead.
     async fn settle_before_ioctl(mut self, failure: FreezeFailure) {
         tracing::warn!(event = "fsfreeze_failed", error = %failure, "freeze failed before any ioctl");
         if self.abort.is_some() {
@@ -566,25 +740,24 @@ impl Driver {
             if let Ok(Err(err)) = removed
                 && !matches!(err, MarkerError::Absent { .. })
             {
-                self.settle_frozen(FreezeFailure::MarkerRetained {
-                    failed: "(preparation)".to_owned(),
-                    cause: FreezeStop::Unreachable(failure.to_string()),
-                    marker: err,
-                });
+                self.conclude(
+                    Terminal::Frozen,
+                    Err(FreezeFailure::MarkerRetained {
+                        failed: "(preparation)".to_owned(),
+                        cause: FreezeStop::Unreachable(failure.to_string()),
+                        marker: err,
+                    }),
+                );
                 return;
             }
         }
-        self.ctx.hooks.on_thawed(&self.ctx);
-        if let Some(token) = self.token.take() {
-            self.ctx.state.freeze_failed(token);
-        }
-        self.reply(Err(failure));
-        self.finish(FreezeState::Thawed);
+        self.conclude(Terminal::Thawed, Err(failure));
     }
 
     /// A hard error while not aborted: roll back the published handles,
     /// then `Thawed`, or `Frozen` when the rollback is incomplete or the
-    /// marker stays (§4.2).
+    /// marker stays (§4.2). The rollback is itself the recovery: the
+    /// deadline does not interrupt it.
     async fn settle_hard_error(mut self, failed: String, stop: FreezeStop) {
         let kernel = Arc::clone(&self.kernel);
         let marker = self.marker.clone();
@@ -613,31 +786,11 @@ impl Driver {
         };
         if failure.retains_frozen_state() || matches!(failure, FreezeFailure::Task(_)) {
             tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
-            self.settle_frozen(failure);
+            self.conclude(Terminal::Frozen, Err(failure));
             return;
         }
-        // Finalise first, publish `Thawed` last (see `FreezeHooks::on_thawed`).
-        self.ctx.hooks.on_thawed(&self.ctx);
-        if let Some(token) = self.token.take() {
-            self.ctx.state.freeze_failed(token);
-        }
         tracing::warn!(event = "fsfreeze_failed", error = %failure, "freeze failed");
-        self.reply(Err(failure));
-        self.finish(FreezeState::Thawed);
-    }
-
-    /// `Frozen` with the marker retained, from `Freezing` (token) or from
-    /// the aborted recovery (thaw token); the watchdog is armed as on any
-    /// entry into `Frozen`.
-    fn settle_frozen(mut self, failure: FreezeFailure) {
-        if let Some(token) = self.token.take() {
-            self.ctx.state.freeze_succeeded(token);
-        } else if let Some(thaw) = self.thaw_token.take() {
-            self.ctx.state.thaw_failed(thaw);
-        }
-        self.ctx.hooks.on_frozen(&self.ctx);
-        self.reply(Err(failure));
-        self.finish(FreezeState::Frozen);
+        self.conclude(Terminal::Thawed, Err(failure));
     }
 
     /// The abort committed and every worker has settled: drain what was
@@ -654,15 +807,14 @@ impl Driver {
                 break;
             }
         }
+        // The reply went out when the abort committed; the value here only
+        // matters if it did not (it never reaches anyone).
+        let aborted = FreezeFailure::Task("aborted".to_owned());
         if let Some((mountpoint, reason)) = self.unrecoverable.take() {
             tracing::error!(event = "fsfreeze_recovery_incomplete", mountpoint = %mountpoint, reason = %reason, "recovery incomplete; marker retained");
             let kept = std::mem::take(&mut self.kept);
             self.ctx.hold_frozen_mounts(kept);
-            if let Some(thaw) = self.thaw_token.take() {
-                self.ctx.state.thaw_failed(thaw);
-            }
-            self.ctx.hooks.on_frozen(&self.ctx);
-            self.finish(FreezeState::Frozen);
+            self.conclude(Terminal::Frozen, Err(aborted));
             return;
         }
         let marker = self.marker.clone();
@@ -671,34 +823,59 @@ impl Driver {
             .await;
         match removed {
             Ok(Ok(())) | Ok(Err(MarkerError::Absent { .. })) => {
-                self.ctx.hooks.on_thawed(&self.ctx);
-                if let Some(thaw) = self.thaw_token.take() {
-                    self.ctx.state.thaw_succeeded(thaw);
-                }
                 tracing::info!(
                     event = "fsfreeze_recovered",
                     recovered = self.recovered,
                     "aborted freeze recovered; thawed"
                 );
-                self.finish(FreezeState::Thawed);
+                self.conclude(Terminal::Thawed, Err(aborted));
             }
             Ok(Err(err)) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "recovery drained but the marker cannot be removed; staying frozen");
-                if let Some(thaw) = self.thaw_token.take() {
-                    self.ctx.state.thaw_failed(thaw);
-                }
-                self.ctx.hooks.on_frozen(&self.ctx);
-                self.finish(FreezeState::Frozen);
+                self.conclude(Terminal::Frozen, Err(aborted));
             }
             Err(err) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
-                if let Some(thaw) = self.thaw_token.take() {
+                self.conclude(Terminal::Frozen, Err(aborted));
+            }
+        }
+    }
+
+    /// The one settlement path: finalise and publish the terminal state
+    /// through whichever token the driver holds, send the reply if none
+    /// went out yet, retire the registration by identity, then announce
+    /// the settlement. Nothing after the retirement touches the context.
+    fn conclude(mut self, terminal: Terminal, reply: Result<u64, FreezeFailure>) {
+        let state = match terminal {
+            Terminal::Thawed => {
+                // Finalise (the audit flush) while still `Freezing` or
+                // `Thawing`, then publish: a freeze admitted afterwards can
+                // never have its logging mode changed by this one.
+                self.ctx.hooks.on_thawed(&self.ctx);
+                if let Some(token) = self.token.take() {
+                    self.ctx.state.freeze_failed(token);
+                } else if let Some(thaw) = self.thaw_token.take() {
+                    self.ctx.state.thaw_succeeded(thaw);
+                }
+                FreezeState::Thawed
+            }
+            Terminal::Frozen => {
+                if let Some(token) = self.token.take() {
+                    self.ctx.state.freeze_succeeded(token);
+                } else if let Some(thaw) = self.thaw_token.take() {
                     self.ctx.state.thaw_failed(thaw);
                 }
                 self.ctx.hooks.on_frozen(&self.ctx);
-                self.finish(FreezeState::Frozen);
+                FreezeState::Frozen
             }
-        }
+        };
+        self.reply(reply);
+        self.ctx.retire_freeze_op(&self.op);
+        self.op.publish(|p| {
+            p.phase = Phase::Settled;
+            p.in_flight = None;
+            p.settled = Some(state);
+        });
     }
 
     /// Sends the request's single reply; later calls are no-ops.
@@ -708,23 +885,40 @@ impl Driver {
             let _ = tx.send(outcome);
         }
     }
-
-    /// Releases the operation's slot and publishes its settlement.
-    fn finish(&mut self, state: FreezeState) {
-        self.ctx.set_freeze_op(None);
-        self.op.publish(|p| {
-            p.phase = Phase::Settled;
-            p.in_flight = None;
-            p.settled = Some(state);
-        });
-    }
 }
 
-/// Resolves when the deadline passes or an abort is requested.
+/// Resolves when an abort is requested or the deadline passes.
 async fn abort_signal(op: &FreezeOp) -> AbortCause {
     tokio::select! {
         biased;
         () = op.abort_requested.notified() => AbortCause::ThawRequested,
-        () = sleep_until(op.deadline) => AbortCause::Deadline,
+        () = op.clock.sleep_until(op.deadline) => AbortCause::Deadline,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn the_manual_clock_wakes_sleepers_only_when_advanced() {
+        let clock = ManualClock::new();
+        let deadline = clock.now() + Duration::from_secs(10);
+        let sleeper = {
+            let clock = clock.clone();
+            tokio::spawn(async move { clock.sleep_until(deadline).await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!sleeper.is_finished(), "real time does not move it");
+        clock.advance(Duration::from_secs(9));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!sleeper.is_finished(), "still short of the deadline");
+        clock.advance(Duration::from_secs(1));
+        tokio::time::timeout(Duration::from_secs(5), sleeper)
+            .await
+            .unwrap()
+            .unwrap();
+        // A sleep that starts past its deadline resolves at once.
+        clock.sleep_until(deadline).await;
     }
 }

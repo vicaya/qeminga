@@ -128,6 +128,10 @@ struct Inner {
     thaw_gates: HashMap<PathBuf, Gate>,
     trim_gates: HashMap<PathBuf, Gate>,
     hook: Option<Hook>,
+    /// Model the kernel's freeze nesting: every successful `fifreeze`
+    /// grants one `fithaw` success on that path; unscripted paths start
+    /// at zero (not frozen) instead of the default one.
+    track_depth: bool,
 }
 
 /// The fake kernel. Thread-safe; cheap to share behind an `Arc`.
@@ -266,6 +270,23 @@ impl FakeKernel {
         gate
     }
 
+    /// Models the kernel's freeze depth from now on: a successful
+    /// `fifreeze(path)` adds one `fithaw(path)` success, and a path that
+    /// was never frozen answers `EINVAL` at once (as the kernel does), so
+    /// a thaw count reflects what was actually frozen. Scripted thaw
+    /// successes and errors still apply on top.
+    pub fn track_freeze_depth(&self) {
+        self.lock().track_depth = true;
+    }
+
+    /// Forgets every freeze (a guest reboot): every path is thawed.
+    pub fn reset_freeze_depths(&self) {
+        let mut inner = self.lock();
+        for depth in inner.thaw_successes.values_mut() {
+            *depth = 0;
+        }
+    }
+
     /// Installs an observer called on every operation.
     pub fn set_hook(&self, hook: Hook) {
         self.lock().hook = Some(hook);
@@ -303,9 +324,18 @@ impl KernelOps for FakeKernel {
         if let Some(gate) = gate {
             gate.wait();
         }
-        match self.lock().freeze_errors.get(mountpoint) {
+        let mut inner = self.lock();
+        match inner.freeze_errors.get(mountpoint) {
             Some(errno) => Err(KernelError::Errno(*errno)),
-            None => Ok(()),
+            None => {
+                if inner.track_depth {
+                    *inner
+                        .thaw_successes
+                        .entry(mountpoint.to_owned())
+                        .or_insert(0) += 1;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -320,10 +350,11 @@ impl KernelOps for FakeKernel {
         if let Some(errno) = inner.thaw_errors.get(mountpoint) {
             return Err(KernelError::Errno(*errno));
         }
+        let unscripted = if inner.track_depth { 0 } else { 1 };
         let remaining = inner
             .thaw_successes
             .entry(mountpoint.to_owned())
-            .or_insert(1);
+            .or_insert(unscripted);
         if *remaining > 0 {
             *remaining -= 1;
             Ok(())
@@ -396,6 +427,27 @@ mod tests {
         assert!(gate.is_released());
         // A released gate no longer blocks.
         k.fifreeze(&Mount::unopened("/home", (8, 2))).unwrap();
+    }
+
+    #[test]
+    fn tracked_freeze_depth_grants_one_thaw_per_freeze_and_a_reboot_clears_it() {
+        let k = FakeKernel::new();
+        k.track_freeze_depth();
+        // Never frozen: not frozen, as the kernel answers.
+        assert!(k.fithaw(&at("/")).unwrap_err().is_invalid());
+        k.fifreeze(&at("/")).unwrap();
+        k.fifreeze(&at("/")).unwrap();
+        k.fithaw(&at("/")).unwrap();
+        k.fithaw(&at("/")).unwrap();
+        assert!(k.fithaw(&at("/")).unwrap_err().is_invalid());
+        // A scripted freeze error freezes nothing.
+        k.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        assert!(k.fifreeze(&at("/home")).is_err());
+        assert!(k.fithaw(&at("/home")).unwrap_err().is_invalid());
+        // A reboot forgets every freeze.
+        k.fifreeze(&at("/")).unwrap();
+        k.reset_freeze_depths();
+        assert!(k.fithaw(&at("/")).unwrap_err().is_invalid());
     }
 
     #[test]

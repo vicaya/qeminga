@@ -18,6 +18,19 @@ semantic versioning.
   gate and the freeze-safe audit mode stay until the operation settles
   (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
 
+### Added
+
+- Design §4.5, the snapshot controller contract: what the freeze, status
+  and thaw replies mean, the one supported protocol for the interval a
+  freeze protects (one mount point per required superblock, one freeze
+  per cycle under a client timeout, heartbeats and a cycle budget under
+  the hard cap, one thaw, quiesced only when the freeze count and the
+  thaw count both equal the number requested), its assumptions and
+  their limit; the reference controller in `tests/controller_contract.rs`
+  exercises it against the production coordinator and watchdog (#43 §1).
+  The scripted kernel can model the freeze nesting depth
+  (`FakeKernel::track_freeze_depth`).
+
 ### Fixed
 
 - The thaw of a freeze operation this process completed drains the

@@ -344,6 +344,15 @@ impl Context {
         self.frozen_mounts_slot().len()
     }
 
+    /// The lock behind the held handles, for tests that must hold the
+    /// driver between a completion and its next decision boundary.
+    #[cfg(test)]
+    pub(crate) fn frozen_mounts_lock_for_tests(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
+        self.frozen_mounts_slot()
+    }
+
     fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
         self.frozen_mounts
             .lock()

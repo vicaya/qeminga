@@ -3014,6 +3014,95 @@ mod tests {
         assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
     }
 
+    /// Holds the driver in the synchronous window after a completion:
+    /// another thread takes the held-handles lock the driver needs to
+    /// publish the completed target, so the driver, past its await and
+    /// short of its next decision, waits there until the gate opens.
+    fn hold_driver_after_completion(rig: &Rig) -> (Gate, std::thread::JoinHandle<()>) {
+        let hold = Gate::new();
+        let gate = hold.clone();
+        let ctx = Arc::clone(&rig.ctx);
+        let holder = std::thread::spawn(move || {
+            let _held = ctx.frozen_mounts_lock_for_tests();
+            gate.wait();
+        });
+        (hold, holder)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_passing_between_a_completion_and_the_next_authorisation_opens_nothing() {
+        // A completes; before the driver reaches its next decision the
+        // clock passes the deadline, with no await in between to notice
+        // it: the decision boundary itself must catch it, so B is never
+        // opened, let alone frozen, and A is recovered.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_secs(1));
+        let a = rig.kernel.script_freeze_gate(A);
+        let _release_a = a.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("A blocked", |_| a.waiting() == 1).await;
+        let (hold, holder) = hold_driver_after_completion(&rig);
+        rig.wait_for("lock held", |_| hold.waiting() == 1).await;
+        a.release();
+        let op = rig.ctx.freeze_op().unwrap();
+        rig.wait_for("driver past A's await", |_| {
+            op.progress().in_flight.is_none()
+        })
+        .await;
+        assert_eq!(
+            op.progress().frozen,
+            0,
+            "A not yet published: the driver is held"
+        );
+        rig.expire();
+        hold.release();
+        holder.join().unwrap();
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("deadline of 1 s expired"), "{err}");
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(rig.opens(), paths(&[A]), "B never authorised");
+        assert_eq!(rig.fifreezes(), paths(&[A]));
+        assert_eq!(rig.fithaws(), paths(&[A, A]));
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_deadline_passing_between_the_last_completion_and_the_commit_enters_recovery() {
+        // D, the last target, completes; the clock passes the deadline
+        // while the driver is held short of its commit: the decision
+        // before the commit enters recovery, `Frozen` is never published.
+        let rig = Rig::nested().with_operation_timeout(Duration::from_secs(1));
+        let d = rig.kernel.script_freeze_gate(D);
+        let _release_d = d.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("D blocked", |_| d.waiting() == 1).await;
+        let (hold, holder) = hold_driver_after_completion(&rig);
+        rig.wait_for("lock held", |_| hold.waiting() == 1).await;
+        d.release();
+        let op = rig.ctx.freeze_op().unwrap();
+        rig.wait_for("driver past D's await", |_| {
+            op.progress().in_flight.is_none()
+        })
+        .await;
+        assert_eq!(
+            op.progress().frozen,
+            3,
+            "D not yet published: the driver is held"
+        );
+        rig.expire();
+        hold.release();
+        holder.join().unwrap();
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("deadline of 1 s expired"), "{err}");
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(rig.fifreezes(), paths(&[A, B, C, D]));
+        assert_eq!(rig.fithaws().len(), 8, "all four recovered");
+        assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
+        assert!(!rig.marker().exists());
+    }
+
     #[tokio::test]
     async fn the_last_completion_after_the_expiry_enters_recovery_not_frozen() {
         // Every target but the last is frozen when the deadline passes

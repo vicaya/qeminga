@@ -402,10 +402,22 @@ impl FreezeOp {
     /// An operation that is not driven: for registration tests.
     #[cfg(test)]
     pub(crate) fn detached_for_tests() -> Arc<FreezeOp> {
+        Self::detached_with_deadline(
+            Arc::new(TokioClock),
+            Instant::now() + Duration::from_secs(3600),
+        )
+    }
+
+    /// An operation that is not driven, on `clock` with `deadline`.
+    #[cfg(test)]
+    pub(crate) fn detached_with_deadline(
+        clock: Arc<dyn FreezeClock>,
+        deadline: Instant,
+    ) -> Arc<FreezeOp> {
         let (progress, _) = watch::channel(Progress::initial());
         Arc::new(FreezeOp {
-            deadline: Instant::now() + Duration::from_secs(3600),
-            clock: Arc::new(TokioClock),
+            deadline,
+            clock,
             abort_requested: Notify::new(),
             outcome: AtomicU8::new(OUTCOME_OPEN),
             aborted: AtomicBool::new(false),
@@ -975,6 +987,24 @@ async fn abort_signal(op: &FreezeOp) -> AbortCause {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_deadline_instant_itself_authorises_nothing() {
+        // The worker's last check and the driver's decision agree on the
+        // boundary: one tick before the deadline authorises, the deadline
+        // instant does not.
+        let clock = ManualClock::new();
+        let deadline = clock.now() + Duration::from_secs(1);
+        let op = FreezeOp::detached_with_deadline(Arc::new(clock.clone()), deadline);
+        assert!(op.authorises());
+        assert_eq!(op.abort_due(), None);
+        clock.advance(Duration::from_millis(999));
+        assert!(op.authorises());
+        assert_eq!(op.abort_due(), None);
+        clock.advance(Duration::from_millis(1));
+        assert!(!op.authorises(), "the deadline instant is expired");
+        assert_eq!(op.abort_due(), Some(AbortCause::Deadline));
+    }
 
     #[test]
     fn abort_and_commit_compete_on_one_transition() {

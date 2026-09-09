@@ -444,8 +444,8 @@ Every input, queue, worker and reply the host can drive has an explicit limit; p
 | Recovery requests | serialised behind the drain in progress, at most the session's 8 places | a further thaw waits unread; each is answered from the kernel's own state, so a drained target costs one call |
 | `guest-get-fsinfo` walks (OQ-5) | 2 alive at once, 10 s each | refused at once; a stuck walk fails its command |
 | Mount table read (§4.2) | 32 MiB | the read fails; freeze, thaw and fsinfo report it |
-| `guest-get-fsinfo` reply | 1 MiB encoded | `GenericError` naming the bound; never truncated |
-| `guest-network-get-interfaces` reply | 256 KiB encoded | `GenericError` naming the bound; never truncated |
+| `guest-get-fsinfo` reply | 1 MiB, the line as sent (value, `{"return":…,"id":…}` envelope and newline) | `GenericError` naming the bound; never truncated |
+| `guest-network-get-interfaces` reply | 256 KiB, the line as sent | `GenericError` naming the bound; never truncated |
 | `os-release` read | 64 KiB | kernel fields only, the read failure logged |
 | Reopen backoff (§5.7) | 1 s doubling to 30 s | n/a: a reconnect storm is paced by the agent, and each session starts with a clean decoder and nothing retained |
 | Retained validity records (§4.5) | none: the contract needs no state in the agent | n/a |

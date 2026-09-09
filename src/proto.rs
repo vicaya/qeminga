@@ -216,6 +216,14 @@ pub enum Response {
     },
 }
 
+/// The most bytes a reply line adds around a command's return value:
+/// `{"return":` and `,"id":<i64>}` with the longest id (`i64::MIN`), plus
+/// the newline framing the line. A reply bound applied to the value
+/// (`handlers::bounded_reply`) reserves this much, so the bound holds for
+/// the whole line as sent (§5.10).
+pub const MAX_RESPONSE_ENVELOPE_BYTES: usize =
+    "{\"return\":".len() + ",\"id\":-9223372036854775808}\n".len();
+
 impl Response {
     /// Builds a response from a handler result, echoing `id`.
     pub fn from_result(id: Option<i64>, result: Result<Value, Error>) -> Self {
@@ -314,6 +322,25 @@ pub fn arguments<T: DeserializeOwned>(request: &Request) -> Result<T, Error> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn the_envelope_bound_is_the_longest_envelope_a_reply_line_can_carry() {
+        let value = json!([1, 2, 3]);
+        let inner = serde_json::to_vec(&value).unwrap().len();
+        let mut line = Response::Success {
+            ret: value,
+            id: Some(i64::MIN),
+        }
+        .to_json();
+        line.push(b'\n');
+        assert_eq!(line.len() - inner, MAX_RESPONSE_ENVELOPE_BYTES);
+        let shorter = Response::Success {
+            ret: json!([1, 2, 3]),
+            id: None,
+        }
+        .to_json();
+        assert!(shorter.len() + 1 < inner + MAX_RESPONSE_ENVELOPE_BYTES);
+    }
 
     #[test]
     fn request_parses_execute_only() {

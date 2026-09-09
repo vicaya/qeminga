@@ -35,8 +35,9 @@ semantic versioning.
   the documented API; the daemon never calls it).
 
 - `guest-get-fsinfo` and `guest-network-get-interfaces` refuse a reply
-  larger than 1 MiB and 256 KiB respectively with an explicit error
-  naming the bound, instead of a truncated list; design §5.10 inventories
+  whose line on the wire (envelope included) would exceed 1 MiB and
+  256 KiB respectively, with an explicit error naming the bound instead
+  of a truncated list; design §5.10 inventories
   every bound the host can drive and states the failure model (#43 §6).
 - The data-protection profile (#43 §5): `[features] shutdown` and
   `[features] information` (both on by default) switch `guest-shutdown`

@@ -336,6 +336,22 @@ impl Context {
         self
     }
 
+    /// Ends everything this instance has in flight, as the process's death
+    /// would: the watchdog is cancelled and a freeze walk waiting on its
+    /// workers is aborted, so neither can publish a state, write a marker
+    /// or thaw after the instance is gone. Blocking work already in the
+    /// kernel (an ioctl) completes on its own thread, as an in-flight
+    /// syscall does. For harnesses that model a crash (`SIGKILL`) and a
+    /// restart in one process; never called by the daemon itself.
+    pub fn abort_tasks(&self) {
+        if let Some(watchdog) = self.watchdog_slot().take() {
+            watchdog.cancel();
+        }
+        if let Some(op) = self.freeze_op() {
+            op.abort_driver();
+        }
+    }
+
     /// The watchdog slot. The guard is short-lived and never held across
     /// an `.await`.
     pub fn watchdog_slot(

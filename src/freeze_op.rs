@@ -303,9 +303,22 @@ pub struct FreezeOp {
     /// ioctl).
     aborted: AtomicBool,
     progress: watch::Sender<Progress>,
+    /// The driver task, once spawned, for [`abort_driver`](Self::abort_driver).
+    driver: std::sync::OnceLock<tokio::task::AbortHandle>,
 }
 
 impl FreezeOp {
+    /// Aborts the driver task where it waits, as the process's death
+    /// would end it: no state is published, no marker written and no
+    /// reply sent by it afterwards; a worker's ioctl already in the kernel
+    /// completes on its own thread. For harnesses modelling a crash
+    /// ([`Context::abort_tasks`]); the daemon never aborts its own driver.
+    pub fn abort_driver(&self) {
+        if let Some(driver) = self.driver.get() {
+            driver.abort();
+        }
+    }
+
     /// Asks the operation to stop authorising targets and to recover the
     /// ones frozen so far (a thaw request). Idempotent; a request that
     /// arrives before the driver waits is not lost. The answer says
@@ -424,6 +437,7 @@ impl FreezeOp {
             outcome: AtomicU8::new(OUTCOME_OPEN),
             aborted: AtomicBool::new(false),
             progress,
+            driver: std::sync::OnceLock::new(),
         })
     }
 }
@@ -447,8 +461,10 @@ pub(crate) fn start(
         outcome: AtomicU8::new(OUTCOME_OPEN),
         aborted: AtomicBool::new(false),
         progress,
+        driver: std::sync::OnceLock::new(),
     });
     ctx.set_freeze_op(Some(Arc::clone(&op)));
+    let spawned = Arc::clone(&op);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let driver = Driver {
         kernel: Arc::clone(&ctx.kernel),
@@ -468,7 +484,10 @@ pub(crate) fn start(
         abort: None,
         timeout,
     };
-    tokio::spawn(driver.drive(restrict).with_subscriber(dispatch));
+    let task = tokio::spawn(driver.drive(restrict).with_subscriber(dispatch));
+    // Set once, here; `abort_driver` before this point aborts nothing,
+    // which is right: the driver has not run yet either.
+    let _ = spawned.driver.set(task.abort_handle());
     reply_rx
 }
 

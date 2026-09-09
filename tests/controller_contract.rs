@@ -42,6 +42,10 @@ const A: &str = "/";
 const B: &str = "/home";
 const IDLE_SECS: u64 = 30;
 const MAX_SECS: u64 = 120;
+/// The controller's cycle budget: under the hard cap by a margin covering
+/// the freeze walk (bounded by the operation deadline) and the thaw
+/// (§4.5 "Timing assumptions").
+const BUDGET_SECS: u64 = MAX_SECS - OPERATION_SECS - 5;
 /// The freeze operation deadline (§4.4), on the manual clock.
 const OPERATION_SECS: u64 = 10;
 /// The controller's own timeout on the freeze reply (§4.5 step 2).
@@ -127,12 +131,13 @@ impl Guest {
     /// kernel keeps every freeze, the marker stays. In-flight requests
     /// are lost.
     fn crash_agent(&self) {
-        if let Some(agent) = self.agent.lock().unwrap().take()
-            && let Some(watchdog) = agent.context().watchdog_slot().take()
-        {
-            watchdog.cancel();
-        }
         self.lost.notify_waiters();
+        if let Some(agent) = self.agent.lock().unwrap().take() {
+            // Everything the instance had in flight dies with it: the
+            // watchdog, a freeze walk waiting on its workers. An ioctl
+            // already in the kernel completes on its own, as it would.
+            agent.context().abort_tasks();
+        }
     }
 
     /// The agent restarts (systemd `Restart=always`): recovery mode when
@@ -164,12 +169,16 @@ impl Guest {
             bytes: json.as_bytes().to_vec(),
             sentinel: false,
         });
+        // A connection lost is lost whatever the dead instance's tasks
+        // produced as they were torn down: nothing of that reaches a
+        // controller across a real crash.
         let reply = tokio::select! {
+            biased;
+            () = &mut lost => Err("connection lost".to_owned()),
             reply = handling => {
                 let reply = reply.ok_or_else(|| "no reply".to_owned())?;
                 serde_json::from_slice(&reply[..reply.len() - 1]).map_err(|e| e.to_string())
             }
-            () = &mut lost => Err("connection lost".to_owned()),
         };
         // Let the agent's own tasks act on the request at the time it was
         // made (a heartbeat reaches the watchdog on its next poll): on the
@@ -283,7 +292,7 @@ impl Cycle {
 
     /// The lease budget left, on the controller's own clock.
     fn budget_left(&self) -> Duration {
-        Duration::from_secs(MAX_SECS).saturating_sub(self.started.elapsed())
+        Duration::from_secs(BUDGET_SECS).saturating_sub(self.started.elapsed())
     }
 
     /// Step 3: a heartbeat; every answer must be `frozen`.
@@ -337,6 +346,16 @@ impl Cycle {
             return Verdict::Rejected(format!(
                 "thaw found {thawed} of {} required superblocks still frozen",
                 self.required.len()
+            ));
+        }
+        // The whole cycle, freeze request to thaw reply, on the
+        // controller's clock (§4.5 step 3): the count says the kernel was
+        // still frozen, not that it was this cycle's lease that held it.
+        let elapsed = self.started.elapsed();
+        if elapsed > Duration::from_secs(BUDGET_SECS) {
+            return Verdict::Rejected(format!(
+                "the thaw replied {}s after the freeze request, beyond the cycle budget of {BUDGET_SECS}s",
+                elapsed.as_secs()
             ));
         }
         Verdict::Quiesced {
@@ -445,10 +464,10 @@ async fn a_lease_that_expires_during_the_cut_is_rejected() {
         .cut("vol-b", Duration::from_secs(90))
         .await
         .unwrap_err();
-    assert!(
-        err.contains("budget exhausted") || err.contains("thawed"),
-        "{err}"
-    );
+    assert!(err.contains("budget exhausted"), "{err}");
+    // A controller that is slow to thaw once its budget is gone meets the
+    // cap: the agent thawed on its own and the count says so.
+    tokio::time::advance(Duration::from_secs(MAX_SECS - BUDGET_SECS + 1)).await;
     wait_for("cap thaw", || guest.state() == FreezeState::Thawed).await;
     let verdict = cycle.thaw().await;
     rejected(&verdict, "thaw found 0 of 2");
@@ -565,6 +584,7 @@ async fn a_crash_before_the_freeze_reply_is_rejected() {
     let cycle = tokio::spawn(Cycle::freeze(Arc::clone(&guest), &[A, B]));
     let g = gate.clone();
     wait_for("B blocked", move || g.waiting() == 1).await;
+    let dead = guest.ctx();
     guest.restart_agent();
     assert_eq!(guest.state(), FreezeState::Frozen, "marker: recovery mode");
     gate.release();
@@ -575,6 +595,47 @@ async fn a_crash_before_the_freeze_reply_is_rejected() {
         guest.fithaws() >= 2,
         "the recovery thaw drained by pathname"
     );
+    // The dead instance is dead: the FIFREEZE that was in the kernel when
+    // it died completed on its own (the recovery thaw above found it), but
+    // its walk never concluded, published nothing, wrote no marker and
+    // armed no watchdog that could thaw under the next cycle's feet.
+    settle().await;
+    assert_eq!(dead.state.current(), FreezeState::Freezing);
+    assert!(dead.watchdog_slot().is_none());
+    assert!(!guest.dir.path().join("frozen").exists());
+    let thaws = guest.fithaws();
+    tokio::time::advance(Duration::from_secs(10 * MAX_SECS)).await;
+    settle().await;
+    assert_eq!(guest.fithaws(), thaws, "no ghost watchdog");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_thaw_reply_past_the_budget_is_rejected_whatever_the_count() {
+    // The agent restarts at t=5 and its recovery re-arms the hard cap from
+    // then (§4.4), so the kernel is still frozen at t=115 and the thaw
+    // counts both superblocks. The controller's budget runs from its own
+    // freeze request: a thaw reply past it cannot be a quiesced cycle,
+    // whatever the count says.
+    let guest = Guest::new();
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &[A, B]).await.unwrap();
+    cycle.cut("vol-a", Duration::from_secs(5)).await.unwrap();
+    guest.restart_agent();
+    cycle
+        .cut("vol-b", Duration::from_secs(BUDGET_SECS - 10))
+        .await
+        .unwrap();
+    // The thaw is sent inside the budget; its FITHAW takes long enough
+    // for the reply to land past it.
+    let gate = guest.kernel.script_thaw_gate(A);
+    let _release: ReleaseOnDrop = gate.release_on_drop();
+    let thaw = tokio::spawn(cycle.thaw());
+    let g = gate.clone();
+    wait_for("A's thaw blocked", move || g.waiting() == 1).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    gate.release();
+    let verdict = thaw.await.unwrap();
+    rejected(&verdict, "beyond the cycle budget");
+    assert_eq!(guest.state(), FreezeState::Thawed);
 }
 
 #[tokio::test(start_paused = true)]

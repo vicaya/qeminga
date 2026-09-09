@@ -129,9 +129,13 @@ struct Inner {
     trim_gates: HashMap<PathBuf, Gate>,
     hook: Option<Hook>,
     /// Model the kernel's freeze nesting: every successful `fifreeze`
-    /// grants one `fithaw` success on that path; unscripted paths start
-    /// at zero (not frozen) instead of the default one.
+    /// grants one `fithaw` success on that superblock; unscripted paths
+    /// start at zero (not frozen) instead of the default one.
     track_depth: bool,
+    /// The tracked freeze depth of each superblock, by `(major, minor)`:
+    /// `FIFREEZE`/`FITHAW` state belongs to the filesystem, not to the
+    /// pathname it was reached by, so an alias thaws what another froze.
+    depths: HashMap<(u32, u32), u32>,
 }
 
 /// The fake kernel. Thread-safe; cheap to share behind an `Arc`.
@@ -181,7 +185,8 @@ impl FakeKernel {
 
     /// Makes `fithaw(path)` succeed `n` times and then return `EINVAL`
     /// (models the kernel's freeze nesting depth). Unscripted paths
-    /// succeed once.
+    /// succeed once, or as often as the superblock was frozen under
+    /// [`track_freeze_depth`](Self::track_freeze_depth).
     pub fn script_thaw_successes(&self, path: impl AsRef<Path>, n: u32) {
         self.lock()
             .thaw_successes
@@ -271,17 +276,19 @@ impl FakeKernel {
     }
 
     /// Models the kernel's freeze depth from now on: a successful
-    /// `fifreeze(path)` adds one `fithaw(path)` success, and a path that
-    /// was never frozen answers `EINVAL` at once (as the kernel does), so
-    /// a thaw count reflects what was actually frozen. Scripted thaw
-    /// successes and errors still apply on top.
+    /// `fifreeze` adds one `fithaw` success on that superblock, whichever
+    /// mount point of it either is called with, and a superblock that was
+    /// never frozen answers `EINVAL` at once (as the kernel does), so a
+    /// thaw count reflects what was actually frozen. Scripted thaw
+    /// successes and errors on a path still take precedence on that path.
     pub fn track_freeze_depth(&self) {
         self.lock().track_depth = true;
     }
 
-    /// Forgets every freeze (a guest reboot): every path is thawed.
+    /// Forgets every freeze (a guest reboot): every superblock is thawed.
     pub fn reset_freeze_depths(&self) {
         let mut inner = self.lock();
+        inner.depths.clear();
         for depth in inner.thaw_successes.values_mut() {
             *depth = 0;
         }
@@ -329,10 +336,7 @@ impl KernelOps for FakeKernel {
             Some(errno) => Err(KernelError::Errno(*errno)),
             None => {
                 if inner.track_depth {
-                    *inner
-                        .thaw_successes
-                        .entry(mountpoint.to_owned())
-                        .or_insert(0) += 1;
+                    *inner.depths.entry(mount.dev()).or_insert(0) += 1;
                 }
                 Ok(())
             }
@@ -350,11 +354,14 @@ impl KernelOps for FakeKernel {
         if let Some(errno) = inner.thaw_errors.get(mountpoint) {
             return Err(KernelError::Errno(*errno));
         }
-        let unscripted = if inner.track_depth { 0 } else { 1 };
-        let remaining = inner
-            .thaw_successes
-            .entry(mountpoint.to_owned())
-            .or_insert(unscripted);
+        let remaining = if inner.track_depth && !inner.thaw_successes.contains_key(mountpoint) {
+            inner.depths.entry(mount.dev()).or_insert(0)
+        } else {
+            inner
+                .thaw_successes
+                .entry(mountpoint.to_owned())
+                .or_insert(1)
+        };
         if *remaining > 0 {
             *remaining -= 1;
             Ok(())
@@ -448,6 +455,31 @@ mod tests {
         k.fifreeze(&at("/")).unwrap();
         k.reset_freeze_depths();
         assert!(k.fithaw(&at("/")).unwrap_err().is_invalid());
+    }
+
+    #[test]
+    fn tracked_freeze_depth_belongs_to_the_superblock_not_the_pathname() {
+        // FIFREEZE/FITHAW state is the superblock's: frozen through one
+        // bind alias, a filesystem thaws through another (as recovery
+        // after a restart may reach it), and only as many times as it was
+        // frozen. A scripted thaw count on a path still overrides.
+        let k = FakeKernel::new();
+        k.track_freeze_depth();
+        let data = Mount::unopened("/data", (8, 2));
+        let alias = Mount::unopened("/srv/data-alias", (8, 2));
+        let other = Mount::unopened("/other", (8, 3));
+        k.fifreeze(&data).unwrap();
+        k.fithaw(&alias).unwrap();
+        assert!(k.fithaw(&data).unwrap_err().is_invalid());
+        assert!(k.fithaw(&alias).unwrap_err().is_invalid());
+        assert!(k.fithaw(&other).unwrap_err().is_invalid());
+        k.fifreeze(&alias).unwrap();
+        k.fifreeze(&data).unwrap();
+        k.reset_freeze_depths();
+        assert!(k.fithaw(&data).unwrap_err().is_invalid());
+        k.script_thaw_successes("/data", 1);
+        k.fithaw(&data).unwrap();
+        assert!(k.fithaw(&data).unwrap_err().is_invalid());
     }
 
     #[test]

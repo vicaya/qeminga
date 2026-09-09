@@ -31,7 +31,7 @@
 //! 5. Every authorised worker is awaited to its end. A late success (or
 //!    `EBUSY`) is drained through the handle it opened; a late error needs
 //!    nothing; a worker that panicked leaves its target uncertain.
-//! 6. The operation settles through one path ([`Driver::conclude`]) only
+//! 6. The operation settles through one path (`Driver::conclude`) only
 //!    when no worker is outstanding and every published handle has been
 //!    drained: complete → marker removed, finalisation hook, `Thawed`; a
 //!    drain incomplete or the marker not removable → `Frozen`, marker

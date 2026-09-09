@@ -22,6 +22,7 @@
 //! resets it to [`INITIAL_BACKOFF`].
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -267,6 +268,44 @@ where
     run_session_until(reader, writer, handler, decoder, &mut never).await
 }
 
+/// Commands a session handles at once. A reply that is pending (a freeze
+/// whose walk is under way) must not stop the host's frozen-safe controls
+/// from being handled: a `guest-fsfreeze-thaw` has to reach the freeze
+/// operation before its deadline, and `guest-fsfreeze-status` has to be
+/// answered while a recovery drain is blocked. Later frames are therefore
+/// dispatched while earlier replies are pending, up to this many at once;
+/// the channel is not read while the bound is reached, so nothing queues
+/// without limit. Replies are written by the one writer strictly in
+/// request order, whatever order the commands finish in: the wire keeps
+/// the correlation a host relies on for requests without an `id`, and a
+/// `guest-sync-delimited` reply follows every earlier reply, which the
+/// host discards up to the sentinel.
+pub const MAX_IN_FLIGHT: usize = 4;
+
+/// A command in flight or its finished reply, in request order.
+enum Slot<'a> {
+    Pending(Pin<Box<dyn Future<Output = Option<Vec<u8>>> + Send + 'a>>),
+    Done(Option<Vec<u8>>),
+}
+
+/// Polls every pending command and resolves once the one at the head of
+/// the deque has finished (its reply is the next to write).
+fn drive_head<'a, 'b>(slots: &'b mut VecDeque<Slot<'a>>) -> impl Future<Output = ()> + 'b {
+    std::future::poll_fn(move |cx| {
+        for slot in slots.iter_mut() {
+            if let Slot::Pending(fut) = slot
+                && let Poll::Ready(reply) = fut.as_mut().poll(cx)
+            {
+                *slot = Slot::Done(reply);
+            }
+        }
+        match slots.front() {
+            Some(Slot::Done(_)) => Poll::Ready(()),
+            _ => Poll::Pending,
+        }
+    })
+}
+
 /// [`run_session`] that also ends with [`SessionEnd::Cancelled`] once
 /// `cancel` is `true` **and** `handler.may_stop()` holds. Cancellation is
 /// only ever raced against the read: a command that is being handled is
@@ -275,6 +314,12 @@ where
 /// `Freezing`, contrary to C-21/§5.7). A cancellation the handler does
 /// not yet allow is re-checked after every command and on every later
 /// notification.
+///
+/// Up to [`MAX_IN_FLIGHT`] commands are handled at once (see there); the
+/// replies go out in request order. When the peer goes away or a read
+/// fails, the commands already in flight are still finished (their side
+/// effects are complete before the session ends; the replies are written
+/// on a best-effort basis) and only then does the session end.
 pub async fn run_session_until<R, W, H>(
     mut reader: R,
     mut writer: W,
@@ -292,37 +337,62 @@ where
     // Once the sender is gone there is nothing left to wait for.
     let mut cancel_live = true;
     let report = |end, received| SessionReport { end, received };
+    let mut slots: VecDeque<Slot<'_>> = VecDeque::new();
+    // Frames decoded from one read but not started yet (the bound was
+    // reached); at most one read's worth, since nothing is read meanwhile.
+    let mut waiting: VecDeque<DecodeEvent> = VecDeque::new();
+    // The input ended: finish what is in flight, then report why.
+    let mut input_end: Option<SessionEnd> = None;
     loop {
-        if *cancel.borrow_and_update() && handler.may_stop() {
-            return report(SessionEnd::Cancelled, received);
-        }
-        let read = if cancel_live {
-            tokio::select! {
-                read = reader.read(&mut buf) => Some(read),
-                changed = cancel.changed() => {
-                    cancel_live = changed.is_ok();
-                    None
-                }
-            }
-        } else {
-            Some(reader.read(&mut buf).await)
-        };
-        let Some(read) = read else {
-            continue; // re-check the cancellation at the top of the loop
-        };
-        let n = match read {
-            Ok(0) => return report(SessionEnd::Eof, received),
-            Ok(n) => n,
-            Err(err) => return report(SessionEnd::ReadError(err), received),
-        };
-        received += n as u64;
-        for event in decoder.push(&buf[..n]) {
-            if let Some(reply) = handler.handle(event).await {
+        while let Some(Slot::Done(_)) = slots.front() {
+            if let Some(Slot::Done(Some(reply))) = slots.pop_front() {
                 match deliver(&mut writer, &reply, handler, cancel, &mut cancel_live).await {
                     Delivery::Done => {}
                     Delivery::Cancelled => return report(SessionEnd::Cancelled, received),
-                    Delivery::Failed(err) => return report(SessionEnd::WriteError(err), received),
+                    Delivery::Failed(err) => {
+                        // The peer is gone; finish the commands in flight
+                        // (nothing more is read), then report the write.
+                        input_end.get_or_insert(SessionEnd::WriteError(err));
+                    }
                 }
+            }
+        }
+        // Start what the bound allows, after the writes freed their slots.
+        while slots.len() < MAX_IN_FLIGHT {
+            match waiting.pop_front() {
+                Some(event) => slots.push_back(Slot::Pending(Box::pin(handler.handle(event)))),
+                None => break,
+            }
+        }
+        if slots.is_empty() {
+            if let Some(end) = input_end.take() {
+                return report(end, received);
+            }
+            if *cancel.borrow_and_update() && handler.may_stop() {
+                return report(SessionEnd::Cancelled, received);
+            }
+        }
+        let can_read = input_end.is_none() && waiting.is_empty() && slots.len() < MAX_IN_FLIGHT;
+        let in_flight = slots.iter().any(|slot| matches!(slot, Slot::Pending(_)));
+        tokio::select! {
+            biased;
+            changed = cancel.changed(), if cancel_live => {
+                cancel_live = changed.is_ok();
+                // Re-checked at the top of the loop.
+            }
+            () = drive_head(&mut slots), if in_flight => {}
+            read = reader.read(&mut buf), if can_read => match read {
+                Ok(0) => input_end = Some(SessionEnd::Eof),
+                Ok(n) => {
+                    received += n as u64;
+                    waiting.extend(decoder.push(&buf[..n]));
+                }
+                Err(err) => input_end = Some(SessionEnd::ReadError(err)),
+            },
+            else => {
+                // Nothing in flight, nothing to read and no cancellation
+                // to wait for: the input has ended.
+                return report(input_end.take().unwrap_or(SessionEnd::Eof), received);
             }
         }
     }
@@ -729,6 +799,148 @@ mod tests {
                 report.end
             );
             assert_eq!(report.end.to_string(), "cancelled");
+        })
+        .await;
+    }
+
+    /// Blocks every command until released and counts how many run at
+    /// once; replies name the frame.
+    struct CountingHandler {
+        release: tokio::sync::Notify,
+        running: AtomicUsize,
+        peak: AtomicUsize,
+    }
+
+    impl CountingHandler {
+        fn new() -> Arc<Self> {
+            Arc::new(CountingHandler {
+                release: tokio::sync::Notify::new(),
+                running: AtomicUsize::new(0),
+                peak: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl Handle for CountingHandler {
+        async fn handle(&self, event: DecodeEvent) -> Option<Vec<u8>> {
+            let DecodeEvent::Frame { bytes, .. } = event else {
+                return None;
+            };
+            let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(now, Ordering::SeqCst);
+            if !bytes.starts_with(b"quick") {
+                self.release.notified().await;
+            }
+            self.running.fetch_sub(1, Ordering::SeqCst);
+            let mut reply = bytes;
+            reply.push(b'\n');
+            Some(reply)
+        }
+    }
+
+    #[tokio::test]
+    async fn later_commands_run_while_a_reply_is_pending_and_replies_keep_request_order() {
+        // The first command blocks; the second finishes at once. Its reply
+        // is held until the first reply has gone out, and the wire carries
+        // the replies in request order.
+        bounded(async {
+            let (mut peer, ours) = duplex(1024);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = CountingHandler::new();
+            let h = handler.clone();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                run_session(reader, writer, h.as_ref(), &mut decoder).await
+            });
+            peer.write_all(b"slow-1\nquick-2\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(handler.peak.load(Ordering::SeqCst), 2, "both were started");
+            let mut out = [0u8; 32];
+            let pending =
+                tokio::time::timeout(Duration::from_millis(100), peer.read(&mut out)).await;
+            assert!(pending.is_err(), "no reply before the first one");
+            handler.release.notify_waiters();
+            let mut got = Vec::new();
+            while got.len() < b"slow-1\nquick-2\n".len() {
+                let n = peer.read(&mut out).await.unwrap();
+                got.extend_from_slice(&out[..n]);
+            }
+            assert_eq!(got, b"slow-1\nquick-2\n");
+            drop(peer);
+            let report = session.await.unwrap();
+            assert!(matches!(report.end, SessionEnd::Eof), "{}", report.end);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn at_most_max_in_flight_commands_run_at_once_and_the_rest_wait_their_turn() {
+        // Ten blocking commands: only MAX_IN_FLIGHT run at a time, the
+        // channel is not read meanwhile, and every reply still arrives in
+        // order once they are released.
+        bounded(async {
+            let (mut peer, ours) = duplex(4096);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = CountingHandler::new();
+            let h = handler.clone();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                run_session(reader, writer, h.as_ref(), &mut decoder).await
+            });
+            let frames: Vec<u8> = (0..10)
+                .flat_map(|i| format!("slow-{i}\n").into_bytes())
+                .collect();
+            peer.write_all(&frames).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(handler.peak.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+            assert_eq!(handler.running.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+            let mut got = Vec::new();
+            let mut out = [0u8; 256];
+            while got.len() < frames.len() {
+                handler.release.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if let Ok(Ok(n)) =
+                    tokio::time::timeout(Duration::from_millis(20), peer.read(&mut out)).await
+                {
+                    got.extend_from_slice(&out[..n]);
+                }
+            }
+            assert_eq!(got, frames, "all replies, in request order");
+            assert!(handler.peak.load(Ordering::SeqCst) <= MAX_IN_FLIGHT);
+            drop(peer);
+            session.await.unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn eof_finishes_the_commands_in_flight_before_the_session_ends() {
+        // The peer goes away while a command is being handled: the command
+        // completes (its side effects are what matter), then the session
+        // reports the EOF.
+        bounded(async {
+            let (mut peer, ours) = duplex(1024);
+            let (reader, writer) = tokio::io::split(ours);
+            let handler = CountingHandler::new();
+            let h = handler.clone();
+            let session = tokio::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                run_session(reader, writer, h.as_ref(), &mut decoder).await
+            });
+            peer.write_all(b"slow-1\n").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(peer);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!session.is_finished(), "waits for the command in flight");
+            assert_eq!(handler.running.load(Ordering::SeqCst), 1);
+            handler.release.notify_waiters();
+            let report = session.await.unwrap();
+            assert!(
+                matches!(report.end, SessionEnd::Eof | SessionEnd::WriteError(_)),
+                "{}",
+                report.end
+            );
+            assert_eq!(handler.running.load(Ordering::SeqCst), 0);
         })
         .await;
     }

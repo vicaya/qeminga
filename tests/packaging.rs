@@ -709,13 +709,27 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
         .1
     };
     let refused = |what: &str| {
-        let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
-        assert!(!ok, "{what}: the start must be refused: {text}");
-        let (_, result) = sh(
-            "systemctl",
-            &["show", "-p", "ExecMainStatus", "--value", "qeminga.service"],
-        );
-        assert_eq!(result.trim(), "78", "{what}: EX_CONFIG:\n{}", journal());
+        // `Type=simple`: `systemctl start` returns once the process is
+        // forked, so the refusal shows as the main process exiting 78 and
+        // the unit's `Restart=always` loop, never as a served request.
+        let (ok, text) = sh("systemctl", &["start", "--no-block", "qeminga.service"]);
+        assert!(ok, "{what}: systemctl start: {text}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (_, status) = sh(
+                "systemctl",
+                &["show", "-p", "ExecMainStatus", "--value", "qeminga.service"],
+            );
+            if status.trim() == "78" {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{what}: no exit status 78 observed (last {status:?}):\n{}",
+                journal()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         assert!(
             journal().contains("refusing to serve the host"),
             "{what}: the refusal names itself:\n{}",
@@ -725,7 +739,10 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
             !Path::new("/run/qeminga/frozen").exists(),
             "{what}: a refusal touches no marker"
         );
+        let _ = sh("systemctl", &["stop", "qeminga.service"]);
         let _ = sh("systemctl", &["reset-failed", "qeminga.service"]);
+        let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+        assert_ne!(active.trim(), "active", "{what}: never serving");
     };
     if qeminga::daemon::seccomp_mode() != "enforce" {
         // The compatibility build cannot provide the profile: it says so

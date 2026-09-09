@@ -576,7 +576,7 @@ mod tests {
                 let ctx = Context::new(
                     std::sync::Arc::new(crate::config::Config::default()),
                     std::sync::Arc::new(crate::state::FreezeStateMachine::new()),
-                    crate::audit::Router::stderr(),
+                    crate::audit::Router::stderr().unwrap(),
                     crate::marker::Marker::open(dir.path().join("frozen")).unwrap(),
                 )
                 .with_kernel(std::sync::Arc::new(crate::kernel::fake::FakeKernel::new()));

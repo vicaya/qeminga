@@ -4,10 +4,13 @@
 //! Every received command produces exactly one [`AuditRecord`], emitted as
 //! a structured `tracing` event with flattened fields. The subscriber
 //! installed by [`init_tracing`] formats each event as one JSON line and
-//! hands it to a [`Router`], which either writes it through to the normal
-//! sink (stderr) or, while filesystems are frozen, keeps it in a
-//! byte-bounded in-memory [`LineRing`] so no descriptor that might reach a
-//! frozen filesystem is written until thaw (§9.1).
+//! hands it to a [`Router`], which either queues it for a dedicated writer
+//! thread that delivers to the normal sink (stderr) or, while filesystems
+//! are frozen, keeps it in a byte-bounded in-memory [`LineRing`] so no
+//! descriptor that might reach a frozen filesystem is written until thaw
+//! (§9.1). No caller ever performs sink I/O: a sink that blocks blocks
+//! its thread and nothing else, and records beyond the bounded queue are
+//! dropped and counted rather than the daemon held (#43 §3).
 //!
 //! Attacker-controlled method names are projected by [`project_method`]
 //! to at most 64 UTF-8 bytes at a character boundary before they reach a
@@ -18,7 +21,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -269,27 +272,141 @@ impl LineRing {
 /// Where the router currently sends records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Records are written through to the sink.
+    /// Records are queued for the writer thread, which delivers them to
+    /// the sink.
     Normal,
-    /// Records are held in the ring; the sink is never touched.
+    /// Records are held in the ring; the sink is never touched and the
+    /// writer thread parks.
     Ring,
 }
 
-struct Inner {
-    mode: Mode,
-    ring: LineRing,
-    sink: Box<dyn Write + Send>,
+/// Bytes of formatted records the delivery queue holds for the writer
+/// thread before further records are dropped and counted (§9.1).
+pub const SINK_QUEUE_CAPACITY: usize = 256 * 1024;
+
+/// How long the last [`Router`] handle waits, when dropped, for the
+/// writer thread to deliver what is queued (tests; the daemon's router
+/// lives in the global subscriber until the process exits).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// Why records were lost, as reported in the loss record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LossReason {
+    /// The freeze-safe ring overflowed while frozen.
+    RingOverflow,
+    /// The delivery queue was full: the sink was not keeping up (a
+    /// blocked journald) and the records were dropped rather than the
+    /// caller blocked.
+    SinkBackpressure,
+    /// The sink refused a write.
+    SinkError,
 }
 
-/// Routes formatted log lines either to the normal sink or to the ring.
+impl LossReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            LossReason::RingOverflow => "ring_overflow",
+            LossReason::SinkBackpressure => "sink_backpressure",
+            LossReason::SinkError => "sink_error",
+        }
+    }
+}
+
+/// One entry of the delivery queue: a formatted line, or the place where
+/// lines were lost (dropped at a full queue, or refused by the sink), so
+/// the loss record is delivered exactly where the gap is.
+enum Item {
+    Line(Vec<u8>),
+    Lost(u64, LossReason),
+}
+
+struct State {
+    mode: Mode,
+    ring: LineRing,
+    /// Lines (and loss markers) awaiting delivery, in order.
+    queue: VecDeque<Item>,
+    /// Bytes of lines in `queue`.
+    queued: usize,
+    capacity: usize,
+    /// The writer thread is inside a sink write.
+    writing: bool,
+    /// The last handle was dropped: deliver what is queued and exit.
+    shutdown: bool,
+    /// The writer thread has exited (or never started).
+    exited: bool,
+    /// Bumped on every push, so a writer parked after a sink failure
+    /// retries only once something new arrived.
+    pushes: u64,
+}
+
+struct Shared {
+    state: Mutex<State>,
+    changed: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        // A poisoned lock only means another thread panicked while holding
+        // it; the state is a mode flag and byte queues, so it is still
+        // usable and audit output must not stop.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Marks the last user-side handle: its drop tells the writer thread to
+/// finish. The writer holds only the [`Shared`] state, never this.
+struct Alive(Arc<Shared>);
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        let mut state = self.0.lock();
+        state.shutdown = true;
+        self.0.changed.notify_all();
+        // Bounded: a sink that is blocked keeps its thread, not the drop.
+        let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
+        while !state.exited && state.mode == Mode::Normal {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            state = self
+                .0
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// Routes formatted log lines either to the delivery queue of a dedicated
+/// writer thread or to the ring (§9.1, #43 §3).
 ///
-/// Cheap to clone (shared state behind an `Arc<Mutex>`); implements
-/// [`MakeWriter`] so it can be installed as the subscriber's writer. Each
-/// `write` call carries exactly one record because the `fmt` layer writes
-/// one line per event.
+/// No sink I/O ever happens on a caller's thread or under the lock: a
+/// `write` queues the line (or drops it, counted, when the queue holds
+/// [`SINK_QUEUE_CAPACITY`] bytes), [`enter_ring`](Self::enter_ring) and
+/// [`flush_to_normal`](Self::flush_to_normal) only move lines between the
+/// ring and the queue, and the writer thread alone calls the sink, one
+/// line at a time. A sink that blocks (a journald whose journal is
+/// frozen) therefore blocks that thread and nothing else. While the mode
+/// is [`Mode::Ring`] the writer parks even with lines queued from before
+/// the window, so no descriptor is written between the first `FIFREEZE`
+/// and the thaw; a write already in flight when the window opened
+/// completes on its own thread. Delivery is in order: the queue is FIFO
+/// and a flush appends the ring's lines behind whatever was queued
+/// before the window. Lost lines (queue full, sink error, ring overflow)
+/// are reported by a loss record ahead of the next delivered line.
+///
+/// Cheap to clone; implements [`MakeWriter`] so it can be installed as
+/// the subscriber's writer. Each `write` call carries exactly one record
+/// because the `fmt` layer writes one line per event.
 #[derive(Clone)]
 pub struct Router {
-    inner: Arc<Mutex<Inner>>,
+    shared: Arc<Shared>,
+    /// Dropped with the last handle: the writer thread's cue to finish.
+    _alive: Arc<Alive>,
 }
 
 impl std::fmt::Debug for Router {
@@ -301,94 +418,299 @@ impl std::fmt::Debug for Router {
 }
 
 impl Router {
-    /// Creates a router in [`Mode::Normal`] writing to `sink`, with a ring
-    /// of [`RING_CAPACITY`] bytes.
+    /// Creates a router in [`Mode::Normal`] delivering to `sink` on a
+    /// writer thread, with a ring of [`RING_CAPACITY`] bytes. Should the
+    /// thread not start, every record is counted lost instead (use
+    /// [`try_new`](Self::try_new) where that must be an error).
     pub fn new(sink: Box<dyn Write + Send>) -> Self {
-        Self::with_ring_capacity(sink, RING_CAPACITY)
+        Self::with_capacities(sink, RING_CAPACITY, SINK_QUEUE_CAPACITY)
+            .unwrap_or_else(|(_, router)| router)
+    }
+
+    /// Like [`new`](Self::new), reporting a writer thread that could not
+    /// be started.
+    pub fn try_new(sink: Box<dyn Write + Send>) -> io::Result<Self> {
+        Self::with_capacities(sink, RING_CAPACITY, SINK_QUEUE_CAPACITY).map_err(|(err, _)| err)
     }
 
     /// Creates a router in [`Mode::Normal`] writing to standard error.
-    pub fn stderr() -> Self {
-        Self::new(Box::new(io::stderr()))
+    pub fn stderr() -> io::Result<Self> {
+        Self::try_new(Box::new(io::stderr()))
     }
 
     /// Creates a router with an explicit ring capacity (tests).
     pub fn with_ring_capacity(sink: Box<dyn Write + Send>, capacity: usize) -> Self {
-        Router {
-            inner: Arc::new(Mutex::new(Inner {
+        Self::with_capacities(sink, capacity, SINK_QUEUE_CAPACITY)
+            .unwrap_or_else(|(_, router)| router)
+    }
+
+    /// Creates a router with explicit ring and queue capacities (tests).
+    pub fn with_queue_capacity(sink: Box<dyn Write + Send>, queue: usize) -> Self {
+        Self::with_capacities(sink, RING_CAPACITY, queue).unwrap_or_else(|(_, router)| router)
+    }
+
+    fn with_capacities(
+        sink: Box<dyn Write + Send>,
+        ring: usize,
+        queue: usize,
+    ) -> Result<Self, (io::Error, Self)> {
+        let shared = Arc::new(Shared {
+            state: Mutex::new(State {
                 mode: Mode::Normal,
-                ring: LineRing::with_capacity(capacity),
-                sink,
-            })),
+                ring: LineRing::with_capacity(ring),
+                queue: VecDeque::new(),
+                queued: 0,
+                capacity: queue,
+                writing: false,
+                shutdown: false,
+                exited: false,
+                pushes: 0,
+            }),
+            changed: Condvar::new(),
+        });
+        let router = Router {
+            _alive: Arc::new(Alive(Arc::clone(&shared))),
+            shared: Arc::clone(&shared),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("qeminga-audit".to_owned())
+            .spawn(move || writer_thread(&shared, sink));
+        match spawned {
+            Ok(_) => Ok(router),
+            Err(err) => {
+                router.shared.lock().exited = true;
+                Err((err, router))
+            }
         }
     }
 
     /// The current mode.
     pub fn mode(&self) -> Mode {
-        self.lock().mode
+        self.shared.lock().mode
     }
 
     /// Switches to [`Mode::Ring`]. Synchronous and free of I/O, so it can be
-    /// called before the recovery marker and the first `FIFREEZE` (§4.2).
+    /// called before the recovery marker and the first `FIFREEZE` (§4.2);
+    /// the writer thread parks at its next line.
     pub fn enter_ring(&self) {
-        self.lock().mode = Mode::Ring;
+        self.shared.lock().mode = Mode::Ring;
+        self.shared.changed.notify_all();
     }
 
-    /// Flushes the ring to the sink and switches to [`Mode::Normal`].
+    /// Moves the ring's lines to the delivery queue and switches to
+    /// [`Mode::Normal`], without touching the sink: delivery is the
+    /// writer thread's, so the caller (the thaw's finalisation) never
+    /// waits for the sink.
     ///
-    /// If any records were lost, a loss record is written first, then the
-    /// buffered records in their original order. Returns the loss count.
+    /// If any records were lost in the ring, a loss record is queued
+    /// first, then the buffered records in their original order, behind
+    /// whatever was queued before the window. Lines the queue cannot hold
+    /// are dropped and counted, and reported like any other drop. Returns
+    /// the ring's loss count.
     pub fn flush_to_normal(&self) -> u64 {
-        let mut inner = self.lock();
-        let (lost, lines) = inner.ring.drain();
+        let mut state = self.shared.lock();
+        let (lost, lines) = state.ring.drain();
         if lost > 0 {
-            let record = loss_record(lost);
-            // Sink failures are deliberately ignored: there is no better
-            // place to report them, and blocking here is the hazard §9.1
-            // guards against.
-            let _ = inner.sink.write_all(record.as_bytes());
+            let record = loss_record(lost, LossReason::RingOverflow);
+            state.enqueue(record.into_bytes());
         }
-        for line in &lines {
-            let _ = inner.sink.write_all(line);
+        for line in lines {
+            state.enqueue(line);
         }
-        let _ = inner.sink.flush();
-        inner.mode = Mode::Normal;
+        state.mode = Mode::Normal;
+        drop(state);
+        self.shared.changed.notify_all();
         lost
     }
 
-    /// Number of lines lost since the last flush.
+    /// Number of lines lost in the ring since the last flush.
     pub fn lost(&self) -> u64 {
-        self.lock().ring.lost()
+        self.shared.lock().ring.lost()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        // A poisoned lock only means another thread panicked while holding
-        // it; the state is a mode flag and a byte ring, so it is still
-        // usable and audit output must not stop.
-        self.inner
+    /// Number of lines dropped at the delivery queue or refused by the
+    /// sink and not yet reported by a loss record.
+    pub fn unreported_losses(&self) -> u64 {
+        self.shared
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .iter()
+            .map(|item| match item {
+                Item::Lost(count, _) => *count,
+                Item::Line(_) => 0,
+            })
+            .sum()
+    }
+
+    /// Bytes queued for the writer thread.
+    pub fn queued_bytes(&self) -> usize {
+        self.shared.lock().queued
+    }
+
+    /// Waits until every queued line has been handed to the sink and no
+    /// write is in flight, at most `timeout`; `false` on timeout. For
+    /// tests that read the sink: a blocked sink never blocks anything
+    /// but its own thread, so a caller must ask before looking.
+    pub fn settle(&self, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.shared.lock();
+        loop {
+            let idle = state.exited
+                || state.mode == Mode::Ring
+                || (state.queue.is_empty() && !state.writing);
+            if idle {
+                return true;
+            }
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            state = self
+                .shared
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
     }
 
     fn write_record(&self, buf: &[u8]) -> io::Result<usize> {
-        let mut inner = self.lock();
-        match inner.mode {
-            Mode::Ring => inner.ring.push(buf),
+        let mut state = self.shared.lock();
+        match state.mode {
+            Mode::Ring => state.ring.push(buf),
             Mode::Normal => {
-                let _ = inner.sink.write_all(buf);
+                if state.exited && !state.shutdown {
+                    // No writer thread: nothing can deliver it.
+                    state.lose(1, LossReason::SinkError);
+                } else {
+                    state.enqueue(buf.to_vec());
+                }
             }
         }
+        drop(state);
+        self.shared.changed.notify_all();
         Ok(buf.len())
     }
 }
 
+impl State {
+    /// Queues a line for delivery, or drops and counts it where it would
+    /// have gone when the queue is full. A loss marker takes no space, so
+    /// the losses are always accounted for.
+    fn enqueue(&mut self, line: Vec<u8>) {
+        if self.queued.saturating_add(line.len()) > self.capacity && self.queued > 0 {
+            self.lose(1, LossReason::SinkBackpressure);
+            return;
+        }
+        self.queued = self.queued.saturating_add(line.len());
+        self.queue.push_back(Item::Line(line));
+        self.pushes = self.pushes.wrapping_add(1);
+    }
+
+    /// Records `count` lost lines at the tail of the queue, merged into a
+    /// marker already there for the same reason.
+    fn lose(&mut self, count: u64, reason: LossReason) {
+        if let Some(Item::Lost(n, r)) = self.queue.back_mut()
+            && *r == reason
+        {
+            *n = n.saturating_add(count);
+        } else {
+            self.queue.push_back(Item::Lost(count, reason));
+        }
+        self.pushes = self.pushes.wrapping_add(1);
+    }
+
+    /// Puts a loss back at the head of the queue (a line the sink refused
+    /// belongs where it was; a loss record the sink refused stays until
+    /// it can be written).
+    fn lose_at_front(&mut self, count: u64, reason: LossReason) {
+        if let Some(Item::Lost(n, r)) = self.queue.front_mut()
+            && *r == reason
+        {
+            *n = n.saturating_add(count);
+        } else {
+            self.queue.push_front(Item::Lost(count, reason));
+        }
+    }
+}
+
+/// The writer thread: takes one item at a time, outside the lock, and
+/// writes it to the sink (a loss marker becomes its loss record); parks
+/// while the ring is in use; after a sink failure waits for something
+/// new before retrying a loss record, so a dead sink is never spun on;
+/// exits once the last handle is gone and the queue is delivered (or the
+/// mode is still `Ring`: nothing may be written then).
+fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
+    let mut failed_at: Option<u64> = None;
+    loop {
+        let item = {
+            let mut state = shared.lock();
+            let item = loop {
+                if state.mode == Mode::Normal
+                    && let Some(front) = state.queue.front()
+                    && failed_at != Some(state.pushes)
+                {
+                    break Some(match front {
+                        Item::Line(line) => Item::Line(line.clone()),
+                        Item::Lost(count, reason) => Item::Lost(*count, *reason),
+                    });
+                }
+                if state.shutdown && (state.queue.is_empty() || state.mode == Mode::Ring) {
+                    break None;
+                }
+                state = shared
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            };
+            let Some(item) = item else {
+                state.exited = true;
+                shared.changed.notify_all();
+                return;
+            };
+            state.writing = true;
+            item
+        };
+        let (bytes, marker) = match &item {
+            Item::Line(line) => (line.clone(), None),
+            Item::Lost(count, reason) => (
+                loss_record(*count, *reason).into_bytes(),
+                Some((*count, *reason)),
+            ),
+        };
+        let delivered = sink.write_all(&bytes).is_ok();
+        let _ = sink.flush();
+        let mut state = shared.lock();
+        // The item stayed at the front while it was written, so the queue
+        // never looked empty to `settle` before delivery.
+        match state.queue.pop_front() {
+            Some(Item::Line(line)) => state.queued -= line.len(),
+            Some(Item::Lost(..)) | None => {}
+        }
+        if delivered {
+            failed_at = None;
+        } else {
+            failed_at = Some(state.pushes);
+            match marker {
+                // The loss record itself was refused: keep it for later.
+                Some((count, reason)) => state.lose_at_front(count, reason),
+                // The line is lost; say so where it was.
+                None => state.lose_at_front(1, LossReason::SinkError),
+            }
+        }
+        state.writing = false;
+        shared.changed.notify_all();
+    }
+}
+
 /// Builds the JSON line reporting `lost` dropped records.
-fn loss_record(lost: u64) -> String {
+fn loss_record(lost: u64, reason: LossReason) -> String {
     let mut line = serde_json::json!({
         "timestamp": format_utc(SystemTime::now()),
         "level": "WARN",
         "event": EVENT_AUDIT_RECORDS_LOST,
         "lost": lost,
+        "reason": reason.as_str(),
     })
     .to_string();
     line.push('\n');
@@ -405,6 +727,8 @@ impl Write for RouterWriter {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        // Delivery is the writer thread's; waiting for it here would put
+        // the sink back on the caller's path.
         Ok(())
     }
 }
@@ -536,6 +860,11 @@ mod tests {
 
     fn router_over(sink: &SharedSink, capacity: usize) -> Router {
         Router::with_ring_capacity(Box::new(sink.clone()), capacity)
+    }
+
+    /// Waits for the writer thread to deliver everything queued.
+    fn settled(router: &Router) {
+        assert!(router.settle(Duration::from_secs(10)), "delivery stalled");
     }
 
     #[test]
@@ -721,7 +1050,7 @@ mod tests {
         assert_eq!(RING_CAPACITY, 65_536);
         let sink = SharedSink::default();
         let router = Router::new(Box::new(sink));
-        assert_eq!(router.lock().ring.capacity(), 65_536);
+        assert_eq!(router.shared.lock().ring.capacity(), 65_536);
         let mut ring = LineRing::with_capacity(RING_CAPACITY);
         let line = vec![b'x'; 1024];
         for _ in 0..64 {
@@ -741,6 +1070,7 @@ mod tests {
         assert_eq!(router.mode(), Mode::Normal);
         let mut w = router.make_writer();
         w.write_all(b"line\n").unwrap();
+        settled(&router);
         assert_eq!(sink.bytes(), b"line\n");
     }
 
@@ -771,6 +1101,7 @@ mod tests {
         let lost = router.flush_to_normal();
         assert_eq!(lost, 1);
         assert_eq!(router.mode(), Mode::Normal);
+        settled(&router);
         let lines = sink.lines();
         assert_eq!(lines.len(), 2, "{lines:?}");
         let loss: Value = serde_json::from_str(&lines[0]).unwrap();
@@ -789,10 +1120,12 @@ mod tests {
         let mut w = router.make_writer();
         w.write_all(b"a\n").unwrap();
         assert_eq!(router.flush_to_normal(), 0);
+        settled(&router);
         assert_eq!(sink.bytes(), b"a\n");
         // A second flush with nothing buffered writes nothing.
         router.enter_ring();
         assert_eq!(router.flush_to_normal(), 0);
+        settled(&router);
         assert_eq!(sink.bytes(), b"a\n");
     }
 
@@ -808,6 +1141,7 @@ mod tests {
         }
         router.flush_to_normal();
         w.write_all(b"after\n").unwrap();
+        settled(&router);
         let lines = sink.lines();
         assert_eq!(lines[0], "before");
         for (i, line) in lines[1..51].iter().enumerate() {
@@ -837,6 +1171,7 @@ mod tests {
             router.flush_to_normal();
             emit(&record);
         });
+        settled(&router);
         let lines = sink.lines();
         assert_eq!(lines.len(), 4, "{lines:?}");
         for line in &lines {
@@ -857,6 +1192,284 @@ mod tests {
                 ]
             );
         }
+    }
+
+    /// A sink that blocks inside `write` for as long as the test says
+    /// (a journald whose journal is on a frozen filesystem), then records
+    /// what it was given.
+    #[derive(Clone, Default)]
+    struct BlockingSink {
+        blocked: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        written: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl BlockingSink {
+        fn blocked() -> Self {
+            let sink = BlockingSink::default();
+            sink.set_blocked(true);
+            sink
+        }
+        fn set_blocked(&self, blocked: bool) {
+            *self.blocked.0.lock().unwrap() = blocked;
+            self.blocked.1.notify_all();
+        }
+        fn text(&self) -> String {
+            String::from_utf8(self.written.lock().unwrap().clone()).unwrap()
+        }
+        fn lines(&self) -> Vec<String> {
+            self.text().lines().map(str::to_owned).collect()
+        }
+        /// Waits until a write is blocked inside the sink.
+        fn wait_entered(&self, n: usize) {
+            let start = std::time::Instant::now();
+            while self.entered.load(std::sync::atomic::Ordering::SeqCst) < n {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "no write entered"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    impl Write for BlockingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.entered
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut blocked = self.blocked.0.lock().unwrap();
+            while *blocked {
+                blocked = self.blocked.1.wait(blocked).unwrap();
+            }
+            drop(blocked);
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Asserts that `f` returns within a bound a blocked sink would
+    /// breach.
+    fn promptly<T>(what: &str, f: impl FnOnce() -> T) -> T {
+        let start = std::time::Instant::now();
+        let out = f();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{what} waited on the sink ({:?})",
+            start.elapsed()
+        );
+        out
+    }
+
+    #[test]
+    fn a_blocked_sink_blocks_only_the_writer_thread() {
+        // The first line enters the sink and blocks there. Every later
+        // write, the switch to the ring and the flush back return at
+        // once; the lines wait in the queue and are delivered, in order,
+        // once the sink moves again.
+        let sink = BlockingSink::blocked();
+        let router = Router::new(Box::new(sink.clone()));
+        let mut w = router.make_writer();
+        w.write_all(b"one\n").unwrap();
+        sink.wait_entered(1);
+        promptly("write", || w.write_all(b"two\n").unwrap());
+        promptly("enter_ring", || router.enter_ring());
+        w.write_all(b"three\n").unwrap();
+        assert_eq!(promptly("flush_to_normal", || router.flush_to_normal()), 0);
+        assert_eq!(router.mode(), Mode::Normal);
+        assert_eq!(router.queued_bytes(), 14, "one (in flight), two, three");
+        assert!(sink.text().is_empty(), "nothing delivered yet");
+        assert!(!router.settle(Duration::from_millis(50)), "still blocked");
+        sink.set_blocked(false);
+        settled(&router);
+        assert_eq!(sink.lines(), ["one", "two", "three"]);
+        assert_eq!(router.unreported_losses(), 0);
+    }
+
+    #[test]
+    fn the_writer_parks_while_the_ring_is_in_use() {
+        // A line queued before the window is not written during it (no
+        // descriptor is touched between FIFREEZE and thaw), even once the
+        // sink would accept it; the flush releases it ahead of the ring's
+        // lines, in order.
+        let sink = BlockingSink::blocked();
+        let router = Router::new(Box::new(sink.clone()));
+        let mut w = router.make_writer();
+        w.write_all(b"one\n").unwrap();
+        sink.wait_entered(1);
+        w.write_all(b"two\n").unwrap();
+        router.enter_ring();
+        sink.set_blocked(false);
+        // `one` was in flight and completes; `two` must wait.
+        let start = std::time::Instant::now();
+        while sink.lines().is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(sink.lines(), ["one"], "parked while the ring is in use");
+        assert_eq!(router.queued_bytes(), 4);
+        w.write_all(b"three\n").unwrap();
+        router.flush_to_normal();
+        settled(&router);
+        assert_eq!(sink.lines(), ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn a_full_queue_drops_the_newest_and_reports_the_loss_where_it_happened() {
+        // Capacity for three 20-byte lines with the first blocked in the
+        // sink: the fourth and fifth are dropped and counted; the loss
+        // record is delivered where the gap is, after the third.
+        let sink = BlockingSink::blocked();
+        let router = Router::with_queue_capacity(Box::new(sink.clone()), 64);
+        let mut w = router.make_writer();
+        let line = |n: u8| format!("{{\"n\":{n},\"pad\":\"xxx\"}}\n");
+        assert_eq!(line(1).len(), 20);
+        for n in 1..=5 {
+            promptly("write", || w.write_all(line(n).as_bytes()).unwrap());
+        }
+        assert_eq!(router.queued_bytes(), 60);
+        assert_eq!(router.unreported_losses(), 2);
+        // A line after the drops that fits again goes behind the marker.
+        sink.set_blocked(false);
+        settled(&router);
+        w.write_all(line(6).as_bytes()).unwrap();
+        settled(&router);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        assert!(lines[0].contains("\"n\":1"));
+        assert!(lines[2].contains("\"n\":3"));
+        let loss: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(loss["event"], EVENT_AUDIT_RECORDS_LOST);
+        assert_eq!(loss["lost"], 2);
+        assert_eq!(loss["reason"], "sink_backpressure");
+        assert!(lines[4].contains("\"n\":6"));
+        assert_eq!(router.unreported_losses(), 0);
+    }
+
+    /// A sink that refuses its first `failures` writes.
+    #[derive(Clone)]
+    struct FailingSink {
+        failures: Arc<std::sync::atomic::AtomicUsize>,
+        written: Arc<Mutex<Vec<u8>>>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Write for FailingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let left = self.failures.load(std::sync::atomic::Ordering::SeqCst);
+            if left > 0 {
+                self.failures
+                    .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+                return Err(io::Error::from(io::ErrorKind::BrokenPipe));
+            }
+            self.written.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_sink_loses_the_refused_records_and_reports_them_without_spinning() {
+        // The first two writes fail: `a` is lost, and the loss record for
+        // it is refused too; the writer then waits for something new
+        // instead of retrying in a loop. `b` arrives: the loss record is
+        // written, then `b` and `c`.
+        let sink = FailingSink {
+            failures: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+            written: Arc::new(Mutex::new(Vec::new())),
+            attempts: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let router = Router::new(Box::new(sink.clone()));
+        let mut w = router.make_writer();
+        let attempts = |n: usize| {
+            let start = std::time::Instant::now();
+            while sink.attempts.load(std::sync::atomic::Ordering::SeqCst) < n {
+                assert!(start.elapsed() < Duration::from_secs(10));
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                sink.attempts.load(std::sync::atomic::Ordering::SeqCst),
+                n,
+                "no spinning on a dead sink"
+            );
+        };
+        w.write_all(b"a\n").unwrap();
+        attempts(1);
+        assert_eq!(router.unreported_losses(), 1);
+        // Something new: the loss record is tried, and refused too.
+        w.write_all(b"b\n").unwrap();
+        attempts(2);
+        assert_eq!(router.unreported_losses(), 1, "the record is kept");
+        w.write_all(b"c\n").unwrap();
+        settled(&router);
+        let text = String::from_utf8(sink.written.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let loss: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(loss["event"], EVENT_AUDIT_RECORDS_LOST);
+        assert_eq!(loss["lost"], 1);
+        assert_eq!(loss["reason"], "sink_error");
+        assert_eq!(&lines[1..], ["b", "c"]);
+        assert_eq!(router.unreported_losses(), 0);
+    }
+
+    #[test]
+    fn the_ring_flush_reports_its_loss_with_its_reason() {
+        let sink = SharedSink::default();
+        let router = router_over(&sink, 16);
+        router.enter_ring();
+        let mut w = router.make_writer();
+        w.write_all(b"first-line\n").unwrap();
+        w.write_all(b"second-ln\n").unwrap();
+        router.flush_to_normal();
+        settled(&router);
+        let loss: Value = serde_json::from_str(&sink.lines()[0]).unwrap();
+        assert_eq!(loss["reason"], "ring_overflow");
+    }
+
+    #[test]
+    fn dropping_the_last_handle_delivers_the_queue() {
+        let sink = SharedSink::default();
+        let router = router_over(&sink, RING_CAPACITY);
+        let mut w = router.make_writer();
+        w.write_all(b"last\n").unwrap();
+        drop(w);
+        drop(router);
+        assert_eq!(sink.bytes(), b"last\n");
+    }
+
+    #[test]
+    fn dropping_the_last_handle_never_waits_on_a_blocked_sink_beyond_the_grace() {
+        let sink = BlockingSink::blocked();
+        let router = Router::new(Box::new(sink.clone()));
+        let mut w = router.make_writer();
+        w.write_all(b"stuck\n").unwrap();
+        sink.wait_entered(1);
+        drop(w);
+        let start = std::time::Instant::now();
+        drop(router);
+        assert!(start.elapsed() < SHUTDOWN_GRACE + Duration::from_secs(2));
+        sink.set_blocked(false);
+    }
+
+    #[test]
+    fn a_router_without_a_writer_thread_counts_every_record_lost() {
+        let sink = SharedSink::default();
+        let router = router_over(&sink, RING_CAPACITY);
+        settled(&router);
+        router.shared.lock().exited = true;
+        let mut w = router.make_writer();
+        w.write_all(b"nowhere\n").unwrap();
+        assert_eq!(router.unreported_losses(), 1);
+        assert!(sink.bytes().is_empty());
     }
 
     #[test]

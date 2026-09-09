@@ -769,6 +769,10 @@ mod tests {
         }
 
         fn audit_records(&self) -> Vec<Value> {
+            assert!(
+                self.ctx().audit.settle(std::time::Duration::from_secs(10)),
+                "audit delivery stalled"
+            );
             self.sink
                 .lines()
                 .into_iter()

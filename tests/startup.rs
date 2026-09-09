@@ -536,6 +536,7 @@ async fn recovery_thaws_without_the_channel_ever_opening() {
     assert!(result.is_ok());
     // The stop was logged by the loop itself (the watchdog task's own
     // records go to the global dispatcher, not this scoped one).
+    assert!(rig.ctx.audit.settle(Duration::from_secs(10)));
     let text = sink.text();
     assert!(text.contains("\"event\":\"signal\""), "{text}");
 }
@@ -621,6 +622,7 @@ async fn sigterm_while_frozen_is_deferred_until_thaw() {
         .unwrap();
     assert!(result.is_ok(), "exits after the thaw");
     assert!(!rig.ctx.marker.exists());
+    assert!(rig.ctx.audit.settle(Duration::from_secs(10)));
     let text = sink.text();
     assert!(
         text.contains("\"event\":\"stop_deferred\""),
@@ -706,6 +708,7 @@ async fn a_terminal_channel_error_while_frozen_waits_for_the_thaw() {
         1,
         "no competing for the port"
     );
+    assert!(rig.ctx.audit.settle(Duration::from_secs(10)));
     let text = sink.text();
     assert!(text.contains("\"event\":\"channel_lost\""), "{text}");
     assert!(text.contains("\"event\":\"stop_deferred\""), "{text}");

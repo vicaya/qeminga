@@ -838,11 +838,13 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
     }
     assert!(filled > 0, "the pipe was filled to capacity");
     set_nonblock(&writer, false);
-    // Thaw with the pipe full. The proof that the FITHAW drain completed
-    // comes from the filesystem itself, not from the daemon's reply (which
-    // cannot be written until the flush that precedes it unblocks): a
-    // write to the mount blocks in D state while frozen and completes as
-    // soon as the drain has thawed it.
+    // Thaw with the pipe full and left full (#43 §3: the pipe is not
+    // drained first, which would hide a dependency on the sink). The
+    // FITHAW drain is proved from the filesystem itself: a write to the
+    // mount blocks in D state while frozen and completes as soon as the
+    // drain has thawed it; and the reply arrives while the pipe is still
+    // full, because delivery of the audit records is the writer thread's
+    // business, not the thaw's finalisation.
     agent.send_line(r#"{"execute":"guest-fsfreeze-thaw","id":9999}"#);
     let probe_path = format!("{mount}/probe-during-full-pipe");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -856,27 +858,45 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
             "the filesystem was not thawed within 20 s while stderr was blocked: the drain waited on the flush (§9.1)"
         ),
     }
-    // Nothing more reached the pipe (still full) and no reply yet: the
-    // flush, and the reply after it, wait for journald, not the drain.
-    assert!(
-        agent.read_line(Duration::from_millis(300)).is_none(),
-        "the reply is written only after the flush, which is blocked"
+    // The reply is delivered while the pipe is still full: state, marker
+    // and reply never waited for journald.
+    let reply = agent
+        .read_line(Duration::from_secs(10))
+        .expect("the thaw reply while stderr is blocked (#43 §3)");
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert!(reply["return"].as_u64().unwrap() >= 1, "{reply}");
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "thawed",
+        "status served while stderr is blocked"
     );
-    // journald comes back: drain the pipe, and the flush and reply follow.
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1}),
+        "a subsequent permitted operation completes while stderr is blocked"
+    );
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    // journald comes back: drain the pipe and the queued records follow,
+    // the ring's loss record among them.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let reply = loop {
+    loop {
         drain(&mut stderr, &mut drained);
-        if let Some(line) = agent.read_line(Duration::from_millis(50)) {
-            break line;
+        let text = String::from_utf8_lossy(&drained);
+        if text.contains("\"event\":\"fsfreeze_thawed\"") {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "no thaw reply after draining; drained {} bytes",
+            "queued records not delivered after draining; drained {} bytes",
             drained.len()
         );
-    };
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert!(reply["return"].as_u64().unwrap() >= 1, "{reply}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     drain(&mut stderr, &mut drained);
     let text = String::from_utf8_lossy(&drained);
     assert!(

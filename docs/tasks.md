@@ -76,7 +76,7 @@ graph LR
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
 | 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
-| 6 | T6.1–T6.3 | fakes (privileged late completion not reproducible) | post-release follow-ups from review and #43 |
+| 6 | T6.1–T6.4 | fakes (privileged late completion not reproducible) | post-release follow-ups from review and #43 |
 
 ---
 
@@ -760,6 +760,21 @@ the answer is a one-line change, and leave the question here.
 - **Implement (green):** no agent behaviour changes (the two abort helpers above are reachable only from a harness). §4.5 states what the replies mean, the five-step protocol (one mount point per required superblock; one freeze per cycle under a client timeout; heartbeats every third of the idle timeout and a cycle budget under the hard cap, both measured from the send of the freeze request; one thaw; quiesced only when `freeze count == requested == thaw count` and the thaw reply arrived inside the budget), the rules it depends on, why the thaw count ties the verdict to the original operation under the single-controller assumption, and the conservative timing assumptions. The identity mechanism for deployments that cannot make that assumption is proposed, not implied, in OQ-9.
 - **Done when:** every row of #43's validation table for §1 (normal, expiry before/during the cut, between two volumes, delayed reply, restart/reconnect, thaw/refreeze) is a scenario above and no uncertain result is published as quiesced.
 
+#### T6.4 — Audit delivery off the recovery and finalisation paths (#43 §3)
+- **Status:** done
+- **Design:** §9.1 "No sink I/O on the agent's own paths", §4.4 (finalisation before `Thawed`), AC13, AC23.
+- **Depends on:** T3.6, T6.1
+- **Files:** `src/audit.rs` (`Router` over a writer thread and a bounded delivery queue with loss markers; `try_new`, `stderr() -> io::Result`, `settle`, `queued_bytes`, `unreported_losses`, `with_queue_capacity`), `src/daemon.rs` (`init_logging` reports a writer that cannot start), `src/handlers/shutdown.rs` (`AUDIT_DELIVERY_GRACE`), `tests/audit_freeze_window.rs`, `tests/privileged_e2e.rs`.
+- **Tests first (red):**
+  - `a_blocked_sink_blocks_only_the_writer_thread` — a write in flight blocks in the sink; later writes, `enter_ring` and `flush_to_normal` return at once, everything is delivered in order afterwards.
+  - `the_writer_parks_while_the_ring_is_in_use` — a line queued before the window is not written during it, and follows the flush ahead of the ring's lines.
+  - `a_full_queue_drops_the_newest_and_reports_the_loss_where_it_happened` (`sink_backpressure`), `a_failing_sink_loses_the_refused_records_and_reports_them_without_spinning` (`sink_error`; a refused loss record is kept, and retried only once something new arrived), `the_ring_flush_reports_its_loss_with_its_reason` (`ring_overflow`).
+  - `dropping_the_last_handle_delivers_the_queue`, `dropping_the_last_handle_never_waits_on_a_blocked_sink_beyond_the_grace`, `a_router_without_a_writer_thread_counts_every_record_lost`.
+  - `a_sink_blocked_throughout_never_holds_the_thaw_the_state_or_the_next_operation` (`tests/audit_freeze_window.rs`) — the sink blocks from the first record and is released only after every assertion: two freeze/thaw cycles finalise the marker, publish `Thawed`, answer status and ping, with every record queued; delivered in order afterwards.
+  - `privileged_journald_pipe_full_does_not_deadlock_thaw` reworked: the pipe is left full; the thaw reply, a status and a further freeze/thaw cycle arrive while it is full, and the queued records (the loss record among them) follow once it is drained.
+- **Implement (green):** the sink is owned by a writer thread; `write` in `Normal` mode enqueues (or drops and counts at `SINK_QUEUE_CAPACITY`, 256 KiB), in `Ring` mode pushes to the ring; `flush_to_normal` moves the ring's loss record and lines to the queue and switches the mode without touching the sink; the writer parks while the mode is `Ring`; losses are `Item::Lost` markers in the FIFO so their record is delivered where the gap is; the last handle's drop waits a bounded grace for delivery (tests). No lock is held during a sink write. `guest-shutdown` waits at most `AUDIT_DELIVERY_GRACE` (2 s) for its record before `reboot(2)`.
+- **Done when:** the in-process test and the privileged pipe test above pass with the sink blocked throughout, and every existing AC13 test passes unchanged in semantics (readers call `Router::settle` before looking at a sink).
+
 ---
 
 ## 6. Acceptance-criteria traceability
@@ -790,6 +805,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC20 freeze operation deadline | T6.1 (`a_completed_target_is_thawed_while_a_later_fifreeze_is_still_blocked` and the scenario tests listed there; `tests/channel_freeze.rs` through the production channel loop; `tests/audit_freeze_window.rs`, `tests/startup.rs`) | unit + transport (manual clock, gated fake) | green; gated-fake evidence only, no real blocked `FIFREEZE` |
 | AC21 zero-work operations settle `Thawed`; freeze-list coverage fails closed | T6.2 (`an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed`, `an_entirely_skipped_plan_settles_thawed_too`, `a_zero_count_with_a_busy_target_keeps_the_conservative_state`, `a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen`, `a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze`; `channel_eof_then_reopen_preserves_state`) | unit + E2E | green |
 | AC22 freeze-validity contract | T6.3 (`tests/controller_contract.rs`, the seventeen scenarios listed there) | integration (paused time, depth-tracking fake) | green; single-controller assumption stated, OQ-9 |
+| AC23 audit delivery never holds recovery | T6.4 (`a_sink_blocked_throughout_never_holds_the_thaw_the_state_or_the_next_operation`, the `audit` writer-thread tests, `privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + integration + privileged | green |
 
 ---
 

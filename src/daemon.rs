@@ -362,7 +362,8 @@ impl Startup for SystemStartup {
     }
 
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
-        let router = Router::stderr();
+        let router = Router::stderr()
+            .map_err(|err| RunError::Runtime(format!("cannot start the audit writer: {err}")))?;
         if ring {
             // Recovery mode: nothing reaches stderr until a thaw succeeds
             // (§4.4, §9.1).

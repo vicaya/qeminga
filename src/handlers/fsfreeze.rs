@@ -2618,6 +2618,7 @@ mod tests {
         thawing.await.unwrap().unwrap();
         assert_eq!(ctx.state.current(), FreezeState::Thawed);
         assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(ctx.audit.settle(Duration::from_secs(10)));
         let flushed = sink.0.lock().unwrap().len();
         assert!(flushed > 0, "the ring was flushed to the sink");
         // The next freeze window is intact: its records stay in the ring
@@ -2640,6 +2641,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(ctx.audit.settle(Duration::from_secs(10)));
         assert!(sink.0.lock().unwrap().len() > flushed);
     }
 

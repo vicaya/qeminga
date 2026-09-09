@@ -57,14 +57,20 @@ pub const fn reboot_command(mode: ShutdownMode) -> RebootCommand {
     }
 }
 
+/// How long a shutdown waits for its audit record to be delivered.
+pub const AUDIT_DELIVERY_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// `guest-shutdown` handler.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let args: ShutdownArgs = arguments(req)?;
     let cmd = reboot_command(args.mode.unwrap_or(ShutdownMode::Powerdown));
     let kernel: Arc<dyn KernelOps> = Arc::clone(&ctx.kernel);
     // The audit record for this command was already emitted by the
-    // dispatcher; make sure it has left the process before the kernel
-    // stops scheduling us.
+    // dispatcher; give the writer thread a bounded chance to deliver it
+    // before the kernel stops scheduling us. Bounded: a sink that is not
+    // reading (§9.1) delays the shutdown by this much and no more.
+    let audit = ctx.audit.clone();
+    let _ = tokio::task::spawn_blocking(move || audit.settle(AUDIT_DELIVERY_GRACE)).await;
     let _ = std::io::stderr().flush();
     tokio::task::spawn_blocking(move || {
         kernel.sync();

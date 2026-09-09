@@ -65,6 +65,23 @@ semantic versioning.
   filesystem was never frozen; a controller relying on the count (design
   §4.2 "Coverage", §4.5) would have accepted that (#43 §1, external
   review).
+  superblock mounted at that path now, never a superblock whose former
+  mount point has been hidden by a mount over it. Before, a name carried
+  by two targets (one of them hidden) selected both, so the count could
+  equal the number requested while a requested filesystem was never
+  frozen; a controller relying on the count (design §4.2 "Coverage",
+  §4.5) would have accepted that (#43 §1, external review).
+- Audit delivery is off every recovery and finalisation path (#43 §3):
+  the sink is written by one dedicated writer thread through a bounded
+  256 KiB delivery queue, so a journald that stops reading blocks that
+  thread and nothing else; a thaw finalises its marker and publishes
+  `Thawed` whether or not a record has been delivered. The writer parks
+  while the freeze-safe ring is in use. Records dropped at a full queue
+  or refused by the sink are counted and reported, like the ring's
+  overflow, by an `audit_records_lost` record delivered where the gap
+  is, now with a `reason` (`ring_overflow`, `sink_backpressure`,
+  `sink_error`). `guest-shutdown` waits at most 2 s for its own record
+  before `reboot(2)`.
 - A freeze that froze nothing and holds nothing (an empty plan, a
   `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
   target of which was skipped) settles `Thawed` with its marker removed

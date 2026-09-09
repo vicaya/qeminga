@@ -1,0 +1,4 @@
+# A configuration from before fsfreeze_operation_timeout_secs existed.
+[agent]
+fsfreeze_idle_timeout_secs = 2
+fsfreeze_max_timeout_secs = 5

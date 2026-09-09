@@ -4,6 +4,42 @@ All notable changes to qeminga. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions follow
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`;
+  omitted it derives `min(60, fsfreeze_max_timeout_secs)`, an explicit
+  value must be at most the hard cap): a `guest-fsfreeze-freeze` whose
+  walk is still inside `FIFREEZE` when the deadline expires is aborted;
+  the targets frozen so far are thawed through their descriptors while
+  the blocked call is still awaited, the request fails with a
+  `GenericError` naming the target in flight, and the marker, the frozen
+  gate and the freeze-safe audit mode stay until the operation settles
+  (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
+
+### Changed
+
+- A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts
+  the walk and is answered at once with the recovery pending, instead of
+  being refused.
+- The channel session admits commands by lane: one command that may
+  change the guest at a time, in request order among themselves; up to
+  three frozen-safe controls beside it (status is served while a
+  recovery drain is blocked) and a thaw beside a running freeze (it
+  reaches the operation before the deadline, even behind a queued walk).
+  The queue has eight places owned from decoding to delivery in request
+  order (an overtaking control never takes the place of the command it
+  overtook) and a 64 KiB backpressure threshold on undelivered replies,
+  so a peer that stops reading stops being read; replies stay in request order; a reply the host is
+  slow to read stalls neither the commands behind it nor a stop; a stop
+  finishes the commands running before the session ends, and so does a
+  lost peer.
+- The freeze walk runs one tracked blocking task per target, publishing
+  each completed descriptor before the next target is authorised; a late
+  completion is drained through its own descriptor and is never published
+  as `Frozen`.
+
 ## [0.1.0] - 2026-09-03
 
 First release: the complete command set of `docs/design.md`.

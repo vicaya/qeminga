@@ -20,6 +20,8 @@ examine_globs = [
     "src/dispatch.rs",
     "src/dispatch/ratelimit.rs",
     "src/handlers/fsfreeze.rs",
+    # The freeze operation coordinator: deadline, abort, late completions.
+    "src/freeze_op.rs",
     # Lifecycle coordination: the timer loop's deadline/heartbeat order.
     "src/watchdog.rs",
 ]

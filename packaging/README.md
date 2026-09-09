@@ -57,6 +57,9 @@ the unit are coupled (§8.4): keep `TimeoutStopSec` greater than the cap
 plus a thaw-drain margin (30 s), otherwise a stop requested during a
 freeze falls back to the forced-stop recovery path (§5.7) instead of
 waiting for the thaw. `tests/packaging.rs` checks the shipped pair.
+`fsfreeze_operation_timeout_secs` (the freeze walk's own deadline, §4.4)
+is validated to be at most the cap, so it never needs a margin of its
+own.
 
 ## Recovery marker
 

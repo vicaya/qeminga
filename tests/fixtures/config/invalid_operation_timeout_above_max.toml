@@ -1,0 +1,3 @@
+[agent]
+fsfreeze_max_timeout_secs = 300
+fsfreeze_operation_timeout_secs = 301

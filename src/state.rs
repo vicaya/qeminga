@@ -7,6 +7,7 @@
 //! Thawed   --> Freezing : begin_freeze
 //! Freezing --> Frozen   : freeze_succeeded
 //! Freezing --> Thawed   : freeze_failed (rollback complete)
+//! Freezing --> Thawing  : abort_freeze (operation deadline or thaw request)
 //! Frozen   --> Thawing  : claim_thaw (thaw request or watchdog deadline)
 //! Thawed   --> Thawing  : claim_thaw (recovery drain)
 //! Thawing  --> Thawed   : thaw_succeeded (drain complete, marker removed)
@@ -169,6 +170,21 @@ impl FreezeStateMachine {
     pub fn freeze_failed(&self, token: FreezeToken) {
         drop(token);
         *self.lock() = FreezeState::Thawed;
+    }
+
+    /// `Freezing → Thawing`: the freeze operation was aborted (its deadline
+    /// expired or a thaw was requested, §4.4) and the coordinator now owns
+    /// the recovery of the targets frozen so far. Consuming the freeze
+    /// token here is what keeps a late `FIFREEZE` completion from ever
+    /// publishing `Frozen`: only the returned thaw token can settle the
+    /// operation, as `Thawed` (everything drained, marker removed) or as
+    /// `Frozen` (a drain incomplete, marker retained).
+    pub fn abort_freeze(&self, token: FreezeToken) -> ThawToken {
+        drop(token);
+        *self.lock() = FreezeState::Thawing;
+        ThawToken {
+            origin: FreezeState::Freezing,
+        }
     }
 
     /// `Frozen → Thawing`, or `Thawed → Thawing` for a recovery drain.
@@ -369,6 +385,30 @@ mod tests {
         assert_eq!(sm.current(), FreezeState::Frozen);
         // A retry is possible.
         assert!(sm.claim_thaw().is_ok());
+    }
+
+    #[test]
+    fn abort_freeze_moves_freezing_to_thawing_with_a_thaw_token() {
+        // The operation deadline (or a thaw request) aborts a freeze in
+        // progress: the freeze token is consumed, so a late completion can
+        // never publish `Frozen`, and the recovery owns a thaw token.
+        let sm = FreezeStateMachine::new();
+        let token = sm.begin_freeze().unwrap();
+        let thaw = sm.abort_freeze(token);
+        assert_eq!(sm.current(), FreezeState::Thawing);
+        assert_eq!(thaw.origin(), FreezeState::Freezing);
+        assert!(!thaw.is_recovery_drain());
+        assert!(sm.begin_freeze().is_err());
+        assert!(sm.claim_thaw().is_err());
+        // Settled with an incomplete drain: `Frozen`, marker retained.
+        sm.thaw_failed(thaw);
+        assert_eq!(sm.current(), FreezeState::Frozen);
+        // Settled completely: `Thawed`.
+        let token = sm.claim_thaw().unwrap();
+        sm.thaw_succeeded(token);
+        let token = sm.begin_freeze().unwrap();
+        sm.thaw_succeeded(sm.abort_freeze(token));
+        assert_eq!(sm.current(), FreezeState::Thawed);
     }
 
     #[test]

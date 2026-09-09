@@ -26,6 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use serde_json::Value;
 
 use crate::audit::{AuditRecord, Disposition, Router, project_method};
+use crate::channel::Kind;
 use crate::config::Config;
 use crate::framing::{DecodeEvent, encode};
 use crate::handlers;
@@ -69,6 +70,19 @@ pub fn is_frozen_safe(method: &str) -> bool {
             | "guest-sync-delimited"
             | "guest-info"
     )
+}
+
+/// The session lane of an allowlisted method (§5.7): the frozen-safe
+/// controls run beside the command in progress, a thaw beside a freeze,
+/// everything else one at a time. Derived from [`is_frozen_safe`] so the
+/// two never disagree.
+pub fn lane(method: &str) -> Kind {
+    match method {
+        "guest-fsfreeze-thaw" => Kind::Thaw,
+        "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => Kind::Freeze,
+        _ if is_frozen_safe(method) => Kind::Control,
+        _ => Kind::Ordinary,
+    }
 }
 
 /// Audit `reason` values for denied frames.
@@ -122,6 +136,14 @@ pub struct Context {
     /// held until their drain completes: a thaw drains the filesystem
     /// each was opened on, whatever its pathnames lead to by then (§4.2).
     frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
+    /// The freeze operation in progress, from `Freezing` until it settles
+    /// (§4.4 operation deadline).
+    freeze_op: std::sync::Mutex<Option<Arc<crate::freeze_op::FreezeOp>>>,
+    /// The freeze operation deadline (`fsfreeze_operation_timeout_secs`).
+    freeze_operation_timeout: std::time::Duration,
+    /// The clock the deadline is measured against (tests inject a manual
+    /// one).
+    freeze_clock: Arc<dyn crate::freeze_op::FreezeClock>,
     handler_calls: AtomicU64,
 }
 
@@ -153,6 +175,8 @@ impl Context {
         #[cfg(test)]
         let kernel: Arc<dyn crate::kernel::KernelOps> =
             Arc::new(crate::kernel::fake::FakeKernel::new());
+        let freeze_operation_timeout =
+            std::time::Duration::from_secs(config.agent.fsfreeze_operation_timeout_secs());
         Context {
             config,
             state,
@@ -170,7 +194,67 @@ impl Context {
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
+            freeze_op: std::sync::Mutex::new(None),
+            freeze_operation_timeout,
+            freeze_clock: Arc::new(crate::freeze_op::TokioClock),
             handler_calls: AtomicU64::new(0),
+        }
+    }
+
+    /// Replaces the freeze operation deadline (tests use short ones).
+    #[must_use]
+    pub fn with_freeze_operation_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.freeze_operation_timeout = timeout;
+        self
+    }
+
+    /// The freeze operation deadline, measured from entry into `Freezing`.
+    pub fn freeze_operation_timeout(&self) -> std::time::Duration {
+        self.freeze_operation_timeout
+    }
+
+    /// Replaces the clock the freeze operation deadline is measured
+    /// against.
+    #[must_use]
+    pub fn with_freeze_clock(mut self, clock: Arc<dyn crate::freeze_op::FreezeClock>) -> Self {
+        self.freeze_clock = clock;
+        self
+    }
+
+    /// The clock the freeze operation deadline is measured against.
+    pub fn freeze_clock(&self) -> Arc<dyn crate::freeze_op::FreezeClock> {
+        Arc::clone(&self.freeze_clock)
+    }
+
+    /// The freeze operation in progress, if any.
+    pub fn freeze_op(&self) -> Option<Arc<crate::freeze_op::FreezeOp>> {
+        self.freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Registers the freeze operation (or, with `None`, clears the slot).
+    pub(crate) fn set_freeze_op(&self, op: Option<Arc<crate::freeze_op::FreezeOp>>) {
+        *self
+            .freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = op;
+    }
+
+    /// Retires `op`: clears the slot only if it still holds that very
+    /// operation, so a settling operation can never clear a successor
+    /// that was admitted after it published its terminal state.
+    pub(crate) fn retire_freeze_op(&self, op: &Arc<crate::freeze_op::FreezeOp>) {
+        let mut slot = self
+            .freeze_op
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, op))
+        {
+            *slot = None;
         }
     }
 
@@ -258,6 +342,15 @@ impl Context {
     /// Number of handles currently held.
     pub fn frozen_mount_count(&self) -> usize {
         self.frozen_mounts_slot().len()
+    }
+
+    /// The lock behind the held handles, for tests that must hold the
+    /// driver between a completion and its next decision boundary.
+    #[cfg(test)]
+    pub(crate) fn frozen_mounts_lock_for_tests(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
+        self.frozen_mounts_slot()
     }
 
     fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
@@ -381,6 +474,22 @@ impl Dispatcher {
         ))
     }
 
+    /// The lane `event` runs in (§5.7), decided by the session before the
+    /// frame is handled. The frame is parsed once more here, without any
+    /// side effect (no audit record, no gate): a frame that cannot be
+    /// parsed, like an oversized one, is answered without running
+    /// anything and counts as a control; an unknown method is treated as
+    /// an ordinary command and rejected in its turn.
+    pub fn classify(&self, event: &DecodeEvent) -> Kind {
+        match event {
+            DecodeEvent::Oversized { .. } => Kind::Control,
+            DecodeEvent::Frame { bytes, .. } => match parse_request(bytes) {
+                Ok(req) => lane(&req.method),
+                Err(_) => Kind::Control,
+            },
+        }
+    }
+
     /// Steps 2–5 of the dispatch order (C-7). On denial returns the audit
     /// reason together with the wire error.
     fn gates(&self, req: &Request) -> Result<(), (&'static str, Error)> {
@@ -452,6 +561,25 @@ mod tests {
     use super::*;
     use crate::audit;
     use crate::framing::MAX_FRAME_LEN;
+
+    #[test]
+    fn retiring_an_operation_never_clears_its_successor() {
+        use crate::freeze_op::FreezeOp;
+        let ctx = Context::for_tests();
+        let a = FreezeOp::detached_for_tests();
+        let b = FreezeOp::detached_for_tests();
+        ctx.set_freeze_op(Some(Arc::clone(&a)));
+        assert!(Arc::ptr_eq(&ctx.freeze_op().unwrap(), &a));
+        // A's settlement overlaps B's admission: A's retirement is a no-op.
+        ctx.set_freeze_op(Some(Arc::clone(&b)));
+        ctx.retire_freeze_op(&a);
+        assert!(Arc::ptr_eq(&ctx.freeze_op().unwrap(), &b));
+        // Only B retires B; a repeated retirement is harmless.
+        ctx.retire_freeze_op(&b);
+        assert!(ctx.freeze_op().is_none());
+        ctx.retire_freeze_op(&b);
+        assert!(ctx.freeze_op().is_none());
+    }
     use crate::state::FreezeState;
     use serde_json::json;
     use std::io::Write;
@@ -707,6 +835,60 @@ mod tests {
                 assert_eq!(record["freeze_state_before"], state.as_str());
             }
         }
+    }
+
+    #[test]
+    fn lanes_follow_the_frozen_safe_set() {
+        // The thaw and the two freezes have lanes of their own; the other
+        // frozen-safe commands are controls; everything else, unknown
+        // methods included, is serial.
+        for spec in handlers::SUPPORTED_COMMANDS {
+            let expected = match spec.name {
+                "guest-fsfreeze-thaw" => Kind::Thaw,
+                "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => Kind::Freeze,
+                name if is_frozen_safe(name) => Kind::Control,
+                _ => Kind::Ordinary,
+            };
+            assert_eq!(lane(spec.name), expected, "{}", spec.name);
+        }
+        assert_eq!(lane("guest-exec"), Kind::Ordinary);
+    }
+
+    #[test]
+    fn classification_parses_without_side_effects() {
+        let ctx = Arc::new(Context::for_tests());
+        let d = Dispatcher::new(Arc::clone(&ctx));
+        let frame = |bytes: &[u8]| DecodeEvent::Frame {
+            bytes: bytes.to_vec(),
+            sentinel: false,
+        };
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-status"}"#)),
+            Kind::Control
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-thaw","id":1}"#)),
+            Kind::Thaw
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fsfreeze-freeze-list"}"#)),
+            Kind::Freeze
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-fstrim"}"#)),
+            Kind::Ordinary
+        );
+        assert_eq!(
+            d.classify(&frame(br#"{"execute":"guest-exec"}"#)),
+            Kind::Ordinary
+        );
+        // Answered without running anything: never in the way of a thaw.
+        assert_eq!(d.classify(&frame(b"not json")), Kind::Control);
+        assert_eq!(
+            d.classify(&DecodeEvent::Oversized { discarded: 1 }),
+            Kind::Control
+        );
+        assert_eq!(ctx.handler_calls(), 0, "classification ran nothing");
     }
 
     #[tokio::test]

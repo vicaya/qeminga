@@ -7,7 +7,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 use nix::errno::Errno;
 
@@ -34,6 +35,85 @@ pub enum Call {
 /// result is returned (used to check ordering against other components).
 pub type Hook = Box<dyn Fn(&Call) + Send + Sync>;
 
+/// A barrier a scripted `fifreeze` or `fithaw` waits at, modelling an
+/// ioctl that blocks in the kernel. The call is recorded first and waits
+/// *outside* the fake's mutex, so calls on other targets, `calls()` and
+/// the scripts proceed meanwhile; the scripted result applies once the
+/// gate is released. Tests hold a [`ReleaseOnDrop`] so a failed assertion
+/// cannot leave a worker (and the runtime's shutdown) blocked.
+#[derive(Clone, Debug, Default)]
+pub struct Gate {
+    inner: Arc<GateInner>,
+}
+
+#[derive(Debug, Default)]
+struct GateInner {
+    released: Mutex<bool>,
+    changed: Condvar,
+    waiting: AtomicUsize,
+}
+
+impl Gate {
+    /// A closed gate.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lets every current and future waiter through.
+    pub fn release(&self) {
+        *self.lock() = true;
+        self.inner.changed.notify_all();
+    }
+
+    /// `true` once released.
+    pub fn is_released(&self) -> bool {
+        *self.lock()
+    }
+
+    /// Number of calls currently blocked at the gate.
+    pub fn waiting(&self) -> usize {
+        self.inner.waiting.load(Ordering::SeqCst)
+    }
+
+    /// A guard that releases the gate when dropped.
+    pub fn release_on_drop(&self) -> ReleaseOnDrop {
+        ReleaseOnDrop(self.clone())
+    }
+
+    /// Blocks the calling thread until the gate is released (what the
+    /// scripted calls do; test doubles of other traits can use it too).
+    pub fn wait(&self) {
+        self.inner.waiting.fetch_add(1, Ordering::SeqCst);
+        let mut released = self.lock();
+        while !*released {
+            released = self
+                .inner
+                .changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        drop(released);
+        self.inner.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.inner
+            .released
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Releases its [`Gate`] when dropped.
+#[derive(Debug)]
+pub struct ReleaseOnDrop(Gate);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     calls: Vec<Call>,
@@ -44,6 +124,9 @@ struct Inner {
     thaw_errors: HashMap<PathBuf, Errno>,
     trim_results: HashMap<PathBuf, Result<(u64, Option<u64>), Errno>>,
     reboot_error: Option<Errno>,
+    freeze_gates: HashMap<PathBuf, Gate>,
+    thaw_gates: HashMap<PathBuf, Gate>,
+    trim_gates: HashMap<PathBuf, Gate>,
     hook: Option<Hook>,
 }
 
@@ -146,6 +229,37 @@ impl FakeKernel {
         self.lock().reboot_error = Some(errno);
     }
 
+    /// Makes every `fifreeze(path)` wait at the returned [`Gate`] (after
+    /// being recorded, outside the fake's mutex) until it is released; the
+    /// scripted result then applies.
+    pub fn script_freeze_gate(&self, path: impl AsRef<Path>) -> Gate {
+        let gate = Gate::new();
+        self.lock()
+            .freeze_gates
+            .insert(path.as_ref().to_owned(), gate.clone());
+        gate
+    }
+
+    /// Makes every `fithaw(path)` wait at the returned [`Gate`], as
+    /// [`script_freeze_gate`](Self::script_freeze_gate) does for freezes.
+    pub fn script_thaw_gate(&self, path: impl AsRef<Path>) -> Gate {
+        let gate = Gate::new();
+        self.lock()
+            .thaw_gates
+            .insert(path.as_ref().to_owned(), gate.clone());
+        gate
+    }
+
+    /// Makes every `fitrim(path, _)` wait at the returned [`Gate`], as
+    /// [`script_freeze_gate`](Self::script_freeze_gate) does for freezes.
+    pub fn script_trim_gate(&self, path: impl AsRef<Path>) -> Gate {
+        let gate = Gate::new();
+        self.lock()
+            .trim_gates
+            .insert(path.as_ref().to_owned(), gate.clone());
+        gate
+    }
+
     /// Installs an observer called on every operation.
     pub fn set_hook(&self, hook: Hook) {
         self.lock().hook = Some(hook);
@@ -179,6 +293,10 @@ impl KernelOps for FakeKernel {
     fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError> {
         let mountpoint = mount.mountpoint();
         self.record(Call::Fifreeze(mountpoint.to_owned()));
+        let gate = self.lock().freeze_gates.get(mountpoint).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         match self.lock().freeze_errors.get(mountpoint) {
             Some(errno) => Err(KernelError::Errno(*errno)),
             None => Ok(()),
@@ -188,6 +306,10 @@ impl KernelOps for FakeKernel {
     fn fithaw(&self, mount: &Mount) -> Result<(), KernelError> {
         let mountpoint = mount.mountpoint();
         self.record(Call::Fithaw(mountpoint.to_owned()));
+        let gate = self.lock().thaw_gates.get(mountpoint).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         let mut inner = self.lock();
         if let Some(errno) = inner.thaw_errors.get(mountpoint) {
             return Err(KernelError::Errno(*errno));
@@ -207,6 +329,10 @@ impl KernelOps for FakeKernel {
     fn fitrim(&self, mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError> {
         let mountpoint = mount.mountpoint();
         self.record(Call::Fitrim(mountpoint.to_owned(), minimum));
+        let gate = self.lock().trim_gates.get(mountpoint).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         match self.lock().trim_results.get(mountpoint) {
             Some(Ok((bytes, effective))) => Ok(Trimmed {
                 bytes: *bytes,
@@ -233,12 +359,55 @@ impl KernelOps for FakeKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// An unopened handle, as the fake's `open_mount` hands out.
     fn at(path: &str) -> Mount {
         Mount::unopened(path, (8, 1))
+    }
+
+    #[test]
+    fn a_gated_freeze_waits_outside_the_fake_mutex_until_released() {
+        // The gate models a FIFREEZE that blocks in the kernel: the call is
+        // recorded first, then waits without holding the fake's mutex, so
+        // other targets' calls and `calls()` proceed meanwhile.
+        let k = Arc::new(FakeKernel::new());
+        let gate = k.script_freeze_gate("/home");
+        let _release = gate.release_on_drop();
+        let worker = {
+            let k = Arc::clone(&k);
+            std::thread::spawn(move || k.fifreeze(&Mount::unopened("/home", (8, 2))))
+        };
+        while gate.waiting() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(k.calls(), vec![Call::Fifreeze("/home".into())]);
+        k.fifreeze(&at("/")).unwrap();
+        assert_eq!(gate.waiting(), 1);
+        assert!(!worker.is_finished());
+        gate.release();
+        worker.join().unwrap().unwrap();
+        assert_eq!(gate.waiting(), 0);
+        assert!(gate.is_released());
+        // A released gate no longer blocks.
+        k.fifreeze(&Mount::unopened("/home", (8, 2))).unwrap();
+    }
+
+    #[test]
+    fn a_gated_thaw_waits_and_a_scripted_error_still_applies_after_release() {
+        let k = Arc::new(FakeKernel::new());
+        let gate = k.script_thaw_gate("/");
+        k.script_thaw_error("/", Errno::EACCES);
+        let worker = {
+            let k = Arc::clone(&k);
+            std::thread::spawn(move || k.fithaw(&at("/")))
+        };
+        while gate.waiting() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(!worker.is_finished());
+        drop(gate.release_on_drop());
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(matches!(err, KernelError::Errno(Errno::EACCES)));
     }
 
     #[test]

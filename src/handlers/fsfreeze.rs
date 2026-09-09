@@ -235,7 +235,7 @@ pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
     let token = match ctx.state.claim_thaw() {
         Ok(token) => token,
         Err(err) => match ctx.freeze_op() {
-            Some(op) => return join_operation(&op).await,
+            Some(op) => return join_operation(ctx, &op).await,
             // The operation may have settled between the claim and the
             // look-up: one more claim before refusing.
             None => ctx
@@ -255,8 +255,27 @@ pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
 /// while the operation can still freeze a target: the host learns the
 /// outcome from `guest-fsfreeze-status`, which answers `frozen` until the
 /// operation has settled `Thawed`.
-async fn join_operation(op: &crate::freeze_op::FreezeOp) -> Result<Value, Error> {
-    op.request_abort();
+///
+/// The request and the operation's own commit compete on one transition:
+/// when the operation had already committed (a freeze that succeeded a
+/// moment ago, or a settlement of its own), nothing is aborted, the
+/// operation's settlement is awaited (the driver is past every blocking
+/// call by then) and the thaw takes the ordinary path from the published
+/// state, so a thaw is never told "recovery pending" by an operation that
+/// then publishes a successful `Frozen`.
+async fn join_operation(
+    ctx: &Arc<Context>,
+    op: &crate::freeze_op::FreezeOp,
+) -> Result<Value, Error> {
+    if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
+        op.wait_for_settlement().await;
+        let token = ctx
+            .state
+            .claim_thaw()
+            .map_err(|err| Error::Internal(format!("cannot thaw: {err}")))?;
+        let count = run_thaw(ctx, token).await?;
+        return Ok(json!(count));
+    }
     let progress = op.progress();
     match progress.settled {
         Some(FreezeState::Thawed) => Ok(json!(progress.recovered)),
@@ -3346,5 +3365,62 @@ mod tests {
         rig.wait_for("settled", |r| r.state() == FreezeState::Frozen)
             .await;
         assert!(rig.ctx.freeze_op().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_thaw_that_finds_a_committed_operation_takes_the_ordinary_path() {
+        // The operation commits its success a moment before the thaw
+        // reaches it (the thaw still holds the registration it looked up
+        // while the last target was in flight): the request is answered
+        // as committed, the thaw waits for the settlement and then drains
+        // from `Frozen` like any thaw, never reporting a recovery that was
+        // not started.
+        let rig = Rig::nested();
+        let d = rig.kernel.script_freeze_gate(D);
+        let _release = d.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("D blocked", |_| d.waiting() == 1).await;
+        let op = rig.ctx.freeze_op().unwrap();
+        d.release();
+        let value = freezing.await.unwrap().unwrap();
+        assert_eq!(value, json!(4));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(
+            op.request_abort(),
+            crate::freeze_op::AbortRequest::Committed,
+            "nothing to abort after the commit"
+        );
+        let value = join_operation(&rig.ctx, &op).await.unwrap();
+        assert_eq!(value, json!(4), "an ordinary thaw of the four targets");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(
+            rig.hooks.events(),
+            ["freezing", "frozen", "thaw_claimed", "thawed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_thaw_accepted_before_the_commit_makes_the_driver_recover() {
+        // The request lands after the driver's last decision boundary and
+        // before its commit: the commit fails on the shared transition and
+        // the driver recovers everything instead of publishing `Frozen`.
+        // Modelled by accepting the abort on the operation directly while
+        // the last target is in flight, without waking the driver.
+        let rig = Rig::nested();
+        let d = rig.kernel.script_freeze_gate(D);
+        let _release = d.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("D blocked", |_| d.waiting() == 1).await;
+        let op = rig.ctx.freeze_op().unwrap();
+        assert_eq!(op.request_abort(), crate::freeze_op::AbortRequest::Accepted);
+        d.release();
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("thaw requested"), "{err}");
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert_eq!(rig.fithaws(), paths(&[C, C, B, B, A, A, D, D]));
+        assert!(!rig.hooks.events().contains(&"frozen"));
+        assert!(!rig.marker().exists());
     }
 }

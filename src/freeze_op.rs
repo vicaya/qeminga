@@ -54,7 +54,7 @@
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Notify, oneshot, watch};
@@ -264,6 +264,25 @@ impl Progress {
     }
 }
 
+/// The answer to [`FreezeOp::request_abort`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbortRequest {
+    /// The abort is accepted (now or already): the operation will not
+    /// commit a successful freeze, and recovery of the targets frozen so
+    /// far is, or will be, under way.
+    Accepted,
+    /// The operation had already committed its outcome (a successful
+    /// freeze, or a settlement of its own): nothing is aborted, and the
+    /// thaw belongs to the ordinary path once the state is published.
+    Committed,
+}
+
+/// The one transition abort and completion compete on: open, aborting,
+/// or committed (see [`FreezeOp::request_abort`] and `try_commit`).
+const OUTCOME_OPEN: u8 = 0;
+const OUTCOME_ABORTING: u8 = 1;
+const OUTCOME_COMMITTED: u8 = 2;
+
 /// One freeze operation, shared between the driver task, the request that
 /// started it and any thaw that joins it. Registered in the [`Context`]
 /// until it settles.
@@ -272,9 +291,14 @@ pub struct FreezeOp {
     deadline: Instant,
     clock: Arc<dyn FreezeClock>,
     abort_requested: Notify,
-    /// A thaw asked for the abort (read at the decision boundaries).
-    requested: AtomicBool,
-    /// The abort committed (read by workers before their ioctl).
+    /// `OUTCOME_OPEN` until either an abort is accepted (`ABORTING`, by a
+    /// thaw request or by the driver at a decision boundary) or the driver
+    /// commits the operation's outcome (`COMMITTED`); the two compete on
+    /// this one atomic, so a thaw request can never be told "recovery
+    /// pending" by an operation that then commits a successful freeze.
+    outcome: AtomicU8,
+    /// The abort committed in the driver (read by workers before their
+    /// ioctl).
     aborted: AtomicBool,
     progress: watch::Sender<Progress>,
 }
@@ -282,10 +306,46 @@ pub struct FreezeOp {
 impl FreezeOp {
     /// Asks the operation to stop authorising targets and to recover the
     /// ones frozen so far (a thaw request). Idempotent; a request that
-    /// arrives before the driver waits is not lost.
-    pub fn request_abort(&self) {
-        self.requested.store(true, Ordering::SeqCst);
-        self.abort_requested.notify_one();
+    /// arrives before the driver waits is not lost. The answer says
+    /// whether the abort is accepted or the operation had already
+    /// committed its outcome.
+    pub fn request_abort(&self) -> AbortRequest {
+        match self.outcome.compare_exchange(
+            OUTCOME_OPEN,
+            OUTCOME_ABORTING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        ) {
+            Ok(_) | Err(OUTCOME_ABORTING) => {
+                self.abort_requested.notify_one();
+                AbortRequest::Accepted
+            }
+            Err(_) => AbortRequest::Committed,
+        }
+    }
+
+    /// The driver's side of the transition: claims the outcome for a
+    /// settlement. `false` when an abort was accepted first, in which case
+    /// the driver must recover instead of committing.
+    fn try_commit(&self) -> bool {
+        self.outcome
+            .compare_exchange(
+                OUTCOME_OPEN,
+                OUTCOME_COMMITTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// The driver accepting the abort itself (deadline, lost worker).
+    fn mark_aborting(&self) {
+        let _ = self.outcome.compare_exchange(
+            OUTCOME_OPEN,
+            OUTCOME_ABORTING,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
     /// The latest snapshot.
@@ -317,10 +377,10 @@ impl FreezeOp {
         }
     }
 
-    /// The abort decision at a boundary: a pending request, else the
+    /// The abort decision at a boundary: an accepted request, else the
     /// deadline.
     fn abort_due(&self) -> Option<AbortCause> {
-        if self.requested.load(Ordering::SeqCst) {
+        if self.outcome.load(Ordering::SeqCst) == OUTCOME_ABORTING {
             Some(AbortCause::ThawRequested)
         } else if self.clock.now() >= self.deadline {
             Some(AbortCause::Deadline)
@@ -347,7 +407,7 @@ impl FreezeOp {
             deadline: Instant::now() + Duration::from_secs(3600),
             clock: Arc::new(TokioClock),
             abort_requested: Notify::new(),
-            requested: AtomicBool::new(false),
+            outcome: AtomicU8::new(OUTCOME_OPEN),
             aborted: AtomicBool::new(false),
             progress,
         })
@@ -370,7 +430,7 @@ pub(crate) fn start(
         deadline: clock.now() + timeout,
         clock,
         abort_requested: Notify::new(),
-        requested: AtomicBool::new(false),
+        outcome: AtomicU8::new(OUTCOME_OPEN),
         aborted: AtomicBool::new(false),
         progress,
     });
@@ -539,6 +599,13 @@ impl Driver {
         if self.abort.is_some() {
             return self.settle_aborted().await;
         }
+        // The commit itself competes with a thaw request on one transition:
+        // a request accepted between the decision above and this claim
+        // wins, and the operation recovers instead of publishing `Frozen`.
+        if !self.op.try_commit() {
+            self.commit_abort(AbortCause::ThawRequested);
+            return self.settle_aborted().await;
+        }
         tracing::info!(
             event = "fsfreeze_frozen",
             frozen = self.frozen,
@@ -638,6 +705,7 @@ impl Driver {
             return;
         }
         self.abort = Some(cause);
+        self.op.mark_aborting();
         self.op.aborted.store(true, Ordering::SeqCst);
         if let Some(token) = self.token.take() {
             self.thaw_token = Some(self.ctx.state.abort_freeze(token));
@@ -851,6 +919,10 @@ impl Driver {
     /// slot released and a successor can only be admitted afterwards;
     /// the identity check keeps the retirement harmless even so.
     fn conclude(mut self, terminal: Terminal, reply: Result<u64, FreezeFailure>) {
+        // Every settlement commits the outcome (a no-op once aborting): a
+        // thaw request from here on is told the operation is committed and
+        // takes the ordinary path once the state is published.
+        let _ = self.op.try_commit();
         if matches!(terminal, Terminal::Thawed) {
             self.ctx.hooks.on_thawed(&self.ctx);
         }
@@ -903,6 +975,27 @@ async fn abort_signal(op: &FreezeOp) -> AbortCause {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn abort_and_commit_compete_on_one_transition() {
+        // A request accepted first makes the commit fail; a commit first
+        // makes the request come back as committed; both are idempotent.
+        let op = FreezeOp::detached_for_tests();
+        assert_eq!(op.request_abort(), AbortRequest::Accepted);
+        assert_eq!(op.request_abort(), AbortRequest::Accepted);
+        assert!(!op.try_commit(), "an accepted abort wins");
+        assert_eq!(op.abort_due(), Some(AbortCause::ThawRequested));
+        let op = FreezeOp::detached_for_tests();
+        assert!(op.try_commit());
+        assert!(!op.try_commit(), "committed once");
+        assert_eq!(op.request_abort(), AbortRequest::Committed);
+        assert_eq!(op.abort_due(), None, "nothing to abort any more");
+        // The driver's own abort is the same transition.
+        let op = FreezeOp::detached_for_tests();
+        op.mark_aborting();
+        assert!(!op.try_commit());
+        assert_eq!(op.request_abort(), AbortRequest::Accepted);
+    }
 
     #[tokio::test]
     async fn the_manual_clock_wakes_sleepers_only_when_advanced() {

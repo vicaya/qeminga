@@ -126,6 +126,7 @@ struct Inner {
     reboot_error: Option<Errno>,
     freeze_gates: HashMap<PathBuf, Gate>,
     thaw_gates: HashMap<PathBuf, Gate>,
+    trim_gates: HashMap<PathBuf, Gate>,
     hook: Option<Hook>,
 }
 
@@ -249,6 +250,16 @@ impl FakeKernel {
         gate
     }
 
+    /// Makes every `fitrim(path, _)` wait at the returned [`Gate`], as
+    /// [`script_freeze_gate`](Self::script_freeze_gate) does for freezes.
+    pub fn script_trim_gate(&self, path: impl AsRef<Path>) -> Gate {
+        let gate = Gate::new();
+        self.lock()
+            .trim_gates
+            .insert(path.as_ref().to_owned(), gate.clone());
+        gate
+    }
+
     /// Installs an observer called on every operation.
     pub fn set_hook(&self, hook: Hook) {
         self.lock().hook = Some(hook);
@@ -318,6 +329,10 @@ impl KernelOps for FakeKernel {
     fn fitrim(&self, mount: &Mount, minimum: u64) -> Result<Trimmed, KernelError> {
         let mountpoint = mount.mountpoint();
         self.record(Call::Fitrim(mountpoint.to_owned(), minimum));
+        let gate = self.lock().trim_gates.get(mountpoint).cloned();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         match self.lock().trim_results.get(mountpoint) {
             Some(Ok((bytes, effective))) => Ok(Trimmed {
                 bytes: *bytes,

@@ -342,7 +342,12 @@ impl Context {
     /// or thaw after the instance is gone. Blocking work already in the
     /// kernel (an ioctl) completes on its own thread, as an in-flight
     /// syscall does. For harnesses that model a crash (`SIGKILL`) and a
-    /// restart in one process; never called by the daemon itself.
+    /// restart in one process; never called by the daemon itself, and
+    /// not an API for anything else: like the crash it models, it leaves
+    /// the state machine where it was (`Freezing`, a live marker, a
+    /// request never answered), which only a new instance's recovery
+    /// resolves.
+    #[doc(hidden)]
     pub fn abort_tasks(&self) {
         if let Some(watchdog) = self.watchdog_slot().take() {
             watchdog.cancel();

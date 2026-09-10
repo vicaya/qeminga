@@ -27,9 +27,12 @@ semantic versioning.
   the hard cap, one thaw, quiesced only when the freeze count and the
   thaw count both equal the number requested), its assumptions and
   their limit; the reference controller in `tests/controller_contract.rs`
-  exercises it against the production coordinator and watchdog (#43 §1).
-  The scripted kernel can model the freeze nesting depth
-  (`FakeKernel::track_freeze_depth`).
+  exercises it against the production coordinator and watchdog (#43 §1);
+  a thaw reply past the budget is rejected whatever its count. The
+  scripted kernel can model the freeze nesting depth per superblock
+  (`FakeKernel::track_freeze_depth`), and a harness can end a dead
+  instance's tasks as a crash would (`Context::abort_tasks`, hidden from
+  the documented API; the daemon never calls it).
 
 ### Fixed
 

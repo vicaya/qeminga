@@ -587,14 +587,31 @@ async fn a_crash_before_the_freeze_reply_is_rejected() {
     let dead = guest.ctx();
     guest.restart_agent();
     assert_eq!(guest.state(), FreezeState::Frozen, "marker: recovery mode");
+    // The walk freezes the deepest mount first, so B is the target in
+    // flight and A was never reached. The controller's thaw over the new
+    // agent drains A first: it is held inside FITHAW(A) until the dead
+    // walk's FIFREEZE(B) has landed, so the drain provably reaches a B
+    // the kernel holds frozen rather than one it froze a moment later.
+    let thaw_gate = guest.kernel.script_thaw_gate(A);
+    let _release_thaw = thaw_gate.release_on_drop();
     gate.release();
+    let k = Arc::clone(&guest.kernel);
+    wait_for("B frozen by the dead walk", move || {
+        k.tracked_frozen_superblocks() == 1
+    })
+    .await;
+    let g = thaw_gate.clone();
+    wait_for("A's thaw blocked", move || g.waiting() == 1).await;
+    thaw_gate.release();
     let verdict = cycle.await.unwrap().unwrap_err();
     rejected(&verdict, "freeze: connection lost");
     assert_eq!(guest.state(), FreezeState::Thawed);
-    assert!(
-        guest.fithaws() >= 2,
-        "the recovery thaw drained by pathname"
+    assert_eq!(
+        guest.fithaws(),
+        3,
+        "the recovery thaw drained by pathname: EINVAL on A, a success and EINVAL on B"
     );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
     // The dead instance is dead: the FIFREEZE that was in the kernel when
     // it died completed on its own (the recovery thaw above found it), but
     // its walk never concluded, published nothing, wrote no marker and

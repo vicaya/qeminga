@@ -312,7 +312,9 @@ impl FreezeOp {
     /// would end it: no state is published, no marker written and no
     /// reply sent by it afterwards; a worker's ioctl already in the kernel
     /// completes on its own thread. For harnesses modelling a crash
-    /// ([`Context::abort_tasks`]); the daemon never aborts its own driver.
+    /// ([`Context::abort_tasks`]); the daemon never aborts its own driver,
+    /// and nothing else should: the operation is left unsettled.
+    #[doc(hidden)]
     pub fn abort_driver(&self) {
         if let Some(driver) = self.driver.get() {
             driver.abort();

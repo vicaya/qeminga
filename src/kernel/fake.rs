@@ -285,6 +285,12 @@ impl FakeKernel {
         self.lock().track_depth = true;
     }
 
+    /// The superblocks whose tracked depth is above zero: what a thaw
+    /// would still find frozen.
+    pub fn tracked_frozen_superblocks(&self) -> usize {
+        self.lock().depths.values().filter(|d| **d > 0).count()
+    }
+
     /// Forgets every freeze (a guest reboot): every superblock is thawed.
     pub fn reset_freeze_depths(&self) {
         let mut inner = self.lock();

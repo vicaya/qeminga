@@ -73,6 +73,9 @@ struct Guest {
     lost: Notify,
     /// The guest's mount table (a fixture name).
     mounts: &'static str,
+    /// The data-protection profile (§5.9): information, shutdown and trim
+    /// off, so `guest-get-fsinfo` is not there to discover with.
+    data_protection: bool,
 }
 
 impl Guest {
@@ -82,6 +85,15 @@ impl Guest {
     }
 
     fn with_mounts(mounts: &'static str) -> Arc<Guest> {
+        Self::build(mounts, false)
+    }
+
+    /// A guest under `packaging/config-data-protection.toml`'s switches.
+    fn data_protection() -> Arc<Guest> {
+        Self::build("simple.txt", true)
+    }
+
+    fn build(mounts: &'static str, data_protection: bool) -> Arc<Guest> {
         let kernel = Arc::new(FakeKernel::new());
         kernel.track_freeze_depth();
         let guest = Arc::new(Guest {
@@ -91,6 +103,7 @@ impl Guest {
             agent: Mutex::new(None),
             lost: Notify::new(),
             mounts,
+            data_protection,
         });
         guest.start_agent();
         guest
@@ -104,6 +117,11 @@ impl Guest {
         let mut config = Config::default();
         config.agent.fsfreeze_idle_timeout_secs = IDLE_SECS;
         config.agent.fsfreeze_max_timeout_secs = MAX_SECS;
+        if self.data_protection {
+            config.features.information = false;
+            config.features.shutdown = false;
+            config.features.fstrim = false;
+        }
         let state = if recovery {
             FreezeStateMachine::starting_frozen()
         } else {
@@ -844,6 +862,42 @@ async fn a_superblock_the_cycle_never_froze_cannot_hold_its_thaw() {
             .any(|c| matches!(c, Call::Open(_, dev) if *dev == (8, 2))),
         "{calls:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cycle_under_the_data_protection_profile_needs_no_discovery() {
+    // §4.5 step 1 under §5.9: with `information` off there is no
+    // `guest-get-fsinfo`, and the required mount points come from the
+    // deployment's own configuration instead (the same trusted source that
+    // chose the profile). The rest of the protocol is unchanged: the
+    // freeze count, the heartbeats, the thaw count and the verdict mean
+    // exactly what they mean under the lifecycle profile.
+    let guest = Guest::data_protection();
+    let reply = guest
+        .request(r#"{"execute":"guest-get-fsinfo"}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["error"]["class"], "CommandNotFound");
+    assert_eq!(
+        reply["error"]["desc"],
+        "command guest-get-fsinfo has been disabled"
+    );
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &[A, B]).await.unwrap();
+    cycle.cut("vol-a", Duration::from_secs(25)).await.unwrap();
+    cycle.cut("vol-b", Duration::from_secs(25)).await.unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-a".to_owned(), "vol-b".to_owned()]
+        }
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    // A provisioned mount point that is wrong fails closed the same way.
+    let verdict = Cycle::freeze(Arc::clone(&guest), &[A, "/srv/provisioned-wrongly"])
+        .await
+        .unwrap_err();
+    rejected(&verdict, "freeze covered 1 of 2");
+    assert_eq!(guest.state(), FreezeState::Thawed);
 }
 
 #[tokio::test(start_paused = true)]

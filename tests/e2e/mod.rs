@@ -397,11 +397,6 @@ impl Agent {
 
     /// Kills the daemon with SIGKILL (a crash) and returns the state
     /// directory so a restart can reuse it (AC10).
-    /// The daemon's process id.
-    pub fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
     pub fn kill(mut self) -> tempfile::TempDir {
         let _ = self.child.kill();
         let _ = self.child.wait();

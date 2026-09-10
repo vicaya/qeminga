@@ -1126,6 +1126,29 @@ fn privileged_data_protection_profile_holds_no_reboot_authority() {
             >= 1
     );
     std::fs::write(format!("{mount}/after-data-protection-thaw"), b"ok").unwrap();
+    // The derived ceiling holds on every thread (§5.4): after the freeze
+    // and thaw the audit writer and the blocking pool are there, and none
+    // of them holds CAP_SYS_BOOT in any set.
+    if stderr.contains("\"event\":\"privileges_dropped\"") {
+        let threads = e2e::thread_statuses(agent.pid());
+        let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"qeminga-audit") && threads.len() >= 3,
+            "{names:?}"
+        );
+        for t in &threads {
+            for set in ["CapEff:", "CapPrm:", "CapBnd:"] {
+                assert_eq!(t.field(set), "0000000000200004", "{} {set}", t.name);
+            }
+            assert_eq!(t.field("CapInh:"), "0000000000000000", "{}", t.name);
+            assert_eq!(t.field("CapAmb:"), "0000000000000000", "{}", t.name);
+            assert_eq!(t.field("NoNewPrivs:"), "1", "{}", t.name);
+            assert!(t.field("Uid:").starts_with("600\t600"), "{}", t.name);
+            if cfg!(feature = "seccomp") {
+                assert_eq!(t.field("Seccomp:"), "2", "{}", t.name);
+            }
+        }
+    }
     let info = agent.execute("guest-info");
     let disabled: Vec<&str> = info["return"]["supported_commands"]
         .as_array()

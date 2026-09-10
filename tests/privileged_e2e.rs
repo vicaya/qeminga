@@ -132,8 +132,7 @@ fn privileged_freeze_sigkill_restart_recovery_thaw() {
     assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
     // The filesystem really is thawed: a write completes.
     std::fs::write(format!("{mount}/after-thaw"), b"ok").unwrap();
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"event\":\"recovery_mode\""), "{stderr}");
+    agent.wait_for_stderr("\"event\":\"recovery_mode\"", e2e::REPLY_TIMEOUT);
     assert!(agent.stop().success());
 }
 
@@ -689,11 +688,7 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         writable_within(&alias.0, "after-handle-thaw", Duration::from_secs(10)),
         "the ext4 is thawed, not the tmpfs in its place"
     );
-    assert!(
-        agent
-            .stderr_text()
-            .contains("\"event\":\"fsfreeze_thawed\"")
-    );
+    agent.wait_for_stderr("\"event\":\"fsfreeze_thawed\"", e2e::REPLY_TIMEOUT);
 
     // (2) Restart: nothing held, the alias is how the ext4 is reached.
     drop(over);
@@ -719,8 +714,7 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         writable_within(&alias.0, "after-alias-thaw", Duration::from_secs(10)),
         "recovery thawed the ext4 through its alias"
     );
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"event\":\"fsfreeze_alias\""), "{stderr}");
+    agent.wait_for_stderr("\"event\":\"fsfreeze_alias\"", e2e::REPLY_TIMEOUT);
 
     // (3) Restart with no pathname leading to the ext4 at all (every
     // mount of its device is covered, the loop script's own bind mount
@@ -1039,6 +1033,7 @@ fn privileged_seccomp_matrix_log_then_enforce() {
     };
     let before = audit_lines();
     let mut agent = Agent::spawn_with(real_kernel(""));
+    agent.wait_for_stderr("\"event\":\"seccomp\"", e2e::REPLY_TIMEOUT);
     let stderr = agent.stderr_text();
     let installed = stderr.contains("\"event\":\"seccomp\",\"installed\":true");
     assert_eq!(installed, cfg!(feature = "seccomp"), "{stderr}");

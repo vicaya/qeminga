@@ -85,7 +85,8 @@ struct MountTree<'a> {
     /// child is the child's own child, at the same mount point.
     children: HashMap<(u32, &'a [u8]), Vec<&'a MountRow>>,
     /// The root of the namespace: mounted at `/`, its parent not in the
-    /// table.
+    /// table or itself (proc_pid_mountinfo(5) permits the root to carry
+    /// its own id as its parent id).
     root: Option<&'a MountRow>,
     rows: usize,
 }
@@ -95,14 +96,21 @@ impl<'a> MountTree<'a> {
         let ids: HashSet<u32> = mounts.iter().map(|row| row.id).collect();
         let mut children: HashMap<(u32, &[u8]), Vec<&MountRow>> = HashMap::new();
         for row in mounts {
+            // A self-parented row (the namespace root) is not its own
+            // child: indexed, it would be found stacked on itself at `/`
+            // and walked into until the bound, resolving nothing.
+            if row.parent == row.id {
+                continue;
+            }
             children
                 .entry((row.parent, row.mount_point.as_os_str().as_bytes()))
                 .or_default()
                 .push(row);
         }
-        let root = mounts
-            .iter()
-            .find(|row| row.mount_point.as_os_str() == "/" && !ids.contains(&row.parent));
+        let root = mounts.iter().find(|row| {
+            row.mount_point.as_os_str() == "/"
+                && (row.parent == row.id || !ids.contains(&row.parent))
+        });
         MountTree {
             children,
             root,
@@ -477,6 +485,31 @@ mod tests {
         let all = plan.restrict_to(&["/data".to_owned(), "/data/nested".to_owned()]);
         let devs: Vec<(u32, u32)> = all.targets().iter().map(|t| t.dev).collect();
         assert_eq!(devs, [(8, 3), (8, 4)]);
+    }
+
+    #[test]
+    fn a_self_parented_root_is_the_root_of_the_namespace() {
+        // proc_pid_mountinfo(5): the root of a mount namespace's tree may
+        // carry its own id as its parent id; that is a valid table, not a
+        // cycle. Such a root is walked from, and it is not its own child
+        // at `/` (which would be a loop the bound ends in `None`).
+        let plan = plan_from("self_parented_root.txt");
+        assert_eq!(plan.visible_at("/data"), Some((8, 1)));
+        assert_eq!(plan.visible_at("/"), Some((0, 1)));
+        let devs: Vec<(u32, u32)> = plan
+            .restrict_to(&["/data".to_owned()])
+            .targets()
+            .iter()
+            .map(|t| t.dev)
+            .collect();
+        assert_eq!(devs, [(8, 1)]);
+        // A parent that is neither absent nor the row itself is not a root:
+        // an inconsistent table (every row under some other row) resolves
+        // nothing rather than guessing.
+        let text = "3 4 0:1 / / rw - rootfs rootfs rw\n4 3 8:1 / /data rw - ext4 /dev/vda1 rw\n";
+        let plan = FreezePlan::build(&parse_mountinfo(text));
+        assert_eq!(plan.visible_at("/data"), None);
+        assert!(plan.restrict_to(&["/data".to_owned()]).is_empty());
     }
 
     #[test]

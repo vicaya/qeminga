@@ -1690,6 +1690,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freeze_list_under_a_self_parented_root_freezes_the_requested_target() {
+        // The namespace root carries its own id as its parent id (valid
+        // per proc_pid_mountinfo(5)): /data is still resolved from it,
+        // selected and frozen through the requested name; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "self_parented_root.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
     async fn a_requested_pathname_that_does_not_lead_to_the_selected_superblock_fails_the_operation()
      {
         // Belt and braces for the selection: if what the kernel opens at

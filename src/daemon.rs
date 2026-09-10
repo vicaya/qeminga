@@ -15,7 +15,8 @@
 //!    plan would freeze (§8.2), judged by the device of the opened
 //!    directory, not by the pathname;
 //! 4. open the channel (`EBUSY` is terminal, §8.4);
-//! 5. drop capabilities (skipped with a warning when not root, C-18), then
+//! 5. drop capabilities (skipped with a warning when not root, C-18; under
+//!    enforced hardening a drop that did not run is a refusal, §8.1), then
 //!    start the audit writer thread (5b): every thread of the process is
 //!    created under the dropped ceiling, which the drop establishes only
 //!    for the calling thread (§5.4);

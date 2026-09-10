@@ -15,8 +15,10 @@
 //!    inheritable and ambient capabilities (and `KEEPCAPS`);
 //! 6. `PR_SET_NO_NEW_PRIVS` (the caller then installs seccomp, §5.5).
 //!
-//! If the process is not root, the drop is skipped with a warning (C-18):
-//! freeze, trim and shutdown will then fail with `EPERM`.
+//! If the process is not root, the drop is skipped with a warning (C-18).
+//! Under enforced hardening the caller then refuses to serve (§8.1); under
+//! the development opt-out freeze, trim and shutdown will fail with
+//! `EPERM`.
 #![forbid(unsafe_code)]
 
 use caps::{CapSet, Capability, CapsHashSet};
@@ -209,7 +211,7 @@ pub fn drop_privileges(user: &str, ops: &dyn CapOps) -> Result<Outcome, Privileg
     if !ops.is_root() {
         tracing::warn!(
             event = "privilege_drop_skipped",
-            "not running as root; capabilities are not dropped and freeze, trim and shutdown will fail with EPERM"
+            "not running as root; capabilities are not dropped (a refusal under enforced hardening; otherwise freeze, trim and shutdown will fail with EPERM)"
         );
         return Ok(Outcome::SkippedUnprivileged);
     }

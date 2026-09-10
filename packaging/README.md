@@ -70,13 +70,18 @@ the daemon refuses to serve the host, exit status 78 and one line in the
 journal (`refusing to serve the host`), unless it was started as root,
 the seccomp filter is compiled in, enabled and installed in its enforcing
 mode, and no test-kernel substitution was requested. `Restart=always`
-then restarts it every second, refusing each time, until the cause is
-fixed; it never falls back to serving without the sandbox. Typical causes
-after an upgrade: a binary built without `--features seccomp` (or with
-`--all-features`, which adds the logging filter), `[features] seccomp =
-false` left in the configuration, a stray `QEMINGA_TEST_FAKE_KERNEL` in
-the unit's environment, or a kernel or container runtime that refuses
-the filter (the line names the installer's error).
+restarts it a second later, refusing each time, until systemd's start
+rate limit ends the loop (five starts in ten seconds by default): the
+unit is then `failed`, and a `systemctl restart` inside that window is
+rejected until `systemctl reset-failed qeminga`. It never falls back to
+serving without the sandbox. Typical causes after an upgrade: a binary
+built without `--features seccomp` (or with `--all-features`, which adds
+the logging filter), a stray `QEMINGA_TEST_FAKE_KERNEL` in the unit's
+environment, or a kernel or container runtime that refuses the filter
+(the line names the installer's error). `[features] seccomp = false`
+left in the configuration is refused one step earlier, as a
+configuration error naming `features.seccomp`: the same exit status 78,
+without the `refusing to serve` line.
 
 The refusal happens before the recovery marker is touched (the drop's
 and the installer's outcomes are checked later, but still before the
@@ -84,7 +89,8 @@ runtime, and are reported to the journal even when a marker put logging
 into recovery mode). If the
 previous instance was frozen when it died, `/run/qeminga/frozen` is still
 there and the filesystems may still be frozen: fix the cause, then
-`systemctl restart qeminga`; the start that can provide the profile
+`systemctl reset-failed qeminga` and `systemctl restart qeminga`; the
+start that can provide the profile
 enters recovery mode from the marker and thaws (§4.4). Do not remove the
 marker by hand, and do not set `hardening = "unenforced-development-only"`
 to get past the refusal on a production host: that value is for a

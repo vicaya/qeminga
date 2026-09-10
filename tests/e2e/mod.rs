@@ -65,6 +65,58 @@ pub fn thread_statuses(pid: u32) -> Vec<ThreadStatus> {
     threads
 }
 
+/// `(major, minor)` of the filesystem `path` currently leads to.
+pub fn dev_of(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).unwrap().dev();
+    (
+        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
+        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
+    )
+}
+
+/// A verified handle on whatever filesystem `path` leads to now (the
+/// test's own view, with `CAP_SYS_ADMIN`).
+pub fn handle(path: &std::path::Path) -> qeminga::kernel::Mount {
+    use qeminga::kernel::KernelOps;
+    qeminga::kernel::LinuxKernel
+        .open_mount(path, dev_of(path))
+        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
+}
+
+/// Thaws the named mounts when dropped, whatever happened in between: a
+/// failed assertion between freeze and thaw would otherwise leave the
+/// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
+/// taking its watchdog with it), so every later test would get EBUSY and
+/// a write to the mount would block in D state. `FITHAW` is repeated
+/// until it fails (nested freezes), bounded.
+pub struct ThawGuard(Vec<String>);
+
+impl ThawGuard {
+    /// Thaws `mounts` on drop, as often as `FITHAW` succeeds.
+    pub fn new(mounts: &[String]) -> Self {
+        ThawGuard(mounts.to_vec())
+    }
+}
+
+impl Drop for ThawGuard {
+    fn drop(&mut self) {
+        use qeminga::kernel::KernelOps;
+        for mount in &self.0 {
+            let path = std::path::Path::new(mount);
+            let Ok(handle) = qeminga::kernel::LinuxKernel.open_mount(path, dev_of(path)) else {
+                continue;
+            };
+            for _ in 0..64 {
+                if qeminga::kernel::LinuxKernel.fithaw(&handle).is_err() {
+                    break;
+                }
+                eprintln!("ThawGuard: thawed {mount} left frozen by the test");
+            }
+        }
+    }
+}
+
 /// Default reply timeout.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 

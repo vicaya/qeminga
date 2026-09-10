@@ -4,6 +4,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod e2e;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -337,7 +339,13 @@ fn install_unit(channel_path: &str) -> Option<InstalledUnit> {
 
 /// As [`install_unit`]; with `production` the shipped defaults apply
 /// (enforced hardening, the real kernel, no drop-in environment), which
-/// is the profile a distributed artifact runs under.
+/// is the profile a distributed artifact runs under, and the binary
+/// installed is the distributed artifact itself when
+/// `QEMINGA_RELEASE_BINARY` names it (CI's enforced privileged run builds
+/// `--release --features seccomp` and points here), else this test build.
+/// The development installs (`production == false`) always use the test
+/// build: their fake-kernel drop-in needs `test-fakes`, which a release
+/// cannot carry.
 fn install_unit_with(channel_path: &str, production: bool) -> Option<InstalledUnit> {
     assert!(nix::unistd::geteuid().is_root(), "run as root");
     // A container without systemd cannot run this; CI's privileged job
@@ -358,7 +366,14 @@ fn install_unit_with(channel_path: &str, production: bool) -> Option<InstalledUn
         std::fs::rename(InstalledUnit::BIN, backup).unwrap();
     }
     let installed = InstalledUnit { backup };
-    std::fs::copy(env!("CARGO_BIN_EXE_qeminga"), InstalledUnit::BIN).unwrap();
+    let test_build = std::path::PathBuf::from(env!("CARGO_BIN_EXE_qeminga"));
+    let binary = match std::env::var_os("QEMINGA_RELEASE_BINARY") {
+        Some(release) if production => std::path::PathBuf::from(release),
+        _ => test_build,
+    };
+    eprintln!("installing {} as {}", binary.display(), InstalledUnit::BIN);
+    std::fs::copy(&binary, InstalledUnit::BIN)
+        .unwrap_or_else(|e| panic!("copy {}: {e}", binary.display()));
     std::fs::set_permissions(
         InstalledUnit::BIN,
         <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
@@ -688,6 +703,10 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     use std::io::Write;
     let mount = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup");
+    // A failed assertion between the freeze and the thaw would otherwise
+    // leave the loop ext4 frozen for the rest of the serial run: the
+    // unit's drop SIGKILLs the daemon, watchdog included.
+    let _thaw = e2e::ThawGuard::new(std::slice::from_ref(&mount));
     let mut pty = PtyChannel::open();
     let Some(installed) = install_unit_with(&pty.slave_path, true) else {
         return;

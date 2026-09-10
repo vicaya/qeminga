@@ -17,63 +17,12 @@ mod e2e;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-use e2e::{Agent, SpawnOptions};
+use e2e::{Agent, SpawnOptions, ThawGuard, dev_of, handle};
 use serde_json::{Value, json};
 
 fn ext4_mount() -> String {
     std::env::var("QEMINGA_TEST_EXT4_MOUNT")
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup")
-}
-
-/// `(major, minor)` of the filesystem `path` currently leads to.
-fn dev_of(path: &std::path::Path) -> (u32, u32) {
-    use std::os::unix::fs::MetadataExt;
-    let dev = std::fs::metadata(path).unwrap().dev();
-    (
-        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
-        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
-    )
-}
-
-/// A verified handle on whatever filesystem `path` leads to now (the
-/// test's own view, with `CAP_SYS_ADMIN`).
-fn handle(path: &std::path::Path) -> qeminga::kernel::Mount {
-    use qeminga::kernel::KernelOps;
-    qeminga::kernel::LinuxKernel
-        .open_mount(path, dev_of(path))
-        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
-}
-
-/// Thaws the named mounts when dropped, whatever happened in between: a
-/// failed assertion between freeze and thaw would otherwise leave the
-/// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
-/// taking its watchdog with it), so every later test would get EBUSY and
-/// a write to the mount would block in D state. `FITHAW` is repeated
-/// until it fails (nested freezes), bounded.
-struct ThawGuard(Vec<String>);
-
-impl ThawGuard {
-    fn new(mounts: &[String]) -> Self {
-        ThawGuard(mounts.to_vec())
-    }
-}
-
-impl Drop for ThawGuard {
-    fn drop(&mut self) {
-        use qeminga::kernel::KernelOps;
-        for mount in &self.0 {
-            let path = std::path::Path::new(mount);
-            let Ok(handle) = qeminga::kernel::LinuxKernel.open_mount(path, dev_of(path)) else {
-                continue;
-            };
-            for _ in 0..64 {
-                if qeminga::kernel::LinuxKernel.fithaw(&handle).is_err() {
-                    break;
-                }
-                eprintln!("ThawGuard: thawed {mount} left frozen by the test");
-            }
-        }
-    }
 }
 
 /// The real kernel, and the default (enforced) hardening whenever this

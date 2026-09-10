@@ -34,12 +34,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+  # Design §8.5 / D6: both supported architectures execute the suite
+  # natively (#51). Each leg first proves it is the machine it claims to
+  # be, so a mislabeled or emulated runner cannot satisfy the requirement
+  # quietly; tests/ci_workflow.rs checks that neither architecture leaves
+  # this matrix. The architecture entries stay on one line each for that
+  # test.
   test:
-    name: test (${{ matrix.features.name }})
-    runs-on: ubuntu-24.04
+    name: test (${{ matrix.arch.name }}, ${{ matrix.features.name }})
+    runs-on: ${{ matrix.arch.runner }}
     strategy:
       fail-fast: false
       matrix:
+        arch:
+          - { name: x86_64, runner: ubuntu-24.04, runner_arch: X64 }
+          - { name: aarch64, runner: ubuntu-24.04-arm, runner_arch: ARM64 }
         features:
           - { name: default, flags: "" }
           - { name: all-features, flags: "--all-features" }
@@ -47,6 +56,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native ${{ matrix.arch.name }} machine
+        run: |
+          uname -m
+          rustc -vV
+          test "$(uname -m)" = "${{ matrix.arch.name }}"
+          test "$RUNNER_ARCH" = "${{ matrix.arch.runner_arch }}"
+          rustc -vV | grep -qx "host: ${{ matrix.arch.name }}-unknown-linux-gnu"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked ${{ matrix.features.flags }}
 
@@ -168,10 +184,12 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/check-unsafe.sh
 
-  # Design §8.5: aarch64 is a supported target. The repository is private, so
-  # free arm64 hosted runners are unavailable; until a runner exists (task
-  # T5.2) we cross-check that everything type-checks for the target, which
-  # also validates target-specific code such as the seccomp profile.
+  # Design §8.5: aarch64 is a supported target and the native jobs above
+  # and below execute it. This cross-check is kept as the cheap first
+  # signal: it is the command an x86-64 developer runs locally
+  # (AGENTS.md), it type-checks every target (tests and benches included)
+  # in a fraction of a native run, and it reports a target-specific
+  # compile error even while the arm64 runners are still queued.
   cross-check-aarch64:
     name: check (aarch64-unknown-linux-gnu)
     runs-on: ubuntu-24.04
@@ -300,11 +318,20 @@ jobs:
   # xfs: freeze/thaw ioctls, the capability drop, SIGKILL recovery, the
   # watchdog, the full journald-pipe scenario, and the seccomp command
   # matrix first with the logging profile, then enforced (AC2, AC3, AC10,
-  # AC11, AC13, AC15, AC17, AC18). x86-64 only until an arm64 runner
-  # exists (recorded in docs/tasks.md).
+  # AC11, AC13, AC15, AC17, AC18), natively on both supported
+  # architectures (#51): the aarch64 leg is the execution evidence for
+  # the aarch64 production seccomp profile, on a real arm64 kernel. Each
+  # leg proves its architecture first (see the test job), and the arm64
+  # leg is never allowed to fail quietly (tests/ci_workflow.rs).
   privileged:
-    name: privileged (loop ext4/xfs, caps, seccomp)
-    runs-on: ubuntu-24.04
+    name: privileged (${{ matrix.arch.name }}; loop ext4/xfs, caps, seccomp)
+    runs-on: ${{ matrix.arch.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: x86_64, runner: ubuntu-24.04, runner_arch: X64 }
+          - { name: aarch64, runner: ubuntu-24.04-arm, runner_arch: ARM64 }
     # A test stuck on a frozen loop filesystem must not run to GitHub's
     # six-hour default; the suite takes about a minute, the release build
     # it installs under the unit a few more.
@@ -319,6 +346,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native ${{ matrix.arch.name }} machine
+        run: |
+          uname -m
+          rustc -vV
+          test "$(uname -m)" = "${{ matrix.arch.name }}"
+          test "$RUNNER_ARCH" = "${{ matrix.arch.runner_arch }}"
+          rustc -vV | grep -qx "host: ${{ matrix.arch.name }}-unknown-linux-gnu"
       - uses: Swatinem/rust-cache@v2
       - name: Install xfsprogs and the service account
         run: |
@@ -342,15 +376,44 @@ jobs:
         run: |
           set -o pipefail
           sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh setup | tee /tmp/loop.env
+          # Both filesystems of AC2 must exist on every architecture: the
+          # script skips xfs quietly where mkfs.xfs is missing, the tests
+          # skip it where the variable is unset, and a run without it
+          # would still be green.
           grep -q QEMINGA_TEST_EXT4_BIND /tmp/loop.env
+          grep -q QEMINGA_TEST_XFS_MOUNT /tmp/loop.env
+      # Each run is captured so the step below can prove that every
+      # privileged test executed: a filter that matched nothing, or a
+      # binary that never got to its tests, would otherwise pass quietly.
       - name: Privileged tests, seccomp-log build (compatibility run)
         run: |
+          set -o pipefail
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_
+          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_ 2>&1 | tee /tmp/privileged-log.txt
+      # A syscall the profile of this architecture omits shows up as a
+      # `type=1326` audit line under the logging build (and fails
+      # privileged_seccomp_matrix_log_then_enforce); the line names the
+      # syscall number, which is the observed need a deliberate profile
+      # change is documented with.
+      - name: Seccomp audit lines after the compatibility run
+        if: always()
+        run: sudo dmesg | grep 'type=1326' || echo 'none'
       - name: Privileged tests, enforced build
         run: |
+          set -o pipefail
           set -a; . /tmp/loop.env; set +a
-          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 QEMINGA_RELEASE_BINARY="$PWD/target/release/qeminga" cargo test --features "$ENFORCED_FEATURES" --locked -- --ignored --test-threads=1 privileged_
+          sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 QEMINGA_RELEASE_BINARY="$PWD/target/release/qeminga" cargo test --features "$ENFORCED_FEATURES" --locked -- --ignored --test-threads=1 privileged_ 2>&1 | tee /tmp/privileged-enforced.txt
+      - name: Seccomp audit lines after the enforced run
+        if: always()
+        run: sudo dmesg | grep 'type=1326' || echo 'none'
+      - name: Every privileged test ran in both builds
+        run: |
+          expected=$(grep -rhoE '^fn privileged_[a-z0-9_]+' tests | sort -u | wc -l)
+          for log in /tmp/privileged-log.txt /tmp/privileged-enforced.txt; do
+            ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$log" | awk '{ s += $4 } END { print s + 0 }')
+            echo "$log: $ran of $expected privileged tests ran"
+            test "$ran" -eq "$expected"
+          done
       - name: Tear down loop devices
         if: always()
         run: sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh teardown

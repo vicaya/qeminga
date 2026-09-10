@@ -5,8 +5,9 @@
 //!
 //! 1. parse ([`crate::proto::parse_request`], bounds first);
 //! 2. allowlist ([`is_allowlisted`], a `match` on the method string);
-//! 3. runtime feature gate (`guest-fstrim`, `guest-suspend-ram` may be
-//!    disabled by configuration → `CommandNotFound`, C-2);
+//! 3. runtime feature gate (`guest-fstrim`, `guest-suspend-ram`,
+//!    `guest-shutdown` and the information commands may be disabled by
+//!    configuration → `CommandNotFound`, C-2, §5.9);
 //! 4. rate limiter ([`ratelimit`]);
 //! 5. freeze gate ([`is_frozen_safe`]; anything else is rejected while the
 //!    state is not `Thawed`, AC9);

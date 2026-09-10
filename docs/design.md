@@ -124,7 +124,7 @@ Only the commands in the following table are implemented. All other commands rec
 
 `guest-info` uses the upstream-compatible `GuestAgentInfo` shape: a build version and a `supported_commands` array (the member name deliberately uses an underscore). Each `GuestAgentCommandInfo` entry contains `name`, `enabled`, and `success-response`.
 
-Every command in §3 appears exactly once. `guest-suspend-ram` remains listed with `"enabled": false` when its Cargo feature is absent or its runtime setting is off; `guest-fstrim` similarly remains listed when disabled at runtime. The remaining implemented commands report `"enabled": true` in normal operation. A temporary `Frozen` state does not change these advertised capabilities; it is enforced by the lifecycle gate in §5.3.
+Every command in §3 appears exactly once. `guest-suspend-ram` remains listed with `"enabled": false` when its Cargo feature is absent or its runtime setting is off; `guest-fstrim`, `guest-shutdown`, `guest-get-osinfo`, `guest-network-get-interfaces` and `guest-get-fsinfo` similarly remain listed when disabled at runtime (`[features] fstrim`, `shutdown` and `information`, §5.9). The remaining implemented commands report `"enabled": true` in normal operation. A temporary `Frozen` state does not change these advertised capabilities; it is enforced by the lifecycle gate in §5.3.
 
 `guest-shutdown` and `guest-suspend-ram` are the listed commands with `"success-response": false` (as upstream declares them; OQ-2); every other listed command has `"success-response": true`. Denied commands do not appear in `supported_commands`.
 
@@ -389,7 +389,7 @@ Each profile covers both the multi-threaded tokio runtime and the agent's allowe
 
 | Surface | Required operations |
 |---|---|
-| File, metadata, and channel I/O | `read`, `write`, `readv`, `writev`, `close`, `openat`, `fcntl`, `ioctl`, `lseek`, `pread64`, `pwrite64`, `newfstatat`, `statx`, `statfs`, `fstatfs`, `getdents64` |
+| File, metadata, and channel I/O | `read`, `write`, `readv`, `writev`, `close`, `openat`, `fcntl`, `ioctl`, `lseek`, `pread64`, `pwrite64`, `newfstatat`, `statx`, `getdents64` |
 | Recovery marker | `openat` with `O_CREAT|O_EXCL`, `fsync`, and `unlinkat`; systemd creates the parent directory, so qeminga does not need `mkdirat` |
 | Runtime and reactor | Memory management; `clone`/`clone3`; robust-list, thread-ID, `rseq`, futex, scheduling, and `prlimit64` support; epoll, eventfd, and portable polling operations; signals, clocks, identity queries, and randomness |
 | OS and network information (only with `[features] information = true`, §5.9) | `uname` for `guest-get-osinfo`; `statfs`/`fstatfs` for `guest-get-fsinfo`; `socket` (AF_NETLINK only), `bind`, `sendmsg`, `recvmsg`, `setsockopt` and `getsockname` for the netlink exchange used by `guest-network-get-interfaces` (`sendto`/`recvfrom` are in the runtime surface: the signal driver's socketpair uses them) |

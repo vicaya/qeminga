@@ -120,7 +120,9 @@ pub enum PrivilegeError {
 /// What [`drop_privileges`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The full sequence ran; the process now holds exactly [`FINAL_CAPS`].
+    /// The full sequence ran; the process now holds exactly the final set
+    /// of its authority ([`final_capability_set`]: [`FINAL_CAPS`] less
+    /// `CAP_SYS_BOOT` when `guest-shutdown` is disabled).
     Dropped,
     /// Not root at startup: nothing was changed (C-18).
     SkippedUnprivileged,

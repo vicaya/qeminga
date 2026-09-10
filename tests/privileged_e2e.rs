@@ -38,6 +38,21 @@ fn real_kernel(agent_extra: &str) -> SpawnOptions {
     }
 }
 
+/// The number of seccomp audit lines (`type=1326`) in the kernel log, or
+/// `None` where dmesg cannot be read. A run under the `seccomp-log`
+/// build that adds one used a syscall the installed profile omits.
+fn seccomp_audit_lines() -> Option<usize> {
+    std::process::Command::new("dmesg")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .matches("type=1326")
+                .count()
+        })
+}
+
 fn freeze_list(agent: &mut Agent, mounts: &[String]) -> Value {
     let req =
         json!({"execute": "guest-fsfreeze-freeze-list", "arguments": {"mountpoints": mounts}});
@@ -974,17 +989,7 @@ fn privileged_seccomp_matrix_log_then_enforce() {
     // deliberately excludes `seccomp-log` (AC15).
     let mount = ext4_mount();
     let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
-    let audit_lines = || -> Option<usize> {
-        std::process::Command::new("dmesg")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .matches("type=1326")
-                    .count()
-            })
-    };
+    let audit_lines = seccomp_audit_lines;
     let before = audit_lines();
     let mut agent = Agent::spawn_with(real_kernel(""));
     agent.wait_for_stderr("\"event\":\"seccomp\"", e2e::REPLY_TIMEOUT);
@@ -1050,9 +1055,12 @@ fn privileged_data_protection_profile_holds_no_reboot_authority() {
     // to regain), under a filter without reboot, uname, statfs or the
     // netlink syscalls, and still freezes and thaws the real filesystem;
     // the optional commands answer "disabled" and nothing the host sends
-    // widens the profile.
+    // widens the profile. Under the `seccomp-log` build a syscall this
+    // profile omits shows as a seccomp audit line, so the run asserts
+    // there is none.
     let mount = ext4_mount();
     let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let before = seccomp_audit_lines();
     let mut agent = Agent::spawn_with(SpawnOptions {
         features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
         ..real_kernel("")
@@ -1138,4 +1146,84 @@ fn privileged_data_protection_profile_holds_no_reboot_authority() {
         ]
     );
     assert!(agent.stop().success());
+    if let (Some(b), Some(a)) = (before, seccomp_audit_lines()) {
+        assert_eq!(
+            a, b,
+            "seccomp audit lines appeared in dmesg (a syscall is missing from the data-protection profile)"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_data_protection_profile_recovers_without_the_host() {
+    // §5.9, AC25: "a profile change between two starts strands nothing"
+    // rests on the recovery paths using only what every profile keeps.
+    // Under the narrowed profile, on the real kernel: a freeze, SIGKILL,
+    // a restart into recovery mode from the marker and the recovery thaw
+    // (the ring flushed behind it); a freeze the idle watchdog thaws on
+    // its own; a channel EOF and the reopen. No seccomp audit line
+    // appears for any of it, so the `seccomp-log` run detects a syscall
+    // the profile omits on these paths as well as on the happy path.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let before = seccomp_audit_lines();
+    let profile = || SpawnOptions {
+        features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
+        ..real_kernel("fsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\n")
+    };
+    let mut agent = Agent::spawn_with(profile());
+    agent.wait_for_stderr(
+        "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false",
+        e2e::REPLY_TIMEOUT,
+    );
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    // Crash while frozen; restart under the same profile and state
+    // directory: recovery mode, and the thaw drains the real filesystem.
+    let dir = agent.kill();
+    assert!(
+        dir.path().join("frozen").exists(),
+        "marker survives SIGKILL"
+    );
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        state_dir: Some(dir),
+        ..profile()
+    });
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "frozen",
+        "recovery mode"
+    );
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert!(thawed["return"].as_u64().unwrap() >= 1, "{thawed}");
+    assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
+    std::fs::write(format!("{mount}/after-recovery-thaw"), b"ok").unwrap();
+    agent.wait_for_stderr("\"event\":\"recovery_mode\"", e2e::REPLY_TIMEOUT);
+    // A freeze the host abandons: the idle watchdog thaws it.
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "thawed",
+        "idle timeout"
+    );
+    assert!(!agent.state_dir().join("frozen").exists());
+    std::fs::write(format!("{mount}/after-watchdog"), b"ok").unwrap();
+    // The channel closes and reopens.
+    agent.reopen_channel();
+    let reply = agent.request_timeout(r#"{"execute":"guest-ping"}"#, e2e::REOPEN_TIMEOUT);
+    assert_eq!(reply["return"], json!({}));
+    assert!(agent.stop().success());
+    if let (Some(b), Some(a)) = (before, seccomp_audit_lines()) {
+        assert_eq!(
+            a, b,
+            "seccomp audit lines appeared in dmesg: a recovery path uses a syscall the data-protection profile omits"
+        );
+    }
 }

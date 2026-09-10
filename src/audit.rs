@@ -319,11 +319,66 @@ impl LossReason {
 }
 
 /// One entry of the delivery queue: a formatted line, or the place where
-/// lines were lost (dropped at a full queue, or refused by the sink), so
-/// the loss record is delivered exactly where the gap is.
+/// lines were lost (in the ring, at a full queue, or refused by the sink),
+/// so the loss records are delivered exactly where the gap is.
 enum Item {
     Line(Vec<u8>),
-    Lost(u64, LossReason),
+    Lost(LossGap),
+}
+
+/// Where records were lost, counted by reason. Adjacent losses merge into
+/// one gap whatever their reasons, so the queue holds at most one gap
+/// between two lines and its entries are bounded by the lines the byte
+/// budget admits (#43 §6): a loss marker takes no budget, and without
+/// this a freeze window overflowing behind a full queue would append a
+/// `ring_overflow` and a `sink_backpressure` marker per window, without
+/// bound. Each reason keeps its own count, so nothing is conflated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LossGap {
+    ring_overflow: u64,
+    sink_backpressure: u64,
+    sink_error: u64,
+}
+
+impl LossGap {
+    fn of(count: u64, reason: LossReason) -> Self {
+        let mut gap = Self::default();
+        gap.add(count, reason);
+        gap
+    }
+
+    fn add(&mut self, count: u64, reason: LossReason) {
+        let slot = match reason {
+            LossReason::RingOverflow => &mut self.ring_overflow,
+            LossReason::SinkBackpressure => &mut self.sink_backpressure,
+            LossReason::SinkError => &mut self.sink_error,
+        };
+        *slot = slot.saturating_add(count);
+    }
+
+    fn merge(&mut self, other: LossGap) {
+        self.add(other.ring_overflow, LossReason::RingOverflow);
+        self.add(other.sink_backpressure, LossReason::SinkBackpressure);
+        self.add(other.sink_error, LossReason::SinkError);
+    }
+
+    fn total(&self) -> u64 {
+        self.ring_overflow
+            .saturating_add(self.sink_backpressure)
+            .saturating_add(self.sink_error)
+    }
+
+    /// The loss records this gap is delivered as: one per reason with a
+    /// count, in a fixed order.
+    fn records(&self) -> impl Iterator<Item = (u64, LossReason)> {
+        [
+            (self.ring_overflow, LossReason::RingOverflow),
+            (self.sink_backpressure, LossReason::SinkBackpressure),
+            (self.sink_error, LossReason::SinkError),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+    }
 }
 
 struct State {
@@ -338,8 +393,12 @@ struct State {
     writing: bool,
     /// The last handle was dropped: deliver what is queued and exit.
     shutdown: bool,
-    /// The writer thread has exited (or never started).
+    /// The writer thread has exited (or could not be started).
     exited: bool,
+    /// The writer thread was started ([`Router::start_writer`]).
+    started: bool,
+    /// The sink, until the writer thread takes it.
+    sink: Option<Box<dyn Write + Send>>,
     /// Bumped on every push, so a writer parked after a sink failure
     /// retries only once something new arrived.
     pushes: u64,
@@ -371,8 +430,9 @@ impl Drop for Alive {
         state.shutdown = true;
         self.0.changed.notify_all();
         // Bounded: a sink that is blocked keeps its thread, not the drop.
+        // A writer that never started has nothing to deliver.
         let deadline = std::time::Instant::now() + SHUTDOWN_GRACE;
-        while !state.exited && state.mode == Mode::Normal {
+        while state.started && !state.exited && state.mode == Mode::Normal {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
                 break;
@@ -444,6 +504,55 @@ impl Router {
         Self::try_new(Box::new(io::stderr()))
     }
 
+    /// Creates a router whose writer thread is not started yet: records
+    /// wait in the bounded delivery queue (or the ring) until
+    /// [`start_writer`](Self::start_writer). The daemon starts logging
+    /// this way and the thread only after the privilege drop, so every
+    /// thread of the process is created under the dropped ceiling (§5.4).
+    pub fn unstarted(sink: Box<dyn Write + Send>) -> Self {
+        Self::build(sink, RING_CAPACITY, SINK_QUEUE_CAPACITY)
+    }
+
+    /// [`unstarted`](Self::unstarted) over standard error.
+    pub fn stderr_unstarted() -> Self {
+        Self::unstarted(Box::new(io::stderr()))
+    }
+
+    /// Starts the writer thread if it is not running yet: idempotent. An
+    /// error means no thread could be created; what is queued then stays
+    /// undelivered and is counted lost from now on.
+    pub fn start_writer(&self) -> io::Result<()> {
+        let sink = {
+            let mut state = self.shared.lock();
+            if state.started {
+                return Ok(());
+            }
+            state.started = true;
+            state.sink.take()
+        };
+        let Some(sink) = sink else {
+            return Ok(());
+        };
+        let shared = Arc::clone(&self.shared);
+        let spawned = std::thread::Builder::new()
+            .name("qeminga-audit".to_owned())
+            .spawn(move || writer_thread(&shared, sink));
+        match spawned {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                self.shared.lock().exited = true;
+                self.shared.changed.notify_all();
+                Err(err)
+            }
+        }
+    }
+
+    /// `true` once [`start_writer`](Self::start_writer) ran (successfully
+    /// or not).
+    pub fn writer_started(&self) -> bool {
+        self.shared.lock().started
+    }
+
     /// Creates a router with an explicit ring capacity (tests).
     pub fn with_ring_capacity(sink: Box<dyn Write + Send>, capacity: usize) -> Self {
         Self::with_capacities(sink, capacity, SINK_QUEUE_CAPACITY)
@@ -455,11 +564,21 @@ impl Router {
         Self::with_capacities(sink, RING_CAPACITY, queue).unwrap_or_else(|(_, router)| router)
     }
 
+    /// A router whose writer is started at once.
     fn with_capacities(
         sink: Box<dyn Write + Send>,
         ring: usize,
         queue: usize,
     ) -> Result<Self, (io::Error, Self)> {
+        let router = Self::build(sink, ring, queue);
+        match router.start_writer() {
+            Ok(()) => Ok(router),
+            Err(err) => Err((err, router)),
+        }
+    }
+
+    /// A router whose writer is not started.
+    fn build(sink: Box<dyn Write + Send>, ring: usize, queue: usize) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 mode: Mode::Normal,
@@ -470,23 +589,15 @@ impl Router {
                 writing: false,
                 shutdown: false,
                 exited: false,
+                started: false,
+                sink: Some(sink),
                 pushes: 0,
             }),
             changed: Condvar::new(),
         });
-        let router = Router {
+        Router {
             _alive: Arc::new(Alive(Arc::clone(&shared))),
-            shared: Arc::clone(&shared),
-        };
-        let spawned = std::thread::Builder::new()
-            .name("qeminga-audit".to_owned())
-            .spawn(move || writer_thread(&shared, sink));
-        match spawned {
-            Ok(_) => Ok(router),
-            Err(err) => {
-                router.shared.lock().exited = true;
-                Err((err, router))
-            }
+            shared,
         }
     }
 
@@ -543,7 +654,7 @@ impl Router {
             .queue
             .iter()
             .map(|item| match item {
-                Item::Lost(count, _) => *count,
+                Item::Lost(gap) => gap.total(),
                 Item::Line(_) => 0,
             })
             .sum()
@@ -552,6 +663,13 @@ impl Router {
     /// Bytes queued for the writer thread.
     pub fn queued_bytes(&self) -> usize {
         self.shared.lock().queued
+    }
+
+    /// Entries in the delivery queue: lines and loss gaps. At most one
+    /// gap sits between two lines, so this is bounded by the lines the
+    /// byte budget admits, whatever the losses.
+    pub fn queued_items(&self) -> usize {
+        self.shared.lock().queue.len()
     }
 
     /// Waits until every queued line has been handed to the sink and no
@@ -563,6 +681,7 @@ impl Router {
         let mut state = self.shared.lock();
         loop {
             let idle = state.exited
+                || !state.started
                 || state.mode == Mode::Ring
                 || (state.queue.is_empty() && !state.writing);
             if idle {
@@ -614,29 +733,25 @@ impl State {
         self.pushes = self.pushes.wrapping_add(1);
     }
 
-    /// Records `count` lost lines at the tail of the queue, merged into a
-    /// marker already there for the same reason.
+    /// Records `count` lost lines at the tail of the queue, in the gap
+    /// already there if the tail is one (whatever its reasons).
     fn lose(&mut self, count: u64, reason: LossReason) {
-        if let Some(Item::Lost(n, r)) = self.queue.back_mut()
-            && *r == reason
-        {
-            *n = n.saturating_add(count);
+        if let Some(Item::Lost(gap)) = self.queue.back_mut() {
+            gap.add(count, reason);
         } else {
-            self.queue.push_back(Item::Lost(count, reason));
+            self.queue.push_back(Item::Lost(LossGap::of(count, reason)));
         }
         self.pushes = self.pushes.wrapping_add(1);
     }
 
     /// Puts a loss back at the head of the queue (a line the sink refused
-    /// belongs where it was; a loss record the sink refused stays until
-    /// it can be written).
-    fn lose_at_front(&mut self, count: u64, reason: LossReason) {
-        if let Some(Item::Lost(n, r)) = self.queue.front_mut()
-            && *r == reason
-        {
-            *n = n.saturating_add(count);
+    /// belongs where it was; a gap whose records the sink refused stays
+    /// until they can be written), merged into a gap already there.
+    fn lose_at_front(&mut self, lost: LossGap) {
+        if let Some(Item::Lost(gap)) = self.queue.front_mut() {
+            gap.merge(lost);
         } else {
-            self.queue.push_front(Item::Lost(count, reason));
+            self.queue.push_front(Item::Lost(lost));
         }
     }
 }
@@ -665,7 +780,7 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
                 {
                     break Some(match front {
                         Item::Line(line) => Item::Line(line.clone()),
-                        Item::Lost(count, reason) => Item::Lost(*count, *reason),
+                        Item::Lost(gap) => Item::Lost(*gap),
                     });
                 }
                 if state.shutdown && (state.queue.is_empty() || state.mode == Mode::Ring) {
@@ -686,9 +801,11 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
         };
         let (bytes, marker) = match &item {
             Item::Line(line) => (line.clone(), None),
-            Item::Lost(count, reason) => (
-                loss_record(*count, *reason).into_bytes(),
-                Some((*count, *reason)),
+            Item::Lost(gap) => (
+                gap.records()
+                    .flat_map(|(count, reason)| loss_record(count, reason).into_bytes())
+                    .collect(),
+                Some(*gap),
             ),
         };
         let delivered = sink.write_all(&bytes).is_ok();
@@ -705,10 +822,10 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
         } else {
             failed_at = Some(state.pushes);
             match marker {
-                // The loss record itself was refused: keep it for later.
-                Some((count, reason)) => state.lose_at_front(count, reason),
+                // The loss records themselves were refused: keep the gap.
+                Some(gap) => state.lose_at_front(gap),
                 // The line is lost; say so where it was.
-                None => state.lose_at_front(1, LossReason::SinkError),
+                None => state.lose_at_front(LossGap::of(1, LossReason::SinkError)),
             }
         }
         state.writing = false;
@@ -1485,6 +1602,91 @@ mod tests {
         let queue_loss: Value = serde_json::from_str(&lines[4]).unwrap();
         assert_eq!(queue_loss["reason"], "sink_backpressure");
         assert_eq!(queue_loss["lost"], kept);
+    }
+
+    #[test]
+    fn alternating_loss_reasons_never_grow_the_queue() {
+        // #43 §6 (external review): a loss marker takes no queue budget,
+        // so behind a full queue every freeze window whose ring overflowed
+        // used to append a `ring_overflow` marker and then a
+        // `sink_backpressure` one for the ring's lines the queue could not
+        // hold: two entries per window, unbounded. Losses now merge into
+        // one gap per position whatever their reasons, so a hundred such
+        // windows leave the queue at its three lines and one gap, with
+        // every loss still counted by reason.
+        let sink = BlockingSink::blocked();
+        let router = Router::with_queue_capacity(Box::new(sink.clone()), 64);
+        let mut w = router.make_writer();
+        let line = |n: u8| format!("{{\"n\":{n},\"pad\":\"xxx\"}}\n");
+        for n in 1..=3 {
+            promptly("write", || w.write_all(line(n).as_bytes()).unwrap());
+        }
+        sink.wait_entered(1);
+        assert_eq!(router.queued_bytes(), 60, "the queue is full");
+        let filler = line(9);
+        let written = RING_CAPACITY / filler.len() + 4;
+        let (mut overflowed, mut kept) = (0, 0);
+        for window in 1..=100 {
+            router.enter_ring();
+            for _ in 0..written {
+                w.write_all(filler.as_bytes()).unwrap();
+            }
+            let lost = router.lost();
+            assert!(lost > 0, "the ring overflowed");
+            overflowed += lost;
+            kept += written as u64 - lost;
+            assert_eq!(router.flush_to_normal(), lost);
+            assert_eq!(
+                router.queued_items(),
+                4,
+                "window {window}: three lines and one gap"
+            );
+            assert_eq!(router.queued_bytes(), 60);
+            assert_eq!(router.unreported_losses(), overflowed + kept);
+        }
+        sink.set_blocked(false);
+        settled(&router);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 5, "{lines:?}");
+        let ring_loss: Value = serde_json::from_str(&lines[3]).unwrap();
+        assert_eq!(ring_loss["reason"], "ring_overflow");
+        assert_eq!(ring_loss["lost"], overflowed);
+        let queue_loss: Value = serde_json::from_str(&lines[4]).unwrap();
+        assert_eq!(queue_loss["reason"], "sink_backpressure");
+        assert_eq!(queue_loss["lost"], kept);
+    }
+
+    #[test]
+    fn records_queued_before_the_writer_starts_are_delivered_once_it_does() {
+        // The daemon starts logging before the privilege drop and the
+        // writer thread after it (§5.4): until then records wait in the
+        // bounded queue, nothing is delivered, and the drop of the last
+        // handle has no thread to wait for.
+        let sink = SharedSink::default();
+        let router = Router::unstarted(Box::new(sink.clone()));
+        assert!(!router.writer_started());
+        let mut w = router.make_writer();
+        w.write_all(b"before\n").unwrap();
+        w.write_all(b"the start\n").unwrap();
+        assert_eq!(router.queued_bytes(), 17);
+        assert!(sink.bytes().is_empty(), "nothing delivers without a writer");
+        assert!(
+            router.settle(Duration::from_millis(10)),
+            "nothing to wait for"
+        );
+        router.start_writer().unwrap();
+        assert!(router.writer_started());
+        router.start_writer().unwrap();
+        settled(&router);
+        assert_eq!(sink.lines(), ["before", "the start"]);
+        assert_eq!(router.unreported_losses(), 0);
+        let unstarted = Router::unstarted(Box::new(SharedSink::default()));
+        let started_at = std::time::Instant::now();
+        drop(unstarted);
+        assert!(
+            started_at.elapsed() < SHUTDOWN_GRACE,
+            "no grace without a thread"
+        );
     }
 
     #[test]

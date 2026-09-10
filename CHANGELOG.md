@@ -86,7 +86,12 @@ semantic versioning.
   itself (the writer thread may hold the stderr lock while blocked in a
   write). The daemon's exit paths flush the ring and give delivery the
   same bounded grace, so a refusal after recovery logging started is
-  reported on the way out.
+  reported on the way out. Losses merge into one gap per position with
+  a count per reason, so the queue's entries are bounded like its bytes.
+  The writer thread is started after the privilege drop (records written
+  before then wait in the queue), so every thread of the process is
+  created under the dropped ceiling; the privileged tests check every
+  thread.
 - A freeze that froze nothing and holds nothing (an empty plan, a
   `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
   target of which was skipped) settles `Thawed` with its marker removed

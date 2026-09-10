@@ -9,12 +9,16 @@
 //! 2. open the recovery marker's directory (read-only; the descriptor is
 //!    kept for every later marker operation, §4.4) and look for the
 //!    marker to choose the initial state; start logging, in ring mode
-//!    when recovering (§4.4);
+//!    when recovering (§4.4): records are queued from here, the writer
+//!    thread that delivers them starts at step 5b;
 //! 3. reject a `state_path` whose directory is on a filesystem the freeze
 //!    plan would freeze (§8.2), judged by the device of the opened
 //!    directory, not by the pathname;
 //! 4. open the channel (`EBUSY` is terminal, §8.4);
-//! 5. drop capabilities (skipped with a warning when not root, C-18);
+//! 5. drop capabilities (skipped with a warning when not root, C-18), then
+//!    start the audit writer thread (5b): every thread of the process is
+//!    created under the dropped ceiling, which the drop establishes only
+//!    for the calling thread (§5.4);
 //! 6. install seccomp when compiled in and enabled;
 //! 7. start the multi-threaded runtime and serve until a signal.
 //!
@@ -213,6 +217,13 @@ pub trait Startup {
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
     /// Step 5.
     fn drop_privileges(&self) -> Result<Outcome, PrivilegeError>;
+    /// Step 5b: start the audit writer thread, after the drop so that it
+    /// is created under the dropped ceiling (§5.4).
+    fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
+        router
+            .start_writer()
+            .map_err(|err| RunError::Runtime(format!("cannot start the audit writer: {err}")))
+    }
     /// Step 6: `Ok(true)` when a filter was installed.
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError>;
     /// Step 7: run until a signal; `recovery` selects the `Frozen` start;
@@ -262,6 +273,10 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
         tracing::error!(event = "startup_failed", error = %err, "exiting");
     }
     logging.flush_to_normal();
+    // A refusal before the drop leaves without a writer thread: one is
+    // started now, to say why, with whatever privileges the process still
+    // has, since it is leaving.
+    let _ = logging.start_writer();
     logging.settle(audit::DELIVERY_GRACE);
     result
 }
@@ -323,6 +338,9 @@ fn serve_after_logging(
         ),
         Outcome::SkippedUnprivileged => {}
     }
+    // Only now a second thread: created by the dropped thread, it inherits
+    // the dropped ceiling (uid, capability sets, bounding set).
+    startup.start_audit_writer(&router)?;
     let seccomp = startup.install_seccomp(&config)?;
     let mode = seccomp_mode();
     tracing::info!(
@@ -383,8 +401,8 @@ impl Startup for SystemStartup {
     }
 
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
-        let router = Router::stderr()
-            .map_err(|err| RunError::Runtime(format!("cannot start the audit writer: {err}")))?;
+        // Not started: the writer thread is step 5b, after the drop.
+        let router = Router::stderr_unstarted();
         if ring {
             // Recovery mode: nothing reaches stderr until a thaw succeeds
             // (§4.4, §9.1).

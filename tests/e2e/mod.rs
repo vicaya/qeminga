@@ -23,6 +23,48 @@ use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use serde_json::Value;
 
+/// One thread of a process, as `/proc/<pid>/task/<tid>/status` shows it.
+pub struct ThreadStatus {
+    pub tid: u32,
+    pub name: String,
+    status: String,
+}
+
+impl ThreadStatus {
+    /// The value of a `status` field, `"Uid:"` say; panics when absent.
+    pub fn field(&self, name: &str) -> String {
+        self.status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing for tid {}:\n{}", self.tid, self.status))
+            .trim()
+            .to_owned()
+    }
+}
+
+/// Every thread of `pid` right now. Capability sets, the bounding set,
+/// `no_new_privs` and the seccomp mode are per thread (§5.4), so a
+/// ceiling is only established when every thread shows it.
+pub fn thread_statuses(pid: u32) -> Vec<ThreadStatus> {
+    let mut threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let entry = entry.unwrap();
+        let tid: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue; // exited between the listing and the read
+        };
+        let name = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Name:"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        threads.push(ThreadStatus { tid, name, status });
+    }
+    threads.sort_by_key(|t| t.tid);
+    threads
+}
+
 /// Default reply timeout.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -292,6 +334,11 @@ impl Agent {
 
     /// Kills the daemon with SIGKILL (a crash) and returns the state
     /// directory so a restart can reuse it (AC10).
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn kill(mut self) -> tempfile::TempDir {
         let _ = self.child.kill();
         let _ = self.child.wait();

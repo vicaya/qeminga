@@ -234,6 +234,12 @@ impl Startup for FakeStartup {
         self.log("caps");
         Ok(Outcome::SkippedUnprivileged)
     }
+    fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
+        self.log("audit writer");
+        router
+            .start_writer()
+            .map_err(|err| RunError::Runtime(err.to_string()))
+    }
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError> {
         self.log(format!("seccomp enabled={}", config.features.seccomp));
         Ok(false)
@@ -272,6 +278,7 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
             "mounts",
             "channel /dev/virtio-ports/org.qemu.guest_agent.0",
             "caps",
+            "audit writer",
             "seccomp enabled=true",
             "runtime recovery=false mode=Normal channel=open",
         ]
@@ -435,6 +442,7 @@ fn a_missing_channel_never_delays_the_drop_the_filter_or_recovery() {
             "channel /dev/virtio-ports/org.qemu.guest_agent.0",
             "channel deferred",
             "caps",
+            "audit writer",
             "seccomp enabled=true",
             "runtime recovery=true mode=Ring channel=none",
         ]

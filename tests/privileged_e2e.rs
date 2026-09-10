@@ -340,6 +340,59 @@ fn privileged_a_mount_moved_over_a_newer_one_is_what_the_request_freezes() {
 
 #[test]
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_every_thread_carries_the_dropped_ceiling() {
+    // §5.4 (external review, finding 3): capability sets and the bounding
+    // set are per thread, and the drop trims the calling thread's, so a
+    // thread created before it would keep the unit's bounding set. Every
+    // thread is created after the drop (the audit writer at step 5b, the
+    // runtime's after the filter): after a freeze and thaw have put the
+    // blocking pool to work, every thread of the daemon shows the dropped
+    // uid, the final sets, the trimmed bounding set, no-new-privs and the
+    // filter, not only the main thread.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    agent.wait_for_stderr("\"event\":\"privileges_dropped\"", e2e::REPLY_TIMEOUT);
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let threads = e2e::thread_statuses(agent.pid());
+    let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.contains(&"qeminga-audit") && names.iter().any(|n| n.starts_with("qeminga-work")),
+        "the audit writer and the runtime's workers are there: {names:?}"
+    );
+    assert!(threads.len() >= 3, "{names:?}");
+    // CAP_DAC_READ_SEARCH (2), CAP_SYS_ADMIN (21), CAP_SYS_BOOT (22).
+    for t in &threads {
+        assert!(
+            t.field("Uid:").starts_with("600\t600"),
+            "{}: {}",
+            t.name,
+            t.field("Uid:")
+        );
+        for set in ["CapEff:", "CapPrm:", "CapBnd:"] {
+            assert_eq!(t.field(set), "0000000000600004", "{} {set}", t.name);
+        }
+        assert_eq!(t.field("CapInh:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("CapAmb:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("NoNewPrivs:"), "1", "{}", t.name);
+        if cfg!(feature = "seccomp") {
+            assert_eq!(t.field("Seccomp:"), "2", "{}", t.name);
+        }
+    }
+    assert!(agent.stop().success());
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_watchdog_idle_and_hard_cap_on_real_fs() {
     let mount = ext4_mount();
     let _thaw = ThawGuard::new(std::slice::from_ref(&mount));

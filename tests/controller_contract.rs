@@ -758,6 +758,58 @@ async fn a_request_that_is_not_fully_covered_is_rejected_before_any_cut() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_mount_moved_over_a_newer_one_is_what_a_request_protects() {
+    // The external review's follow-up counterexample: A (8:5) was mounted
+    // before B (8:2), then moved over B at /data, so A keeps the earlier
+    // row while /data leads to A. A cycle requiring /data must protect A:
+    // the freeze opens /data on 8:5 and nothing on 8:2 before the thaw,
+    // the counts are 1 and 1, and the verdict is quiesced for the right
+    // filesystem.
+    let guest = Guest::with_mounts("moved_mount.txt");
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &["/data"]).await.unwrap();
+    let before_thaw: Vec<Call> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .take_while(|c| !matches!(c, Call::Fithaw(_)))
+        .collect();
+    assert!(
+        before_thaw.contains(&Call::Open("/data".into(), (8, 5))),
+        "{before_thaw:?}"
+    );
+    assert!(
+        !before_thaw
+            .iter()
+            .any(|c| matches!(c, Call::Open(_, dev) if *dev == (8, 2))),
+        "B was never touched by the freeze: {before_thaw:?}"
+    );
+    cycle.cut("vol-a", Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-a".to_owned()]
+        }
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_requirement_hidden_by_a_mount_over_its_ancestor_is_rejected() {
+    // /data/nested hangs off the mount at /data that a later mount covers:
+    // the pathname leads into the covering filesystem, where nothing is
+    // mounted, so the name selects nothing and the cycle is rejected
+    // before any cut.
+    let guest = Guest::with_mounts("hidden_nested.txt");
+    let verdict = Cycle::freeze(Arc::clone(&guest), &["/data/nested"])
+        .await
+        .unwrap_err();
+    rejected(&verdict, "freeze covered 0 of 1");
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_hidden_mount_point_cannot_stand_in_for_an_unprotected_requirement() {
     // The external review's counterexample against the coverage
     // certificate: 8:3 is mounted over 8:2 at /data, and 8:2 keeps /data

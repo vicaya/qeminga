@@ -1065,13 +1065,11 @@ fn privileged_data_protection_profile_holds_no_reboot_authority() {
         features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
         ..real_kernel("")
     });
-    let stderr = agent.stderr_text();
-    assert!(
-        stderr.contains(
-            "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false"
-        ),
-        "{stderr}"
+    agent.wait_for_stderr(
+        "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false",
+        e2e::REPLY_TIMEOUT,
     );
+    let stderr = agent.stderr_text();
     let status = std::fs::read_to_string(format!("/proc/{}/status", agent.pid())).unwrap();
     let field = |name: &str| -> String {
         status

@@ -432,7 +432,7 @@ Every input, queue, worker and reply the host can drive has an explicit limit; p
 | Audit method field (§5.2) | 64 bytes verbatim | prefix, length and digest |
 | Audit records per frame (§9) | exactly one | n/a |
 | Freeze-safe ring (§9.1) | 64 KiB | oldest records evicted, counted, reported after thaw |
-| Audit delivery queue (§9.1) | 256 KiB | newest records dropped, counted, reported where the gap is |
+| Audit delivery queue (§9.1) | 256 KiB of records; at most one loss gap (a count per reason) between two records, so the entries are bounded with the bytes | newest records dropped, counted, reported where the gap is |
 | Session places (§5.7) | 8 commands from decoding to delivery | nothing more is read |
 | `guest-fsfreeze-freeze-list` mount points (§4.2) | the frame: no count of its own | matching is one pass over the plan's targets and their mount points per requested name, each of the three bounded by the frame or the mount table; a name matching nothing is left out of the count |
 | Controls beside the command in progress (§5.7) | 3 | a fourth control keeps the place it holds and waits for a control lane |

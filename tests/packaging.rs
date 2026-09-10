@@ -813,6 +813,28 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     std::fs::File::create(format!("{mount}/installed-unit-probe"))
         .and_then(|mut f| f.write_all(b"ok"))
         .expect("the loop filesystem is thawed");
+    // Every thread, not only the main one (§5.4): the ceiling is per
+    // thread, and the freeze and thaw have put the audit writer and the
+    // blocking pool to work.
+    let threads = e2e::thread_statuses(pid.trim().parse().unwrap());
+    let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
+    assert!(names.contains(&"qeminga-audit"), "{names:?}");
+    assert!(threads.len() >= 3, "{names:?}");
+    for t in &threads {
+        for set in ["CapEff:", "CapPrm:", "CapBnd:"] {
+            assert_eq!(t.field(set), FINAL_CAPS, "{} {set} (AC3)", t.name);
+        }
+        assert_eq!(t.field("CapInh:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("CapAmb:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("NoNewPrivs:"), "1", "{}", t.name);
+        assert_eq!(t.field("Seccomp:"), "2", "{}", t.name);
+        assert!(
+            t.field("Uid:").starts_with("600\t600"),
+            "{}: {}",
+            t.name,
+            t.field("Uid:")
+        );
+    }
     let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
     assert!(ok, "systemctl stop: {text}");
     // The distributed profile cannot be talked into faking the kernel.

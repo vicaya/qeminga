@@ -347,7 +347,15 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
         })
     })
     .await
-    .unwrap_or_else(|err| (Err(ThawFailure::Task(err.to_string())), Vec::new()));
+    .unwrap_or_else(|err| {
+        // The task is lost with the descriptors it took: they are no
+        // longer evidence of complete ownership, so the next thaw must
+        // discover its targets (§4.2 "Thaw scope"), as after a lost
+        // recovery drain in the coordinator.
+        tracing::error!(event = "fsfreeze_thaw_lost", error = %err, "thaw drain lost; targets uncertain");
+        ctx.set_thaw_scope(ThawScope::Discovery);
+        (Err(ThawFailure::Task(err.to_string())), Vec::new())
+    });
     // Whatever could not be drained keeps its handle for the next attempt.
     ctx.hold_frozen_mounts(held);
 
@@ -3150,6 +3158,46 @@ mod tests {
             ThawScope::Discovery,
             "a completed thaw leaves the conservative default"
         );
+    }
+
+    #[tokio::test]
+    async fn a_lost_thaw_worker_leaves_the_next_thaw_to_discovery() {
+        // The external review's fifth-round finding: the ordinary thaw
+        // moves the held descriptors into its blocking task; when that
+        // task is lost (a panic on the first FITHAW, in an unwind build)
+        // the descriptors are gone with it, so they are no longer evidence
+        // of complete ownership. The state returns to `Frozen` with the
+        // marker, and the next thaw must discover its targets through the
+        // table (pathnames consulted, every target drained) before the
+        // marker goes, never drain an empty list and publish `Thawed`.
+        let rig = Rig::nested();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.held(), 4);
+        rig.kernel.set_hook(Box::new(|call| {
+            if matches!(call, Call::Fithaw(_)) {
+                panic!("thaw worker lost");
+            }
+        }));
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("thaw worker lost"), "{err}");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+        assert_eq!(rig.held(), 0, "the descriptors were lost with the task");
+        assert_eq!(rig.ctx.thaw_scope(), ThawScope::Discovery);
+        rig.kernel.set_hook(Box::new(|_| {}));
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4), "every target found frozen by its pathname");
+        assert_eq!(rig.opens().len(), 4, "discovery: {:?}", rig.opens());
+        assert_eq!(rig.fithaws().len(), 8);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
     }
 
     #[tokio::test]

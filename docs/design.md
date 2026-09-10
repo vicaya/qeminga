@@ -375,6 +375,8 @@ The final effective and permitted sets contain exactly:
 
 `CAP_DAC_READ_SEARCH` is intentionally retained: `FIFREEZE` requires an fd opened on the mountpoint, and UID 600 would otherwise receive `EACCES` on a mode-0700 mountpoint and roll back the entire freeze. qeminga does not support running this path solely in a non-initial user namespace; startup fails rather than claiming freeze support that the kernel will reject.
 
+The UID transition and the permitted, effective, inheritable and ambient sets are process-wide (the `setresuid` broadcast reaches every thread), as is the filter of §5.5 (installed for all threads). The bounding set is per thread and is trimmed on the thread that performs the drop; the audit writer thread (§9.1) is created when logging starts, before the drop, and keeps the unit's bounding set. That residual is inert: the thread holds no permitted capability that the bounding set could let it keep, it runs under `no_new_privs` and the same filter, and the bounding set is consulted only across `execve`, which the filter does not allow. It is visible in `/proc/<pid>/task/<tid>/status` and nowhere else.
+
 > **Important:** `CAP_SYS_ADMIN` is close to retaining root. It covers `mount`, `pivot_root`, `setns`, `bpf` on older kernels, and ioctls across a wide range of kernel subsystems. Running as UID 600 is defence in depth, but G6's "non-root where possible" should not be read as meaningful privilege reduction while `CAP_SYS_ADMIN` is held. The effective narrowing boundary is the seccomp filter (§5.5), not the capability drop.
 
 ### 5.5 Seccomp Filter (optional, recommended)

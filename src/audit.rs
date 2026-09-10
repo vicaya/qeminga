@@ -653,6 +653,12 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
         let item = {
             let mut state = shared.lock();
             let item = loop {
+                // A writer declared gone (`exited`) delivers nothing more
+                // and leaves: what a caller then writes is counted lost,
+                // consistently with what the caller was told.
+                if state.exited {
+                    break None;
+                }
                 if state.mode == Mode::Normal
                     && let Some(front) = state.queue.front()
                     && failed_at != Some(state.pushes)
@@ -1511,7 +1517,11 @@ mod tests {
         let sink = SharedSink::default();
         let router = router_over(&sink, RING_CAPACITY);
         settled(&router);
+        // Declared gone, the thread delivers nothing more (it leaves at
+        // its next look), so the record is lost at the write, never
+        // raced onto the sink.
         router.shared.lock().exited = true;
+        router.shared.changed.notify_all();
         let mut w = router.make_writer();
         w.write_all(b"nowhere\n").unwrap();
         assert_eq!(router.unreported_losses(), 1);

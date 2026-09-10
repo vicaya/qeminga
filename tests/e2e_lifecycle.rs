@@ -27,9 +27,8 @@ fn shutdown_emits_no_reply() {
         agent.request(r#"{"execute":"guest-ping","id":10}"#),
         json!({"return": {}, "id": 10})
     );
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"method\":\"guest-shutdown\""));
-    assert!(stderr.contains("\"event\":\"fake_kernel\""));
+    agent.wait_for_stderr("\"method\":\"guest-shutdown\"", e2e::REPLY_TIMEOUT);
+    agent.wait_for_stderr("\"event\":\"fake_kernel\"", e2e::REPLY_TIMEOUT);
     // Errors are still reported: the shutdown class allows 2/min.
     agent.send_line(r#"{"execute":"guest-shutdown"}"#);
     assert!(agent.read_line(Duration::from_millis(500)).is_none());
@@ -149,10 +148,10 @@ fn channel_eof_then_reopen_preserves_state() {
         assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "thawed");
         assert!(!agent.state_dir().join("frozen").exists());
         // The thaw flushed the audit ring, so both channel events are
-        // visible, and a zero-work freeze now settles thawed at once.
-        let stderr = agent.stderr_text();
-        assert!(stderr.contains("\"event\":\"channel_closed\""));
-        assert_eq!(stderr.matches("\"event\":\"channel_open\"").count(), 2);
+        // visible (once the writer thread has delivered them), and a
+        // zero-work freeze now settles thawed at once.
+        agent.wait_for_stderr("\"event\":\"channel_closed\"", e2e::REPLY_TIMEOUT);
+        agent.wait_for_stderr_count("\"event\":\"channel_open\"", 2, e2e::REPLY_TIMEOUT);
         let zero = agent
             .request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":[]}}"#);
         assert_eq!(zero, json!({"return": 0}));
@@ -180,8 +179,7 @@ fn partial_frame_is_dropped_on_reconnect() {
     agent.reopen_channel();
     let reply = agent.request_timeout(r#"{"execute":"guest-ping","id":3}"#, e2e::REOPEN_TIMEOUT);
     assert_eq!(reply, json!({"return": {}, "id": 3}));
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"event\":\"channel_closed\""), "{stderr}");
-    assert_eq!(stderr.matches("\"event\":\"channel_open\"").count(), 2);
+    agent.wait_for_stderr("\"event\":\"channel_closed\"", e2e::REPLY_TIMEOUT);
+    agent.wait_for_stderr_count("\"event\":\"channel_open\"", 2, e2e::REPLY_TIMEOUT);
     assert!(agent.stop().success());
 }

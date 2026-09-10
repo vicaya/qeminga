@@ -327,6 +327,33 @@ impl Agent {
         }
     }
 
+    /// Waits until stderr holds exactly `count` occurrences of `needle`
+    /// (at least `count` to stop waiting, then exactly). Audit delivery
+    /// runs on the daemon's writer thread, unordered with respect to the
+    /// replies (§9.1), so a record is never read right after its reply.
+    pub fn wait_for_stderr_count(&mut self, needle: &str, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = self.stderr_text().matches(needle).count();
+            if seen >= count {
+                assert_eq!(seen, count, "{needle:?}; stderr:\n{}", self.stderr_text());
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "daemon exited with {status}; stderr:\n{}",
+                    self.stderr_text()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for {count} x {needle:?} (saw {seen}); stderr:\n{}",
+                self.stderr_text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn poll(&self, flags: PollFlags, timeout: Duration) -> PollFlags {
         let fd = self.pty.master.as_fd();
         let mut fds = [PollFd::new(fd, flags)];

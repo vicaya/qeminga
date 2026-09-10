@@ -28,7 +28,11 @@ Commit subjects reference the task and acceptance criteria:
 
 ## Checks
 
-These are exactly what CI runs. Run them locally before every push:
+These are exactly what CI runs. Run them locally before every push. CI
+runs the two `cargo test` lines and the privileged suite below natively
+on both supported architectures (`ubuntu-24.04` for x86-64,
+`ubuntu-24.04-arm` for aarch64); the aarch64 cross-check is the local
+stand-in on an x86-64 machine.
 
 ```sh
 cargo fmt --all --check

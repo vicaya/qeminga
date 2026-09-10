@@ -3,7 +3,12 @@
 Automated coverage lives in CI (`AGENTS.md` §Checks, `.github/workflows/`):
 unit and property tests, the unprivileged end-to-end suite over a pty,
 the privileged job on loop-mounted filesystems, fuzzing, and the
-packaging checks. This page covers the one check that stays manual:
+packaging checks. The test and privileged jobs run natively on both
+supported architectures (`ubuntu-24.04` for x86-64, `ubuntu-24.04-arm`
+for aarch64; #51): the aarch64 privileged leg is the execution evidence
+for the aarch64 seccomp profile (AC15), and each leg proves its
+architecture (`uname -m`, `RUNNER_ARCH`, the rustc host triple) before
+it builds anything. This page covers the one check that stays manual:
 interoperability with a real libvirt/QEMU host (AC16, T5.4). Hosted CI
 runners have no nested virtualisation.
 

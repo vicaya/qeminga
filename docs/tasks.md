@@ -152,7 +152,7 @@ the answer is a one-line change, and leave the question here.
 #### T0.3 — Continuous integration `done`
 - **Design:** §5.8, AC6, AC7, AC8, D6.
 - **Files:** `.github/workflows/ci.yml`.
-- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit --deny warnings`, a release-profile build, and an aarch64 cross-compile check (the target is provisioned by `rust-toolchain.toml`). Native arm64 execution is T5.2 (the repository is private, so free arm64 runners are unavailable).
+- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit --deny warnings`, a release-profile build, and an aarch64 cross-compile check (the target is provisioned by `rust-toolchain.toml`). Native arm64 execution of the test and privileged jobs is T5.2 (#51).
 
 #### T0.4 — Supply-chain policy `done`
 - **Design:** §5.8, AC6.
@@ -654,7 +654,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the weekly job has one green run recorded in the PR description.
 
 #### T5.2 — Privileged CI job (loop-mounted ext4/xfs, caps, seccomp matrix, SIGKILL recovery)
-- **Status:** done (x86-64); arm64 pending a runner, see §7
+- **Status:** done on both supported architectures (the test and privileged jobs run natively on `ubuntu-24.04` and `ubuntu-24.04-arm`; first green native arm64 run in PR #52, #51)
 - **Design:** AC2, AC3, AC10, AC11, AC13, AC15, AC17, AC18, D6.
 - **Depends on:** T3.4, T3.5, T3.6, T4.4, T4.5, T4.7
 - **Files:** `.github/workflows/ci.yml` (new `privileged` job), `scripts/ci/mk-loop-fs.sh`, `tests/privileged_*.rs`.
@@ -667,8 +667,8 @@ the answer is a one-line change, and leave the question here.
   - `privileged_seccomp_matrix_log_then_enforce` (AC15).
   - `privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount` — the loop ext4 gets a bind alias, is frozen, and a tmpfs is mounted over its original pathname (a superblock that would answer "not frozen"); the thaw must reach the ext4, and the marker may only go once it did: in the same process through the handle the freeze opened, after a SIGKILL and a restart through the alias, and with every pathname of the device covered not at all (unreachable, marker and frozen gate retained) until one leads there again. Each phase proves the ext4 writable through a bounded write. The alias is a *private* bind mount: under shared mount propagation (systemd's default for `/`, and the CI runner) an overmount on a mount point propagates onto its peer bind mounts too, so a plain bind alias is hidden together with its source, which is the unreachable case, not the alias one (review follow-up).
   - `privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze` — a bind mount of the loop ext4 at a directory whose name carries a raw non-UTF-8 byte: the table is not UTF-8, the entry is parsed byte-exact, the ioctls take the raw path, the daemon starts, lists it lossily in `guest-get-fsinfo` and freezes/thaws with it present (review follow-up for the byte-oriented parser of T2.5).
-- **Implement (green):** `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`) on `ubuntu-24.04`; create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`; run on arm64 as well once a runner is available (public repo, larger runner, or self-hosted) — until then the job is `x86_64` only and this task stays partially open.
-- **Done when:** all privileged tests are green on x86-64 in CI and the arm64 gap is recorded here. Every freezing test holds a `ThawGuard` that repeats `FITHAW` on drop, the job has `timeout-minutes`, and `mk-loop-fs.sh teardown` unfreezes before unmounting, so one failed assertion cannot leave the loop filesystem frozen for the rest of the job; both privileged steps run the whole `privileged_` set.
+- **Implement (green):** `sudo -E cargo test --features seccomp,suspend_ram,test-fakes -- --ignored --test-threads=1 privileged_` (never `--all-features`, which would add `seccomp-log`) on `ubuntu-24.04` (x86-64) and natively on `ubuntu-24.04-arm` (aarch64, #51); create `ext4` and `xfs` images with `mkfs` + `losetup` + `mount` in `scripts/ci/mk-loop-fs.sh`, the same script on both architectures. Each leg first proves its architecture (`uname -m`, `RUNNER_ARCH` and the rustc host triple must match the matrix entry, so a mislabeled or emulated runner fails instead of passing quietly), requires the xfs image (the script skips xfs quietly without `mkfs.xfs`), and checks that every `privileged_` test ran in the logging and the enforced build; the kernel's `type=1326` seccomp audit lines are printed after each run so a syscall an architecture's profile omits is named by its observed need. `tests/ci_workflow.rs` fails if an architecture leaves either matrix, if the arm64 leg is moved onto an x86-64 runner, or if a job carries `continue-on-error`.
+- **Done when:** all privileged tests are green on x86-64 and aarch64 in CI. Every freezing test holds a `ThawGuard` that repeats `FITHAW` on drop, the job has `timeout-minutes`, and `mk-loop-fs.sh teardown` unfreezes before unmounting, so one failed assertion cannot leave the loop filesystem frozen for the rest of the job; both privileged steps run the whole `privileged_` set.
 
 #### T5.3 — Packaging: systemd unit, udev rule, sysusers, example config ∥
 - **Status:** done
@@ -692,7 +692,7 @@ the answer is a one-line change, and leave the question here.
 - **Status:** in-progress (documentation and §7 refreshed; the release itself waits on T5.4's run log and T5.7's first publication on `main`, both in-progress, and on the `v0.1.0` tag, which the maintainer applies after the merge; open items in §7)
 - **Design:** §7 (C-4), §12.
 - **Depends on:** everything above
-- **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done, record arm64 gap).
+- **Files:** `README.md`, `docs/design.md` §7 (versions only), `CHANGELOG.md`, `docs/tasks.md` (this file: mark done).
 - **Also:** bump `rust-toolchain.toml` and `rust-version` to the current stable release (six-week cadence) and rerun the full check suite; consider Renovate, which understands `rust-toolchain.toml`.
 - **Done when:** the AC traceability matrix below has every row linked to a green test or a documented manual run; `cargo doc --no-deps` is warning-free; version `0.1.0` is tagged.
 
@@ -780,7 +780,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** the in-process test and the privileged pipe test above pass with the sink blocked throughout, and every existing AC13 test passes unchanged in semantics (readers call `Router::settle` before looking at a sink).
 
 #### T6.5 — Production hardening enforced (#43 §4)
-- **Status:** done (x86-64; the installed-artifact test runs where the privileged job runs, arm64 pending a runner, §7)
+- **Status:** done (the installed-artifact test runs where the privileged job runs: x86-64 and aarch64, #51)
 - **Design:** §8.1 "Hardening profile", §5.5, §8.2, AC3, AC15, AC24, C-25.
 - **Depends on:** T4.4, T4.5, T4.6, T5.3
 - **Files:** `src/config.rs` (`Hardening`, `agent.hardening`, the `features.seccomp = false` refusal), `src/daemon.rs` (`BuildProfile`, `check_hardening`, `RunError::Hardening`, `Startup::build_profile`, the drop and install refusals, the guarded fake-kernel swap), `src/lib.rs` (`compile_error!` for `test-fakes` outside debug), `packaging/config.toml`, `packaging/README.md`, `tests/fixtures/config/{default,invalid_seccomp_off_enforced}.toml`, `tests/e2e/mod.rs` (`SpawnOptions::enforce_hardening`; `ThawGuard` and `dev_of`, shared with `tests/packaging.rs`), `tests/privileged_e2e.rs` (`real_kernel` enforces where the build can), `tests/packaging.rs` (`QEMINGA_RELEASE_BINARY`), `tests/startup.rs`, `.github/workflows/ci.yml` (the release build with `test-fakes` must fail; the enforced privileged run installs the release artifact).
@@ -789,11 +789,11 @@ the answer is a one-line change, and leave the question here.
   - `enforced_hardening_refuses_what_the_build_cannot_enforce_before_the_marker_is_touched` (a missing feature, a logging filter, a test-kernel request: step 1 only, the marker of a previous instance untouched; the same builds serve a development host), `enforced_hardening_refuses_a_start_whose_sandbox_did_not_come_up` (not root; a filter that did not install), `the_binary_refuses_enforced_hardening_it_cannot_provide` (the real binary: exit 78 naming what was missing, `features.seccomp = false` a configuration error; a full start as root with an enforcing build) — `tests/startup.rs`.
   - `privileged_installed_unit_matches_the_advertised_profile` (`tests/packaging.rs`): the shipped unit and defaults, real kernel; `/proc/<pid>/status` shows uid 600, `CapEff`/`CapPrm`/`CapBnd` exactly the AC3 set, empty inheritable and ambient sets, `NoNewPrivs: 1`, `Seccomp: 2`; `guest-exec` refused; a real freeze/thaw of the loop ext4, after which every thread of the daemon (`/proc/<pid>/task/*/status`: the audit writer and the blocking-pool workers among them) shows the same uid, sets, bounding set, `NoNewPrivs` and `Seccomp` as the main thread (§5.4, external review); then a `QEMINGA_TEST_FAKE_KERNEL` drop-in makes the start fail with 78 and no marker. Under the `seccomp-log` build the enforced start is refused outright (the negative half).
 - **Implement (green):** as §8.1 "Hardening profile". The check order is configuration → build profile (before the marker is opened) → the drop's outcome → the installer's outcome (an installer error is the refusal under enforced hardening and a `seccomp_unavailable` warning under the opt-out, never `EX_OSERR`); every refusal is `RunError::Hardening` (`EX_CONFIG`) with the cause and the opt-out named, and one that comes after recovery logging started is reported through the exit path of T6.4 (tests: `a_refusal_after_recovery_logging_started_is_reported_on_the_way_out`, `a_filter_the_kernel_refuses_is_a_hardening_refusal_when_enforced_and_a_warning_otherwise`). The recovery procedure for a failed upgrade or configuration is in `packaging/README.md`.
-- **Not done here:** arm64 execution of the installed-artifact test (no runner, §7). The enforced privileged run installs the release artifact itself (`cargo build --release --features seccomp`, handed to the test as `QEMINGA_RELEASE_BINARY`) under the shipped unit; the compatibility run, which expects the refusal, and the development installs (fake-kernel drop-in) use the test build, which also carries `test-fakes` and debug assertions. A failed assertion between the test's freeze and thaw is covered by the shared `e2e::ThawGuard`, so the loop ext4 is never left frozen for the rest of the serial run.
-- **Done when:** the negative tests above are green, the release build with `test-fakes` fails in CI, and the privileged job runs the installed-artifact test on x86-64.
+- **Notes:** The enforced privileged run installs the release artifact itself (`cargo build --release --features seccomp`, handed to the test as `QEMINGA_RELEASE_BINARY`) under the shipped unit; the compatibility run, which expects the refusal, and the development installs (fake-kernel drop-in) use the test build, which also carries `test-fakes` and debug assertions. A failed assertion between the test's freeze and thaw is covered by the shared `e2e::ThawGuard`, so the loop ext4 is never left frozen for the rest of the serial run.
+- **Done when:** the negative tests above are green, the release build with `test-fakes` fails in CI, and the privileged job runs the installed-artifact test on both supported architectures.
 
 #### T6.6 — The data-protection profile: authority derived from the configuration (#43 §5)
-- **Status:** done (x86-64 privileged evidence; arm64 pending a runner, §7)
+- **Status:** done (privileged evidence on x86-64 and aarch64, #51)
 - **Design:** §5.9 (new), §5.4, §5.5, §8.1, §8.2, D8, AC25, C-26, OQ-10.
 - **Depends on:** T4.4, T4.5, T6.5
 - **Files:** `src/config.rs` (`Features::{shutdown, information}`, `Authority`, `Config::authority`), `src/kernel/caps.rs` (`final_capability_set(&Authority)`, the drop takes the authority), `src/seccomp.rs` (`INFORMATION`, `POWER`, `rules`/`profile` take the authority), `src/daemon.rs` (`Startup::drop_privileges(&Authority)`, the `authority` startup record), `src/dispatch.rs` (the runtime gate), `src/handlers/info.rs`, `packaging/config-data-protection.toml`, `packaging/README.md`, `tests/packaging.rs`, `tests/privileged_e2e.rs`, `tests/e2e/mod.rs` (`Agent::pid`).
@@ -830,7 +830,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 |---|---|---|---|
 | AC1 denied commands → `CommandNotFound` | T1.8 (`every_denied_command_in_design_table_returns_command_not_found`), T4.7 (`guest_exec_and_every_denied_command_return_command_not_found`) | unit + E2E | green |
 | AC2 freeze/thaw on real ext4/xfs | T3.4 (`privileged_freeze_thaw_cycle_on_ext4_and_xfs`), T5.2 | privileged | green on ext4 (local + CI); xfs in CI |
-| AC3 exact final capability set | T4.4 (`privileged_drop_leaves_exactly_final_caps`), T5.2 | privileged | green (x86-64) |
+| AC3 exact final capability set | T4.4 (`privileged_drop_leaves_exactly_final_caps`), T5.2 | privileged | green (x86-64 and aarch64) |
 | AC4 oversized frame resync | T1.2, T4.7 (`oversized_frame_then_valid_command`), T5.1 corpus | unit + property + E2E + fuzz | green |
 | AC5 1 000-ping flood | T1.7, T4.7 (`flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served`) | unit + E2E | green |
 | AC6 lockfile, deny, audit | T0.1, T0.4 | CI | green |
@@ -842,7 +842,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC12 shutdown has no success reply | T4.2, T4.7 (`shutdown_emits_no_reply`) | unit + E2E | green |
 | AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 (`privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + privileged | green |
 | AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | pending: the 60 s run is green on every PR; the one-hour weekly run has not executed yet, so AC14 as written is not yet demonstrated |
-| AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64; arm64 pending runner (§7) |
+| AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64 and aarch64 (native `ubuntu-24.04-arm` leg, #51) |
 | AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`) | manual | manual, run log pending (§7) |
 | AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 (`privileged_freeze_with_tmpfs_bind_and_0700_mountpoint`) | unit + privileged | green |
 | AC18 EOF/reopen during freeze | T4.1, T4.7 (`channel_eof_then_reopen_preserves_state`), T5.2 (`privileged_channel_eof_during_freeze_preserves_marker`) | unit + E2E + privileged | green |
@@ -851,8 +851,8 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC21 zero-work operations settle `Thawed`; freeze-list coverage fails closed | T6.2 (`an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed`, `an_entirely_skipped_plan_settles_thawed_too`, `a_zero_count_with_a_busy_target_keeps_the_conservative_state`, `a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen`, `a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze`; `channel_eof_then_reopen_preserves_state`) | unit + E2E | green |
 | AC22 freeze-validity contract | T6.3 (`tests/controller_contract.rs`, the seventeen scenarios listed there) | integration (paused time, depth-tracking fake) | green; single-controller assumption stated, OQ-9 |
 | AC23 audit delivery never holds recovery | T6.4 (`a_sink_blocked_throughout_never_holds_the_thaw_the_state_or_the_next_operation`, the `audit` writer-thread tests, `privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + integration + privileged | green |
-| AC24 production hardening enforced | T6.5 (`the_binary_refuses_enforced_hardening_it_cannot_provide`, the startup-fake refusals, `privileged_installed_unit_matches_the_advertised_profile`, the CI release build with `test-fakes`) | unit + binary + privileged + CI | green on x86-64; arm64 pending runner (§7) |
-| AC25 data-protection profile | T6.6 (`a_profile_without_shutdown_gives_up_cap_sys_boot_everywhere`, `the_profile_carries_only_the_surfaces_the_configuration_enables`, `a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them`, `privileged_data_protection_profile_holds_no_reboot_authority`, `privileged_data_protection_profile_recovers_without_the_host`) | unit + privileged | green on x86-64 |
+| AC24 production hardening enforced | T6.5 (`the_binary_refuses_enforced_hardening_it_cannot_provide`, the startup-fake refusals, `privileged_installed_unit_matches_the_advertised_profile`, the CI release build with `test-fakes`) | unit + binary + privileged + CI | green on x86-64 and aarch64 |
+| AC25 data-protection profile | T6.6 (`a_profile_without_shutdown_gives_up_cap_sys_boot_everywhere`, `the_profile_carries_only_the_surfaces_the_configuration_enables`, `a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them`, `privileged_data_protection_profile_holds_no_reboot_authority`, `privileged_data_protection_profile_recovers_without_the_host`) | unit + privileged | green on x86-64 and aarch64 |
 | AC26 resource bounds under adversarial traffic | T6.7 (`a_mount_table_whose_reply_exceeds_the_bound_is_an_explicit_error`, `a_reply_beyond_the_bound_is_an_explicit_error_not_a_truncated_list`, `repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order`, `a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue`; §5.10 rows by their tasks) | unit + integration | green |
 
 ---
@@ -863,4 +863,3 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 |---|---|---|
 | stuck `FITHAW` isolation | The operation deadline (T6.1) bounds the freeze walk; a `FITHAW` that blocks in the kernel still holds its drain, and with it the operation, until it returns (OQ-8, still open). | design owner |
 | libvirt run log | `scripts/e2e-libvirt.sh` and the recipe in `docs/testing.md` exist, but no run against a real libvirt host has been recorded yet (no nested virtualisation in hosted CI or the development container). AC16 stays open until a log is attached to a PR. | T5.4 / T5.5 |
-| arm64 execution | The privileged job (T5.2) and the seccomp matrix (AC15) run on `x86_64` only. The `aarch64` profile is compiled and checked in every CI run (`cross-check-aarch64`, plus unit tests that build both profiles), but no arm64 runner executes it. Needs a public repository, a larger hosted runner, or a self-hosted arm64 machine. | T5.2 / T5.5 |

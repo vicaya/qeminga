@@ -13,9 +13,9 @@ the guest.
 
 **Status:** 0.1.0. Every command in the design is implemented and tested
 (unit, property, fuzz, end-to-end over a pty, and privileged tests on
-loop-mounted filesystems). Two items stay open, tracked in
-[`docs/tasks.md`](docs/tasks.md) §7: the manual libvirt run log (AC16) and
-arm64 execution in CI (AC15).
+loop-mounted filesystems, natively on x86-64 and aarch64). One item stays
+open, tracked in [`docs/tasks.md`](docs/tasks.md) §7: the manual libvirt
+run log (AC16).
 
 ## Commands
 

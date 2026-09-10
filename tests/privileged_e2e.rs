@@ -224,6 +224,11 @@ impl MovedMount {
         sh(&["--bind", a, &format!("{root}/staging-a")]);
         sh(&["--bind", b, &format!("{root}/data")]);
         sh(&["--bind", b, &format!("{root}/b-alias")]);
+        // A bind mount joins its source's peer group: on a host whose
+        // mounts are shared (systemd's default), the move onto B's bind
+        // would otherwise propagate A over every peer of B, its original
+        // mount point included. The subtree is private before the move.
+        sh(&["--make-rprivate", &root]);
         sh(&[
             "--move",
             &format!("{root}/staging-a"),
@@ -234,6 +239,10 @@ impl MovedMount {
 
     fn data(&self) -> String {
         format!("{}/data", self.base.path().to_str().unwrap())
+    }
+
+    fn b_alias(&self) -> String {
+        format!("{}/b-alias", self.base.path().to_str().unwrap())
     }
 }
 
@@ -272,12 +281,34 @@ fn privileged_a_mount_moved_over_a_newer_one_is_what_the_request_freezes() {
         dev_of(std::path::Path::new(&a)),
         "A is what data leads to"
     );
+    assert_eq!(
+        dev_of(std::path::Path::new(&b)),
+        dev_of(std::path::Path::new(&arranged.b_alias())),
+        "B still leads to its own superblock: the move did not propagate"
+    );
+    let kernel = qeminga::kernel::LinuxKernel;
+    // Both superblocks start thawed (a freeze and thaw of each succeed),
+    // so a freeze found afterwards is the request's.
+    for (name, mount) in [("A", &a), ("B", &b)] {
+        let handle = handle(std::path::Path::new(mount));
+        kernel
+            .fifreeze(&handle)
+            .unwrap_or_else(|err| panic!("{name} is frozen before the request: {err}"));
+        kernel.fithaw(&handle).unwrap();
+    }
+    let rows = || {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap()
+            .lines()
+            .filter(|row| row.contains(&a) || row.contains(&b) || row.contains(&data))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     let mut agent = Agent::spawn_with(real_kernel(""));
     assert_eq!(
         freeze_list(&mut agent, std::slice::from_ref(&data)),
         json!({"return": 1})
     );
-    let kernel = qeminga::kernel::LinuxKernel;
     let frozen = kernel.fifreeze(&handle(std::path::Path::new(&a)));
     assert!(
         matches!(
@@ -286,10 +317,18 @@ fn privileged_a_mount_moved_over_a_newer_one_is_what_the_request_freezes() {
                 nix::errno::Errno::EBUSY
             ))
         ),
-        "A is frozen: {frozen:?}"
+        "A is frozen: {frozen:?}\nmounts:\n{}\ndaemon stderr:\n{}",
+        rows(),
+        agent.stderr_text()
     );
     let b_handle = handle(std::path::Path::new(&b));
-    kernel.fifreeze(&b_handle).expect("B is not frozen");
+    if let Err(err) = kernel.fifreeze(&b_handle) {
+        panic!(
+            "B is not frozen: {err}\nmounts:\n{}\ndaemon stderr:\n{}",
+            rows(),
+            agent.stderr_text()
+        );
+    }
     kernel.fithaw(&b_handle).unwrap();
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
     let thawed = agent.execute("guest-fsfreeze-thaw");

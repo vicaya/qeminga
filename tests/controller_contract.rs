@@ -71,10 +71,17 @@ struct Guest {
     /// Signalled when the connection to the agent is lost (a crash, a
     /// reboot): an in-flight request fails instead of waiting for ever.
     lost: Notify,
+    /// The guest's mount table (a fixture name).
+    mounts: &'static str,
 }
 
 impl Guest {
+    /// `/` (8:1) and `/home` (8:2), both freezable.
     fn new() -> Arc<Guest> {
+        Self::with_mounts("simple.txt")
+    }
+
+    fn with_mounts(mounts: &'static str) -> Arc<Guest> {
         let kernel = Arc::new(FakeKernel::new());
         kernel.track_freeze_depth();
         let guest = Arc::new(Guest {
@@ -83,6 +90,7 @@ impl Guest {
             clock: ManualClock::new(),
             agent: Mutex::new(None),
             lost: Notify::new(),
+            mounts,
         });
         guest.start_agent();
         guest
@@ -109,7 +117,7 @@ impl Guest {
                 marker,
             )
             .with_kernel(self.kernel.clone() as Arc<dyn KernelOps>)
-            .with_mounts(Arc::new(StaticMounts(fixture("simple.txt"))))
+            .with_mounts(Arc::new(StaticMounts(fixture(self.mounts))))
             .with_freeze_clock(Arc::new(self.clock.clone()))
             .with_freeze_operation_timeout(Duration::from_secs(OPERATION_SECS)),
         );
@@ -746,5 +754,43 @@ async fn a_request_that_is_not_fully_covered_is_rejected_before_any_cut() {
         .unwrap_err();
     rejected(&verdict, "freeze covered 1 of 2");
     assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hidden_mount_point_cannot_stand_in_for_an_unprotected_requirement() {
+    // The external review's counterexample against the coverage
+    // certificate: 8:3 is mounted over 8:2 at /data, and 8:2 keeps /data
+    // as its (hidden) first name beside the alias /data-alias it is still
+    // reachable at. A controller requiring /data and /required, the
+    // latter unfreezable, must be rejected: were the hidden name to
+    // select 8:2 too, the freeze would answer 2, the thaw 2, and the
+    // cycle would be accepted with /required never protected. A name
+    // selects the superblock mounted at that path now, so the count is
+    // 1 and the controller fails closed.
+    let guest = Guest::with_mounts("hidden_mount.txt");
+    let verdict = Cycle::freeze(Arc::clone(&guest), &["/data", "/required"])
+        .await
+        .unwrap_err();
+    rejected(&verdict, "freeze covered 1 of 2");
+    // What the freeze reached was 8:3 through /data, and nothing else.
+    let frozen: Vec<(std::path::PathBuf, (u32, u32))> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open(p, dev) => Some((p, dev)),
+            _ => None,
+        })
+        .take_while(|(_, dev)| *dev != (8, 1))
+        .collect();
+    assert!(
+        frozen.contains(&(std::path::PathBuf::from("/data"), (8, 3))),
+        "{frozen:?}"
+    );
+    assert!(!frozen.iter().any(|(_, dev)| *dev == (8, 2)), "{frozen:?}");
+    // The rejection's thaw drained it: nothing left frozen, no marker.
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
     assert!(!guest.dir.path().join("frozen").exists());
 }

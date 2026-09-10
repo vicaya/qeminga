@@ -696,7 +696,7 @@ the answer is a one-line change, and leave the question here.
 - **Status:** done (`cargo mutants --all-features`: 194 mutants, **0 missed**; the CI job is a gate). Review follow-ups: the gate reads `mutants.out/missed.txt` (the exit status reports timeouts ahead of misses, which hid one survivor in `Drained::incomplete`, killed by the tests added on T3.4); `FrameDecoder::push` is an indexed loop bounded by its input, so no mutant of it can loop (one re-scanned a delimiter forever, allocated without bound, and got the CI runner shut down); the channel session tests run under a real-time bound so a broken decoder fails them instead of hanging the binary; the job runs test binaries under a 4 GiB memory cap (`scripts/ci/bounded-test.sh`); `src/watchdog.rs` is examined too (lifecycle coordination), `src/audit.rs` is not (about 140 mostly formatting mutants would double the job).
 - **Design:** AC8 (test quality), §5.2.
 - **Depends on:** T1.*, T3.4
-- **Files:** `.cargo/mutants.toml`, CI job `mutants` (advisory until the baseline survivors were killed).
+- **Files:** `.cargo/mutants.toml`, CI job `mutants` (advisory until the baseline survivors were killed; since T6.2 split over four shards, `--shard k/4`, each its own gate with its own report, because one job for every mutant reached its 90-minute cap as the suite grew).
 - **Done when:** `cargo mutants` on `framing`, `proto`, `state`, and `fsfreeze` reports no surviving mutants in the errno-policy and gate code paths.
 
 #### T5.7 — Coverage floor and status badges ∥

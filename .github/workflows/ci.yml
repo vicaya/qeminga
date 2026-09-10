@@ -217,10 +217,17 @@ jobs:
   # uploaded either way. Test binaries run under a memory cap: a mutant
   # that allocates without bound must abort its test, not the runner.
   mutants:
-    name: cargo mutants
+    name: cargo mutants (${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
-    # About 45 minutes on the shared runners; never GitHub's six-hour default.
-    timeout-minutes: 90
+    # The mutants are split over four shards (`--shard k/4`), about 20
+    # minutes each on the shared runners: one job for all of them reached
+    # the 90-minute cap as the suite grew, and a gate that passes or fails
+    # on runner speed is not a gate. Never GitHub's six-hour default.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -234,7 +241,7 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: ${{ github.workspace }}/scripts/ci/bounded-test.sh
         run: |
           set +e
-          cargo mutants --all-features --no-shuffle -j 2
+          cargo mutants --all-features --no-shuffle -j 2 --shard ${{ matrix.shard }}/4
           code=$?
           set -e
           echo "cargo mutants exited with $code"
@@ -253,7 +260,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mutants-out
+          name: mutants-out-${{ matrix.shard }}
           path: mutants.out
           if-no-files-found: ignore
 

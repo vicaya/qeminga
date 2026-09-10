@@ -1596,6 +1596,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freeze_list_over_an_overmount_counts_the_visible_superblock_only() {
+        // #43 §1, the coverage contract: /data is 8:3 mounted over 8:2,
+        // whose first name /data is hidden (it stays reachable as
+        // /data-alias). A controller requesting /data and an unsupported
+        // /required must see a count of 1, not 2: the hidden name cannot
+        // contribute 8:2 to the count of a request that never named it.
+        let rig = Rig::new(FreezeState::Thawed, "hidden_mount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data","/required"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data"), (8, 3))]);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
     async fn freeze_list_with_unknown_paths_freezes_nothing_and_returns_0() {
         let rig = Rig::nested();
         let value = freeze_list(

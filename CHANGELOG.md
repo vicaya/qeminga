@@ -20,6 +20,13 @@ semantic versioning.
 
 ### Fixed
 
+- `guest-fsfreeze-freeze-list`: a requested mount point selects the
+  superblock mounted at that path now, never a superblock whose former
+  mount point has been hidden by a mount over it. Before, a name carried
+  by two targets (one of them hidden) selected both, so the count could
+  equal the number requested while a requested filesystem was never
+  frozen; a controller relying on the count (design §4.2 "Coverage",
+  §4.5) would have accepted that (#43 §1, external review).
 - A freeze that froze nothing and holds nothing (an empty plan, a
   `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
   target of which was skipped) settles `Thawed` with its marker removed

@@ -120,25 +120,43 @@ impl FreezePlan {
         self.targets.iter()
     }
 
-    /// The intersection with the requested mount points, matched exactly
-    /// on the unescaped mount point (as a path, no normalisation; a mount
-    /// point that is not valid UTF-8 can never be named on the wire) or
-    /// any of its aliases; unknown paths are ignored, not errors (C-12).
-    /// Order and the mount table are preserved.
+    /// The intersection with the requested mount points. A requested name
+    /// selects the superblock mounted at exactly that path *now*: the last
+    /// mount-table entry with that mount point (byte-exact, no
+    /// normalisation; a mount point that is not valid UTF-8 can never be
+    /// named on the wire), whatever the plan calls the superblock. So one
+    /// name never selects two superblocks, a name that only a hidden
+    /// (overmounted) mount point of a target carries selects nothing, and
+    /// the count of §4.2 "Coverage" is one per requested superblock (#43
+    /// §1). The selected target keeps all its mount points: they are how
+    /// it is reached and recovered, not what it was selected by. Unknown
+    /// paths are ignored, not errors (C-12). Order and the mount table are
+    /// preserved.
     pub fn restrict_to(&self, mountpoints: &[String]) -> FreezePlan {
+        let selected: Vec<(u32, u32)> = mountpoints
+            .iter()
+            .filter_map(|name| self.mounted_at(name))
+            .collect();
         FreezePlan {
             targets: self
                 .targets
                 .iter()
-                .filter(|t| {
-                    // Byte-exact (`Path` equality would tolerate `/home/`).
-                    t.mountpoints()
-                        .any(|name| mountpoints.iter().any(|m| m.as_str() == name.as_os_str()))
-                })
+                .filter(|t| selected.contains(&t.dev))
                 .cloned()
                 .collect(),
             mounts: self.mounts.clone(),
         }
+    }
+
+    /// The superblock mounted at exactly `path` now: the last entry of the
+    /// mount table with that mount point (a later mount over the same path
+    /// hides the earlier one), or `None` when nothing is mounted there.
+    fn mounted_at(&self, path: &str) -> Option<(u32, u32)> {
+        self.mounts
+            .iter()
+            .rev()
+            .find(|(mountpoint, _)| mountpoint.as_os_str() == path)
+            .map(|(_, dev)| *dev)
     }
 
     /// The mount point that holds `path` (longest matching prefix, by path
@@ -259,10 +277,36 @@ mod tests {
         let restricted = plan.restrict_to(&["/data-alias".to_owned()]);
         assert_eq!(restricted.len(), 1);
         assert_eq!(restricted.targets()[0].dev, (8, 2));
-        // Naming /data selects every superblock that carries the name.
+        // Naming /data selects what is mounted there now (8:3), not the
+        // superblock whose hidden first name it also is.
         let restricted = plan.restrict_to(&["/data".to_owned()]);
         let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 3)]);
+    }
+
+    #[test]
+    fn a_requested_name_selects_at_most_one_superblock_so_the_count_is_coverage() {
+        // The coverage contract (§4.2, §4.5) rests on one requested name
+        // selecting at most one superblock. Over the overmount, a request
+        // for /data and a path nothing is mounted at must select exactly
+        // one target, so a controller requesting two sees a count of one
+        // and rejects; were the hidden name to select 8:2 as well, the
+        // count would read 2 with /required never protected.
+        let plan = plan_from("hidden_mount.txt");
+        let restricted = plan.restrict_to(&["/data".to_owned(), "/required".to_owned()]);
+        let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 3)]);
+        // The selected target keeps every name it has: they are how it is
+        // reached, not what selected it.
+        let both = plan.restrict_to(&["/data".to_owned(), "/data-alias".to_owned()]);
+        let devs: Vec<(u32, u32)> = both.targets().iter().map(|t| t.dev).collect();
         assert_eq!(devs, [(8, 2), (8, 3)]);
+        let hidden = both.targets().iter().find(|t| t.dev == (8, 2)).unwrap();
+        assert_eq!(hidden.aliases, [PathBuf::from("/data-alias")]);
+        // A name nothing is mounted at, or a mount outside the plan,
+        // selects nothing.
+        assert!(plan.restrict_to(&["/required".to_owned()]).is_empty());
+        assert!(plan.restrict_to(&["/data/".to_owned()]).is_empty());
     }
 
     #[test]

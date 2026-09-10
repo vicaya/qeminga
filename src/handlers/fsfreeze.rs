@@ -3153,6 +3153,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_discovery_drain_uses_the_held_handle_of_the_same_superblock() {
+        // Under discovery (as after an uncertain settlement) a planned
+        // target is drained through the handle this process holds for
+        // *its* superblock, matched by device, so nothing is reopened even
+        // where a pathname now leads elsewhere, and the drain runs in
+        // forward mount order: a handle of another device never stands in.
+        let rig = Rig::nested();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.held(), 4);
+        rig.ctx.set_thaw_scope(ThawScope::Discovery);
+        rig.kernel.script_mount_device("/home/data", (8, 9));
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+        assert!(rig.opens().is_empty(), "{:?}", rig.opens());
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/",
+                "/",
+                "/home",
+                "/home",
+                "/home/data",
+                "/home/data",
+                "/home/data/deep",
+                "/home/data/deep"
+            ]),
+            "each target through its own handle, forward"
+        );
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+    }
+
+    #[tokio::test]
     async fn an_operation_that_lost_a_worker_leaves_its_thaw_to_discovery() {
         // The worker for /home/data panics inside FIFREEZE: its outcome is
         // unknown and no descriptor shows for it, so the operation settles

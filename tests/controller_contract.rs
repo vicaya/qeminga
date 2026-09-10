@@ -810,6 +810,43 @@ async fn a_requirement_hidden_by_a_mount_over_its_ancestor_is_rejected() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_superblock_the_cycle_never_froze_cannot_hold_its_thaw() {
+    // directory_overmount.txt: A (8:2) at /data/nested is hidden under B
+    // (8:3) at /data and reachable by no name; C (8:4) is at the
+    // /data/nested B provides. A cycle requiring /data/nested protects C
+    // (count 1) and its thaw drains C alone (§4.2 "Thaw scope"): A, never
+    // this cycle's obligation, cannot hold the marker; the verdict is
+    // quiesced and the next cycle is admitted at once, twice over.
+    let guest = Guest::with_mounts("directory_overmount.txt");
+    guest.kernel.script_mount_device("/data/nested", (8, 4));
+    for cycle_no in 0..2 {
+        let mut cycle = Cycle::freeze(Arc::clone(&guest), &["/data/nested"])
+            .await
+            .unwrap_or_else(|verdict| panic!("cycle {cycle_no}: {verdict:?}"));
+        cycle.cut("vol-c", Duration::from_secs(5)).await.unwrap();
+        assert_eq!(
+            cycle.thaw().await,
+            Verdict::Quiesced {
+                volumes: vec!["vol-c".to_owned()]
+            },
+            "cycle {cycle_no}"
+        );
+        assert_eq!(guest.state(), FreezeState::Thawed);
+        assert!(!guest.dir.path().join("frozen").exists());
+        assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+    }
+    // A was never opened, for a freeze or a drain: nothing of this
+    // cycle's touched a filesystem it did not freeze.
+    let calls = guest.kernel.calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|c| matches!(c, Call::Open(_, dev) if *dev == (8, 2))),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn a_hidden_mount_point_cannot_stand_in_for_an_unprotected_requirement() {
     // The external review's counterexample against the coverage
     // certificate: 8:3 is mounted over 8:2 at /data, and 8:2 keeps /data

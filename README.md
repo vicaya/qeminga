@@ -75,7 +75,7 @@ Cargo features (compile-time half of the two-level switches in the design):
 | `seccomp` | Build the seccomp-BPF filter (`seccompiler`). Release builds use it. |
 | `seccomp-log` | Same profile, logging instead of killing (compatibility runs only). |
 | `suspend_ram` | Build the opt-in `guest-suspend-ram` handler. |
-| `test-fakes` | Let the binary fake the kernel shim for the E2E suite. Never in releases. |
+| `test-fakes` | Let the binary fake the kernel shim for the E2E suite (development hardening only). A compile error in release builds. |
 
 Tests that need root or `CAP_SYS_ADMIN` are `#[ignore]`d and named
 `privileged_*`; see `AGENTS.md`.

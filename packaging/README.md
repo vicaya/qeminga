@@ -8,12 +8,15 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 | `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
 | `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
 | `config.toml` | `/etc/qeminga/config.toml` | The documented defaults (§8.2); every key is optional. |
+| `config-data-protection.toml` | `/etc/qeminga/config.toml` (instead of the above) | The data-protection profile (§5.9): freeze, thaw, status and the controls only; `guest-shutdown`, the information commands and `guest-fstrim` disabled, and with them `CAP_SYS_BOOT`, `reboot(2)`, `uname`, `statfs`, netlink and `FITRIM` given up. |
 | `tmpfiles.d/qeminga.conf` | `/usr/lib/tmpfiles.d/` | Creates `/run/qeminga` (0700, owned by `qeminga`) at boot for the recovery marker (C-20). Always install it and run `systemd-tmpfiles --create`. |
 | `tmpfiles.d/qeminga-suspend.conf` | `/usr/lib/tmpfiles.d/` **only with** `[features] suspend_ram = true` | Hands `/sys/power/state` to group `qeminga` (mode 0664) on every boot, without which the dropped daemon cannot write it (OQ-6). Not installed by default. |
 
 The binary itself goes to `/usr/bin/qeminga`. Build releases with
 `cargo build --release --locked --features seccomp` (never
-`--all-features`, which includes the test-only `test-fakes` feature).
+`--all-features`: the test-only `test-fakes` feature is a compile error
+in a release build, and `seccomp-log` would fail the enforced hardening
+check at startup).
 
 ## Migration from qemu-guest-agent
 
@@ -60,6 +63,57 @@ waiting for the thaw. `tests/packaging.rs` checks the shipped pair.
 `fsfreeze_operation_timeout_secs` (the freeze walk's own deadline, §4.4)
 is validated to be at most the cap, so it never needs a margin of its
 own.
+
+## Data-protection profile
+
+A guest whose only job for the host is snapshot coordination installs
+`config-data-protection.toml` as `/etc/qeminga/config.toml`: it keeps
+`guest-fsfreeze-*`, `guest-ping`, `guest-sync*` and `guest-info` and
+disables `guest-shutdown`, `guest-get-osinfo`,
+`guest-network-get-interfaces`, `guest-get-fsinfo` and `guest-fstrim`
+(`[features] shutdown`, `information`, `fstrim`; design §5.9). The
+daemon derives its authority from the file before it accepts a host
+request: without `guest-shutdown` it drops `CAP_SYS_BOOT` and the
+`reboot`/`sync` syscalls, without the information commands the netlink,
+`uname` and `statfs` syscalls, without trim the `FITRIM` ioctl. Nothing
+the host sends re-enables any of it; `guest-info` lists the disabled
+commands as disabled. The default `config.toml` keeps every command on,
+as before. What remains after a compromise of the daemon, with either
+file, is stated in design §5.9.
+
+## Hardening profile and a failed upgrade or configuration
+
+The shipped configuration says `hardening = "enforced"` (design §8.1):
+the daemon refuses to serve the host, exit status 78 and one line in the
+journal (`refusing to serve the host`), unless it was started as root,
+the seccomp filter is compiled in, enabled and installed in its enforcing
+mode, and no test-kernel substitution was requested. `Restart=always`
+restarts it a second later, refusing each time, until systemd's start
+rate limit ends the loop (five starts in ten seconds by default): the
+unit is then `failed`, and a `systemctl restart` inside that window is
+rejected until `systemctl reset-failed qeminga`. It never falls back to
+serving without the sandbox. Typical causes after an upgrade: a binary
+built without `--features seccomp` (or with `--all-features`, which adds
+the logging filter), a stray `QEMINGA_TEST_FAKE_KERNEL` in the unit's
+environment, or a kernel or container runtime that refuses the filter
+(the line names the installer's error). `[features] seccomp = false`
+left in the configuration is refused one step earlier, as a
+configuration error naming `features.seccomp`: the same exit status 78,
+without the `refusing to serve` line.
+
+The refusal happens before the recovery marker is touched (the drop's
+and the installer's outcomes are checked later, but still before the
+runtime, and are reported to the journal even when a marker put logging
+into recovery mode). If the
+previous instance was frozen when it died, `/run/qeminga/frozen` is still
+there and the filesystems may still be frozen: fix the cause, then
+`systemctl reset-failed qeminga` and `systemctl restart qeminga`; the
+start that can provide the profile
+enters recovery mode from the marker and thaws (§4.4). Do not remove the
+marker by hand, and do not set `hardening = "unenforced-development-only"`
+to get past the refusal on a production host: that value is for a
+development machine only, where it allows an unprivileged start, a
+missing or logging filter and the faked kernel, with warnings.
 
 ## Recovery marker
 

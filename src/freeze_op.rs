@@ -36,7 +36,9 @@
 //!    drained: complete → marker removed, finalisation hook, `Thawed`; a
 //!    drain incomplete or the marker not removable → `Frozen`, marker
 //!    retained, the watchdog armed as on any entry into that state, the
-//!    incomplete handles kept for it. The operation retires its
+//!    incomplete handles kept for it; nothing frozen and nothing held
+//!    (an empty or entirely skipped plan) → marker removed, `Thawed`,
+//!    reply `0` (#43 §2). The operation retires its
 //!    registration (by identity: a successor is never touched) before the
 //!    state is published, so whoever observes the terminal state finds
 //!    the slot released; the settlement is announced and the reply sent
@@ -62,7 +64,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 
-use crate::dispatch::Context;
+use crate::dispatch::{Context, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
     FreezeFailure, FreezeStop, build_plan, drain_held, open_target, rollback,
@@ -301,9 +303,24 @@ pub struct FreezeOp {
     /// ioctl).
     aborted: AtomicBool,
     progress: watch::Sender<Progress>,
+    /// The driver task, once spawned, for [`abort_driver`](Self::abort_driver).
+    driver: std::sync::OnceLock<tokio::task::AbortHandle>,
 }
 
 impl FreezeOp {
+    /// Aborts the driver task where it waits, as the process's death
+    /// would end it: no state is published, no marker written and no
+    /// reply sent by it afterwards; a worker's ioctl already in the kernel
+    /// completes on its own thread. For harnesses modelling a crash
+    /// ([`Context::abort_tasks`]); the daemon never aborts its own driver,
+    /// and nothing else should: the operation is left unsettled.
+    #[doc(hidden)]
+    pub fn abort_driver(&self) {
+        if let Some(driver) = self.driver.get() {
+            driver.abort();
+        }
+    }
+
     /// Asks the operation to stop authorising targets and to recover the
     /// ones frozen so far (a thaw request). Idempotent; a request that
     /// arrives before the driver waits is not lost. The answer says
@@ -422,6 +439,7 @@ impl FreezeOp {
             outcome: AtomicU8::new(OUTCOME_OPEN),
             aborted: AtomicBool::new(false),
             progress,
+            driver: std::sync::OnceLock::new(),
         })
     }
 }
@@ -445,8 +463,10 @@ pub(crate) fn start(
         outcome: AtomicU8::new(OUTCOME_OPEN),
         aborted: AtomicBool::new(false),
         progress,
+        driver: std::sync::OnceLock::new(),
     });
     ctx.set_freeze_op(Some(Arc::clone(&op)));
+    let spawned = Arc::clone(&op);
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let driver = Driver {
         kernel: Arc::clone(&ctx.kernel),
@@ -461,11 +481,15 @@ pub(crate) fn start(
         recovered: 0,
         recovery: None,
         kept: Vec::new(),
+        uncertain: false,
         unrecoverable: None,
         abort: None,
         timeout,
     };
-    tokio::spawn(driver.drive(restrict).with_subscriber(dispatch));
+    let task = tokio::spawn(driver.drive(restrict).with_subscriber(dispatch));
+    // Set once, here; `abort_driver` before this point aborts nothing,
+    // which is right: the driver has not run yet either.
+    let _ = spawned.driver.set(task.abort_handle());
     reply_rx
 }
 
@@ -521,6 +545,10 @@ struct Driver {
     /// Handles whose drain did not complete, kept for the watchdog.
     kept: Vec<Mount>,
     unrecoverable: Option<(String, String)>,
+    /// A target's outcome is unknown and no descriptor shows for it (a
+    /// worker, a drain or a rollback lost): the thaw of what this
+    /// operation leaves must discover its targets (§4.2 "Thaw scope").
+    uncertain: bool,
     abort: Option<AbortCause>,
     timeout: Duration,
 }
@@ -596,6 +624,7 @@ impl Driver {
                     // operation settles `Frozen` and the watchdog's drain
                     // by pathname reaches it.
                     tracing::error!(event = "fsfreeze_worker_lost", mountpoint = %mountpoint, error = %err, "freeze worker lost; target uncertain");
+                    self.uncertain = true;
                     self.unrecoverable.get_or_insert((
                         mountpoint.clone(),
                         format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
@@ -618,6 +647,15 @@ impl Driver {
             self.commit_abort(AbortCause::ThawRequested);
             return self.settle_aborted().await;
         }
+        // Zero work (#43 §2): nothing frozen, nothing held for a drain
+        // (no `EBUSY` target), nothing uncertain and no worker
+        // outstanding leaves nothing to recover, so the operation settles
+        // `Thawed` with the marker removed, never `Frozen` with an armed
+        // watchdog and a gate closed on nothing. `frozen == 0` alone is
+        // not the test: a held handle keeps the conservative state.
+        if self.frozen == 0 && self.ctx.frozen_mount_count() == 0 && self.unrecoverable.is_none() {
+            return self.settle_nothing_frozen().await;
+        }
         tracing::info!(
             event = "fsfreeze_frozen",
             frozen = self.frozen,
@@ -625,6 +663,40 @@ impl Driver {
         );
         let frozen = self.frozen;
         self.conclude(Terminal::Frozen, Ok(frozen));
+    }
+
+    /// The operation committed with nothing frozen and nothing held: the
+    /// marker is removed (tracked) and the operation settles `Thawed`
+    /// with the reply `0`; a marker that cannot be removed keeps the
+    /// conservative state and the reply is an error.
+    async fn settle_nothing_frozen(mut self) {
+        let marker = self.marker.clone();
+        let removed = self
+            .await_tracked(self.spawn_blocking(move || marker.remove()), false)
+            .await;
+        match removed {
+            Ok(Ok(())) | Ok(Err(MarkerError::Absent { .. })) => {
+                tracing::info!(
+                    event = "fsfreeze_nothing_frozen",
+                    "no target frozen (empty or entirely skipped plan); thawed"
+                );
+                self.conclude(Terminal::Thawed, Ok(0));
+            }
+            Ok(Err(err)) => {
+                tracing::error!(event = "fsfreeze_marker_retained", error = %err, "nothing frozen but the marker cannot be removed; staying frozen");
+                self.conclude(
+                    Terminal::Frozen,
+                    Err(FreezeFailure::NothingFrozenMarkerRetained(err)),
+                );
+            }
+            Err(err) => {
+                tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
+                self.conclude(
+                    Terminal::Frozen,
+                    Err(FreezeFailure::Task(format!("marker removal lost: {err}"))),
+                );
+            }
+        }
     }
 
     /// Takes the abort decision at a boundary (no-op once committed).
@@ -784,6 +856,7 @@ impl Driver {
                 // The drain's handles are lost with it; the targets stay
                 // uncertain and the watchdog's drain by pathname follows.
                 tracing::error!(event = "fsfreeze_drain_lost", error = %err, "recovery drain lost; targets uncertain");
+                self.uncertain = true;
                 self.unrecoverable.get_or_insert((
                     "(recovery drain)".to_owned(),
                     format!("recovery drain lost ({err})"),
@@ -863,7 +936,10 @@ impl Driver {
                 self.ctx.hold_frozen_mounts(keep);
                 failure
             }
-            Err(err) => FreezeFailure::Task(format!("rollback lost: {err}")),
+            Err(err) => {
+                self.uncertain = true;
+                FreezeFailure::Task(format!("rollback lost: {err}"))
+            }
         };
         if failure.retains_frozen_state() || matches!(failure, FreezeFailure::Task(_)) {
             tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
@@ -939,6 +1015,13 @@ impl Driver {
             self.ctx.hooks.on_thawed(&self.ctx);
         }
         self.ctx.retire_freeze_op(&self.op);
+        // What the thaw of this operation's leftovers must do (§4.2 "Thaw
+        // scope"): drain the descriptors published, unless a target's
+        // outcome is unknown, in which case it discovers its targets.
+        self.ctx.set_thaw_scope(match terminal {
+            Terminal::Frozen if !self.uncertain => ThawScope::Tracked,
+            Terminal::Frozen | Terminal::Thawed => ThawScope::Discovery,
+        });
         let state = match terminal {
             Terminal::Thawed => {
                 if let Some(token) = self.token.take() {

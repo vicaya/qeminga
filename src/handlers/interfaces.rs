@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatch::Context;
 use crate::handlers::NoArgs;
@@ -205,16 +205,23 @@ pub fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
     IpAddr::V4(Ipv4Addr::new(a, b, c, d))
 }
 
+/// Bound on the encoded reply (§5.10, #43 §6): a guest with more
+/// interfaces and addresses than fit is answered with an explicit error,
+/// never a truncated list. 256 KiB is thousands of addresses.
+pub const MAX_INTERFACES_REPLY_BYTES: usize = 256 * 1024;
+
 /// `guest-network-get-interfaces` handler.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
     let source: Arc<dyn InterfaceSource> = Arc::clone(&ctx.interfaces);
-    Ok(json!(collect(source.addresses()?)))
+    let interfaces = collect(source.addresses()?);
+    crate::handlers::bounded_reply("interfaces", &interfaces, MAX_INTERFACES_REPLY_BYTES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn link(ifname: &str, loopback: bool, mac: Option<[u8; 6]>) -> RawAddr {
         RawAddr {
@@ -439,6 +446,45 @@ mod tests {
         fn addresses(&self) -> Result<Vec<RawAddr>, Error> {
             Ok(self.0.clone())
         }
+    }
+
+    #[tokio::test]
+    async fn a_reply_beyond_the_bound_is_an_explicit_error_not_a_truncated_list() {
+        // #43 §6: thousands of interfaces with an address each exceed the
+        // reply bound; the command fails naming it. A few hundred are
+        // answered whole.
+        let records = |n: u32| -> Vec<RawAddr> {
+            (0..n)
+                .flat_map(|i| {
+                    let name = format!("veth{i:05}");
+                    let octets = i.to_be_bytes();
+                    [
+                        link(
+                            &name,
+                            false,
+                            Some([2, 0, octets[1], octets[2], octets[3], 1]),
+                        ),
+                        ip(
+                            &name,
+                            &format!("10.{}.{}.{}", octets[1], octets[2], octets[3]),
+                            Some("255.255.255.0"),
+                        ),
+                    ]
+                })
+                .collect()
+        };
+        let req =
+            crate::proto::parse_request(br#"{"execute":"guest-network-get-interfaces"}"#).unwrap();
+        let ctx = Context::for_tests().with_interfaces(Arc::new(Fake(records(4_000))));
+        let err = handle(&ctx, &req).await.unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("over the 262144 byte bound") && text.contains("not truncated"),
+            "{text}"
+        );
+        let ctx = Context::for_tests().with_interfaces(Arc::new(Fake(records(500))));
+        let value = handle(&ctx, &req).await.unwrap();
+        assert_eq!(value.as_array().unwrap().len(), 500);
     }
 
     #[tokio::test]

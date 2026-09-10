@@ -58,6 +58,10 @@ fn is_enabled(config: &Config, name: &str) -> bool {
     match name {
         "guest-fstrim" => config.fstrim_enabled(),
         "guest-suspend-ram" => config.suspend_ram_enabled(),
+        "guest-shutdown" => config.shutdown_enabled(),
+        "guest-get-osinfo" | "guest-network-get-interfaces" | "guest-get-fsinfo" => {
+            config.information_enabled()
+        }
         _ => true,
     }
 }

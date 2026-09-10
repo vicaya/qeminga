@@ -5,8 +5,9 @@
 //!
 //! 1. parse ([`crate::proto::parse_request`], bounds first);
 //! 2. allowlist ([`is_allowlisted`], a `match` on the method string);
-//! 3. runtime feature gate (`guest-fstrim`, `guest-suspend-ram` may be
-//!    disabled by configuration → `CommandNotFound`, C-2);
+//! 3. runtime feature gate (`guest-fstrim`, `guest-suspend-ram`,
+//!    `guest-shutdown` and the information commands may be disabled by
+//!    configuration → `CommandNotFound`, C-2, §5.9);
 //! 4. rate limiter ([`ratelimit`]);
 //! 5. freeze gate ([`is_frozen_safe`]; anything else is rejected while the
 //!    state is not `Thawed`, AC9);
@@ -101,6 +102,22 @@ pub mod reason {
     pub const FROZEN: &str = "frozen";
 }
 
+/// How a thaw finds the filesystems it must drain (§4.2 "Thaw scope").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThawScope {
+    /// Every obligation is a held descriptor: a freeze operation this
+    /// process completed with no target's outcome unknown. The thaw
+    /// drains the descriptors the operation published and nothing else,
+    /// and reads no mount table: a superblock the operation never
+    /// touched cannot hold its thaw.
+    Tracked,
+    /// A filesystem may be frozen with no descriptor to show for it:
+    /// after a restart, for a drain from `Thawed`, or after an operation
+    /// that lost a worker or a drain. The thaw discovers every eligible
+    /// superblock through the mount table, by its pathnames and aliases.
+    Discovery,
+}
+
 /// Everything handlers need, shared behind an `Arc`. Tests build it with
 /// fakes; later tasks add the kernel shim and information sources.
 pub struct Context {
@@ -136,6 +153,8 @@ pub struct Context {
     /// held until their drain completes: a thaw drains the filesystem
     /// each was opened on, whatever its pathnames lead to by then (§4.2).
     frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
+    /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
+    thaw_scope: std::sync::Mutex<ThawScope>,
     /// The freeze operation in progress, from `Freezing` until it settles
     /// (§4.4 operation deadline).
     freeze_op: std::sync::Mutex<Option<Arc<crate::freeze_op::FreezeOp>>>,
@@ -194,6 +213,7 @@ impl Context {
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
+            thaw_scope: std::sync::Mutex::new(ThawScope::Discovery),
             freeze_op: std::sync::Mutex::new(None),
             freeze_operation_timeout,
             freeze_clock: Arc::new(crate::freeze_op::TokioClock),
@@ -317,6 +337,27 @@ impl Context {
         self
     }
 
+    /// Ends everything this instance has in flight, as the process's death
+    /// would: the watchdog is cancelled and a freeze walk waiting on its
+    /// workers is aborted, so neither can publish a state, write a marker
+    /// or thaw after the instance is gone. Blocking work already in the
+    /// kernel (an ioctl) completes on its own thread, as an in-flight
+    /// syscall does. For harnesses that model a crash (`SIGKILL`) and a
+    /// restart in one process; never called by the daemon itself, and
+    /// not an API for anything else: like the crash it models, it leaves
+    /// the state machine where it was (`Freezing`, a live marker, a
+    /// request never answered), which only a new instance's recovery
+    /// resolves.
+    #[doc(hidden)]
+    pub fn abort_tasks(&self) {
+        if let Some(watchdog) = self.watchdog_slot().take() {
+            watchdog.cancel();
+        }
+        if let Some(op) = self.freeze_op() {
+            op.abort_driver();
+        }
+    }
+
     /// The watchdog slot. The guard is short-lived and never held across
     /// an `.await`.
     pub fn watchdog_slot(
@@ -342,6 +383,24 @@ impl Context {
     /// Number of handles currently held.
     pub fn frozen_mount_count(&self) -> usize {
         self.frozen_mounts_slot().len()
+    }
+
+    /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
+    pub fn thaw_scope(&self) -> ThawScope {
+        *self
+            .thaw_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records how the next thaw must find what it drains: a settling
+    /// freeze operation sets it from what it knows of its targets, a
+    /// completed thaw resets it.
+    pub fn set_thaw_scope(&self, scope: ThawScope) {
+        *self
+            .thaw_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = scope;
     }
 
     /// The lock behind the held handles, for tests that must hold the
@@ -520,6 +579,14 @@ impl Dispatcher {
         match method {
             "guest-fstrim" if !config.fstrim_enabled() => Err(Error::Disabled(method.to_owned())),
             "guest-suspend-ram" if !config.suspend_ram_enabled() => {
+                Err(Error::Disabled(method.to_owned()))
+            }
+            "guest-shutdown" if !config.shutdown_enabled() => {
+                Err(Error::Disabled(method.to_owned()))
+            }
+            "guest-get-osinfo" | "guest-network-get-interfaces" | "guest-get-fsinfo"
+                if !config.information_enabled() =>
+            {
                 Err(Error::Disabled(method.to_owned()))
             }
             _ => Ok(()),
@@ -711,6 +778,10 @@ mod tests {
         }
 
         fn audit_records(&self) -> Vec<Value> {
+            assert!(
+                self.ctx().audit.settle(std::time::Duration::from_secs(10)),
+                "audit delivery stalled"
+            );
             self.sink
                 .lines()
                 .into_iter()
@@ -994,6 +1065,78 @@ mod tests {
             error_desc(&reply),
             "command guest-suspend-ram has been disabled"
         );
+    }
+
+    #[tokio::test]
+    async fn a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them()
+     {
+        // #43 §5: with shutdown, information and trim off, those commands
+        // answer `CommandNotFound` "has been disabled" (C-2) without a
+        // handler running or a kernel call, in every state, and freeze,
+        // thaw, status and the controls keep working. The profile comes
+        // from the configuration the daemon was started with; no request
+        // changes it.
+        let config =
+            Config::parse("[features]\nshutdown = false\ninformation = false\nfstrim = false\n")
+                .unwrap();
+        let h = Harness::new(FreezeState::Thawed, config);
+        for method in [
+            "guest-shutdown",
+            "guest-get-osinfo",
+            "guest-network-get-interfaces",
+            "guest-get-fsinfo",
+            "guest-fstrim",
+            "guest-suspend-ram",
+        ] {
+            let reply = h.execute(method).await;
+            assert_eq!(error_class(&reply), "CommandNotFound", "{method}: {reply}");
+            assert_eq!(
+                error_desc(&reply),
+                format!("command {method} has been disabled"),
+                "{method}"
+            );
+        }
+        assert_eq!(h.ctx().handler_calls(), 0, "no handler ran");
+        let kernel = h.ctx().kernel.clone();
+        let _ = kernel;
+        let ping = h.execute("guest-ping").await;
+        assert_eq!(ping["return"], serde_json::json!({}));
+        let status = h.execute("guest-fsfreeze-status").await;
+        assert_eq!(status["return"], "thawed");
+        let frozen = h.execute("guest-fsfreeze-freeze").await;
+        assert_eq!(frozen["return"], 2, "{frozen}");
+        let reply = h.execute("guest-shutdown").await;
+        assert_eq!(
+            error_class(&reply),
+            "CommandNotFound",
+            "disabled beats the frozen gate (C-7)"
+        );
+        let thawed = h.execute("guest-fsfreeze-thaw").await;
+        assert_eq!(thawed["return"], 2, "{thawed}");
+        let records = h.audit_records();
+        assert!(
+            records
+                .iter()
+                .filter(|r| r["reason"] == reason::DISABLED)
+                .count()
+                >= 7,
+            "{records:?}"
+        );
+        // The capability list says the same.
+        let info = h.execute("guest-info").await;
+        for e in info["return"]["supported_commands"].as_array().unwrap() {
+            let name = e["name"].as_str().unwrap();
+            let optional = matches!(
+                name,
+                "guest-shutdown"
+                    | "guest-get-osinfo"
+                    | "guest-network-get-interfaces"
+                    | "guest-get-fsinfo"
+                    | "guest-fstrim"
+                    | "guest-suspend-ram"
+            );
+            assert_eq!(e["enabled"], !optional, "{name}");
+        }
     }
 
     #[tokio::test]

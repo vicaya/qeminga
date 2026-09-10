@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use qeminga::audit::Router;
@@ -51,9 +52,36 @@ struct Rig {
     kernel: Arc<FakeKernel>,
     clock: ManualClock,
     peer: DuplexStream,
+    /// Bytes the session has read from the stream so far: with a small
+    /// stream buffer, the only way to know that a frame written has also
+    /// been consumed (the buffer may still hold its tail).
+    received: Arc<AtomicU64>,
     cancel: tokio::sync::watch::Sender<bool>,
     session: tokio::task::JoinHandle<SessionEnd>,
     _dir: tempfile::TempDir,
+}
+
+/// The session's reader, counting what it reads.
+struct Counted<R> {
+    inner: R,
+    received: Arc<AtomicU64>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Counted<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &polled {
+            let read = buf.filled().len() - before;
+            self.received
+                .fetch_add(u64::try_from(read).unwrap(), Ordering::SeqCst);
+        }
+        polled
+    }
 }
 
 fn rig() -> Rig {
@@ -80,6 +108,11 @@ fn rig_with_buffer(buffer: usize) -> Rig {
     );
     let (peer, ours) = tokio::io::duplex(buffer);
     let (reader, writer) = tokio::io::split(ours);
+    let received = Arc::new(AtomicU64::new(0));
+    let reader = Counted {
+        inner: reader,
+        received: Arc::clone(&received),
+    };
     let (cancel, mut cancel_rx) = channel::cancel_pair();
     let dispatcher = Dispatcher::new(Arc::clone(&ctx));
     let session = tokio::spawn(async move {
@@ -93,6 +126,7 @@ fn rig_with_buffer(buffer: usize) -> Rig {
         kernel,
         clock,
         peer,
+        received,
         cancel,
         session,
         _dir: dir,
@@ -103,6 +137,11 @@ impl Rig {
     async fn send(&mut self, frame: &str) {
         self.peer.write_all(frame.as_bytes()).await.unwrap();
         self.peer.write_all(b"\n").await.unwrap();
+    }
+
+    /// Bytes the session has read so far.
+    fn received(&self) -> u64 {
+        self.received.load(Ordering::SeqCst)
     }
 
     /// Reads one reply line (a delimited reply keeps its sentinel).
@@ -736,4 +775,62 @@ async fn a_lost_connection_leaves_the_operation_owned() {
     assert!(rig.ctx.freeze_op().is_none());
     assert!(!rig.ctx.marker.exists());
     drop(rig.cancel);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order() {
+    // #43 §6: a host that keeps asking for recovery while a drain is
+    // blocked inside FITHAW adds no work beyond the queue's places: the
+    // thaws behind the running one wait in the serial lane (a thaw runs
+    // beside a freeze only), a frame beyond the places is not read, and
+    // once the drain moves each thaw is answered from the kernel's own
+    // state (the drained targets answer "not frozen" at once), in order.
+    // The watchdog and the coordinator hold their own capacity, so the
+    // ability to request recovery is never rate-limited away. The stream
+    // holds 16 bytes, so a frame the session does not read is a write
+    // that does not complete.
+    let mut rig = rig_with_buffer(16);
+    let freeze = r#"{"execute":"guest-fsfreeze-freeze"}"#;
+    rig.send(freeze).await;
+    assert_eq!(rig.json_reply().await, json!({"return": 4}));
+    let a = rig.kernel.script_thaw_gate(A);
+    let _release = a.release_on_drop();
+    let mut sent = freeze.len() as u64 + 1;
+    for i in 1..=MAX_QUEUED as u64 {
+        let thaw = format!(r#"{{"execute":"guest-fsfreeze-thaw","id":{i}}}"#);
+        rig.send(&thaw).await;
+        sent += thaw.len() as u64 + 1;
+    }
+    let g = a.clone();
+    rig.wait_for("first thaw blocked", move |_| g.waiting() == 1)
+        .await;
+    // A write completes once the stream holds the bytes, before the
+    // session has read them: wait until every frame sent was consumed.
+    rig.wait_for("eight frames consumed", move |r| r.received() == sent)
+        .await;
+    assert_eq!(rig.ctx.handler_calls(), 2, "one thaw runs; the rest wait");
+    // The places are taken: a ninth thaw is not read. Every earlier
+    // frame was consumed whole, so the stream takes the ninth's first 16
+    // bytes and the write never completes while the places are held.
+    let ninth = b"{\"execute\":\"guest-fsfreeze-thaw\",\"id\":9}\n";
+    let unread = tokio::time::timeout(Duration::from_millis(200), rig.peer.write_all(ninth)).await;
+    assert!(unread.is_err(), "nothing is read while MAX_QUEUED are held");
+    assert_eq!(rig.ctx.handler_calls(), 2);
+    a.release();
+    assert_eq!(rig.json_reply().await, json!({"return": 4, "id": 1}));
+    for i in 2..=MAX_QUEUED as u64 {
+        // Each later thaw is a recovery drain from `Thawed`: every target
+        // answers EINVAL at once and the count is 0.
+        assert_eq!(rig.json_reply().await, json!({"return": 0, "id": i}));
+    }
+    // Reading freed the places: the ninth's first 16 bytes are read now
+    // and the rest of the frame follows.
+    rig.peer.write_all(&ninth[16..]).await.unwrap();
+    assert_eq!(rig.json_reply().await, json!({"return": 0, "id": 9}));
+    // Bounded work: the first drain issues success + EINVAL per target,
+    // every later one a single EINVAL per target.
+    let fithaws = rig.fithaws().len();
+    assert_eq!(fithaws, 4 * 2 + MAX_QUEUED * 4, "{fithaws}");
+    assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+    assert!(!rig.ctx.marker.exists());
 }

@@ -1,0 +1,25 @@
+# qeminga: the data-protection profile (design §5.9, #43 §5).
+#
+# A guest whose only job for the host is snapshot coordination: freeze,
+# thaw, status and the controls (ping, sync, info) stay; trim, the
+# information commands and power management are disabled. The daemon
+# derives its authority from this file before it accepts a host request:
+# without guest-shutdown it gives up CAP_SYS_BOOT and the reboot/sync
+# syscalls, without the information commands the netlink, uname and
+# statfs syscalls; the host cannot widen it. Install as
+# /etc/qeminga/config.toml in place of config.toml.
+[agent]
+config_version          = 1
+channel_path            = "/dev/virtio-ports/org.qemu.guest_agent.0"
+log_level               = "info"
+state_path              = "/run/qeminga/frozen"
+fsfreeze_idle_timeout_secs = 30
+fsfreeze_max_timeout_secs  = 300
+hardening               = "enforced"
+
+[features]
+suspend_ram = false
+fstrim      = false
+seccomp     = true
+shutdown    = false
+information = false

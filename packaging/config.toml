@@ -5,6 +5,7 @@ log_level               = "info"   # trace | debug | info | warn | error
 state_path              = "/run/qeminga/frozen"
 fsfreeze_idle_timeout_secs = 30    # auto-thaw if no guest-fsfreeze-status heartbeat received
 fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriving
+hardening               = "enforced"  # production: refuse to serve without the sandbox (§8.1)
 # fsfreeze_operation_timeout_secs = 60  # freeze-walk deadline; omitted: min(60, fsfreeze_max_timeout_secs)
 
 [rate_limits]
@@ -18,4 +19,6 @@ shutdown_per_min           = 2
 # Runtime half of the two-level feature flag (compile-time half: --features)
 suspend_ram = false   # opt-in: can disrupt security monitoring
 fstrim      = true    # opt-out: discard unused blocks
-seccomp     = true    # no effect if binary not compiled with --features seccomp
+seccomp     = true    # required under hardening = "enforced"
+shutdown    = true    # opt-out: guest-shutdown; off, CAP_SYS_BOOT and reboot(2) are given up too (§5.9)
+information = true    # opt-out: guest-get-osinfo, guest-network-get-interfaces, guest-get-fsinfo (§5.9)

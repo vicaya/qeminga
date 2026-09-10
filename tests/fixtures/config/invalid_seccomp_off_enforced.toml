@@ -1,0 +1,3 @@
+# The sandbox switched off without the development opt-out (#43 §4).
+[features]
+seccomp = false

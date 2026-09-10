@@ -1,0 +1,2 @@
+1 1 0:1 / / rw - rootfs rootfs rw
+2 1 8:1 / /data rw - ext4 /dev/vda1 rw

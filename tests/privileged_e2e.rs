@@ -17,7 +17,7 @@ mod e2e;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
-use e2e::{Agent, SpawnOptions};
+use e2e::{Agent, SpawnOptions, ThawGuard, dev_of, handle};
 use serde_json::{Value, json};
 
 fn ext4_mount() -> String {
@@ -25,63 +25,32 @@ fn ext4_mount() -> String {
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup")
 }
 
-/// `(major, minor)` of the filesystem `path` currently leads to.
-fn dev_of(path: &std::path::Path) -> (u32, u32) {
-    use std::os::unix::fs::MetadataExt;
-    let dev = std::fs::metadata(path).unwrap().dev();
-    (
-        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
-        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
-    )
-}
-
-/// A verified handle on whatever filesystem `path` leads to now (the
-/// test's own view, with `CAP_SYS_ADMIN`).
-fn handle(path: &std::path::Path) -> qeminga::kernel::Mount {
-    use qeminga::kernel::KernelOps;
-    qeminga::kernel::LinuxKernel
-        .open_mount(path, dev_of(path))
-        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
-}
-
-/// Thaws the named mounts when dropped, whatever happened in between: a
-/// failed assertion between freeze and thaw would otherwise leave the
-/// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
-/// taking its watchdog with it), so every later test would get EBUSY and
-/// a write to the mount would block in D state. `FITHAW` is repeated
-/// until it fails (nested freezes), bounded.
-struct ThawGuard(Vec<String>);
-
-impl ThawGuard {
-    fn new(mounts: &[String]) -> Self {
-        ThawGuard(mounts.to_vec())
-    }
-}
-
-impl Drop for ThawGuard {
-    fn drop(&mut self) {
-        use qeminga::kernel::KernelOps;
-        for mount in &self.0 {
-            let path = std::path::Path::new(mount);
-            let Ok(handle) = qeminga::kernel::LinuxKernel.open_mount(path, dev_of(path)) else {
-                continue;
-            };
-            for _ in 0..64 {
-                if qeminga::kernel::LinuxKernel.fithaw(&handle).is_err() {
-                    break;
-                }
-                eprintln!("ThawGuard: thawed {mount} left frozen by the test");
-            }
-        }
-    }
-}
-
+/// The real kernel, and the default (enforced) hardening whenever this
+/// build can provide it: the enforced privileged run therefore proves
+/// the production profile end to end, while the `seccomp-log`
+/// compatibility run opts out, as a development host must (#43 §4).
 fn real_kernel(agent_extra: &str) -> SpawnOptions {
     SpawnOptions {
         fake_kernel: false,
         agent_extra: agent_extra.to_owned(),
+        enforce_hardening: qeminga::daemon::seccomp_mode() == "enforce",
         ..SpawnOptions::default()
     }
+}
+
+/// The number of seccomp audit lines (`type=1326`) in the kernel log, or
+/// `None` where dmesg cannot be read. A run under the `seccomp-log`
+/// build that adds one used a syscall the installed profile omits.
+fn seccomp_audit_lines() -> Option<usize> {
+    std::process::Command::new("dmesg")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .matches("type=1326")
+                .count()
+        })
 }
 
 fn freeze_list(agent: &mut Agent, mounts: &[String]) -> Value {
@@ -132,8 +101,261 @@ fn privileged_freeze_sigkill_restart_recovery_thaw() {
     assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
     // The filesystem really is thawed: a write completes.
     std::fs::write(format!("{mount}/after-thaw"), b"ok").unwrap();
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"event\":\"recovery_mode\""), "{stderr}");
+    agent.wait_for_stderr("\"event\":\"recovery_mode\"", e2e::REPLY_TIMEOUT);
+    assert!(agent.stop().success());
+}
+
+/// A second, independent filesystem for tests that need two: the xfs
+/// loop mount when `mk-loop-fs.sh` made one, else an ext4 image of its
+/// own on a loop device, detached on drop.
+struct SecondFs {
+    mount: String,
+    loop_dev: Option<String>,
+    _dir: Option<tempfile::TempDir>,
+}
+
+impl SecondFs {
+    fn new() -> Self {
+        if let Ok(mount) = std::env::var("QEMINGA_TEST_XFS_MOUNT") {
+            return SecondFs {
+                mount,
+                loop_dev: None,
+                _dir: None,
+            };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("second.img");
+        let mount = dir.path().join("second");
+        std::fs::create_dir(&mount).unwrap();
+        let ok = |cmd: &str, args: &[&str]| {
+            let out = std::process::Command::new(cmd).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{cmd} {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        ok("truncate", &["-s", "64M", image.to_str().unwrap()]);
+        ok("mkfs.ext4", &["-q", image.to_str().unwrap()]);
+        let loop_dev = ok("losetup", &["--find", "--show", image.to_str().unwrap()]);
+        ok("mount", &[&loop_dev, mount.to_str().unwrap()]);
+        SecondFs {
+            mount: mount.to_str().unwrap().to_owned(),
+            loop_dev: Some(loop_dev),
+            _dir: Some(dir),
+        }
+    }
+}
+
+impl Drop for SecondFs {
+    fn drop(&mut self) {
+        if let Some(loop_dev) = &self.loop_dev {
+            let _ = std::process::Command::new("umount")
+                .arg(&self.mount)
+                .status();
+            let _ = std::process::Command::new("losetup")
+                .args(["-d", loop_dev])
+                .status();
+        }
+    }
+}
+
+/// The external review's arrangement, on real mounts in a private tmpfs:
+/// A bound first (`staging-a`), B bound at `data` and again at `b-alias`,
+/// then A moved over `data`. A keeps its earlier row in the mount table
+/// while it is what `data` leads to. Unmounted in reverse on drop.
+struct MovedMount {
+    base: tempfile::TempDir,
+}
+
+impl MovedMount {
+    fn arrange(a: &str, b: &str) -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().to_str().unwrap().to_owned();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("mount")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "mount {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["-t", "tmpfs", "tmpfs", &root]);
+        sh(&["--make-private", &root]);
+        for d in ["staging-a", "data", "b-alias"] {
+            std::fs::create_dir(base.path().join(d)).unwrap();
+        }
+        sh(&["--bind", a, &format!("{root}/staging-a")]);
+        sh(&["--bind", b, &format!("{root}/data")]);
+        sh(&["--bind", b, &format!("{root}/b-alias")]);
+        // A bind mount joins its source's peer group: on a host whose
+        // mounts are shared (systemd's default), the move onto B's bind
+        // would otherwise propagate A over every peer of B, its original
+        // mount point included. The subtree is private before the move.
+        sh(&["--make-rprivate", &root]);
+        sh(&[
+            "--move",
+            &format!("{root}/staging-a"),
+            &format!("{root}/data"),
+        ]);
+        MovedMount { base }
+    }
+
+    fn data(&self) -> String {
+        format!("{}/data", self.base.path().to_str().unwrap())
+    }
+
+    fn b_alias(&self) -> String {
+        format!("{}/b-alias", self.base.path().to_str().unwrap())
+    }
+}
+
+impl Drop for MovedMount {
+    fn drop(&mut self) {
+        let root = self.base.path().to_str().unwrap().to_owned();
+        for target in [
+            format!("{root}/data"),
+            format!("{root}/data"),
+            format!("{root}/b-alias"),
+            root,
+        ] {
+            let _ = std::process::Command::new("umount").arg(&target).status();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_a_mount_moved_over_a_newer_one_is_what_the_request_freezes() {
+    // The external review's counterexample on the real kernel: with A
+    // moved over B at `data`, a request for `data` must freeze A (what
+    // the pathname leads to) and not B (the later row at that path, still
+    // reachable at `b-alias`), and the count must be 1. Proven on the
+    // superblocks themselves: FIFREEZE on A's original mount answers
+    // EBUSY (already frozen), on B's it succeeds (thawed again at once).
+    use qeminga::kernel::KernelOps;
+    let b = ext4_mount();
+    let second = SecondFs::new();
+    let a = second.mount.clone();
+    let _thaw = ThawGuard::new(&[a.clone(), b.clone()]);
+    let arranged = MovedMount::arrange(&a, &b);
+    let data = arranged.data();
+    assert_eq!(
+        dev_of(std::path::Path::new(&data)),
+        dev_of(std::path::Path::new(&a)),
+        "A is what data leads to"
+    );
+    assert_eq!(
+        dev_of(std::path::Path::new(&b)),
+        dev_of(std::path::Path::new(&arranged.b_alias())),
+        "B still leads to its own superblock: the move did not propagate"
+    );
+    let kernel = qeminga::kernel::LinuxKernel;
+    // Both superblocks start thawed (a freeze and thaw of each succeed),
+    // so a freeze found afterwards is the request's.
+    for (name, mount) in [("A", &a), ("B", &b)] {
+        let handle = handle(std::path::Path::new(mount));
+        kernel
+            .fifreeze(&handle)
+            .unwrap_or_else(|err| panic!("{name} is frozen before the request: {err}"));
+        kernel.fithaw(&handle).unwrap();
+    }
+    let rows = || {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap()
+            .lines()
+            .filter(|row| row.contains(&a) || row.contains(&b) || row.contains(&data))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&data)),
+        json!({"return": 1})
+    );
+    let frozen = kernel.fifreeze(&handle(std::path::Path::new(&a)));
+    assert!(
+        matches!(
+            frozen,
+            Err(qeminga::kernel::KernelError::Errno(
+                nix::errno::Errno::EBUSY
+            ))
+        ),
+        "A is frozen: {frozen:?}\nmounts:\n{}\ndaemon stderr:\n{}",
+        rows(),
+        agent.stderr_text()
+    );
+    let b_handle = handle(std::path::Path::new(&b));
+    if let Err(err) = kernel.fifreeze(&b_handle) {
+        panic!(
+            "B is not frozen: {err}\nmounts:\n{}\ndaemon stderr:\n{}",
+            rows(),
+            agent.stderr_text()
+        );
+    }
+    kernel.fithaw(&b_handle).unwrap();
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert_eq!(thawed["return"], 1, "{thawed}");
+    std::fs::write(format!("{a}/after-moved-mount-thaw"), b"ok").unwrap();
+    std::fs::write(format!("{b}/after-moved-mount-thaw"), b"ok").unwrap();
+    assert!(agent.stop().success());
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_every_thread_carries_the_dropped_ceiling() {
+    // §5.4 (external review, finding 3): capability sets and the bounding
+    // set are per thread, and the drop trims the calling thread's, so a
+    // thread created before it would keep the unit's bounding set. Every
+    // thread is created after the drop (the audit writer at step 5b, the
+    // runtime's after the filter): after a freeze and thaw have put the
+    // blocking pool to work, every thread of the daemon shows the dropped
+    // uid, the final sets, the trimmed bounding set, no-new-privs and the
+    // filter, not only the main thread.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    agent.wait_for_stderr("\"event\":\"privileges_dropped\"", e2e::REPLY_TIMEOUT);
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    let threads = e2e::thread_statuses(agent.pid());
+    let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
+    assert!(
+        names.contains(&"qeminga-audit") && names.iter().any(|n| n.starts_with("qeminga-work")),
+        "the audit writer and the runtime's workers are there: {names:?}"
+    );
+    assert!(threads.len() >= 3, "{names:?}");
+    // CAP_DAC_READ_SEARCH (2), CAP_SYS_ADMIN (21), CAP_SYS_BOOT (22).
+    for t in &threads {
+        assert!(
+            t.field("Uid:").starts_with("600\t600"),
+            "{}: {}",
+            t.name,
+            t.field("Uid:")
+        );
+        for set in ["CapEff:", "CapPrm:", "CapBnd:"] {
+            assert_eq!(t.field(set), "0000000000600004", "{} {set}", t.name);
+        }
+        assert_eq!(t.field("CapInh:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("CapAmb:"), "0000000000000000", "{}", t.name);
+        assert_eq!(t.field("NoNewPrivs:"), "1", "{}", t.name);
+        if cfg!(feature = "seccomp") {
+            assert_eq!(t.field("Seccomp:"), "2", "{}", t.name);
+        }
+    }
     assert!(agent.stop().success());
 }
 
@@ -435,11 +657,7 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         writable_within(&alias.0, "after-handle-thaw", Duration::from_secs(10)),
         "the ext4 is thawed, not the tmpfs in its place"
     );
-    assert!(
-        agent
-            .stderr_text()
-            .contains("\"event\":\"fsfreeze_thawed\"")
-    );
+    agent.wait_for_stderr("\"event\":\"fsfreeze_thawed\"", e2e::REPLY_TIMEOUT);
 
     // (2) Restart: nothing held, the alias is how the ext4 is reached.
     drop(over);
@@ -465,8 +683,7 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         writable_within(&alias.0, "after-alias-thaw", Duration::from_secs(10)),
         "recovery thawed the ext4 through its alias"
     );
-    let stderr = agent.stderr_text();
-    assert!(stderr.contains("\"event\":\"fsfreeze_alias\""), "{stderr}");
+    agent.wait_for_stderr("\"event\":\"fsfreeze_alias\"", e2e::REPLY_TIMEOUT);
 
     // (3) Restart with no pathname leading to the ext4 at all (every
     // mount of its device is covered, the loop script's own bind mount
@@ -637,11 +854,13 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
     }
     assert!(filled > 0, "the pipe was filled to capacity");
     set_nonblock(&writer, false);
-    // Thaw with the pipe full. The proof that the FITHAW drain completed
-    // comes from the filesystem itself, not from the daemon's reply (which
-    // cannot be written until the flush that precedes it unblocks): a
-    // write to the mount blocks in D state while frozen and completes as
-    // soon as the drain has thawed it.
+    // Thaw with the pipe full and left full (#43 §3: the pipe is not
+    // drained first, which would hide a dependency on the sink). The
+    // FITHAW drain is proved from the filesystem itself: a write to the
+    // mount blocks in D state while frozen and completes as soon as the
+    // drain has thawed it; and the reply arrives while the pipe is still
+    // full, because delivery of the audit records is the writer thread's
+    // business, not the thaw's finalisation.
     agent.send_line(r#"{"execute":"guest-fsfreeze-thaw","id":9999}"#);
     let probe_path = format!("{mount}/probe-during-full-pipe");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -655,27 +874,45 @@ fn privileged_journald_pipe_full_does_not_deadlock_thaw() {
             "the filesystem was not thawed within 20 s while stderr was blocked: the drain waited on the flush (§9.1)"
         ),
     }
-    // Nothing more reached the pipe (still full) and no reply yet: the
-    // flush, and the reply after it, wait for journald, not the drain.
-    assert!(
-        agent.read_line(Duration::from_millis(300)).is_none(),
-        "the reply is written only after the flush, which is blocked"
+    // The reply is delivered while the pipe is still full: state, marker
+    // and reply never waited for journald.
+    let reply = agent
+        .read_line(Duration::from_secs(10))
+        .expect("the thaw reply while stderr is blocked (#43 §3)");
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert!(reply["return"].as_u64().unwrap() >= 1, "{reply}");
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "thawed",
+        "status served while stderr is blocked"
     );
-    // journald comes back: drain the pipe, and the flush and reply follow.
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1}),
+        "a subsequent permitted operation completes while stderr is blocked"
+    );
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    // journald comes back: drain the pipe and the queued records follow,
+    // the ring's loss record among them.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let reply = loop {
+    loop {
         drain(&mut stderr, &mut drained);
-        if let Some(line) = agent.read_line(Duration::from_millis(50)) {
-            break line;
+        let text = String::from_utf8_lossy(&drained);
+        if text.contains("\"event\":\"fsfreeze_thawed\"") {
+            break;
         }
         assert!(
             Instant::now() < deadline,
-            "no thaw reply after draining; drained {} bytes",
+            "queued records not delivered after draining; drained {} bytes",
             drained.len()
         );
-    };
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert!(reply["return"].as_u64().unwrap() >= 1, "{reply}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
     drain(&mut stderr, &mut drained);
     let text = String::from_utf8_lossy(&drained);
     assert!(
@@ -752,19 +989,10 @@ fn privileged_seccomp_matrix_log_then_enforce() {
     // deliberately excludes `seccomp-log` (AC15).
     let mount = ext4_mount();
     let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
-    let audit_lines = || -> Option<usize> {
-        std::process::Command::new("dmesg")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .matches("type=1326")
-                    .count()
-            })
-    };
+    let audit_lines = seccomp_audit_lines;
     let before = audit_lines();
     let mut agent = Agent::spawn_with(real_kernel(""));
+    agent.wait_for_stderr("\"event\":\"seccomp\"", e2e::REPLY_TIMEOUT);
     let stderr = agent.stderr_text();
     let installed = stderr.contains("\"event\":\"seccomp\",\"installed\":true");
     assert_eq!(installed, cfg!(feature = "seccomp"), "{stderr}");
@@ -815,6 +1043,208 @@ fn privileged_seccomp_matrix_log_then_enforce() {
         assert_eq!(
             a, b,
             "seccomp audit lines appeared in dmesg (a syscall is missing from the profile)"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_data_protection_profile_holds_no_reboot_authority() {
+    // #43 §5: with shutdown, information and trim off, the daemon runs
+    // with exactly CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH (no CAP_SYS_BOOT
+    // to regain), under a filter without reboot, uname, statfs or the
+    // netlink syscalls, and still freezes and thaws the real filesystem;
+    // the optional commands answer "disabled" and nothing the host sends
+    // widens the profile. Under the `seccomp-log` build a syscall this
+    // profile omits shows as a seccomp audit line, so the run asserts
+    // there is none.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let before = seccomp_audit_lines();
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
+        ..real_kernel("")
+    });
+    agent.wait_for_stderr(
+        "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false",
+        e2e::REPLY_TIMEOUT,
+    );
+    let stderr = agent.stderr_text();
+    let status = std::fs::read_to_string(format!("/proc/{}/status", agent.pid())).unwrap();
+    let field = |name: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing in {status}"))
+            .trim()
+            .to_owned()
+    };
+    if stderr.contains("\"event\":\"privileges_dropped\"") {
+        // CAP_DAC_READ_SEARCH (2) and CAP_SYS_ADMIN (21) only.
+        assert_eq!(field("CapEff:"), "0000000000200004");
+        assert_eq!(field("CapPrm:"), "0000000000200004");
+        assert_eq!(
+            field("CapBnd:"),
+            "0000000000200004",
+            "CAP_SYS_BOOT cannot be regained"
+        );
+    }
+    if cfg!(feature = "seccomp") {
+        assert_eq!(field("Seccomp:"), "2");
+    }
+    for method in [
+        "guest-shutdown",
+        "guest-get-osinfo",
+        "guest-network-get-interfaces",
+        "guest-get-fsinfo",
+        "guest-fstrim",
+    ] {
+        let reply = agent.execute(method);
+        assert_eq!(
+            reply["error"]["class"], "CommandNotFound",
+            "{method}: {reply}"
+        );
+        assert_eq!(
+            reply["error"]["desc"],
+            format!("command {method} has been disabled"),
+            "{method}"
+        );
+    }
+    assert!(agent.is_running(), "a disabled shutdown rebooted nothing");
+    assert_eq!(agent.execute("guest-ping")["return"], json!({}));
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    assert!(
+        agent.execute("guest-fsfreeze-thaw")["return"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    std::fs::write(format!("{mount}/after-data-protection-thaw"), b"ok").unwrap();
+    // The derived ceiling holds on every thread (§5.4): after the freeze
+    // and thaw the audit writer and the blocking pool are there, and none
+    // of them holds CAP_SYS_BOOT in any set.
+    if stderr.contains("\"event\":\"privileges_dropped\"") {
+        let threads = e2e::thread_statuses(agent.pid());
+        let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"qeminga-audit") && threads.len() >= 3,
+            "{names:?}"
+        );
+        for t in &threads {
+            for set in ["CapEff:", "CapPrm:", "CapBnd:"] {
+                assert_eq!(t.field(set), "0000000000200004", "{} {set}", t.name);
+            }
+            assert_eq!(t.field("CapInh:"), "0000000000000000", "{}", t.name);
+            assert_eq!(t.field("CapAmb:"), "0000000000000000", "{}", t.name);
+            assert_eq!(t.field("NoNewPrivs:"), "1", "{}", t.name);
+            assert!(t.field("Uid:").starts_with("600\t600"), "{}", t.name);
+            if cfg!(feature = "seccomp") {
+                assert_eq!(t.field("Seccomp:"), "2", "{}", t.name);
+            }
+        }
+    }
+    let info = agent.execute("guest-info");
+    let disabled: Vec<&str> = info["return"]["supported_commands"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["enabled"] == false)
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        disabled,
+        [
+            "guest-get-osinfo",
+            "guest-network-get-interfaces",
+            "guest-get-fsinfo",
+            "guest-fstrim",
+            "guest-shutdown",
+            "guest-suspend-ram",
+        ]
+    );
+    assert!(agent.stop().success());
+    if let (Some(b), Some(a)) = (before, seccomp_audit_lines()) {
+        assert_eq!(
+            a, b,
+            "seccomp audit lines appeared in dmesg (a syscall is missing from the data-protection profile)"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_data_protection_profile_recovers_without_the_host() {
+    // §5.9, AC25: "a profile change between two starts strands nothing"
+    // rests on the recovery paths using only what every profile keeps.
+    // Under the narrowed profile, on the real kernel: a freeze, SIGKILL,
+    // a restart into recovery mode from the marker and the recovery thaw
+    // (the ring flushed behind it); a freeze the idle watchdog thaws on
+    // its own; a channel EOF and the reopen. No seccomp audit line
+    // appears for any of it, so the `seccomp-log` run detects a syscall
+    // the profile omits on these paths as well as on the happy path.
+    let mount = ext4_mount();
+    let _thaw = ThawGuard::new(std::slice::from_ref(&mount));
+    let before = seccomp_audit_lines();
+    let profile = || SpawnOptions {
+        features_extra: "shutdown = false\ninformation = false\nfstrim = false\n".to_owned(),
+        ..real_kernel("fsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\n")
+    };
+    let mut agent = Agent::spawn_with(profile());
+    agent.wait_for_stderr(
+        "\"event\":\"authority\",\"reboot\":false,\"information\":false,\"trim\":false",
+        e2e::REPLY_TIMEOUT,
+    );
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    // Crash while frozen; restart under the same profile and state
+    // directory: recovery mode, and the thaw drains the real filesystem.
+    let dir = agent.kill();
+    assert!(
+        dir.path().join("frozen").exists(),
+        "marker survives SIGKILL"
+    );
+    let mut agent = Agent::spawn_with(SpawnOptions {
+        state_dir: Some(dir),
+        ..profile()
+    });
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "frozen",
+        "recovery mode"
+    );
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert!(thawed["return"].as_u64().unwrap() >= 1, "{thawed}");
+    assert!(!agent.state_dir().join("frozen").exists(), "marker gone");
+    std::fs::write(format!("{mount}/after-recovery-thaw"), b"ok").unwrap();
+    agent.wait_for_stderr("\"event\":\"recovery_mode\"", e2e::REPLY_TIMEOUT);
+    // A freeze the host abandons: the idle watchdog thaws it.
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&mount)),
+        json!({"return": 1})
+    );
+    std::thread::sleep(Duration::from_millis(3500));
+    assert_eq!(
+        agent.execute("guest-fsfreeze-status")["return"],
+        "thawed",
+        "idle timeout"
+    );
+    assert!(!agent.state_dir().join("frozen").exists());
+    std::fs::write(format!("{mount}/after-watchdog"), b"ok").unwrap();
+    // The channel closes and reopens.
+    agent.reopen_channel();
+    let reply = agent.request_timeout(r#"{"execute":"guest-ping"}"#, e2e::REOPEN_TIMEOUT);
+    assert_eq!(reply["return"], json!({}));
+    assert!(agent.stop().success());
+    if let (Some(b), Some(a)) = (before, seccomp_audit_lines()) {
+        assert_eq!(
+            a, b,
+            "seccomp audit lines appeared in dmesg: a recovery path uses a syscall the data-protection profile omits"
         );
     }
 }

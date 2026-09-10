@@ -23,6 +23,100 @@ use nix::fcntl::OFlag;
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use serde_json::Value;
 
+/// One thread of a process, as `/proc/<pid>/task/<tid>/status` shows it.
+pub struct ThreadStatus {
+    pub tid: u32,
+    pub name: String,
+    status: String,
+}
+
+impl ThreadStatus {
+    /// The value of a `status` field, `"Uid:"` say; panics when absent.
+    pub fn field(&self, name: &str) -> String {
+        self.status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing for tid {}:\n{}", self.tid, self.status))
+            .trim()
+            .to_owned()
+    }
+}
+
+/// Every thread of `pid` right now. Capability sets, the bounding set,
+/// `no_new_privs` and the seccomp mode are per thread (§5.4), so a
+/// ceiling is only established when every thread shows it.
+pub fn thread_statuses(pid: u32) -> Vec<ThreadStatus> {
+    let mut threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+        let entry = entry.unwrap();
+        let tid: u32 = entry.file_name().to_string_lossy().parse().unwrap();
+        let Ok(status) = std::fs::read_to_string(entry.path().join("status")) else {
+            continue; // exited between the listing and the read
+        };
+        let name = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Name:"))
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        threads.push(ThreadStatus { tid, name, status });
+    }
+    threads.sort_by_key(|t| t.tid);
+    threads
+}
+
+/// `(major, minor)` of the filesystem `path` currently leads to.
+pub fn dev_of(path: &std::path::Path) -> (u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let dev = std::fs::metadata(path).unwrap().dev();
+    (
+        u32::try_from(nix::sys::stat::major(dev)).unwrap(),
+        u32::try_from(nix::sys::stat::minor(dev)).unwrap(),
+    )
+}
+
+/// A verified handle on whatever filesystem `path` leads to now (the
+/// test's own view, with `CAP_SYS_ADMIN`).
+pub fn handle(path: &std::path::Path) -> qeminga::kernel::Mount {
+    use qeminga::kernel::KernelOps;
+    qeminga::kernel::LinuxKernel
+        .open_mount(path, dev_of(path))
+        .unwrap_or_else(|err| panic!("open {}: {err}", path.display()))
+}
+
+/// Thaws the named mounts when dropped, whatever happened in between: a
+/// failed assertion between freeze and thaw would otherwise leave the
+/// loop filesystem frozen (the daemon is SIGKILLed by `Agent::drop`,
+/// taking its watchdog with it), so every later test would get EBUSY and
+/// a write to the mount would block in D state. `FITHAW` is repeated
+/// until it fails (nested freezes), bounded.
+pub struct ThawGuard(Vec<String>);
+
+impl ThawGuard {
+    /// Thaws `mounts` on drop, as often as `FITHAW` succeeds.
+    pub fn new(mounts: &[String]) -> Self {
+        ThawGuard(mounts.to_vec())
+    }
+}
+
+impl Drop for ThawGuard {
+    fn drop(&mut self) {
+        use qeminga::kernel::KernelOps;
+        for mount in &self.0 {
+            let path = std::path::Path::new(mount);
+            let Ok(handle) = qeminga::kernel::LinuxKernel.open_mount(path, dev_of(path)) else {
+                continue;
+            };
+            for _ in 0..64 {
+                if qeminga::kernel::LinuxKernel.fithaw(&handle).is_err() {
+                    break;
+                }
+                eprintln!("ThawGuard: thawed {mount} left frozen by the test");
+            }
+        }
+    }
+}
+
 /// Default reply timeout.
 pub const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -45,6 +139,16 @@ pub struct SpawnOptions {
     /// Give the daemon a pipe as stderr instead of a file; the read end is
     /// returned by [`Agent::take_stderr_pipe`] (AC13).
     pub stderr_pipe: bool,
+    /// Start under the default (enforced) hardening: root, an enforcing
+    /// filter compiled in, the real kernel. Off by default: the harness
+    /// writes the development opt-out, which is what an unprivileged run
+    /// or a faked kernel needs (#43 §4).
+    pub enforce_hardening: bool,
+    /// Leave a recovery marker in the state directory before the spawn,
+    /// so the daemon starts in recovery mode (`Frozen`, the ring holding
+    /// its records) without any ioctl: the way to a frozen agent that
+    /// works unprivileged and without fakes.
+    pub recovery_marker: bool,
 }
 
 impl Default for SpawnOptions {
@@ -55,6 +159,8 @@ impl Default for SpawnOptions {
             features_extra: String::new(),
             state_dir: None,
             stderr_pipe: false,
+            enforce_hardening: false,
+            recovery_marker: false,
         }
     }
 }
@@ -156,18 +262,30 @@ impl Agent {
         std::fs::write(
             &config_path,
             format!(
-                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}\n[features]\nseccomp = true\n{}\n",
+                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}\n[features]\nseccomp = true\n{}\n",
                 link.display(),
                 dir.path().join("frozen").display(),
+                if opts.enforce_hardening {
+                    ""
+                } else {
+                    "hardening = \"unenforced-development-only\"\n"
+                },
                 opts.agent_extra,
                 opts.features_extra
             ),
         )
         .unwrap();
+        if opts.recovery_marker {
+            std::fs::write(dir.path().join("frozen"), b"").unwrap();
+        }
         if nix::unistd::geteuid().is_root()
             && let Some(user) = nix::unistd::User::from_name("qeminga").unwrap()
         {
             nix::unistd::chown(dir.path(), Some(user.uid), Some(user.gid)).unwrap();
+            if opts.recovery_marker {
+                nix::unistd::chown(&dir.path().join("frozen"), Some(user.uid), Some(user.gid))
+                    .unwrap();
+            }
         }
         let stderr_path = dir.path().join("stderr.log");
         let mut stderr_pipe = None;
@@ -209,7 +327,16 @@ impl Agent {
             stderr_writer,
             pending: Vec::new(),
         };
-        if agent.stderr_pipe.is_none() {
+        if opts.recovery_marker {
+            // Recovery mode writes nothing to stderr until a thaw (§4.4):
+            // the channel is proved open by a reply instead.
+            let reply = agent.request_timeout(r#"{"execute":"guest-ping"}"#, REPLY_TIMEOUT);
+            assert_eq!(
+                reply,
+                serde_json::json!({"return": {}}),
+                "recovery-mode start"
+            );
+        } else if agent.stderr_pipe.is_none() {
             agent.wait_for_stderr("\"event\":\"channel_open\"", Duration::from_secs(10));
         } else {
             // Give the daemon time to open the channel; the caller drains
@@ -231,12 +358,54 @@ impl Agent {
         self.stderr_writer.take()
     }
 
+    /// Fills the daemon's stderr pipe to capacity from the test's own
+    /// write end and leaves it full, so the daemon's next write to stderr
+    /// blocks as a journald that stopped reading would make it (§9.1).
+    /// `O_NONBLOCK` is a status flag of the open file description, which
+    /// the dup shares with the daemon's stderr: it is set only while the
+    /// pipe is being filled and cleared before returning. Returns the
+    /// number of bytes it took.
+    pub fn fill_stderr_pipe(&mut self) -> usize {
+        use std::io::Write;
+        let writer = self.stderr_writer.as_ref().expect("a stderr_pipe spawn");
+        let set_nonblock = |writer: &File, on: bool| {
+            use std::os::fd::AsFd;
+            let fd = writer.as_fd();
+            let flags = nix::fcntl::OFlag::from_bits_retain(
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL).unwrap(),
+            );
+            let flags = if on {
+                flags | nix::fcntl::OFlag::O_NONBLOCK
+            } else {
+                flags - nix::fcntl::OFlag::O_NONBLOCK
+            };
+            nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags)).unwrap();
+        };
+        set_nonblock(writer, true);
+        let mut filled = 0usize;
+        loop {
+            match (&*writer).write(&[b'#'; 4096]) {
+                Ok(n) => filled += n,
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("filling the pipe: {err}"),
+            }
+        }
+        set_nonblock(writer, false);
+        assert!(filled > 0, "the pipe was filled to capacity");
+        filled
+    }
+
     /// Kills the daemon with SIGKILL (a crash) and returns the state
     /// directory so a restart can reuse it (AC10).
     pub fn kill(mut self) -> tempfile::TempDir {
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.dir.take().unwrap()
+    }
+
+    /// The daemon's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     /// `true` when the binary can fake the kernel.
@@ -262,6 +431,33 @@ impl Agent {
             assert!(
                 Instant::now() < deadline,
                 "timeout waiting for {needle:?}; stderr:\n{}",
+                self.stderr_text()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Waits until stderr holds exactly `count` occurrences of `needle`
+    /// (at least `count` to stop waiting, then exactly). Audit delivery
+    /// runs on the daemon's writer thread, unordered with respect to the
+    /// replies (§9.1), so a record is never read right after its reply.
+    pub fn wait_for_stderr_count(&mut self, needle: &str, count: usize, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = self.stderr_text().matches(needle).count();
+            if seen >= count {
+                assert_eq!(seen, count, "{needle:?}; stderr:\n{}", self.stderr_text());
+                return;
+            }
+            if let Some(status) = self.child.try_wait().unwrap() {
+                panic!(
+                    "daemon exited with {status}; stderr:\n{}",
+                    self.stderr_text()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timeout waiting for {count} x {needle:?} (saw {seen}); stderr:\n{}",
                 self.stderr_text()
             );
             std::thread::sleep(Duration::from_millis(10));

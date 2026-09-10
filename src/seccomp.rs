@@ -17,6 +17,7 @@
 
 use seccompiler::{BpfProgram, TargetArch};
 
+use crate::config::Authority;
 use crate::kernel::ioctl::{FIFREEZE, FITHAW, FITRIM};
 
 /// The two supported targets (§8.5).
@@ -89,8 +90,6 @@ pub const COMMON: &[&str] = &[
     "newfstatat",
     "statx",
     "fstat",
-    "statfs",
-    "fstatfs",
     "getdents64",
     "readlinkat",
     "faccessat",
@@ -133,6 +132,12 @@ pub const COMMON: &[&str] = &[
     "ppoll",
     "pipe2",
     "socketpair",
+    // The signal driver's socketpair is written with send(2) and read
+    // with recv(2), which are sendto/recvfrom on Linux: needed to stop the
+    // daemon whatever the profile (observed under the data-protection
+    // profile as SECCOMP audit lines for syscalls 44 and 45 on x86-64).
+    "sendto",
+    "recvfrom",
     // Signals.
     "rt_sigaction",
     "rt_sigprocmask",
@@ -149,21 +154,32 @@ pub const COMMON: &[&str] = &[
     "getgid",
     "getegid",
     "getrandom",
-    // OS and network information (`socket` is listed separately,
-    // restricted to AF_NETLINK: getifaddrs(3) talks NETLINK_ROUTE).
+    // ioctl is listed separately with argument conditions; the
+    // information and power-management surfaces are in INFORMATION and
+    // POWER, present only with their consumer (§5.9).
+];
+
+/// Syscalls only the information commands need (§5.5, §5.9): `uname` for
+/// `guest-get-osinfo`, `statfs`/`fstatfs` for `guest-get-fsinfo`, and the
+/// netlink exchange of getifaddrs(3) for `guest-network-get-interfaces`
+/// (`socket` is listed separately, restricted to AF_NETLINK; `sendto` and
+/// `recvfrom` are common, the signal driver needs them too). Absent from
+/// the profile when `[features] information = false`.
+pub const INFORMATION: &[&str] = &[
     "uname",
+    "statfs",
+    "fstatfs",
     "bind",
     "getsockname",
-    "sendto",
     "sendmsg",
     "recvmsg",
-    "recvfrom",
     "setsockopt",
-    // Privileged handlers (C-11: sync before reboot).
-    "sync",
-    "reboot",
-    // ioctl is listed separately with argument conditions.
 ];
+
+/// Syscalls only `guest-shutdown` needs (C-11: sync before reboot).
+/// Absent from the profile when `[features] shutdown = false`, together
+/// with `CAP_SYS_BOOT` (§5.4).
+pub const POWER: &[&str] = &["sync", "reboot"];
 
 /// x86-64-only legacy aliases (§5.5): an alias is listed only with an
 /// observed runtime need. `open`, `stat`, `lstat` and `poll` were dropped
@@ -185,28 +201,38 @@ pub const X86_64_ONLY: &[&str] = &[
 /// refused, so a compromised handler has no socket egress path.
 pub const AF_NETLINK: u64 = 16;
 
-/// The allow rules for `target`, ioctl restricted to [`IOCTL_REQUESTS`].
-pub fn rules(target: Target) -> Vec<Rule> {
-    let mut out: Vec<Rule> = COMMON
-        .iter()
-        .map(|name| Rule {
-            syscall: name,
-            conditions: Vec::new(),
-        })
-        .collect();
+/// The allow rules for `target` under `authority` (§5.9): the common
+/// surface, the x86-64 aliases, `ioctl` restricted to `FIFREEZE` and
+/// `FITHAW` (and `FITRIM` with trim), `prctl(PR_SET_NAME)`, and only with
+/// their consumer the information syscalls with `socket(AF_NETLINK)` and
+/// the power syscalls.
+pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
+    let plain = |name: &&'static str| Rule {
+        syscall: name,
+        conditions: Vec::new(),
+    };
+    let mut out: Vec<Rule> = COMMON.iter().map(plain).collect();
     if target == Target::X86_64 {
-        out.extend(X86_64_ONLY.iter().map(|name| Rule {
-            syscall: name,
-            conditions: Vec::new(),
-        }));
+        out.extend(X86_64_ONLY.iter().map(plain));
     }
-    out.extend(IOCTL_REQUESTS.iter().map(|request| Rule {
-        syscall: "ioctl",
-        conditions: vec![ArgEq {
-            index: 1,
-            value: u64::from(*request),
-        }],
-    }));
+    if authority.information {
+        out.extend(INFORMATION.iter().map(plain));
+    }
+    if authority.reboot {
+        out.extend(POWER.iter().map(plain));
+    }
+    out.extend(
+        IOCTL_REQUESTS
+            .iter()
+            .filter(|request| authority.trim || **request != FITRIM)
+            .map(|request| Rule {
+                syscall: "ioctl",
+                conditions: vec![ArgEq {
+                    index: 1,
+                    value: u64::from(*request),
+                }],
+            }),
+    );
     out.push(Rule {
         syscall: "prctl",
         conditions: vec![ArgEq {
@@ -214,13 +240,15 @@ pub fn rules(target: Target) -> Vec<Rule> {
             value: PR_SET_NAME,
         }],
     });
-    out.push(Rule {
-        syscall: "socket",
-        conditions: vec![ArgEq {
-            index: 0,
-            value: AF_NETLINK,
-        }],
-    });
+    if authority.information {
+        out.push(Rule {
+            syscall: "socket",
+            conditions: vec![ArgEq {
+                index: 0,
+                value: AF_NETLINK,
+            }],
+        });
+    }
     out
 }
 
@@ -247,9 +275,9 @@ pub const fn default_action() -> &'static str {
 /// The name of the single filter in the JSON document.
 const FILTER_NAME: &str = "qeminga";
 
-/// The `seccompiler` JSON document for `target`.
-pub fn profile_json(target: Target) -> String {
-    let filter: Vec<serde_json::Value> = rules(target)
+/// The `seccompiler` JSON document for `target` under `authority`.
+pub fn profile_json(target: Target, authority: &Authority) -> String {
+    let filter: Vec<serde_json::Value> = rules(target, authority)
         .into_iter()
         .map(|rule| {
             if rule.conditions.is_empty() {
@@ -296,9 +324,9 @@ pub enum SeccompError {
     Install(String),
 }
 
-/// Compiles the profile for `target` into a BPF program.
-pub fn profile(target: Target) -> Result<BpfProgram, SeccompError> {
-    let json = profile_json(target);
+/// Compiles the profile for `target` under `authority` into a BPF program.
+pub fn profile(target: Target, authority: &Authority) -> Result<BpfProgram, SeccompError> {
+    let json = profile_json(target, authority);
     let mut map = seccompiler::compile_from_json(json.as_bytes(), target.arch())
         .map_err(|err| SeccompError::Compile(err.to_string()))?;
     map.remove(FILTER_NAME).ok_or(SeccompError::Missing)
@@ -315,11 +343,14 @@ pub fn install(program: &BpfProgram) -> Result<(), SeccompError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Authority;
+
+    const FULL: Authority = Authority::full();
 
     #[test]
     fn profile_builds_for_x86_64_and_aarch64() {
         for target in [Target::X86_64, Target::Aarch64] {
-            let program = profile(target).unwrap_or_else(|e| panic!("{target:?}: {e}"));
+            let program = profile(target, &FULL).unwrap_or_else(|e| panic!("{target:?}: {e}"));
             assert!(
                 program.len() > COMMON.len(),
                 "{target:?}: {} instructions",
@@ -346,7 +377,7 @@ mod tests {
     #[test]
     fn ioctl_rule_allows_exactly_fifreeze_fithaw_fitrim() {
         for target in [Target::X86_64, Target::Aarch64] {
-            let ioctl: Vec<&Rule> = rules(target)
+            let ioctl: Vec<&Rule> = rules(target, &FULL)
                 .iter()
                 .filter(|r| r.syscall == "ioctl")
                 .cloned()
@@ -366,10 +397,10 @@ mod tests {
                 [u64::from(FIFREEZE), u64::from(FITHAW), u64::from(FITRIM)]
             );
             // No unconditional ioctl (or prctl) rule exists.
-            assert!(rules(target).iter().all(|r| {
+            assert!(rules(target, &FULL).iter().all(|r| {
                 (r.syscall != "ioctl" && r.syscall != "prctl") || !r.conditions.is_empty()
             }));
-            let prctl: Vec<Rule> = rules(target)
+            let prctl: Vec<Rule> = rules(target, &FULL)
                 .into_iter()
                 .filter(|r| r.syscall == "prctl")
                 .collect();
@@ -381,7 +412,7 @@ mod tests {
                     value: PR_SET_NAME
                 }]
             );
-            let json = profile_json(target);
+            let json = profile_json(target, &FULL);
             assert_eq!(json.matches("\"syscall\":\"ioctl\"").count(), 3);
             assert!(json.contains(&format!("\"val\":{}", FIFREEZE)));
         }
@@ -390,7 +421,7 @@ mod tests {
     #[test]
     fn socket_is_restricted_to_af_netlink() {
         for target in [Target::X86_64, Target::Aarch64] {
-            let socket: Vec<Rule> = rules(target)
+            let socket: Vec<Rule> = rules(target, &FULL)
                 .into_iter()
                 .filter(|r| r.syscall == "socket")
                 .collect();
@@ -403,7 +434,7 @@ mod tests {
                 }]
             );
             assert!(!COMMON.contains(&"socket"));
-            let json = profile_json(target);
+            let json = profile_json(target, &FULL);
             assert_eq!(json.matches("\"syscall\":\"socket\"").count(), 1);
             assert!(json.contains("\"val\":16"));
         }
@@ -411,8 +442,9 @@ mod tests {
 
     #[test]
     fn x86_64_only_legacy_aliases_are_absent_from_aarch64_profile() {
-        let names =
-            |t: Target| -> Vec<&'static str> { rules(t).iter().map(|r| r.syscall).collect() };
+        let names = |t: Target| -> Vec<&'static str> {
+            rules(t, &FULL).iter().map(|r| r.syscall).collect()
+        };
         let a64 = names(Target::Aarch64);
         let x86 = names(Target::X86_64);
         assert_eq!(
@@ -449,31 +481,93 @@ mod tests {
     }
 
     #[test]
+    fn the_profile_carries_only_the_surfaces_the_configuration_enables() {
+        // #43 §5: with the information commands and guest-shutdown off,
+        // their syscalls (and the AF_NETLINK socket) are not in the
+        // filter; with trim off, FITRIM is not an allowed ioctl. Freeze
+        // and thaw stay whatever the profile. Both targets compile.
+        let names = |t: Target, a: &Authority| -> Vec<&'static str> {
+            rules(t, a).iter().map(|r| r.syscall).collect()
+        };
+        for target in [Target::X86_64, Target::Aarch64] {
+            let dp = Authority::data_protection();
+            let narrow = names(target, &dp);
+            for gone in INFORMATION
+                .iter()
+                .chain(POWER.iter())
+                .chain(["socket"].iter())
+            {
+                assert!(
+                    !narrow.contains(gone),
+                    "{target:?}: {gone} without a consumer"
+                );
+                assert!(
+                    names(target, &FULL).contains(gone),
+                    "{target:?}: {gone} in full"
+                );
+            }
+            assert!(!COMMON.contains(&"uname") && !COMMON.contains(&"reboot"));
+            let ioctls: Vec<u64> = rules(target, &dp)
+                .iter()
+                .filter(|r| r.syscall == "ioctl")
+                .map(|r| r.conditions[0].value)
+                .collect();
+            assert_eq!(ioctls, [u64::from(FIFREEZE), u64::from(FITHAW)]);
+            profile(target, &dp).unwrap();
+            // Each switch alone.
+            let info = Authority {
+                information: true,
+                ..dp
+            };
+            assert!(names(target, &info).contains(&"uname"));
+            assert!(names(target, &info).contains(&"socket"));
+            assert!(!names(target, &info).contains(&"reboot"));
+            let power = Authority { reboot: true, ..dp };
+            assert!(names(target, &power).contains(&"reboot"));
+            assert!(names(target, &power).contains(&"sync"));
+            assert!(!names(target, &power).contains(&"uname"));
+            let trim = Authority { trim: true, ..dp };
+            assert!(
+                rules(target, &trim)
+                    .iter()
+                    .any(|r| r.syscall == "ioctl" && r.conditions[0].value == u64::from(FITRIM))
+            );
+            assert_eq!(
+                profile_json(target, &dp)
+                    .matches("\"syscall\":\"ioctl\"")
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
     fn default_action_is_kill_process_unless_seccomp_log_in_a_debug_build() {
         if cfg!(feature = "seccomp-log") && cfg!(debug_assertions) {
             assert!(log_mode());
             assert_eq!(mode(), "log");
             assert_eq!(default_action(), "log");
-            assert!(profile_json(Target::current()).contains("\"mismatch_action\":\"log\""));
+            assert!(profile_json(Target::current(), &FULL).contains("\"mismatch_action\":\"log\""));
         } else {
             assert!(!log_mode());
             assert_eq!(mode(), "enforce");
             assert_eq!(default_action(), "kill_process");
             assert!(
-                profile_json(Target::current()).contains("\"mismatch_action\":\"kill_process\"")
+                profile_json(Target::current(), &FULL)
+                    .contains("\"mismatch_action\":\"kill_process\"")
             );
         }
         // A release build enforces whatever features are on.
         if !cfg!(debug_assertions) {
             assert_eq!(default_action(), "kill_process");
         }
-        assert!(profile_json(Target::current()).contains("\"match_action\":\"allow\""));
+        assert!(profile_json(Target::current(), &FULL).contains("\"match_action\":\"allow\""));
     }
 
     #[test]
     fn sync_and_reboot_are_present() {
         for target in [Target::X86_64, Target::Aarch64] {
-            let names: Vec<&str> = rules(target).iter().map(|r| r.syscall).collect();
+            let names: Vec<&str> = rules(target, &FULL).iter().map(|r| r.syscall).collect();
             assert!(names.contains(&"sync"), "{target:?}");
             assert!(names.contains(&"reboot"), "{target:?}");
             assert!(names.contains(&"fsync"));
@@ -495,7 +589,7 @@ mod tests {
     #[test]
     fn execve_and_mkdirat_are_absent() {
         for target in [Target::X86_64, Target::Aarch64] {
-            let names: Vec<&str> = rules(target).iter().map(|r| r.syscall).collect();
+            let names: Vec<&str> = rules(target, &FULL).iter().map(|r| r.syscall).collect();
             for forbidden in [
                 "execve",
                 "execveat",
@@ -563,7 +657,7 @@ mod tests {
             // tempdir) happens before the filter is installed.
             let dir = tempfile::tempdir().unwrap();
             nix::sys::prctl::set_no_new_privs().unwrap();
-            let program = profile(Target::current()).unwrap();
+            let program = profile(Target::current(), &FULL).unwrap();
             install(&program).unwrap();
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
@@ -576,7 +670,7 @@ mod tests {
                 let ctx = Context::new(
                     std::sync::Arc::new(crate::config::Config::default()),
                     std::sync::Arc::new(crate::state::FreezeStateMachine::new()),
-                    crate::audit::Router::stderr(),
+                    crate::audit::Router::stderr().unwrap(),
                     crate::marker::Marker::open(dir.path().join("frozen")).unwrap(),
                 )
                 .with_kernel(std::sync::Arc::new(crate::kernel::fake::FakeKernel::new()));

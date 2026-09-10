@@ -52,10 +52,10 @@ fn guest_exec_and_every_denied_command_return_command_not_found() {
     assert_eq!(reply["error"]["class"], "CommandNotFound");
     assert_eq!(reply["id"], 7);
     assert!(agent.execute("guest-ping").get("return").is_some());
-    let stderr = agent.stderr_text();
-    assert_eq!(
-        stderr.matches("\"reason\":\"command_not_found\"").count(),
-        DENIED.len() + 1
+    agent.wait_for_stderr_count(
+        "\"reason\":\"command_not_found\"",
+        DENIED.len() + 1,
+        e2e::REPLY_TIMEOUT,
     );
     assert!(agent.stop().success());
 }
@@ -76,11 +76,7 @@ fn oversized_frame_then_valid_command() {
             .read_line(std::time::Duration::from_millis(200))
             .is_none()
     );
-    assert!(
-        agent
-            .stderr_text()
-            .contains("\"reason\":\"oversized_frame\"")
-    );
+    agent.wait_for_stderr("\"reason\":\"oversized_frame\"", e2e::REPLY_TIMEOUT);
     // An exactly-64 KiB frame is parsed (and rejected as JSON, not as size).
     let mut exact = vec![b'y'; 65_536];
     exact.push(b'\n');

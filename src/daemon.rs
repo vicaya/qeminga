@@ -9,12 +9,17 @@
 //! 2. open the recovery marker's directory (read-only; the descriptor is
 //!    kept for every later marker operation, §4.4) and look for the
 //!    marker to choose the initial state; start logging, in ring mode
-//!    when recovering (§4.4);
+//!    when recovering (§4.4): records are queued from here, the writer
+//!    thread that delivers them starts at step 5b;
 //! 3. reject a `state_path` whose directory is on a filesystem the freeze
 //!    plan would freeze (§8.2), judged by the device of the opened
 //!    directory, not by the pathname;
 //! 4. open the channel (`EBUSY` is terminal, §8.4);
-//! 5. drop capabilities (skipped with a warning when not root, C-18);
+//! 5. drop capabilities (skipped with a warning when not root, C-18; under
+//!    enforced hardening a drop that did not run is a refusal, §8.1), then
+//!    start the audit writer thread (5b): every thread of the process is
+//!    created under the dropped ceiling, which the drop establishes only
+//!    for the calling thread (§5.4);
 //! 6. install seccomp when compiled in and enabled;
 //! 7. start the multi-threaded runtime and serve until a signal.
 //!
@@ -40,7 +45,7 @@ use std::time::Duration;
 
 use crate::audit::{self, Router};
 use crate::channel::{self, OpenError, OpenFn};
-use crate::config::{Config, ConfigError, DEFAULT_CONFIG_PATH, LogLevel};
+use crate::config::{Authority, Config, ConfigError, DEFAULT_CONFIG_PATH, LogLevel};
 use crate::dispatch::{Context, Dispatcher};
 use crate::freeze_plan::FreezePlan;
 use crate::handlers::fsfreeze;
@@ -171,6 +176,14 @@ pub enum RunError {
     /// The seccomp filter could not be built or installed.
     #[error("seccomp: {0}")]
     Seccomp(String),
+    /// `[agent] hardening = "enforced"` and the advertised sandbox is
+    /// unavailable, disabled or would not be installed (#43 §4): the
+    /// daemon refuses to serve the host. A recovery marker, if any, is
+    /// left in place for the next start.
+    #[error(
+        "hardening: {0}; refusing to serve the host (set [agent] hardening = \"unenforced-development-only\" on a development host only)"
+    )]
+    Hardening(String),
     /// The runtime could not be built or logging could not be initialised.
     #[error("{0}")]
     Runtime(String),
@@ -183,7 +196,8 @@ impl RunError {
             RunError::Config(_)
             | RunError::Marker(_)
             | RunError::StatePath { .. }
-            | RunError::MountTable(_) => EX_CONFIG,
+            | RunError::MountTable(_)
+            | RunError::Hardening(_) => EX_CONFIG,
             RunError::Channel(_) => EX_UNAVAILABLE,
             RunError::Privileges(_) => EX_NOPERM,
             RunError::Seccomp(_) | RunError::Runtime(_) => EX_OSERR,
@@ -191,11 +205,70 @@ impl RunError {
     }
 }
 
+/// What this build can enforce (§8.1, #43 §4): checked against
+/// `[agent] hardening` right after the configuration is loaded, before
+/// the marker is touched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildProfile {
+    /// The `seccomp` Cargo feature is compiled in.
+    pub seccomp_compiled: bool,
+    /// The filter's mode: `"enforce"`, `"log"` or `"unavailable"`.
+    pub seccomp_mode: &'static str,
+    /// A test-kernel substitution was requested (`QEMINGA_TEST_FAKE_KERNEL`
+    /// is set), whether or not this build could honour it.
+    pub fake_kernel_requested: bool,
+}
+
+impl BuildProfile {
+    /// The running binary's profile.
+    pub fn current() -> Self {
+        BuildProfile {
+            seccomp_compiled: cfg!(feature = "seccomp"),
+            seccomp_mode: seccomp_mode(),
+            fake_kernel_requested: std::env::var_os(FAKE_KERNEL_ENV).is_some(),
+        }
+    }
+}
+
+/// Refuses, under `hardening = "enforced"`, what this build or this
+/// configuration cannot enforce: a filter that is not compiled in, that is
+/// disabled (already a configuration error), that would only log, or a
+/// requested test-kernel substitution. Nothing here has touched the marker.
+pub fn check_hardening(config: &Config, build: &BuildProfile) -> Result<(), RunError> {
+    if !config.agent.hardening.is_enforced() {
+        return Ok(());
+    }
+    if !config.features.seccomp {
+        return Err(RunError::Hardening(
+            "the seccomp filter is disabled ([features] seccomp = false)".to_owned(),
+        ));
+    }
+    if !build.seccomp_compiled {
+        return Err(RunError::Hardening(
+            "this binary was built without the `seccomp` Cargo feature".to_owned(),
+        ));
+    }
+    if build.seccomp_mode != "enforce" {
+        return Err(RunError::Hardening(format!(
+            "this binary's seccomp filter would only {} (a `seccomp-log` debug build)",
+            build.seccomp_mode
+        )));
+    }
+    if build.fake_kernel_requested {
+        return Err(RunError::Hardening(format!(
+            "{FAKE_KERNEL_ENV} is set: a test-kernel substitution is never honoured under enforced hardening"
+        )));
+    }
+    Ok(())
+}
+
 /// The steps of the startup sequence, in the order [`run_with`] calls
 /// them. Production is [`SystemStartup`]; tests record the calls.
 pub trait Startup {
     /// Step 1.
     fn load_config(&self, path: &Path) -> Result<Config, ConfigError>;
+    /// Step 1b: what this build can enforce, for [`check_hardening`].
+    fn build_profile(&self) -> BuildProfile;
     /// Step 2a: open the recovery marker's directory, read-only, and keep
     /// it for every later marker operation (§4.4); the marker's presence
     /// (`exists`) chooses the initial state. Nothing is created.
@@ -211,8 +284,15 @@ pub trait Startup {
     /// device never delays the privilege drop, the seccomp filter or the
     /// recovery watchdog (C-14, OQ-7).
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
-    /// Step 5.
-    fn drop_privileges(&self) -> Result<Outcome, PrivilegeError>;
+    /// Step 5: keep the final set of `authority` (§5.4, §5.9).
+    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError>;
+    /// Step 5b: start the audit writer thread, after the drop so that it
+    /// is created under the dropped ceiling (§5.4).
+    fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
+        router
+            .start_writer()
+            .map_err(|err| RunError::Runtime(format!("cannot start the audit writer: {err}")))
+    }
     /// Step 6: `Ok(true)` when a filter was installed.
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError>;
     /// Step 7: run until a signal; `recovery` selects the `Frozen` start;
@@ -243,12 +323,45 @@ pub fn seccomp_mode() -> &'static str {
     }
 }
 
-/// Runs the startup sequence through `startup`.
+/// Runs the startup sequence through `startup`. Once logging is up, every
+/// way out, a refusal or the end of serving, is reported to it and then
+/// gives delivery the bounded [`audit::DELIVERY_GRACE`], the ring flushed
+/// first: the process is leaving, so a refusal that came after recovery
+/// logging started (§4.4) is not left in a ring nothing will drain, and a
+/// record queued behind a slow sink is not lost to the exit. The global
+/// subscriber keeps its handle for the life of the process, so this is
+/// the settlement, not the last handle's drop.
 pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     let config = startup.load_config(&opts.config_path)?;
+    // Before the marker is even opened: a refusal leaves a recovery marker
+    // exactly as it was, for the next start to act on.
+    check_hardening(&config, &startup.build_profile())?;
     let marker = startup.open_marker(&config.agent.state_path)?;
     let recovery = marker.exists();
     let router = startup.init_logging(config.agent.log_level, recovery)?;
+    let logging = router.clone();
+    let result = serve_after_logging(opts, startup, config, marker, recovery, router);
+    if let Err(err) = &result {
+        tracing::error!(event = "startup_failed", error = %err, "exiting");
+    }
+    logging.flush_to_normal();
+    // A refusal before the drop leaves without a writer thread: one is
+    // started now, to say why, with whatever privileges the process still
+    // has, since it is leaving.
+    let _ = logging.start_writer();
+    logging.settle(audit::DELIVERY_GRACE);
+    result
+}
+
+/// The steps after logging is up (see [`run_with`]).
+fn serve_after_logging(
+    opts: &Options,
+    startup: &dyn Startup,
+    config: Config,
+    marker: Marker,
+    recovery: bool,
+    router: Router,
+) -> Result<(), RunError> {
     for warning in config.warnings() {
         tracing::warn!(
             event = "feature_warning",
@@ -289,15 +402,57 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
             "channel not open yet; the runtime retries after the privilege drop"
         );
     }
-    match startup.drop_privileges()? {
+    let authority = config.authority();
+    tracing::info!(
+        event = "authority",
+        reboot = authority.reboot,
+        information = authority.information,
+        trim = authority.trim,
+        suspend = authority.suspend,
+        "authority derived from the configuration"
+    );
+    match startup.drop_privileges(&authority)? {
         Outcome::Dropped => tracing::info!(
             event = "privileges_dropped",
             user = SERVICE_USER,
             "capabilities dropped"
         ),
+        Outcome::SkippedUnprivileged if config.agent.hardening.is_enforced() => {
+            return Err(RunError::Hardening(
+                "not started as root, so the capability drop did not run".to_owned(),
+            ));
+        }
         Outcome::SkippedUnprivileged => {}
     }
-    let seccomp = startup.install_seccomp(&config)?;
+    // Only now a second thread: created by the dropped thread, it inherits
+    // the dropped ceiling (uid, capability sets, bounding set).
+    startup.start_audit_writer(&router)?;
+    // An installer that fails (a kernel or a container policy refusing
+    // the filter) is a hardening outcome like a filter that is absent:
+    // the refusal under the enforced profile, a warning under the
+    // development opt-out. It is never an `EX_OSERR` exit of its own.
+    let seccomp = match startup.install_seccomp(&config) {
+        Ok(installed) => installed,
+        Err(RunError::Seccomp(reason)) if config.agent.hardening.is_enforced() => {
+            return Err(RunError::Hardening(format!(
+                "the seccomp filter could not be installed: {reason}"
+            )));
+        }
+        Err(RunError::Seccomp(reason)) => {
+            tracing::warn!(
+                event = "seccomp_unavailable",
+                reason = %reason,
+                "the seccomp filter could not be installed; running without it (development hardening)"
+            );
+            false
+        }
+        Err(other) => return Err(other),
+    };
+    if !seccomp && config.agent.hardening.is_enforced() {
+        return Err(RunError::Hardening(
+            "the seccomp filter was not installed".to_owned(),
+        ));
+    }
     let mode = seccomp_mode();
     tracing::info!(
         event = "seccomp",
@@ -324,15 +479,10 @@ pub fn run(opts: Options) -> ExitCode {
     match run_with(&opts, &SystemStartup) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            if tracing::dispatcher::has_been_set() {
-                // Logging is up: the record goes where the router sends
-                // it. In recovery mode that is the ring, never fd 2
-                // (§4.4, §9.1), and in normal mode this is the one line
-                // on stderr.
-                tracing::error!(event = "startup_failed", error = %err, "exiting");
-            } else {
-                // Failed before logging existed (a configuration error):
-                // stderr is the only channel left.
+            // Logging up: `run_with` reported the failure to it and gave
+            // delivery its grace. Failed before logging existed (a
+            // configuration error): stderr is the only channel left.
+            if !tracing::dispatcher::has_been_set() {
                 diag(&format!("qeminga: {err}"));
             }
             ExitCode::from(err.exit_code())
@@ -357,12 +507,17 @@ impl Startup for SystemStartup {
         Config::load(path)
     }
 
+    fn build_profile(&self) -> BuildProfile {
+        BuildProfile::current()
+    }
+
     fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
         Ok(Marker::open(path)?)
     }
 
     fn init_logging(&self, level: LogLevel, ring: bool) -> Result<Router, RunError> {
-        let router = Router::stderr();
+        // Not started: the writer thread is step 5b, after the drop.
+        let router = Router::stderr_unstarted();
         if ring {
             // Recovery mode: nothing reaches stderr until a thaw succeeds
             // (§4.4, §9.1).
@@ -398,8 +553,12 @@ impl Startup for SystemStartup {
         }
     }
 
-    fn drop_privileges(&self) -> Result<Outcome, PrivilegeError> {
-        crate::kernel::caps::drop_privileges(SERVICE_USER, &crate::kernel::caps::SystemCaps)
+    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError> {
+        crate::kernel::caps::drop_privileges(
+            SERVICE_USER,
+            &crate::kernel::caps::SystemCaps,
+            authority,
+        )
     }
 
     #[cfg(feature = "seccomp")]
@@ -407,8 +566,9 @@ impl Startup for SystemStartup {
         if !config.seccomp_enabled() {
             return Ok(false);
         }
-        let program = crate::seccomp::profile(crate::seccomp::Target::current())
-            .map_err(|err| RunError::Seccomp(err.to_string()))?;
+        let program =
+            crate::seccomp::profile(crate::seccomp::Target::current(), &config.authority())
+                .map_err(|err| RunError::Seccomp(err.to_string()))?;
         crate::seccomp::install(&program).map_err(|err| RunError::Seccomp(err.to_string()))?;
         Ok(true)
     }
@@ -492,9 +652,11 @@ pub const FAKE_KERNEL_ENV: &str = "QEMINGA_TEST_FAKE_KERNEL";
 /// The production context: real sources, state chosen by `recovery`, the
 /// marker handle opened at startup.
 ///
-/// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set, the
-/// kernel shim is the fake: no ioctl, `sync` or `reboot` ever reaches the
-/// kernel. Release builds must not enable that feature.
+/// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set
+/// **and** development hardening, the kernel shim is the fake: no ioctl,
+/// `sync` or `reboot` ever reaches the kernel. A release build cannot
+/// carry the feature (`compile_error!` in the crate root), and enforced
+/// hardening refuses the variable before anything starts.
 pub fn production_context(
     config: Arc<Config>,
     router: Router,
@@ -507,8 +669,12 @@ pub fn production_context(
         FreezeStateMachine::new()
     };
     let ctx = Context::new(config, Arc::new(state), router, marker);
+    // Never under enforced hardening (`check_hardening` refused the start
+    // already; this keeps the swap itself conditional on the profile).
     #[cfg(feature = "test-fakes")]
-    let ctx = if std::env::var_os(FAKE_KERNEL_ENV).is_some() {
+    let ctx = if std::env::var_os(FAKE_KERNEL_ENV).is_some()
+        && !ctx.config.agent.hardening.is_enforced()
+    {
         tracing::warn!(
             event = "fake_kernel",
             "test-fakes: kernel operations are faked; no ioctl, sync or reboot will run"

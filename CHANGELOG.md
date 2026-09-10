@@ -18,6 +18,115 @@ semantic versioning.
   gate and the freeze-safe audit mode stay until the operation settles
   (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
 
+### Added
+
+- Design §4.5, the snapshot controller contract: what the freeze, status
+  and thaw replies mean, the one supported protocol for the interval a
+  freeze protects (one mount point per required superblock, one freeze
+  per cycle under a client timeout, heartbeats and a cycle budget under
+  the hard cap, one thaw, quiesced only when the freeze count and the
+  thaw count both equal the number requested), its assumptions and
+  their limit; the reference controller in `tests/controller_contract.rs`
+  exercises it against the production coordinator and watchdog (#43 §1);
+  a thaw reply past the budget is rejected whatever its count. The
+  scripted kernel can model the freeze nesting depth per superblock
+  (`FakeKernel::track_freeze_depth`), and a harness can end a dead
+  instance's tasks as a crash would (`Context::abort_tasks`, hidden from
+  the documented API; the daemon never calls it).
+
+- `guest-get-fsinfo` and `guest-network-get-interfaces` refuse a reply
+  whose line on the wire (envelope included) would exceed 1 MiB and
+  256 KiB respectively, with an explicit error naming the bound instead
+  of a truncated list; design §5.10 inventories
+  every bound the host can drive and states the failure model (#43 §6).
+- The data-protection profile (#43 §5): `[features] shutdown` and
+  `[features] information` (both on by default) switch `guest-shutdown`
+  and the information commands off like `fstrim`; a disabled command
+  answers `CommandNotFound` "has been disabled" and `guest-info` lists
+  it disabled. The capability set and the seccomp profile follow the
+  switches: without `shutdown` the daemon gives up `CAP_SYS_BOOT`,
+  `reboot` and `sync`; without `information` `uname`, `statfs`, the
+  netlink syscalls and `socket`; without `fstrim` the `FITRIM` ioctl.
+  `packaging/config-data-protection.toml` is the profile with all of them
+  off; design §5.9 records the residual authority.
+- `[agent] hardening = "enforced"` (the default): the daemon refuses to
+  serve the host (exit 78, one line, the recovery marker untouched)
+  unless it was started as root with the seccomp filter compiled in,
+  enabled and installed in its enforcing mode (an installer the kernel
+  refuses is that refusal, not an `EX_OSERR` exit), and refuses a
+  test-kernel request; a refusal after recovery logging started is still
+  reported on the way out; `"unenforced-development-only"` is the one opt-out, for a
+  development host. A release build cannot carry the `test-fakes`
+  feature. **Deployments built without `--features seccomp` stop
+  starting until rebuilt with it** (#43 §4; recovery procedure in
+  `packaging/README.md`).
+
+### Fixed
+
+- The thaw of a freeze operation this process completed drains the
+  descriptors the operation published (its frozen targets and the
+  `EBUSY` ones it retained) and nothing else, reading no mount table: a
+  superblock the operation never froze, one hidden under a mount over
+  its ancestor or one outside a `guest-fsfreeze-freeze-list` request,
+  cannot hold the thaw. Before, every thaw discovered every eligible
+  superblock through the table and reported a planned one reached by no
+  pathname as unrecoverable, so after a freeze through a directory
+  overmount the marker and the frozen gate stayed while a filesystem
+  that was never frozen remained hidden. Recovery drains (after a
+  restart, from `Thawed`, or after an operation or a thaw that lost a
+  worker or a drain) keep the table-wide discovery and the conservative
+  rule (design §4.2 "Thaw scope"; #43, external review).
+- `guest-fsfreeze-freeze-list`: a mount table whose root carries its own
+  id as its parent id (valid per proc_pid_mountinfo(5)) resolved no
+  requested name, so the request froze nothing and replied `0`; such a
+  root is now walked from (#43, external review).
+- `guest-fsfreeze-freeze-list`: a requested mount point selects the
+  superblock its pathname leads to now, resolved as the kernel resolves
+  the path (from the root mount along the components, by mount ids and
+  parents), never a superblock whose mount point is hidden by a mount
+  over it or over any directory above it, and the freeze opens a
+  selected superblock on the requested name only, so a name that leads
+  elsewhere fails the operation instead of an alias standing in. Before,
+  a name carried by two targets (one of them hidden) selected both, so
+  the count could equal the number requested while a requested
+  filesystem was never frozen; a controller relying on the count (design
+  §4.2 "Coverage", §4.5) would have accepted that (#43 §1, external
+  review).
+  superblock mounted at that path now, never a superblock whose former
+  mount point has been hidden by a mount over it. Before, a name carried
+  by two targets (one of them hidden) selected both, so the count could
+  equal the number requested while a requested filesystem was never
+  frozen; a controller relying on the count (design §4.2 "Coverage",
+  §4.5) would have accepted that (#43 §1, external review).
+- Audit delivery is off every recovery and finalisation path (#43 §3):
+  the sink is written by one dedicated writer thread through a bounded
+  256 KiB delivery queue, so a journald that stops reading blocks that
+  thread and nothing else; a thaw finalises its marker and publishes
+  `Thawed` whether or not a record has been delivered. The writer parks
+  while the freeze-safe ring is in use. Records dropped at a full queue
+  or refused by the sink are counted and reported, like the ring's
+  overflow, by an `audit_records_lost` record delivered where the gap
+  is, now with a `reason` (`ring_overflow`, `sink_backpressure`,
+  `sink_error`); the ring's own overflow is reported as a marker, so a
+  full queue cannot lose the report. `guest-shutdown` waits at most 2 s
+  for its own record before `reboot(2)` and no longer flushes stderr
+  itself (the writer thread may hold the stderr lock while blocked in a
+  write). The daemon's exit paths flush the ring and give delivery the
+  same bounded grace, so a refusal after recovery logging started is
+  reported on the way out. Losses merge into one gap per position with
+  a count per reason, so the queue's entries are bounded like its bytes.
+  The writer thread is started after the privilege drop (records written
+  before then wait in the queue), so every thread of the process is
+  created under the dropped ceiling; the privileged tests check every
+  thread.
+- A freeze that froze nothing and holds nothing (an empty plan, a
+  `guest-fsfreeze-freeze-list` matching no mount point, or a plan every
+  target of which was skipped) settles `Thawed` with its marker removed
+  and replies `0`, instead of `Frozen` with the watchdog armed and the
+  gate closed on nothing. An `EBUSY` target, an uncertain result or a
+  marker that cannot be removed still keep the conservative state; the
+  last is now reported as an error rather than a `0` (#43 §2).
+
 ### Changed
 
 - A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts

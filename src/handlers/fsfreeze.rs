@@ -33,7 +33,10 @@
 //!    on, whatever its pathnames lead to later.
 //! 4. Success: `Freezing → Frozen`, [`FreezeHooks::on_frozen`] (T3.5 arms
 //!    the watchdog). Failure: `Freezing → Thawed`,
-//!    [`FreezeHooks::on_thawed`]. An aborted operation ends in `Thawed`
+//!    [`FreezeHooks::on_thawed`]. Nothing frozen and nothing held (an
+//!    empty or entirely skipped plan): the marker is removed and the
+//!    operation settles `Freezing → Thawed` with the reply `0`; there is
+//!    nothing to recover, so no watchdog and no closed gate (#43 §2). An aborted operation ends in `Thawed`
 //!    (everything drained, marker removed) or `Frozen` (a drain incomplete
 //!    or the marker retained; the watchdog is armed).
 //!
@@ -68,7 +71,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::dispatch::Context;
+use crate::dispatch::{Context, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::NoArgs;
 use crate::kernel::{KernelError, KernelOps, Mount};
@@ -327,19 +330,32 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     let marker = ctx.marker.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let held = ctx.take_frozen_mounts();
+    // The scope (§4.2 "Thaw scope"): a tracked operation's thaw drains
+    // the descriptors it published and nothing else; a recovery drain
+    // (from `Thawed`, after a restart, or after an operation with an
+    // uncertain target) discovers every planned superblock.
+    let discover = token.is_recovery_drain() || ctx.thaw_scope() == ThawScope::Discovery;
     let (outcome, held) = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             let mut held = held;
             // Discovery and drain are separate: the handles this process
             // holds are drained whether or not the mount table can be
-            // read (`thaw_blocking`).
-            let plan = build_plan::<ThawFailure>(mounts.as_ref(), None);
+            // read (`thaw_blocking`), and a tracked thaw reads none.
+            let plan = discover.then(|| build_plan::<ThawFailure>(mounts.as_ref(), None));
             let outcome = thaw_blocking(kernel.as_ref(), &marker, plan, &mut held);
             (outcome, held)
         })
     })
     .await
-    .unwrap_or_else(|err| (Err(ThawFailure::Task(err.to_string())), Vec::new()));
+    .unwrap_or_else(|err| {
+        // The task is lost with the descriptors it took: they are no
+        // longer evidence of complete ownership, so the next thaw must
+        // discover its targets (§4.2 "Thaw scope"), as after a lost
+        // recovery drain in the coordinator.
+        tracing::error!(event = "fsfreeze_thaw_lost", error = %err, "thaw drain lost; targets uncertain");
+        ctx.set_thaw_scope(ThawScope::Discovery);
+        (Err(ThawFailure::Task(err.to_string())), Vec::new())
+    });
     // Whatever could not be drained keeps its handle for the next attempt.
     ctx.hold_frozen_mounts(held);
 
@@ -349,6 +365,7 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // `Thawed`: a freeze accepted after the publication can never
             // have its logging mode changed by this thaw's completion.
             ctx.hooks.on_thawed(ctx);
+            ctx.set_thaw_scope(ThawScope::Discovery);
             ctx.state.thaw_succeeded(token);
             tracing::info!(event = "fsfreeze_thawed", thawed, "filesystems thawed");
             Ok(thawed)
@@ -358,6 +375,7 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // `Thawed`), so there is no frozen state to retain: return to
             // `Thawed` and report the error (OQ-3).
             ctx.hooks.on_thawed(ctx);
+            ctx.set_thaw_scope(ThawScope::Discovery);
             ctx.state.thaw_succeeded(token);
             tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
             Err(Error::Internal(failure.to_string()))
@@ -450,6 +468,12 @@ pub enum FreezeFailure {
     /// The blocking task could not be joined.
     #[error("freeze task failed: {0}")]
     Task(String),
+    /// Nothing was frozen and nothing is held (an empty or entirely
+    /// skipped plan, #43 §2), but the marker could not be removed: the
+    /// state stays `Frozen` and the marker is retained, so the reply is
+    /// never a `0` that reads as a clean settlement.
+    #[error("nothing was frozen but cannot remove recovery marker: {0}; marker retained")]
+    NothingFrozenMarkerRetained(MarkerError),
     /// The operation was aborted (§4.4): its deadline expired or a thaw was
     /// requested while a `FIFREEZE` was still in flight. The targets frozen
     /// so far are being thawed by the coordinator; the marker and the
@@ -477,7 +501,9 @@ impl FreezeFailure {
     pub fn retains_frozen_state(&self) -> bool {
         matches!(
             self,
-            FreezeFailure::RollbackIncomplete { .. } | FreezeFailure::MarkerRetained { .. }
+            FreezeFailure::RollbackIncomplete { .. }
+                | FreezeFailure::MarkerRetained { .. }
+                | FreezeFailure::NothingFrozenMarkerRetained(_)
         )
     }
 }
@@ -531,13 +557,23 @@ impl From<String> for ThawFailure {
     }
 }
 
-/// Opens `target` on its planned device through the first of its mount
-/// points that still leads there (the kernel shim verifies each opened
-/// directory, so a mount placed over a pathname is seen, not frozen or
-/// thawed by mistake). When none does, the attempts are reported in
-/// order: `/data: mountpoint is on 8:3, not on the planned 8:2;
-/// /data-alias: cannot open mountpoint: ENOENT`.
+/// Opens `target` on its planned device. A target a request selected
+/// ([`Target::requested`]) is opened on the requested name and on nothing
+/// else: the kernel shim verifies the opened directory, so a name that
+/// does not lead to the selected superblock is a failure of this target,
+/// never an alias standing in for it (a controller's coverage must not be
+/// rescued by reaching another name of a wrongly selected superblock).
+/// Otherwise, through the first of its mount points that still leads
+/// there (a mount placed over a pathname is seen, not frozen or thawed by
+/// mistake). When none does, the attempts are reported in order: `/data:
+/// mountpoint is on 8:3, not on the planned 8:2; /data-alias: cannot open
+/// mountpoint: ENOENT`.
 pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mount, String> {
+    if let Some(requested) = &target.requested {
+        return kernel
+            .open_mount(requested, target.dev)
+            .map_err(|err| format!("{}: {err}", lossy(requested)));
+    }
     let mut attempts = Vec::new();
     for path in target.mountpoints() {
         match kernel.open_mount(path, target.dev) {
@@ -634,12 +670,15 @@ pub(crate) fn drain_held(
 /// Drains every target in forward order, then removes the marker. Returns
 /// the number of targets on which at least one `FITHAW` succeeded.
 ///
-/// A target is drained through the handle its freeze opened when `held`
-/// has one for its device (that handle names the frozen filesystem
-/// whatever its pathnames lead to now), otherwise through the first of
-/// its mount points that still opens on its device. Handles for devices
-/// the plan no longer lists are drained too: this process froze them.
-/// On return `held` keeps the handles whose drain did not complete.
+/// With a `plan` (a discovery drain, §4.2 "Thaw scope") a target is
+/// drained through the handle its freeze opened when `held` has one for
+/// its device (that handle names the frozen filesystem whatever its
+/// pathnames lead to now), otherwise through the first of its mount
+/// points that still opens on its device. Handles for devices the plan
+/// no longer lists are drained too: this process froze them. Without a
+/// plan (a tracked thaw: every obligation is a held descriptor) the held
+/// handles are all there is to drain, and no pathname is consulted. On
+/// return `held` keeps the handles whose drain did not complete.
 ///
 /// Discovery is not a prerequisite of the drain: when the mount table
 /// could not be read (`plan` is the failure; `EMFILE`, which the held
@@ -658,13 +697,22 @@ pub(crate) fn drain_held(
 fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
-    plan: Result<FreezePlan, ThawFailure>,
+    plan: Option<Result<FreezePlan, ThawFailure>>,
     held: &mut Vec<Mount>,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
     let mut retained = std::mem::take(held);
+    let planned = matches!(plan, Some(Ok(_)));
     let discovery = match plan {
-        Ok(plan) => {
+        None => {
+            tracing::info!(
+                event = "fsfreeze_thaw_tracked",
+                held = retained.len(),
+                "draining the descriptors the operation published; nothing to discover"
+            );
+            None
+        }
+        Some(Ok(plan)) => {
             for target in plan.thaw_order() {
                 let mount = match retained.iter().position(|m| m.dev() == target.dev) {
                     Some(index) => retained.remove(index),
@@ -693,7 +741,7 @@ fn thaw_blocking(
             }
             None
         }
-        Err(failure) => {
+        Some(Err(failure)) => {
             tracing::error!(
                 event = "fsfreeze_thaw_plan_failed",
                 error = %failure,
@@ -706,7 +754,7 @@ fn thaw_blocking(
     // `held` was filled in reverse mount order (deepest first): drain the
     // leftovers forward, as the plan and the rollback do.
     for mount in retained.into_iter().rev() {
-        if discovery.is_none() {
+        if planned {
             tracing::warn!(
                 event = "fsfreeze_unplanned_drain",
                 mountpoint = %mount.mountpoint().display(),
@@ -1585,6 +1633,206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freeze_list_over_an_overmount_counts_the_visible_superblock_only() {
+        // #43 §1, the coverage contract: /data is 8:3 mounted over 8:2,
+        // whose first name /data is hidden (it stays reachable as
+        // /data-alias). A controller requesting /data and an unsupported
+        // /required must see a count of 1, not 2: the hidden name cannot
+        // contribute 8:2 to the count of a request that never named it.
+        let rig = Rig::new(FreezeState::Thawed, "hidden_mount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data","/required"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data"), (8, 3))]);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn freeze_list_freezes_what_the_requested_pathname_leads_to_not_a_later_row() {
+        // The external review's moved-mount arrangement: A (8:5) moved over
+        // B (8:2) at /data keeps its earlier row. A request for /data must
+        // freeze A, opened on /data, and leave B alone; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "moved_mount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data"), (8, 5))]);
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn freeze_list_freezes_the_mount_over_a_directory_not_the_one_it_hides() {
+        // A (8:2) at /data/nested is hidden by B (8:3) mounted at /data, a
+        // plain directory until then; C (8:4) is at the /data/nested B
+        // provides. A request for /data/nested freezes C through that
+        // name, A untouched; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "directory_overmount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data/nested"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data/nested"), (8, 4))]);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn a_thaw_of_a_completed_operation_is_not_held_by_a_superblock_it_never_froze() {
+        // The external review's lifecycle over directory_overmount.txt: A
+        // (8:2) is hidden under B at /data and reachable by no name; the
+        // request freezes C (8:4) through /data/nested. The thaw of that
+        // operation drains what the operation published (C, through its
+        // held descriptor) and nothing else: A was never its obligation,
+        // so A being unreachable cannot hold the thaw. The marker goes,
+        // the state is `Thawed`, and the next cycle is admitted.
+        let rig = Rig::new(FreezeState::Thawed, "directory_overmount.txt");
+        rig.kernel.script_mount_device("/data/nested", (8, 4));
+        let freeze_req = req(
+            r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data/nested"]}}"#,
+        );
+        for cycle in 0..2 {
+            // The fake's thaw budget is per path and consumed by a drain:
+            // C is frozen once per cycle.
+            rig.kernel.script_thaw_successes("/data/nested", 1);
+            let value = freeze_list(&rig.ctx, &freeze_req).await.unwrap();
+            assert_eq!(value, json!(1), "cycle {cycle}");
+            assert_eq!(rig.state(), FreezeState::Frozen);
+            assert!(rig.marker().exists());
+            rig.kernel.clear_calls();
+            let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+                .await
+                .unwrap();
+            assert_eq!(value, json!(1), "cycle {cycle}");
+            assert!(
+                rig.opens().is_empty(),
+                "no pathname consulted: {:?}",
+                rig.opens()
+            );
+            assert_eq!(rig.fithaws(), paths(&["/data/nested", "/data/nested"]));
+            assert_eq!(rig.state(), FreezeState::Thawed);
+            assert!(!rig.marker().exists(), "marker removed after cycle {cycle}");
+            assert_eq!(rig.held(), 0);
+            rig.kernel.clear_calls();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_recovery_drain_over_the_same_topology_still_reports_the_hidden_superblock() {
+        // After a restart nothing is held and nothing is known: the drain
+        // discovers every planned superblock, and A, reachable by no
+        // name, is reported unreachable with the marker retained (§4.2),
+        // the conservative rule the tracked thaw above does not need.
+        let rig = Rig::new(FreezeState::Frozen, "directory_overmount.txt");
+        rig.marker().create().unwrap();
+        rig.kernel.script_mount_device("/data/nested", (8, 4));
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("8:2") && text.contains("marker retained"),
+            "{text}"
+        );
+        assert_eq!(
+            rig.fithaws(),
+            paths(&["/", "/", "/data", "/data", "/data/nested", "/data/nested"]),
+            "B and C are drained; A cannot be reached"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn freeze_list_under_a_self_parented_root_freezes_the_requested_target() {
+        // The namespace root carries its own id as its parent id (valid
+        // per proc_pid_mountinfo(5)): /data is still resolved from it,
+        // selected and frozen through the requested name; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "self_parented_root.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn a_requested_pathname_that_does_not_lead_to_the_selected_superblock_fails_the_operation()
+     {
+        // Belt and braces for the selection: if what the kernel opens at
+        // the requested name is not the selected superblock, the target
+        // fails and the operation with it; an alias of the selected
+        // superblock never stands in, since that would turn a wrong
+        // selection into a count.
+        let rig = Rig::new(FreezeState::Thawed, "moved_mount.txt");
+        rig.kernel.script_mount_device("/data", (8, 2));
+        let err = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("/data") && text.contains("8:2") && text.contains("8:5"),
+            "{text}"
+        );
+        assert!(
+            rig.fifreezes().is_empty(),
+            "nothing frozen through an alias"
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
     async fn freeze_list_with_unknown_paths_freezes_nothing_and_returns_0() {
         let rig = Rig::nested();
         let value = freeze_list(
@@ -1595,10 +1843,176 @@ mod tests {
         .unwrap();
         assert_eq!(value, json!(0));
         assert!(rig.fifreezes().is_empty());
-        // Zero targets is still a successful freeze: the marker exists
-        // and the state is Frozen until thawed.
+        // Zero targets is a zero-work operation (#43 §2): nothing to
+        // recover, so it settles Thawed with the marker removed.
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_freezes_nothing_settles_thawed_with_the_marker_removed() {
+        // #43 §2: an empty plan leaves no frozen, busy, uncertain or
+        // outstanding target, so there is nothing to recover: the reply
+        // is 0, the marker is gone, the state is Thawed, no `frozen`
+        // hook (no watchdog), and the next freeze is admitted.
+        let rig = Rig::new(FreezeState::Thawed, "no_freezable.txt");
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert!(rig.fifreezes().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists(), "nothing to recover: no marker");
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+        assert!(rig.ctx.freeze_op().is_none());
+        let value = status(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-status"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!("thawed"));
+        // A freeze-list that matches nothing is the same case (C-12).
+        let rig = Rig::nested();
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/nope","/proc"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(0));
+        assert!(rig.fifreezes().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        // And the next freeze is admitted at once.
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+    }
+
+    #[tokio::test]
+    async fn a_freeze_list_count_is_the_number_of_requested_superblocks_this_operation_froze() {
+        // The coverage contract (#43 §2, C-24): the reply counts the
+        // distinct superblocks among the requested mount points on which
+        // this operation's FIFREEZE succeeded, and nothing else. A
+        // controller that requests one mount point per required
+        // superblock and demands `count == requested` therefore fails
+        // closed on a missing, unsupported, unmatched or busy target, and
+        // an alias of an already requested superblock never inflates it.
+        let list = |mountpoints: &[&str]| {
+            let json = json!({"execute": "guest-fsfreeze-freeze-list", "arguments": {"mountpoints": mountpoints}});
+            parse_request(json.to_string().as_bytes()).unwrap()
+        };
+        // Duplicate aliases: three names of one ext4 superblock.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/", "/var/www", "/mnt/rootbind"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1), "one superblock, whatever its names");
+        assert_eq!(rig.fifreezes(), paths(&["/"]));
+        // Missing target: a required path outside the plan lowers the
+        // count below the number requested.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/data", "/nope"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        // Mixed supported/unsupported: the unsupported one is skipped, so
+        // the count says the request is not fully covered.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        rig.kernel.script_freeze_error("/data", Errno::EOPNOTSUPP);
+        let value = freeze_list(&rig.ctx, &list(&["/", "/data"])).await.unwrap();
+        assert_eq!(value, json!(1));
+        // EBUSY under the single-freezer assumption is another freezer's
+        // freeze, not this operation's: not counted (AC17), retained for
+        // the drain, and the count again says "not fully covered".
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        rig.kernel.script_freeze_error("/data", Errno::EBUSY);
+        let value = freeze_list(&rig.ctx, &list(&["/", "/data"])).await.unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.held(), 2, "both handles are held for the thaw");
+        // Full coverage: exactly the number of distinct superblocks, each
+        // frozen through the name the request gave for it (an alias here),
+        // never through another name of the same superblock.
+        let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
+        let value = freeze_list(&rig.ctx, &list(&["/", "/srv/exports"]))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(2));
+        assert_eq!(rig.fifreezes(), paths(&["/srv/exports", "/"]));
+    }
+
+    #[tokio::test]
+    async fn an_entirely_skipped_plan_settles_thawed_too() {
+        // Every target answers EOPNOTSUPP: nothing was frozen, nothing is
+        // held, nothing is outstanding. Same rule as the empty plan.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EOPNOTSUPP);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0));
+        assert_eq!(rig.fifreezes(), paths(&["/home", "/"]));
+        assert!(rig.fithaws().is_empty(), "nothing to drain");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(rig.hooks.events(), ["freezing", "thawed"]);
+    }
+
+    #[tokio::test]
+    async fn a_zero_count_with_a_busy_target_keeps_the_conservative_state() {
+        // Not `successful_freezes == 0` alone: an EBUSY target is held for
+        // the drain (§4.2), so the operation settles Frozen with the
+        // marker and the watchdog, and a thaw drains it.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EBUSY);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        rig.kernel.script_thaw_successes("/home", 0);
+        let value = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(0), "EBUSY is not counted (AC17)");
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
+        assert_eq!(rig.held(), 1, "the busy target's handle is retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1), "the retained target is drained");
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn a_zero_work_operation_whose_marker_cannot_be_removed_stays_frozen() {
+        // Cleanup failed: the marker path was replaced by a non-empty
+        // directory while the last (skipped) target was being processed,
+        // so unlink fails. The conservative state is kept (the next start
+        // would recover) and the reply is an error, never a 0 that reads
+        // as a clean settlement.
+        let rig = Rig::new(FreezeState::Thawed, "simple.txt");
+        rig.kernel.script_freeze_error("/", Errno::EOPNOTSUPP);
+        rig.kernel.script_freeze_error("/home", Errno::EOPNOTSUPP);
+        let marker_path = rig.marker().path().to_path_buf();
+        rig.kernel.set_hook(Box::new(move |call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new("/")) {
+                let _ = std::fs::remove_file(&marker_path);
+                std::fs::create_dir(&marker_path).unwrap();
+                std::fs::write(marker_path.join("child"), b"x").unwrap();
+            }
+        }));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nothing was frozen")
+                && err.to_string().contains("cannot remove recovery marker"),
+            "{err}"
+        );
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().path().exists(), "marker path retained");
+        assert_eq!(rig.hooks.events(), ["freezing", "frozen"]);
     }
 
     #[tokio::test]
@@ -2204,6 +2618,7 @@ mod tests {
         thawing.await.unwrap().unwrap();
         assert_eq!(ctx.state.current(), FreezeState::Thawed);
         assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(ctx.audit.settle(Duration::from_secs(10)));
         let flushed = sink.0.lock().unwrap().len();
         assert!(flushed > 0, "the ring was flushed to the sink");
         // The next freeze window is intact: its records stay in the ring
@@ -2226,6 +2641,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ctx.audit.mode(), crate::audit::Mode::Normal);
+        assert!(ctx.audit.settle(Duration::from_secs(10)));
         assert!(sink.0.lock().unwrap().len() > flushed);
     }
 
@@ -2327,8 +2743,8 @@ mod tests {
         assert!(
             kernel.calls()[before..]
                 .iter()
-                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/home"))),
-            "the watchdog drain still thaws what it can"
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/"))),
+            "the watchdog drain retries the held target (tracked scope: the drained ones are done)"
         );
         assert_eq!(ctx.state.current(), FreezeState::Frozen);
         assert!(ctx.marker.exists());
@@ -2543,16 +2959,27 @@ mod tests {
         assert!(err.to_string().contains("marker retained"), "{err}");
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert_eq!(rig.held(), 1, "only the undrained target keeps its handle");
-        // The next thaw drains /home through that handle (no reopen) and
-        // reopens the targets whose drain completed, since a pathname is
-        // all that is left for those.
+        // The next thaw is still the operation's (tracked scope, §4.2): it
+        // drains /home through that handle and opens nothing, since the
+        // targets whose drain completed are done; it fails the same way
+        // and keeps the handle again.
         rig.kernel.clear_calls();
         let _ = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#)).await;
-        let opens = rig.opens();
-        assert!(!opens.contains(&PathBuf::from("/home")), "{opens:?}");
-        assert!(opens.contains(&PathBuf::from("/")), "{opens:?}");
-        assert!(rig.fithaws().contains(&PathBuf::from("/home")));
+        assert!(rig.opens().is_empty(), "{:?}", rig.opens());
+        assert_eq!(rig.fithaws(), paths(&["/home"]));
         assert_eq!(rig.held(), 1);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        // Once the kernel permits it, the drain of that one target
+        // completes the operation: marker gone, `Thawed`.
+        rig.kernel.script_thaw_successes("/home", 1);
+        rig.kernel.clear_thaw_errors();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(1));
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
     }
 
     #[tokio::test]
@@ -2632,6 +3059,9 @@ mod tests {
             .unwrap();
         assert_eq!(value, json!(4));
         assert_eq!(rig.held(), 4);
+        // As after an uncertain settlement (a lost worker): the thaw must
+        // discover its targets, so the table matters.
+        rig.ctx.set_thaw_scope(ThawScope::Discovery);
         mounts.fail_reads(true);
         rig.kernel.clear_calls();
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
@@ -2699,6 +3129,160 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_tracked_thaw_reads_no_mount_table() {
+        // The thaw of an operation this process completed has every
+        // obligation in hand: it drains the held descriptors and completes
+        // (marker gone, `Thawed`) although the table cannot be read at
+        // all, the EMFILE those descriptors may have caused included.
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts.clone());
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.ctx.thaw_scope(), ThawScope::Tracked);
+        mounts.fail_reads(true);
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+        assert!(rig.opens().is_empty());
+        assert_eq!(
+            rig.fithaws().len(),
+            8,
+            "every held target, success + EINVAL"
+        );
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+        assert_eq!(
+            rig.ctx.thaw_scope(),
+            ThawScope::Discovery,
+            "a completed thaw leaves the conservative default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_thaw_worker_leaves_the_next_thaw_to_discovery() {
+        // The external review's fifth-round finding: the ordinary thaw
+        // moves the held descriptors into its blocking task; when that
+        // task is lost (a panic on the first FITHAW, in an unwind build)
+        // the descriptors are gone with it, so they are no longer evidence
+        // of complete ownership. The state returns to `Frozen` with the
+        // marker, and the next thaw must discover its targets through the
+        // table (pathnames consulted, every target drained) before the
+        // marker goes, never drain an empty list and publish `Thawed`.
+        let rig = Rig::nested();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.held(), 4);
+        rig.kernel.set_hook(Box::new(|call| {
+            if matches!(call, Call::Fithaw(_)) {
+                panic!("thaw worker lost");
+            }
+        }));
+        let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("thaw worker lost"), "{err}");
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert!(rig.marker().exists());
+        assert_eq!(rig.held(), 0, "the descriptors were lost with the task");
+        assert_eq!(rig.ctx.thaw_scope(), ThawScope::Discovery);
+        rig.kernel.set_hook(Box::new(|_| {}));
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4), "every target found frozen by its pathname");
+        assert_eq!(rig.opens().len(), 4, "discovery: {:?}", rig.opens());
+        assert_eq!(rig.fithaws().len(), 8);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
+    async fn a_discovery_drain_uses_the_held_handle_of_the_same_superblock() {
+        // Under discovery (as after an uncertain settlement) a planned
+        // target is drained through the handle this process holds for
+        // *its* superblock, matched by device, so nothing is reopened even
+        // where a pathname now leads elsewhere, and the drain runs in
+        // forward mount order: a handle of another device never stands in.
+        let rig = Rig::nested();
+        freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(rig.held(), 4);
+        rig.ctx.set_thaw_scope(ThawScope::Discovery);
+        rig.kernel.script_mount_device("/home/data", (8, 9));
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        assert_eq!(value, json!(4));
+        assert!(rig.opens().is_empty(), "{:?}", rig.opens());
+        assert_eq!(
+            rig.fithaws(),
+            paths(&[
+                "/",
+                "/",
+                "/home",
+                "/home",
+                "/home/data",
+                "/home/data",
+                "/home/data/deep",
+                "/home/data/deep"
+            ]),
+            "each target through its own handle, forward"
+        );
+        assert_eq!(rig.held(), 0);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_lost_a_worker_leaves_its_thaw_to_discovery() {
+        // The worker for /home/data panics inside FIFREEZE: its outcome is
+        // unknown and no descriptor shows for it, so the operation settles
+        // `Frozen` with the target uncertain and the thaw must discover
+        // its targets through the table: /home/data is reached by its
+        // pathname although this process holds nothing for it.
+        let rig = Rig::nested();
+        rig.kernel.set_hook(Box::new(|call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new("/home/data")) {
+                panic!("worker lost");
+            }
+        }));
+        let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("worker lost"), "{err}");
+        // The reply went out when the abort committed; the recovery of the
+        // target frozen before (/home/data/deep) settles afterwards.
+        if let Some(op) = rig.ctx.freeze_op() {
+            op.wait_for_settlement().await;
+        }
+        settle().await;
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(rig.ctx.thaw_scope(), ThawScope::Discovery);
+        rig.kernel.set_hook(Box::new(|_| {}));
+        rig.kernel.clear_calls();
+        let value = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap();
+        // Three targets are found frozen by their pathnames (the fake
+        // thaws once per path); /home/data/deep was drained by the
+        // recovery pass and answers EINVAL at once.
+        assert_eq!(value, json!(3));
+        assert!(
+            rig.opens().contains(&PathBuf::from("/home/data")),
+            "the uncertain target is discovered by its pathname: {:?}",
+            rig.opens()
+        );
+        assert!(rig.fithaws().contains(&PathBuf::from("/home/data")));
+    }
+
+    #[tokio::test]
     async fn an_incomplete_held_drain_is_reported_before_the_read_failure() {
         // Both retain the marker; the target that may still be frozen is
         // the more specific report, and its handle is kept.
@@ -2707,6 +3291,7 @@ mod tests {
         freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap();
+        rig.ctx.set_thaw_scope(ThawScope::Discovery);
         mounts.fail_reads(true);
         rig.kernel.script_thaw_error("/home", Errno::EACCES);
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
@@ -2781,6 +3366,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, json!(4));
+        // A tracked thaw would read no table at all (§4.2 "Thaw scope");
+        // the case is the discovery drain's, as after an uncertain
+        // settlement.
+        rig.ctx.set_thaw_scope(ThawScope::Discovery);
         // Exhaust the descriptors, as retained handles on a busy agent
         // could: the mount table can no longer be opened.
         let mut hoard = Vec::new();
@@ -2930,6 +3519,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(value, json!(4), "a new freeze is accepted again");
+    }
+
+    #[tokio::test]
+    async fn a_dead_instances_walk_is_aborted_and_never_publishes() {
+        // `Context::abort_tasks` is a harness's SIGKILL (§4.5 scenarios,
+        // T6.3): the driver waiting on B is ended where it waits, so when
+        // B's FIFREEZE lands the walk does not go on to C, publishes no
+        // state, arms no watchdog and answers nothing; the marker written
+        // before the walk and the kernel's freezes stay for the recovery
+        // of the next instance.
+        let rig = Rig::nested();
+        let gate = rig.kernel.script_freeze_gate(B);
+        let _release = gate.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("B blocked", |_| gate.waiting() == 1).await;
+        assert_eq!(rig.state(), FreezeState::Freezing);
+        rig.ctx.abort_tasks();
+        gate.release();
+        rig.wait_for("B's late FIFREEZE landed", |_| gate.waiting() == 0)
+            .await;
+        // Real time, so a driver that survived would have gone on to C.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        settle().await;
+        assert_eq!(rig.fifreezes(), paths(&[A, B]), "C never authorised");
+        assert_eq!(rig.state(), FreezeState::Freezing, "nothing published");
+        assert!(rig.ctx.watchdog_slot().is_none(), "no watchdog armed");
+        assert_eq!(rig.hooks.events(), ["freezing"]);
+        assert!(rig.marker().exists(), "the marker stays for recovery");
+        assert_eq!(rig.fithaws(), Vec::<PathBuf>::new(), "nothing drained");
+        if let Ok(Ok(Ok(value))) = tokio::time::timeout(Duration::from_millis(100), freezing).await
+        {
+            panic!("a dead walk answered {value}");
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,4 @@
+27 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro
+40 41 8:5 / /data rw,relatime - xfs /dev/sdd1 rw
+41 27 8:2 / /data rw,relatime shared:5 - ext4 /dev/sdb1 rw
+42 27 8:2 / /b-alias rw,relatime shared:5 - ext4 /dev/sdb1 rw

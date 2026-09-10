@@ -101,6 +101,22 @@ pub mod reason {
     pub const FROZEN: &str = "frozen";
 }
 
+/// How a thaw finds the filesystems it must drain (§4.2 "Thaw scope").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThawScope {
+    /// Every obligation is a held descriptor: a freeze operation this
+    /// process completed with no target's outcome unknown. The thaw
+    /// drains the descriptors the operation published and nothing else,
+    /// and reads no mount table: a superblock the operation never
+    /// touched cannot hold its thaw.
+    Tracked,
+    /// A filesystem may be frozen with no descriptor to show for it:
+    /// after a restart, for a drain from `Thawed`, or after an operation
+    /// that lost a worker or a drain. The thaw discovers every eligible
+    /// superblock through the mount table, by its pathnames and aliases.
+    Discovery,
+}
+
 /// Everything handlers need, shared behind an `Arc`. Tests build it with
 /// fakes; later tasks add the kernel shim and information sources.
 pub struct Context {
@@ -136,6 +152,8 @@ pub struct Context {
     /// held until their drain completes: a thaw drains the filesystem
     /// each was opened on, whatever its pathnames lead to by then (§4.2).
     frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
+    /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
+    thaw_scope: std::sync::Mutex<ThawScope>,
     /// The freeze operation in progress, from `Freezing` until it settles
     /// (§4.4 operation deadline).
     freeze_op: std::sync::Mutex<Option<Arc<crate::freeze_op::FreezeOp>>>,
@@ -194,6 +212,7 @@ impl Context {
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
+            thaw_scope: std::sync::Mutex::new(ThawScope::Discovery),
             freeze_op: std::sync::Mutex::new(None),
             freeze_operation_timeout,
             freeze_clock: Arc::new(crate::freeze_op::TokioClock),
@@ -342,6 +361,24 @@ impl Context {
     /// Number of handles currently held.
     pub fn frozen_mount_count(&self) -> usize {
         self.frozen_mounts_slot().len()
+    }
+
+    /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
+    pub fn thaw_scope(&self) -> ThawScope {
+        *self
+            .thaw_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records how the next thaw must find what it drains: a settling
+    /// freeze operation sets it from what it knows of its targets, a
+    /// completed thaw resets it.
+    pub fn set_thaw_scope(&self, scope: ThawScope) {
+        *self
+            .thaw_scope
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = scope;
     }
 
     /// The lock behind the held handles, for tests that must hold the

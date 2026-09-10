@@ -20,6 +20,23 @@ semantic versioning.
 
 ### Fixed
 
+- The thaw of a freeze operation this process completed drains the
+  descriptors the operation published (its frozen targets and the
+  `EBUSY` ones it retained) and nothing else, reading no mount table: a
+  superblock the operation never froze, one hidden under a mount over
+  its ancestor or one outside a `guest-fsfreeze-freeze-list` request,
+  cannot hold the thaw. Before, every thaw discovered every eligible
+  superblock through the table and reported a planned one reached by no
+  pathname as unrecoverable, so after a freeze through a directory
+  overmount the marker and the frozen gate stayed while a filesystem
+  that was never frozen remained hidden. Recovery drains (after a
+  restart, from `Thawed`, or after an operation that lost a worker or a
+  drain) keep the table-wide discovery and the conservative rule
+  (design §4.2 "Thaw scope"; #43, external review).
+- `guest-fsfreeze-freeze-list`: a mount table whose root carries its own
+  id as its parent id (valid per proc_pid_mountinfo(5)) resolved no
+  requested name, so the request froze nothing and replied `0`; such a
+  root is now walked from (#43, external review).
 - `guest-fsfreeze-freeze-list`: a requested mount point selects the
   superblock its pathname leads to now, resolved as the kernel resolves
   the path (from the root mount along the components, by mount ids and

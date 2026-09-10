@@ -191,6 +191,12 @@ impl FakeKernel {
             .insert(path.as_ref().to_owned(), errno);
     }
 
+    /// Lifts every scripted `fithaw` error (the kernel permits the drain
+    /// again).
+    pub fn clear_thaw_errors(&self) {
+        self.lock().thaw_errors.clear();
+    }
+
     /// Makes `open_mount(path, _)` fail with `errno`
     /// ([`KernelError::Open`]: no ioctl issued on that path).
     pub fn script_open_error(&self, path: impl AsRef<Path>, errno: Errno) {

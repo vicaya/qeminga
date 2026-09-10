@@ -64,7 +64,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 
-use crate::dispatch::Context;
+use crate::dispatch::{Context, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
     FreezeFailure, FreezeStop, build_plan, drain_held, open_target, rollback,
@@ -463,6 +463,7 @@ pub(crate) fn start(
         recovered: 0,
         recovery: None,
         kept: Vec::new(),
+        uncertain: false,
         unrecoverable: None,
         abort: None,
         timeout,
@@ -523,6 +524,10 @@ struct Driver {
     /// Handles whose drain did not complete, kept for the watchdog.
     kept: Vec<Mount>,
     unrecoverable: Option<(String, String)>,
+    /// A target's outcome is unknown and no descriptor shows for it (a
+    /// worker, a drain or a rollback lost): the thaw of what this
+    /// operation leaves must discover its targets (§4.2 "Thaw scope").
+    uncertain: bool,
     abort: Option<AbortCause>,
     timeout: Duration,
 }
@@ -598,6 +603,7 @@ impl Driver {
                     // operation settles `Frozen` and the watchdog's drain
                     // by pathname reaches it.
                     tracing::error!(event = "fsfreeze_worker_lost", mountpoint = %mountpoint, error = %err, "freeze worker lost; target uncertain");
+                    self.uncertain = true;
                     self.unrecoverable.get_or_insert((
                         mountpoint.clone(),
                         format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
@@ -829,6 +835,7 @@ impl Driver {
                 // The drain's handles are lost with it; the targets stay
                 // uncertain and the watchdog's drain by pathname follows.
                 tracing::error!(event = "fsfreeze_drain_lost", error = %err, "recovery drain lost; targets uncertain");
+                self.uncertain = true;
                 self.unrecoverable.get_or_insert((
                     "(recovery drain)".to_owned(),
                     format!("recovery drain lost ({err})"),
@@ -908,7 +915,10 @@ impl Driver {
                 self.ctx.hold_frozen_mounts(keep);
                 failure
             }
-            Err(err) => FreezeFailure::Task(format!("rollback lost: {err}")),
+            Err(err) => {
+                self.uncertain = true;
+                FreezeFailure::Task(format!("rollback lost: {err}"))
+            }
         };
         if failure.retains_frozen_state() || matches!(failure, FreezeFailure::Task(_)) {
             tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
@@ -984,6 +994,13 @@ impl Driver {
             self.ctx.hooks.on_thawed(&self.ctx);
         }
         self.ctx.retire_freeze_op(&self.op);
+        // What the thaw of this operation's leftovers must do (§4.2 "Thaw
+        // scope"): drain the descriptors published, unless a target's
+        // outcome is unknown, in which case it discovers its targets.
+        self.ctx.set_thaw_scope(match terminal {
+            Terminal::Frozen if !self.uncertain => ThawScope::Tracked,
+            Terminal::Frozen | Terminal::Thawed => ThawScope::Discovery,
+        });
         let state = match terminal {
             Terminal::Thawed => {
                 if let Some(token) = self.token.take() {

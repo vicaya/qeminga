@@ -542,13 +542,23 @@ impl From<String> for ThawFailure {
     }
 }
 
-/// Opens `target` on its planned device through the first of its mount
-/// points that still leads there (the kernel shim verifies each opened
-/// directory, so a mount placed over a pathname is seen, not frozen or
-/// thawed by mistake). When none does, the attempts are reported in
-/// order: `/data: mountpoint is on 8:3, not on the planned 8:2;
-/// /data-alias: cannot open mountpoint: ENOENT`.
+/// Opens `target` on its planned device. A target a request selected
+/// ([`Target::requested`]) is opened on the requested name and on nothing
+/// else: the kernel shim verifies the opened directory, so a name that
+/// does not lead to the selected superblock is a failure of this target,
+/// never an alias standing in for it (a controller's coverage must not be
+/// rescued by reaching another name of a wrongly selected superblock).
+/// Otherwise, through the first of its mount points that still leads
+/// there (a mount placed over a pathname is seen, not frozen or thawed by
+/// mistake). When none does, the attempts are reported in order: `/data:
+/// mountpoint is on 8:3, not on the planned 8:2; /data-alias: cannot open
+/// mountpoint: ENOENT`.
 pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mount, String> {
+    if let Some(requested) = &target.requested {
+        return kernel
+            .open_mount(requested, target.dev)
+            .map_err(|err| format!("{}: {err}", lossy(requested)));
+    }
     let mut attempts = Vec::new();
     for path in target.mountpoints() {
         match kernel.open_mount(path, target.dev) {
@@ -1624,6 +1634,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freeze_list_freezes_what_the_requested_pathname_leads_to_not_a_later_row() {
+        // The external review's moved-mount arrangement: A (8:5) moved over
+        // B (8:2) at /data keeps its earlier row. A request for /data must
+        // freeze A, opened on /data, and leave B alone; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "moved_mount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data"), (8, 5))]);
+        assert_eq!(rig.fifreezes(), paths(&["/data"]));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
+    async fn a_requested_pathname_that_does_not_lead_to_the_selected_superblock_fails_the_operation()
+     {
+        // Belt and braces for the selection: if what the kernel opens at
+        // the requested name is not the selected superblock, the target
+        // fails and the operation with it; an alias of the selected
+        // superblock never stands in, since that would turn a wrong
+        // selection into a count.
+        let rig = Rig::new(FreezeState::Thawed, "moved_mount.txt");
+        rig.kernel.script_mount_device("/data", (8, 2));
+        let err = freeze_list(
+            &rig.ctx,
+            &req(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+            ),
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("/data") && text.contains("8:2") && text.contains("8:5"),
+            "{text}"
+        );
+        assert!(
+            rig.fifreezes().is_empty(),
+            "nothing frozen through an alias"
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+    }
+
+    #[tokio::test]
     async fn freeze_list_with_unknown_paths_freezes_nothing_and_returns_0() {
         let rig = Rig::nested();
         let value = freeze_list(
@@ -1721,13 +1791,15 @@ mod tests {
         let value = freeze_list(&rig.ctx, &list(&["/", "/data"])).await.unwrap();
         assert_eq!(value, json!(1));
         assert_eq!(rig.held(), 2, "both handles are held for the thaw");
-        // Full coverage: exactly the number of distinct superblocks.
+        // Full coverage: exactly the number of distinct superblocks, each
+        // frozen through the name the request gave for it (an alias here),
+        // never through another name of the same superblock.
         let rig = Rig::new(FreezeState::Thawed, "bind_mounts.txt");
         let value = freeze_list(&rig.ctx, &list(&["/", "/srv/exports"]))
             .await
             .unwrap();
         assert_eq!(value, json!(2));
-        assert_eq!(rig.fifreezes(), paths(&["/data", "/"]));
+        assert_eq!(rig.fifreezes(), paths(&["/srv/exports", "/"]));
     }
 
     #[tokio::test]

@@ -40,6 +40,11 @@ pub struct Target {
     pub dev: (u32, u32),
     /// Filesystem type.
     pub fs_type: String,
+    /// The requested mount point that selected this target
+    /// ([`FreezePlan::restrict_to`]), if any: the freeze opens the target
+    /// on that name and on nothing else, so a wrong selection is a failed
+    /// open rather than an alias silently standing in.
+    pub requested: Option<PathBuf>,
 }
 
 impl Target {
@@ -54,8 +59,20 @@ impl Target {
 pub struct FreezePlan {
     /// Targets in mount order.
     targets: Vec<Target>,
-    /// Every mount point with its device, for [`covers`](Self::covers).
-    mounts: Vec<(PathBuf, (u32, u32))>,
+    /// The whole mount table, as far as the plan needs it: for
+    /// [`covers`](Self::covers) and for what a pathname leads to.
+    mounts: Vec<MountRow>,
+}
+
+/// One row of the mount table: its identity and its parent (the mount
+/// graph, which decides what a pathname leads to), its mount point and
+/// its superblock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MountRow {
+    id: u32,
+    parent: u32,
+    mount_point: PathBuf,
+    dev: (u32, u32),
 }
 
 /// `true` when the entry is a local, device-backed filesystem of an
@@ -82,6 +99,7 @@ impl FreezePlan {
                         aliases: Vec::new(),
                         dev: entry.dev(),
                         fs_type: entry.fs_type.clone(),
+                        requested: None,
                     });
                 }
             }
@@ -90,7 +108,12 @@ impl FreezePlan {
             targets,
             mounts: mounts
                 .iter()
-                .map(|e| (e.mount_point.clone(), e.dev()))
+                .map(|e| MountRow {
+                    id: e.mount_id,
+                    parent: e.parent_id,
+                    mount_point: e.mount_point.clone(),
+                    dev: e.dev(),
+                })
                 .collect(),
         }
     }
@@ -121,42 +144,95 @@ impl FreezePlan {
     }
 
     /// The intersection with the requested mount points. A requested name
-    /// selects the superblock mounted at exactly that path *now*: the last
-    /// mount-table entry with that mount point (byte-exact, no
+    /// selects the superblock the pathname leads to *now*, decided by the
+    /// mount graph (`visible_at`, below; byte-exact, no
     /// normalisation; a mount point that is not valid UTF-8 can never be
     /// named on the wire), whatever the plan calls the superblock. So one
     /// name never selects two superblocks, a name that only a hidden
-    /// (overmounted) mount point of a target carries selects nothing, and
-    /// the count of §4.2 "Coverage" is one per requested superblock (#43
-    /// §1). The selected target keeps all its mount points: they are how
-    /// it is reached and recovered, not what it was selected by. Unknown
-    /// paths are ignored, not errors (C-12). Order and the mount table are
-    /// preserved.
+    /// mount point of a target carries selects nothing, and the count of
+    /// §4.2 "Coverage" is one per requested superblock (#43 §1). The
+    /// selected target records the name that selected it
+    /// ([`Target::requested`]) and is opened on that name only; it keeps
+    /// all its mount points for the thaw, which reaches and recovers it by
+    /// any of them. Unknown paths are ignored, not errors (C-12). Order
+    /// and the mount table are preserved.
     pub fn restrict_to(&self, mountpoints: &[String]) -> FreezePlan {
-        let selected: Vec<(u32, u32)> = mountpoints
-            .iter()
-            .filter_map(|name| self.mounted_at(name))
-            .collect();
-        FreezePlan {
-            targets: self
-                .targets
+        let mut targets = Vec::new();
+        for target in &self.targets {
+            if let Some(name) = mountpoints
                 .iter()
-                .filter(|t| selected.contains(&t.dev))
-                .cloned()
-                .collect(),
+                .find(|name| self.visible_at(name) == Some(target.dev))
+            {
+                targets.push(Target {
+                    requested: Some(PathBuf::from(name)),
+                    ..target.clone()
+                });
+            }
+        }
+        FreezePlan {
+            targets,
             mounts: self.mounts.clone(),
         }
     }
 
-    /// The superblock mounted at exactly `path` now: the last entry of the
-    /// mount table with that mount point (a later mount over the same path
-    /// hides the earlier one), or `None` when nothing is mounted there.
-    fn mounted_at(&self, path: &str) -> Option<(u32, u32)> {
+    /// The superblock the pathname `path` leads to now: the mount at
+    /// exactly that mount point that is visible, decided by the mount
+    /// graph (mount ids and parents), never by the order of the table
+    /// (a mount moved over a newer one keeps its earlier row). `None`
+    /// when nothing visible is mounted there, or when the table shows more
+    /// than one visible candidate (a consistent table never does; refused
+    /// rather than guessed).
+    fn visible_at(&self, path: &str) -> Option<(u32, u32)> {
+        let mut candidates = self
+            .mounts
+            .iter()
+            .filter(|row| row.mount_point.as_os_str() == path && self.is_visible(row));
+        let first = candidates.next()?;
+        if candidates.next().is_some() {
+            return None;
+        }
+        Some(first.dev)
+    }
+
+    fn parent_of(&self, row: &MountRow) -> Option<&MountRow> {
         self.mounts
             .iter()
-            .rev()
-            .find(|(mountpoint, _)| mountpoint.as_os_str() == path)
-            .map(|(_, dev)| *dev)
+            .find(|p| p.id == row.parent && p.id != row.id)
+    }
+
+    /// `true` when another mount is stacked on `row` at its own mount
+    /// point, hiding it and everything under it.
+    fn covered(&self, row: &MountRow) -> bool {
+        self.mounts
+            .iter()
+            .any(|c| c.parent == row.id && c.id != row.id && c.mount_point == row.mount_point)
+    }
+
+    /// `true` when `row` is what its mount point leads to: nothing is
+    /// stacked on it, and the mount its stack stands on (the ancestor
+    /// providing the directory it is attached to) is itself visible, so no
+    /// mount over an ancestor hides it (`proc_pid_mountinfo(5)`).
+    fn is_visible(&self, row: &MountRow) -> bool {
+        let mut row = row;
+        // Bounded by the table: a malformed table cannot loop this.
+        for _ in 0..=self.mounts.len() {
+            if self.covered(row) {
+                return false;
+            }
+            // Down the stack of mounts at this mount point, to its bottom.
+            let mut bottom = row;
+            while let Some(parent) = self.parent_of(bottom)
+                && parent.mount_point == bottom.mount_point
+            {
+                bottom = parent;
+            }
+            match self.parent_of(bottom) {
+                // The root of the namespace.
+                None => return true,
+                Some(ancestor) => row = ancestor,
+            }
+        }
+        false
     }
 
     /// The mount point that holds `path` (longest matching prefix, by path
@@ -164,9 +240,9 @@ impl FreezePlan {
     pub fn mount_of(&self, path: &Path) -> Option<(&Path, (u32, u32))> {
         self.mounts
             .iter()
-            .filter(|(mp, _)| path.starts_with(mp))
-            .max_by_key(|(mp, _)| mp.components().count())
-            .map(|(mp, dev)| (mp.as_path(), *dev))
+            .filter(|row| path.starts_with(&row.mount_point))
+            .max_by_key(|row| row.mount_point.components().count())
+            .map(|row| (row.mount_point.as_path(), row.dev))
     }
 
     /// `true` when the filesystem holding `path` is in the plan, going by
@@ -282,6 +358,52 @@ mod tests {
         let restricted = plan.restrict_to(&["/data".to_owned()]);
         let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
         assert_eq!(devs, [(8, 3)]);
+    }
+
+    #[test]
+    fn a_mount_moved_over_a_newer_one_is_what_the_pathname_leads_to() {
+        // The external review's second counterexample: A was mounted first
+        // (row 40), B at /data after it, B bound at /b-alias, then A moved
+        // over /data. The table keeps A's earlier row, so "the last row at
+        // /data" is B, while what /data leads to is A (row 40's parent is
+        // row 41). Selection follows the graph.
+        let plan = plan_from("moved_mount.txt");
+        assert_eq!(plan.visible_at("/data"), Some((8, 5)));
+        assert_eq!(plan.visible_at("/b-alias"), Some((8, 2)));
+        let restricted = plan.restrict_to(&["/data".to_owned()]);
+        let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 5)]);
+        assert_eq!(
+            restricted.targets()[0].requested.as_deref(),
+            Some(Path::new("/data"))
+        );
+        // B is still selectable by the name it is visible at.
+        let restricted = plan.restrict_to(&["/b-alias".to_owned()]);
+        let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 2)]);
+        // A full freeze selects by nothing.
+        assert!(plan.targets().iter().all(|t| t.requested.is_none()));
+    }
+
+    #[test]
+    fn a_mount_under_an_overmounted_ancestor_is_hidden() {
+        // /data/nested (row 41) hangs off row 40, which row 42 covers at
+        // /data: /data/nested now leads into row 42's filesystem, where
+        // nothing is mounted, so the name selects nothing; /data selects
+        // row 42.
+        let plan = plan_from("hidden_nested.txt");
+        assert_eq!(plan.visible_at("/data/nested"), None);
+        assert_eq!(plan.visible_at("/data"), Some((8, 4)));
+        assert!(plan.restrict_to(&["/data/nested".to_owned()]).is_empty());
+        let devs: Vec<(u32, u32)> = plan
+            .restrict_to(&["/data".to_owned()])
+            .targets()
+            .iter()
+            .map(|t| t.dev)
+            .collect();
+        assert_eq!(devs, [(8, 4)]);
+        // The hidden superblock is still in the plan for a thaw to reach.
+        assert!(plan.covers_device((8, 3)));
     }
 
     #[test]

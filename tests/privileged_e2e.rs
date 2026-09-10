@@ -137,6 +137,168 @@ fn privileged_freeze_sigkill_restart_recovery_thaw() {
     assert!(agent.stop().success());
 }
 
+/// A second, independent filesystem for tests that need two: the xfs
+/// loop mount when `mk-loop-fs.sh` made one, else an ext4 image of its
+/// own on a loop device, detached on drop.
+struct SecondFs {
+    mount: String,
+    loop_dev: Option<String>,
+    _dir: Option<tempfile::TempDir>,
+}
+
+impl SecondFs {
+    fn new() -> Self {
+        if let Ok(mount) = std::env::var("QEMINGA_TEST_XFS_MOUNT") {
+            return SecondFs {
+                mount,
+                loop_dev: None,
+                _dir: None,
+            };
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("second.img");
+        let mount = dir.path().join("second");
+        std::fs::create_dir(&mount).unwrap();
+        let ok = |cmd: &str, args: &[&str]| {
+            let out = std::process::Command::new(cmd).args(args).output().unwrap();
+            assert!(
+                out.status.success(),
+                "{cmd} {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        ok("truncate", &["-s", "64M", image.to_str().unwrap()]);
+        ok("mkfs.ext4", &["-q", image.to_str().unwrap()]);
+        let loop_dev = ok("losetup", &["--find", "--show", image.to_str().unwrap()]);
+        ok("mount", &[&loop_dev, mount.to_str().unwrap()]);
+        SecondFs {
+            mount: mount.to_str().unwrap().to_owned(),
+            loop_dev: Some(loop_dev),
+            _dir: Some(dir),
+        }
+    }
+}
+
+impl Drop for SecondFs {
+    fn drop(&mut self) {
+        if let Some(loop_dev) = &self.loop_dev {
+            let _ = std::process::Command::new("umount")
+                .arg(&self.mount)
+                .status();
+            let _ = std::process::Command::new("losetup")
+                .args(["-d", loop_dev])
+                .status();
+        }
+    }
+}
+
+/// The external review's arrangement, on real mounts in a private tmpfs:
+/// A bound first (`staging-a`), B bound at `data` and again at `b-alias`,
+/// then A moved over `data`. A keeps its earlier row in the mount table
+/// while it is what `data` leads to. Unmounted in reverse on drop.
+struct MovedMount {
+    base: tempfile::TempDir,
+}
+
+impl MovedMount {
+    fn arrange(a: &str, b: &str) -> Self {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().to_str().unwrap().to_owned();
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new("mount")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "mount {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        sh(&["-t", "tmpfs", "tmpfs", &root]);
+        sh(&["--make-private", &root]);
+        for d in ["staging-a", "data", "b-alias"] {
+            std::fs::create_dir(base.path().join(d)).unwrap();
+        }
+        sh(&["--bind", a, &format!("{root}/staging-a")]);
+        sh(&["--bind", b, &format!("{root}/data")]);
+        sh(&["--bind", b, &format!("{root}/b-alias")]);
+        sh(&[
+            "--move",
+            &format!("{root}/staging-a"),
+            &format!("{root}/data"),
+        ]);
+        MovedMount { base }
+    }
+
+    fn data(&self) -> String {
+        format!("{}/data", self.base.path().to_str().unwrap())
+    }
+}
+
+impl Drop for MovedMount {
+    fn drop(&mut self) {
+        let root = self.base.path().to_str().unwrap().to_owned();
+        for target in [
+            format!("{root}/data"),
+            format!("{root}/data"),
+            format!("{root}/b-alias"),
+            root,
+        ] {
+            let _ = std::process::Command::new("umount").arg(&target).status();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_a_mount_moved_over_a_newer_one_is_what_the_request_freezes() {
+    // The external review's counterexample on the real kernel: with A
+    // moved over B at `data`, a request for `data` must freeze A (what
+    // the pathname leads to) and not B (the later row at that path, still
+    // reachable at `b-alias`), and the count must be 1. Proven on the
+    // superblocks themselves: FIFREEZE on A's original mount answers
+    // EBUSY (already frozen), on B's it succeeds (thawed again at once).
+    use qeminga::kernel::KernelOps;
+    let b = ext4_mount();
+    let second = SecondFs::new();
+    let a = second.mount.clone();
+    let _thaw = ThawGuard::new(&[a.clone(), b.clone()]);
+    let arranged = MovedMount::arrange(&a, &b);
+    let data = arranged.data();
+    assert_eq!(
+        dev_of(std::path::Path::new(&data)),
+        dev_of(std::path::Path::new(&a)),
+        "A is what data leads to"
+    );
+    let mut agent = Agent::spawn_with(real_kernel(""));
+    assert_eq!(
+        freeze_list(&mut agent, std::slice::from_ref(&data)),
+        json!({"return": 1})
+    );
+    let kernel = qeminga::kernel::LinuxKernel;
+    let frozen = kernel.fifreeze(&handle(std::path::Path::new(&a)));
+    assert!(
+        matches!(
+            frozen,
+            Err(qeminga::kernel::KernelError::Errno(
+                nix::errno::Errno::EBUSY
+            ))
+        ),
+        "A is frozen: {frozen:?}"
+    );
+    let b_handle = handle(std::path::Path::new(&b));
+    kernel.fifreeze(&b_handle).expect("B is not frozen");
+    kernel.fithaw(&b_handle).unwrap();
+    assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
+    let thawed = agent.execute("guest-fsfreeze-thaw");
+    assert_eq!(thawed["return"], 1, "{thawed}");
+    std::fs::write(format!("{a}/after-moved-mount-thaw"), b"ok").unwrap();
+    std::fs::write(format!("{b}/after-moved-mount-thaw"), b"ok").unwrap();
+    assert!(agent.stop().success());
+}
+
 #[test]
 #[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_watchdog_idle_and_hard_cap_on_real_fs() {

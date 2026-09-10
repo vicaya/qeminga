@@ -389,8 +389,15 @@ struct State {
     /// Bytes of lines in `queue`.
     queued: usize,
     capacity: usize,
-    /// The writer thread is inside a sink write.
+    /// The writer thread is inside a sink write: the item it took out of
+    /// the queue is in flight, owned by the writer, and still counted here
+    /// (its bytes in `queued`, a gap's losses in `in_flight`).
     writing: bool,
+    /// The losses of the gap in flight, if the item in flight is one, so
+    /// they stay reported as unreported until delivered. Losses recorded
+    /// meanwhile go to a new gap in the queue, never into the one being
+    /// written (#43 §6, external review).
+    in_flight: Option<LossGap>,
     /// The last handle was dropped: deliver what is queued and exit.
     shutdown: bool,
     /// The writer thread has exited (or could not be started).
@@ -587,6 +594,7 @@ impl Router {
                 queued: 0,
                 capacity: queue,
                 writing: false,
+                in_flight: None,
                 shutdown: false,
                 exited: false,
                 started: false,
@@ -649,15 +657,16 @@ impl Router {
     /// Number of lines dropped at the delivery queue or refused by the
     /// sink and not yet reported by a loss record.
     pub fn unreported_losses(&self) -> u64 {
-        self.shared
-            .lock()
+        let state = self.shared.lock();
+        let queued: u64 = state
             .queue
             .iter()
             .map(|item| match item {
                 Item::Lost(gap) => gap.total(),
                 Item::Line(_) => 0,
             })
-            .sum()
+            .sum();
+        queued + state.in_flight.map_or(0, |gap| gap.total())
     }
 
     /// Bytes queued for the writer thread.
@@ -665,11 +674,13 @@ impl Router {
         self.shared.lock().queued
     }
 
-    /// Entries in the delivery queue: lines and loss gaps. At most one
-    /// gap sits between two lines, so this is bounded by the lines the
-    /// byte budget admits, whatever the losses.
+    /// Entries awaiting delivery: lines and loss gaps in the queue, plus
+    /// the item in flight. At most one gap sits between two lines, so
+    /// this is bounded by the lines the byte budget admits, whatever the
+    /// losses.
     pub fn queued_items(&self) -> usize {
-        self.shared.lock().queue.len()
+        let state = self.shared.lock();
+        state.queue.len() + usize::from(state.writing)
     }
 
     /// Waits until every queued line has been handed to the sink and no
@@ -775,13 +786,14 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
                     break None;
                 }
                 if state.mode == Mode::Normal
-                    && let Some(front) = state.queue.front()
+                    && !state.queue.is_empty()
                     && failed_at != Some(state.pushes)
                 {
-                    break Some(match front {
-                        Item::Line(line) => Item::Line(line.clone()),
-                        Item::Lost(gap) => Item::Lost(*gap),
-                    });
+                    // Taken out of the queue: the writer owns the item
+                    // while it is written, so a loss recorded meanwhile
+                    // starts a new gap behind it instead of merging into
+                    // a gap whose copy is already on its way to the sink.
+                    break state.queue.pop_front();
                 }
                 if state.shutdown && (state.queue.is_empty() || state.mode == Mode::Ring) {
                     break None;
@@ -797,35 +809,38 @@ fn writer_thread(shared: &Shared, mut sink: Box<dyn Write + Send>) {
                 return;
             };
             state.writing = true;
+            if let Item::Lost(gap) = &item {
+                state.in_flight = Some(*gap);
+            }
             item
         };
-        let (bytes, marker) = match &item {
-            Item::Line(line) => (line.clone(), None),
-            Item::Lost(gap) => (
-                gap.records()
-                    .flat_map(|(count, reason)| loss_record(count, reason).into_bytes())
-                    .collect(),
-                Some(*gap),
-            ),
+        let bytes: Vec<u8> = match &item {
+            Item::Line(line) => line.clone(),
+            Item::Lost(gap) => gap
+                .records()
+                .flat_map(|(count, reason)| loss_record(count, reason).into_bytes())
+                .collect(),
         };
         let delivered = sink.write_all(&bytes).is_ok();
         let _ = sink.flush();
         let mut state = shared.lock();
-        // The item stayed at the front while it was written, so the queue
-        // never looked empty to `settle` before delivery.
-        match state.queue.pop_front() {
-            Some(Item::Line(line)) => state.queued -= line.len(),
-            Some(Item::Lost(..)) | None => {}
+        // `writing` kept the item counted while it was in flight, so the
+        // queue never looked settled before delivery.
+        state.in_flight = None;
+        if let Item::Line(line) = &item {
+            state.queued -= line.len();
         }
         if delivered {
             failed_at = None;
         } else {
             failed_at = Some(state.pushes);
-            match marker {
-                // The loss records themselves were refused: keep the gap.
-                Some(gap) => state.lose_at_front(gap),
+            match item {
+                // The loss records themselves were refused: the gap goes
+                // back to the head, merged into a newer gap there if any
+                // (counts add; nothing recorded meanwhile is overwritten).
+                Item::Lost(gap) => state.lose_at_front(gap),
                 // The line is lost; say so where it was.
-                None => state.lose_at_front(LossGap::of(1, LossReason::SinkError)),
+                Item::Line(_) => state.lose_at_front(LossGap::of(1, LossReason::SinkError)),
             }
         }
         state.writing = false;
@@ -1654,6 +1669,51 @@ mod tests {
         let queue_loss: Value = serde_json::from_str(&lines[4]).unwrap();
         assert_eq!(queue_loss["reason"], "sink_backpressure");
         assert_eq!(queue_loss["lost"], kept);
+    }
+
+    #[test]
+    fn a_gap_being_written_does_not_swallow_losses_recorded_meanwhile() {
+        // #43 §6 (external review, follow-up): the writer used to copy the
+        // gap at the head for delivery and leave the original in the
+        // queue, where later losses merged into it; after writing the old
+        // copy it popped the whole entry, and the losses added meanwhile
+        // were neither reported nor retained. The writer now owns the item
+        // in flight; a loss recorded meanwhile starts a new gap, and
+        // reported + unreported == actual throughout. A ring too small for
+        // one line makes every window a pure loss, so the gap is what the
+        // writer is blocked on.
+        let sink = BlockingSink::blocked();
+        let router = Router::with_ring_capacity(Box::new(sink.clone()), 2);
+        let mut w = router.make_writer();
+        router.enter_ring();
+        w.write_all(b"one\n").unwrap();
+        w.write_all(b"two\n").unwrap();
+        assert_eq!(router.lost(), 2);
+        assert_eq!(router.flush_to_normal(), 2);
+        sink.wait_entered(1);
+        assert_eq!(router.unreported_losses(), 2, "in flight, not yet reported");
+        assert_eq!(router.queued_items(), 1);
+        router.enter_ring();
+        w.write_all(b"three\n").unwrap();
+        w.write_all(b"four\n").unwrap();
+        w.write_all(b"five\n").unwrap();
+        assert_eq!(router.flush_to_normal(), 3);
+        assert_eq!(router.unreported_losses(), 5);
+        assert_eq!(router.queued_items(), 2, "the gap in flight and a new one");
+        sink.set_blocked(false);
+        settled(&router);
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        let reported: u64 = lines
+            .iter()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["lost"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .sum();
+        assert_eq!(reported, 5);
+        assert_eq!(router.unreported_losses(), 0);
     }
 
     #[test]

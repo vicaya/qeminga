@@ -406,14 +406,20 @@ jobs:
       - name: Seccomp audit lines after the enforced run
         if: always()
         run: sudo dmesg | grep 'type=1326' || echo 'none'
+      # The expected count comes from each build's own test harness (the
+      # unit tests under src/ and the integration tests under tests/ both
+      # carry privileged_ tests), so a build that carries a different set
+      # is measured against itself.
       - name: Every privileged test ran in both builds
         run: |
-          expected=$(grep -rhoE '^fn privileged_[a-z0-9_]+' tests | sort -u | wc -l)
-          for log in /tmp/privileged-log.txt /tmp/privileged-enforced.txt; do
-            ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$log" | awk '{ s += $4 } END { print s + 0 }')
-            echo "$log: $ran of $expected privileged tests ran"
+          check() {
+            expected=$(cargo test --features "$1" --locked -- --list --ignored privileged_ | grep -c ': test$')
+            ran=$(grep -oE 'test result: ok\. [0-9]+ passed' "$2" | awk '{ s += $4 } END { print s + 0 }')
+            echo "$2: $ran of $expected privileged tests ran (features $1)"
             test "$ran" -eq "$expected"
-          done
+          }
+          check "$LOG_FEATURES" /tmp/privileged-log.txt
+          check "$ENFORCED_FEATURES" /tmp/privileged-enforced.txt
       - name: Tear down loop devices
         if: always()
         run: sudo env QEMINGA_LOOP_BASE=/mnt/qeminga-test scripts/ci/mk-loop-fs.sh teardown

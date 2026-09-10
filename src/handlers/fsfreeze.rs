@@ -3520,6 +3520,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dead_instances_walk_is_aborted_and_never_publishes() {
+        // `Context::abort_tasks` is a harness's SIGKILL (§4.5 scenarios,
+        // T6.3): the driver waiting on B is ended where it waits, so when
+        // B's FIFREEZE lands the walk does not go on to C, publishes no
+        // state, arms no watchdog and answers nothing; the marker written
+        // before the walk and the kernel's freezes stay for the recovery
+        // of the next instance.
+        let rig = Rig::nested();
+        let gate = rig.kernel.script_freeze_gate(B);
+        let _release = gate.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("B blocked", |_| gate.waiting() == 1).await;
+        assert_eq!(rig.state(), FreezeState::Freezing);
+        rig.ctx.abort_tasks();
+        gate.release();
+        rig.wait_for("B's late FIFREEZE landed", |_| gate.waiting() == 0)
+            .await;
+        // Real time, so a driver that survived would have gone on to C.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        settle().await;
+        assert_eq!(rig.fifreezes(), paths(&[A, B]), "C never authorised");
+        assert_eq!(rig.state(), FreezeState::Freezing, "nothing published");
+        assert!(rig.ctx.watchdog_slot().is_none(), "no watchdog armed");
+        assert_eq!(rig.hooks.events(), ["freezing"]);
+        assert!(rig.marker().exists(), "the marker stays for recovery");
+        assert_eq!(rig.fithaws(), Vec::<PathBuf>::new(), "nothing drained");
+        if let Ok(Ok(Ok(value))) = tokio::time::timeout(Duration::from_millis(100), freezing).await
+        {
+            panic!("a dead walk answered {value}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_completion_and_the_expiry_ready_together_abort_the_walk() {
         // The deadline passes and B completes before the driver is polled
         // again (the runtime has one thread: it runs only when this test

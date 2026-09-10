@@ -21,9 +21,10 @@ semantic versioning.
 ### Fixed
 
 - `guest-fsfreeze-freeze-list`: a requested mount point selects the
-  superblock its pathname leads to now, decided by the mount graph
-  (mount ids and parents), never a superblock whose mount point is
-  hidden by a mount over it or over an ancestor, and the freeze opens a
+  superblock its pathname leads to now, resolved as the kernel resolves
+  the path (from the root mount along the components, by mount ids and
+  parents), never a superblock whose mount point is hidden by a mount
+  over it or over any directory above it, and the freeze opens a
   selected superblock on the requested name only, so a name that leads
   elsewhere fails the operation instead of an alias standing in. Before,
   a name carried by two targets (one of them hidden) selected both, so

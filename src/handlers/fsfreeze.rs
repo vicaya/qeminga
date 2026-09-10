@@ -1663,6 +1663,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn freeze_list_freezes_the_mount_over_a_directory_not_the_one_it_hides() {
+        // A (8:2) at /data/nested is hidden by B (8:3) mounted at /data, a
+        // plain directory until then; C (8:4) is at the /data/nested B
+        // provides. A request for /data/nested freezes C through that
+        // name, A untouched; the count is 1.
+        let rig = Rig::new(FreezeState::Thawed, "directory_overmount.txt");
+        let value = freeze_list(
+            &rig.ctx,
+            &req(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data/nested"]}}"#),
+        )
+        .await
+        .unwrap();
+        assert_eq!(value, json!(1));
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, dev) => Some((p, dev)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, [(PathBuf::from("/data/nested"), (8, 4))]);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+    }
+
+    #[tokio::test]
     async fn a_requested_pathname_that_does_not_lead_to_the_selected_superblock_fails_the_operation()
      {
         // Belt and braces for the selection: if what the kernel opens at

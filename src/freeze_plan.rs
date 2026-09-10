@@ -14,7 +14,8 @@
 //! forward.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::mountinfo::MountEntry;
@@ -73,6 +74,92 @@ struct MountRow {
     parent: u32,
     mount_point: PathBuf,
     dev: (u32, u32),
+}
+
+/// The mount table as the tree the kernel walks when it resolves a path:
+/// every mount's children by the pathname they are attached at. Indexed
+/// once per request, in one pass over the table.
+struct MountTree<'a> {
+    /// Children of a mount, by `(parent id, mount point)`. A consistent
+    /// table has one child per attachment point: a mount stacked on that
+    /// child is the child's own child, at the same mount point.
+    children: HashMap<(u32, &'a [u8]), Vec<&'a MountRow>>,
+    /// The root of the namespace: mounted at `/`, its parent not in the
+    /// table.
+    root: Option<&'a MountRow>,
+    rows: usize,
+}
+
+impl<'a> MountTree<'a> {
+    fn index(mounts: &'a [MountRow]) -> Self {
+        let ids: HashSet<u32> = mounts.iter().map(|row| row.id).collect();
+        let mut children: HashMap<(u32, &[u8]), Vec<&MountRow>> = HashMap::new();
+        for row in mounts {
+            children
+                .entry((row.parent, row.mount_point.as_os_str().as_bytes()))
+                .or_default()
+                .push(row);
+        }
+        let root = mounts
+            .iter()
+            .find(|row| row.mount_point.as_os_str() == "/" && !ids.contains(&row.parent));
+        MountTree {
+            children,
+            root,
+            rows: mounts.len(),
+        }
+    }
+
+    /// The superblock mounted at exactly `path` now. From the root mount,
+    /// the walk crosses into the child attached at the shortest prefix of
+    /// `path` at or below the current mount's own mount point (the first
+    /// mount point the kernel meets on the way: a mount stacked on the
+    /// current one, or one placed over a directory further down, hides
+    /// everything the current mount holds beneath that point), and stops
+    /// where there is none. `None` when the path then is not that mount's
+    /// mount point (it leads into a filesystem, not to a mount), when the
+    /// table is inconsistent at some step (two mounts attached at one
+    /// point under one parent: refused rather than guessed), or when it
+    /// cannot be walked at all. Proportional to the length of `path`.
+    fn resolve(&self, path: &[u8]) -> Option<(u32, u32)> {
+        if path.first() != Some(&b'/') {
+            return None;
+        }
+        let mut current = self.root?;
+        let mut settled = false;
+        // Bounded by the table: a malformed table (a cycle) cannot loop this.
+        for _ in 0..=self.rows {
+            let at = current.mount_point.as_os_str().as_bytes().len();
+            let next = prefixes(path)
+                .filter(|prefix| prefix.len() >= at)
+                .find_map(|prefix| self.children.get(&(current.id, prefix)));
+            match next {
+                Some(children) => {
+                    if children.len() != 1 {
+                        return None;
+                    }
+                    current = children[0];
+                }
+                None => {
+                    settled = true;
+                    break;
+                }
+            }
+        }
+        (settled && current.mount_point.as_os_str().as_bytes() == path).then_some(current.dev)
+    }
+}
+
+/// The prefixes of an absolute `path` at which a mount point could be,
+/// shortest first: `/`, then `path` cut at each later `/`, then `path`.
+fn prefixes(path: &[u8]) -> impl Iterator<Item = &[u8]> {
+    std::iter::once(&path[..1])
+        .chain(
+            (1..path.len())
+                .filter(move |&i| path[i] == b'/')
+                .map(move |i| &path[..i]),
+        )
+        .chain(std::iter::once(path))
 }
 
 /// `true` when the entry is a local, device-backed filesystem of an
@@ -144,95 +231,58 @@ impl FreezePlan {
     }
 
     /// The intersection with the requested mount points. A requested name
-    /// selects the superblock the pathname leads to *now*, decided by the
-    /// mount graph (`visible_at`, below; byte-exact, no
-    /// normalisation; a mount point that is not valid UTF-8 can never be
-    /// named on the wire), whatever the plan calls the superblock. So one
-    /// name never selects two superblocks, a name that only a hidden
-    /// mount point of a target carries selects nothing, and the count of
-    /// §4.2 "Coverage" is one per requested superblock (#43 §1). The
-    /// selected target records the name that selected it
-    /// ([`Target::requested`]) and is opened on that name only; it keeps
-    /// all its mount points for the thaw, which reaches and recovers it by
-    /// any of them. Unknown paths are ignored, not errors (C-12). Order
-    /// and the mount table are preserved.
+    /// selects the superblock the pathname leads to *now*, resolved as the
+    /// kernel resolves a path (`MountTree::resolve`, below: from the root mount
+    /// along the pathname's components, crossing into whatever is mounted
+    /// at each point, whether stacked on a mount, moved over a newer one
+    /// or placed over a plain directory above another mount point;
+    /// byte-exact, no normalisation; a mount point that is not valid UTF-8
+    /// can never be named on the wire), whatever the plan calls the
+    /// superblock. So one name never selects two superblocks, a name that
+    /// only a hidden mount point of a target carries selects nothing, and
+    /// the count of §4.2 "Coverage" is one per requested superblock (#43
+    /// §1). The table is indexed once and each distinct name is resolved
+    /// once, so the work is proportional to the request plus the table,
+    /// never their product. The selected target records the name that
+    /// selected it ([`Target::requested`]) and is opened on that name
+    /// only; it keeps all its mount points for the thaw, which reaches and
+    /// recovers it by any of them. Unknown paths are ignored, not errors
+    /// (C-12). Order and the mount table are preserved.
     pub fn restrict_to(&self, mountpoints: &[String]) -> FreezePlan {
-        let mut targets = Vec::new();
-        for target in &self.targets {
-            if let Some(name) = mountpoints
-                .iter()
-                .find(|name| self.visible_at(name) == Some(target.dev))
-            {
-                targets.push(Target {
-                    requested: Some(PathBuf::from(name)),
-                    ..target.clone()
-                });
+        let tree = MountTree::index(&self.mounts);
+        // Each distinct name once; the first name that leads to a
+        // superblock is the one it is opened on.
+        let mut resolved: HashMap<&str, Option<(u32, u32)>> = HashMap::new();
+        let mut selecting: HashMap<(u32, u32), &str> = HashMap::new();
+        for name in mountpoints {
+            let dev = *resolved
+                .entry(name.as_str())
+                .or_insert_with(|| tree.resolve(name.as_bytes()));
+            if let Some(dev) = dev {
+                selecting.entry(dev).or_insert(name.as_str());
             }
         }
+        let targets = self
+            .targets
+            .iter()
+            .filter_map(|target| {
+                selecting.get(&target.dev).map(|name| Target {
+                    requested: Some(PathBuf::from(name)),
+                    ..target.clone()
+                })
+            })
+            .collect();
         FreezePlan {
             targets,
             mounts: self.mounts.clone(),
         }
     }
 
-    /// The superblock the pathname `path` leads to now: the mount at
-    /// exactly that mount point that is visible, decided by the mount
-    /// graph (mount ids and parents), never by the order of the table
-    /// (a mount moved over a newer one keeps its earlier row). `None`
-    /// when nothing visible is mounted there, or when the table shows more
-    /// than one visible candidate (a consistent table never does; refused
-    /// rather than guessed).
+    /// What `path` leads to now (tests; the handlers go through
+    /// [`restrict_to`](Self::restrict_to)).
+    #[cfg(test)]
     fn visible_at(&self, path: &str) -> Option<(u32, u32)> {
-        let mut candidates = self
-            .mounts
-            .iter()
-            .filter(|row| row.mount_point.as_os_str() == path && self.is_visible(row));
-        let first = candidates.next()?;
-        if candidates.next().is_some() {
-            return None;
-        }
-        Some(first.dev)
-    }
-
-    fn parent_of(&self, row: &MountRow) -> Option<&MountRow> {
-        self.mounts
-            .iter()
-            .find(|p| p.id == row.parent && p.id != row.id)
-    }
-
-    /// `true` when another mount is stacked on `row` at its own mount
-    /// point, hiding it and everything under it.
-    fn covered(&self, row: &MountRow) -> bool {
-        self.mounts
-            .iter()
-            .any(|c| c.parent == row.id && c.id != row.id && c.mount_point == row.mount_point)
-    }
-
-    /// `true` when `row` is what its mount point leads to: nothing is
-    /// stacked on it, and the mount its stack stands on (the ancestor
-    /// providing the directory it is attached to) is itself visible, so no
-    /// mount over an ancestor hides it (`proc_pid_mountinfo(5)`).
-    fn is_visible(&self, row: &MountRow) -> bool {
-        let mut row = row;
-        // Bounded by the table: a malformed table cannot loop this.
-        for _ in 0..=self.mounts.len() {
-            if self.covered(row) {
-                return false;
-            }
-            // Down the stack of mounts at this mount point, to its bottom.
-            let mut bottom = row;
-            while let Some(parent) = self.parent_of(bottom)
-                && parent.mount_point == bottom.mount_point
-            {
-                bottom = parent;
-            }
-            match self.parent_of(bottom) {
-                // The root of the namespace.
-                None => return true,
-                Some(ancestor) => row = ancestor,
-            }
-        }
-        false
+        MountTree::index(&self.mounts).resolve(path.as_bytes())
     }
 
     /// The mount point that holds `path` (longest matching prefix, by path
@@ -267,6 +317,7 @@ impl FreezePlan {
 mod tests {
     use super::*;
     use crate::mountinfo::parse_mountinfo;
+    use std::time::Duration;
 
     fn plan_from(fixture: &str) -> FreezePlan {
         let text = std::fs::read_to_string(
@@ -404,6 +455,63 @@ mod tests {
         assert_eq!(devs, [(8, 4)]);
         // The hidden superblock is still in the plan for a thaw to reach.
         assert!(plan.covers_device((8, 3)));
+    }
+
+    #[test]
+    fn a_mount_over_a_directory_hides_the_mounts_beneath_it() {
+        // The external review's third counterexample: A (8:2) at
+        // /data/nested, then B (8:3) mounted at /data, a plain directory
+        // until then, so A's parent is still the root mount; then C (8:4)
+        // at the /data/nested B provides. /data/nested leads to C; A is
+        // hidden by a mount over an intermediate directory, not over a
+        // mount point, which following parent links alone misses.
+        let plan = plan_from("directory_overmount.txt");
+        assert_eq!(plan.visible_at("/data/nested"), Some((8, 4)));
+        assert_eq!(plan.visible_at("/data"), Some((8, 3)));
+        let restricted = plan.restrict_to(&["/data/nested".to_owned()]);
+        let devs: Vec<(u32, u32)> = restricted.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 4)]);
+        // A is in the plan (a thaw reaches it by its handle or its name
+        // if it is ever visible again) but no requested name leads to it.
+        assert!(plan.covers_device((8, 2)));
+        let all = plan.restrict_to(&["/data".to_owned(), "/data/nested".to_owned()]);
+        let devs: Vec<(u32, u32)> = all.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(devs, [(8, 3), (8, 4)]);
+    }
+
+    #[test]
+    fn resolution_costs_the_request_plus_the_table_not_their_product() {
+        // The external review's amplification: 8 192 copies of a missing
+        // name (a valid 41 KiB request) against 20 000 rows and 32 eligible
+        // targets used to cost their product in comparisons. Each distinct
+        // name is resolved once through an index built in one pass, so
+        // the whole request costs the request plus the table.
+        let mut text = String::from("27 1 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        for i in 0..20_000 {
+            let (dev, fs, source) = if i % 625 == 0 {
+                (format!("8:{}", 10 + i / 625), "ext4", "/dev/sdb1")
+            } else {
+                ("0:99".to_owned(), "tmpfs", "tmpfs")
+            };
+            text.push_str(&format!(
+                "{} 27 {dev} / /m{i} rw - {fs} {source} rw\n",
+                100 + i
+            ));
+        }
+        let plan = FreezePlan::build(&parse_mountinfo(&text));
+        assert_eq!(plan.len(), 33);
+        let missing = vec!["/x".to_owned(); 8192];
+        let started = std::time::Instant::now();
+        assert!(plan.restrict_to(&missing).is_empty());
+        let present = vec!["/m625".to_owned(); 8192];
+        let restricted = plan.restrict_to(&present);
+        assert_eq!(restricted.len(), 1);
+        assert_eq!(restricted.targets()[0].dev, (8, 11));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

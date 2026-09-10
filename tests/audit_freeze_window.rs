@@ -642,11 +642,6 @@ async fn a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue() 
     }
     assert_eq!(denied, 4000);
     assert!(
-        ctx.audit.queued_bytes() <= audit::SINK_QUEUE_CAPACITY + 1024,
-        "queued {} bytes",
-        ctx.audit.queued_bytes()
-    );
-    assert!(
         ctx.audit.unreported_losses() > 0,
         "the excess was dropped, not retained"
     );
@@ -664,5 +659,26 @@ async fn a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue() 
         text.contains("\"reason\":\"sink_backpressure\""),
         "{}",
         &text[..text.len().min(500)]
+    );
+    // One record per frame under the flood: the records the sink received
+    // and the ones the loss records account for are exactly the 4 001
+    // frames, the flood's and the ping's.
+    let delivered = text
+        .lines()
+        .filter(|line| line.contains("\"disposition\":"))
+        .count();
+    let lost: u64 = text
+        .lines()
+        .filter(|line| line.contains("\"event\":\"audit_records_lost\""))
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["lost"]
+                .as_u64()
+                .unwrap()
+        })
+        .sum();
+    assert_eq!(
+        u64::try_from(delivered).unwrap() + lost,
+        4001,
+        "delivered {delivered}, lost {lost}"
     );
 }

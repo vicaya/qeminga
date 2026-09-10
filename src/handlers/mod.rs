@@ -102,22 +102,43 @@ pub fn spec(name: &str) -> Option<&'static CommandSpec> {
 /// envelope the dispatcher adds (`{"return":…,"id":…}` and the newline),
 /// so the value is measured against the bound less the longest envelope
 /// ([`MAX_RESPONSE_ENVELOPE_BYTES`](crate::proto::MAX_RESPONSE_ENVELOPE_BYTES)).
+/// The length is counted through a writer that stores nothing, so a
+/// reply over the bound costs no buffer of its size, and the value is
+/// converted to the reply tree directly rather than parsed back from
+/// its bytes.
 pub fn bounded_reply<T: serde::Serialize>(
     what: &str,
     value: &T,
     bound: usize,
 ) -> Result<serde_json::Value, crate::proto::Error> {
-    let bytes = serde_json::to_vec(value)
-        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))?;
-    let line = bytes.len() + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES;
+    let encode = |err: serde_json::Error| {
+        crate::proto::Error::Internal(format!("{what}: cannot encode: {err}"))
+    };
+    let mut counter = Counting(0);
+    serde_json::to_writer(&mut counter, value).map_err(encode)?;
+    let line = counter.0 + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES;
     if line > bound {
         return Err(crate::proto::Error::Internal(format!(
             "{what}: the reply would be {line} bytes on the wire ({} of value), over the {bound} byte bound; not truncated",
-            bytes.len()
+            counter.0
         )));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))
+    serde_json::to_value(value).map_err(encode)
+}
+
+/// Counts the bytes written through it and keeps none of them: the
+/// length of an encoding without a buffer of that length.
+struct Counting(usize);
+
+impl std::io::Write for Counting {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Argument type for commands that take no arguments; rejects any key.

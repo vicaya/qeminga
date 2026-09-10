@@ -434,13 +434,14 @@ Every input, queue, worker and reply the host can drive has an explicit limit; p
 | Freeze-safe ring (§9.1) | 64 KiB | oldest records evicted, counted, reported after thaw |
 | Audit delivery queue (§9.1) | 256 KiB | newest records dropped, counted, reported where the gap is |
 | Session places (§5.7) | 8 commands from decoding to delivery | nothing more is read |
-| Controls beside the command in progress (§5.7) | 3 | the next control waits for a place |
+| `guest-fsfreeze-freeze-list` mount points (§4.2) | the frame: no count of its own | matching is one pass over the plan's targets and their mount points per requested name, each of the three bounded by the frame or the mount table; a name matching nothing is left out of the count |
+| Controls beside the command in progress (§5.7) | 3 | a fourth control keeps the place it holds and waits for a control lane |
 | Undelivered replies (§5.7) | 64 KiB backpressure threshold | nothing more is started or read; started commands finish and their replies are kept whole |
 | Rate limits (§5.3) | 120/30/10/5/2 per minute per class | `GenericError`; status and thaw never limited |
 | Freeze operations (§4.4) | 1, with 1 freeze worker, 1 recovery drain, 1 preparation task | a second freeze is refused; a thaw joins |
 | Freeze walk (§4.4) | `fsfreeze_operation_timeout_secs` | aborted; completed targets recovered on independent capacity |
 | `Frozen` state (§4.4) | idle and hard-cap watchdog | thawed by the agent |
-| `FITHAW` drain per target (§4.2) | 1024 calls | reported unrecoverable, marker retained |
+| `FITHAW` drain per target (§4.2) | 1024 calls | reported unrecoverable; a marker that was set is retained (a recovery drain from `Thawed` stays `Thawed`, OQ-3) |
 | Recovery requests | serialised behind the drain in progress, at most the session's 8 places | a further thaw waits unread; each is answered from the kernel's own state, so a drained target costs one call |
 | `guest-get-fsinfo` walks (OQ-5) | 2 alive at once, 10 s each | refused at once; a stuck walk fails its command |
 | Mount table read (§4.2) | 32 MiB | the read fails; freeze, thaw and fsinfo report it |
@@ -452,7 +453,7 @@ Every input, queue, worker and reply the host can drive has an explicit limit; p
 | Runtime shutdown (§5.7) | 5 s for an abandoned informational walk | the runtime is torn down |
 | `guest-shutdown` audit delivery (§9.1) | 2 s | `reboot(2)` proceeds |
 
-**The failure model, stated honestly.** Recovery (the watchdog's drain, the coordinator's settlement, the marker's finalisation) depends on nothing the host does: it runs on the agent's own tasks, writes no audit record synchronously, and needs no reply delivered. It does depend on the runtime being scheduled and on the kernel calls it issues (`FITHAW`, `unlinkat`) making progress; a `FITHAW` that never returns holds its drain (OQ-8), and no wall-clock deadline can make an unresponsive device writable. Replies are delivered in request order to a peer that reads them; no protocol can deliver a reply to a peer that refuses to receive it, and the agent does not try to: a host that stops reading is stopped being read, its commands already started finish, and the memory it can pin is the threshold above plus the replies of the commands that had a place. The bounds hold back new work only, never the completion of what runs.
+**The failure model, stated honestly.** Recovery (the watchdog's drain, the coordinator's settlement, the marker's finalisation) depends on nothing the host does: it runs on the agent's own tasks, performs no sink I/O synchronously (a record goes to the delivery queue or the ring under the router's lock, §9.1), and needs no reply delivered. It does depend on the runtime being scheduled and on the kernel calls it issues (`FITHAW`, `unlinkat`) making progress; a `FITHAW` that never returns holds its drain (OQ-8), and no wall-clock deadline can make an unresponsive device writable. Replies are delivered in request order to a peer that reads them; no protocol can deliver a reply to a peer that refuses to receive it, and the agent does not try to: a host that stops reading is stopped being read, its commands already started finish, and the memory it can pin is the threshold above plus the replies of the commands that had a place. The bounds hold back new work only, never the completion of what runs.
 
 ---
 

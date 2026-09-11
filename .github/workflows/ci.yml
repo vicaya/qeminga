@@ -390,11 +390,13 @@ jobs:
           set -o pipefail
           set -a; . /tmp/loop.env; set +a
           sudo -E env "PATH=$PATH" QEMINGA_REQUIRE_SYSTEMD=1 cargo test --features "$LOG_FEATURES" --locked -- --ignored --test-threads=1 privileged_ 2>&1 | tee /tmp/privileged-log.txt
-      # A syscall the profile of this architecture omits shows up as a
-      # `type=1326` audit line under the logging build (and fails
-      # privileged_seccomp_matrix_log_then_enforce); the line names the
-      # syscall number, which is the observed need a deliberate profile
-      # change is documented with.
+      # Diagnostic dump, not a gate: the privileged seccomp tests count the
+      # kernel's `type=1326` audit lines before and after each daemon run
+      # and fail on a new one, so a syscall the profile of this
+      # architecture omits fails privileged_seccomp_matrix_log_then_enforce
+      # under the logging build. This step prints those lines, which name
+      # the syscall number: the observed need a deliberate profile change
+      # is documented with.
       - name: Seccomp audit lines after the compatibility run
         if: always()
         run: sudo dmesg | grep 'type=1326' || echo 'none'

@@ -805,7 +805,7 @@ the answer is a one-line change, and leave the question here.
   - `privileged_data_protection_profile_holds_no_reboot_authority` also reads every `/proc/<pid>/task/*/status` after the freeze and thaw: no thread of the daemon holds `CAP_SYS_BOOT` in any set (§5.4).
   - `privileged_data_protection_profile_holds_no_reboot_authority` (`tests/privileged_e2e.rs`: the real daemon under the profile shows `CapEff`/`CapPrm`/`CapBnd` `0000000000200004`, `Seccomp: 2`, answers "disabled" to the six commands, is still alive after a disabled shutdown, freezes and thaws the loop ext4; no seccomp audit line appears in dmesg, so the `seccomp-log` run detects a syscall this profile omits), `privileged_data_protection_profile_recovers_without_the_host` (the same profile through the paths §5.9 says every profile keeps: SIGKILL while frozen, the restart into recovery mode and the recovery thaw, a freeze the idle watchdog thaws, a channel EOF and reopen; the same dmesg assertion across all of it).
 - **Implement (green):** as §5.9. Recovery is unaffected by any profile: the marker, the drain and the watchdog use only what every profile keeps (`FIFREEZE`/`FITHAW`, `openat`, `unlinkat`, `fsync`).
-- **Done when:** AC25 is green on x86-64 and the residual authority is recorded (§5.9, OQ-10).
+- **Done when:** AC25 is green on both supported architectures and the residual authority is recorded (§5.9, OQ-10).
 
 #### T6.7 — Resource bounds under adversarial traffic (#43 §6)
 - **Status:** done

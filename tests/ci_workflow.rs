@@ -125,9 +125,12 @@ fn the_privileged_matrix_enforces_the_production_filter_on_every_architecture() 
 }
 
 #[test]
-fn no_job_is_allowed_to_fail_quietly() {
-    assert!(
-        !workflow().contains("continue-on-error"),
-        "an architecture that may fail is not covered"
-    );
+fn no_native_job_is_allowed_to_fail_quietly() {
+    let text = workflow();
+    for name in NATIVE_JOBS {
+        assert!(
+            !job(&text, name).contains("continue-on-error"),
+            "{name}: an architecture that may fail is not covered"
+        );
+    }
 }

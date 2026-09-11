@@ -124,6 +124,83 @@ fn the_privileged_matrix_enforces_the_production_filter_on_every_architecture() 
     );
 }
 
+/// Runs `scripts/ci/docs-only.sh` over `paths` and reports whether it
+/// classified the change as documentation only.
+fn docs_only(paths: &[&str]) -> bool {
+    use std::io::Write;
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/ci/docs-only.sh");
+    let mut child = std::process::Command::new(&script)
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+    let mut input = paths.join("\n");
+    if !paths.is_empty() {
+        input.push('\n');
+    }
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap().status.success()
+}
+
+#[test]
+fn markdown_no_check_reads_is_documentation_only() {
+    assert!(docs_only(&[
+        "README.md",
+        "docs/tasks.md",
+        "docs/testing.md",
+        "CHANGELOG.md",
+        "AGENTS.md",
+    ]));
+}
+
+#[test]
+fn markdown_a_test_parses_is_code() {
+    // tests/packaging.rs reads design blocks and the packaging README.
+    assert!(!docs_only(&["docs/design.md"]));
+    assert!(!docs_only(&["README.md", "packaging/README.md"]));
+}
+
+#[test]
+fn anything_else_and_an_empty_change_run_everything() {
+    assert!(!docs_only(&["README.md", "src/lib.rs"]));
+    assert!(!docs_only(&[".github/workflows/ci.yml"]));
+    assert!(!docs_only(&["Cargo.lock"]));
+    assert!(!docs_only(&["docs/notes.markdown"]));
+    assert!(!docs_only(&[]));
+}
+
+#[test]
+fn every_job_that_runs_cargo_waits_for_the_change_classification() {
+    let text = workflow();
+    let changes = job(&text, "changes");
+    assert!(
+        changes.contains("scripts/ci/docs-only.sh"),
+        "the changes job classifies with the script the tests above cover"
+    );
+    let mut gated = 0;
+    for line in text.lines() {
+        if line.starts_with("  ") && !line.starts_with("   ") && line.trim_end().ends_with(':') {
+            let name = line.trim().trim_end_matches(':');
+            let block = job(&text, name);
+            if !block.contains("cargo ") {
+                continue;
+            }
+            assert!(
+                block.contains("needs: changes")
+                    && block.contains("if: needs.changes.outputs.code == 'true'"),
+                "{name}: runs cargo without waiting for the change classification"
+            );
+            gated += 1;
+        }
+    }
+    assert!(gated >= 10, "only {gated} cargo jobs found");
+}
+
 #[test]
 fn no_native_job_is_allowed_to_fail_quietly() {
     let text = workflow();

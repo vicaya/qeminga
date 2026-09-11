@@ -135,6 +135,10 @@ semantic versioning.
   as x86-64; each leg proves its architecture first, and the aarch64
   privileged run is the execution evidence for the aarch64 seccomp profile
   (AC15, #51). The aarch64 cross-compile check is retained.
+- CI skips every job that builds for a change touching only Markdown that
+  no check reads (`scripts/ci/docs-only.sh`; `docs/design.md` and
+  `packaging/README.md` are parsed by tests and count as code), so a
+  documentation pull request no longer waits on the mutants shards.
 - A `guest-fsfreeze-thaw` received while a freeze walk is under way aborts
   the walk and is answered at once with the recovery pending, instead of
   being refused.

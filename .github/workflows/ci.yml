@@ -15,9 +15,42 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # A change that touches only Markdown no check reads (scripts/ci/docs-only.sh;
+  # docs/design.md and packaging/README.md are parsed by tests/packaging.rs,
+  # so they count as code) skips every job that builds: they are gated on
+  # this job's `code` output and report "skipped", which satisfies a
+  # required check, unlike a path-filtered workflow that never starts.
+  # Anything the diff cannot be established for (a manual dispatch, a
+  # push whose previous tip is unknown) runs everything. A documentation
+  # push to main therefore also skips the badge publication, so a README
+  # badge change is verified on the next code push.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code=true
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } \
+              && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE" "$GITHUB_SHA" | tee changed.txt
+            if scripts/ci/docs-only.sh < changed.txt; then code=false; fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -27,6 +60,8 @@ jobs:
   clippy:
     name: clippy (-D warnings)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -43,6 +78,8 @@ jobs:
   test:
     name: test (${{ matrix.arch.name }}, ${{ matrix.features.name }})
     runs-on: ${{ matrix.arch.runner }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +119,8 @@ jobs:
   coverage:
     name: coverage (production lines, 85% floor)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     permissions:
       contents: read
     env:
@@ -168,6 +207,8 @@ jobs:
   docs:
     name: rustdoc (-D warnings)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     env:
       RUSTDOCFLAGS: -D warnings
     steps:
@@ -180,6 +221,8 @@ jobs:
   unsafe-policy:
     name: no unsafe outside src/kernel
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - run: scripts/check-unsafe.sh
@@ -193,6 +236,8 @@ jobs:
   cross-check-aarch64:
     name: check (aarch64-unknown-linux-gnu)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -206,6 +251,8 @@ jobs:
   release-build:
     name: release build
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -225,6 +272,8 @@ jobs:
   packaging:
     name: packaging (systemd-analyze verify)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -243,6 +292,8 @@ jobs:
   mutants:
     name: cargo mutants (${{ matrix.shard }}/4)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     # The mutants are split over four shards (`--shard k/4`), about 20
     # minutes each on the shared runners: one job for all of them reached
     # the 90-minute cap as the suite grew, and a gate that passes or fails
@@ -291,6 +342,8 @@ jobs:
   deny:
     name: cargo deny
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -303,6 +356,8 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned toolchain (rust-toolchain.toml)
@@ -326,6 +381,8 @@ jobs:
   privileged:
     name: privileged (${{ matrix.arch.name }}; loop ext4/xfs, caps, seccomp)
     runs-on: ${{ matrix.arch.runner }}
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     strategy:
       fail-fast: false
       matrix:

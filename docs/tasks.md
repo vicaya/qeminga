@@ -152,7 +152,7 @@ the answer is a one-line change, and leave the question here.
 #### T0.3 — Continuous integration `done`
 - **Design:** §5.8, AC6, AC7, AC8, D6.
 - **Files:** `.github/workflows/ci.yml`.
-- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit --deny warnings`, a release-profile build, and an aarch64 cross-compile check (the target is provisioned by `rust-toolchain.toml`). Native arm64 execution of the test and privileged jobs is T5.2 (#51).
+- **Done:** fmt, clippy `-D warnings`, tests (default and all features), docs, unsafe check, `cargo deny`, `cargo audit --deny warnings`, a release-profile build, and an aarch64 cross-compile check (the target is provisioned by `rust-toolchain.toml`). Native arm64 execution of the test and privileged jobs is T5.2 (#51). A change touching only Markdown that no check reads skips every job that builds: the `changes` job classifies the diff with `scripts/ci/docs-only.sh` (`docs/design.md` and `packaging/README.md` are parsed by `tests/packaging.rs` and count as code; an unknown diff runs everything), and the skipped jobs still satisfy a required check (`tests/ci_workflow.rs`).
 
 #### T0.4 — Supply-chain policy `done`
 - **Design:** §5.8, AC6.

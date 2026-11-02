@@ -491,6 +491,7 @@ qeminga/
         ├── mod.rs         # safe wrappers, re-exports
         ├── ioctl.rs       # unsafe: FIFREEZE/FITHAW/FITRIM via nix
         ├── shutdown.rs    # unsafe: reboot(2) via nix
+        ├── async_fd.rs    # unsafe: owned channel fd registered with the Tokio reactor
         └── caps.rs        # capability dropping via caps crate
 ```
 

@@ -4,11 +4,14 @@
 //! Everything the daemon needs from the kernel goes through the
 //! [`KernelOps`] trait so that handlers are tested against
 //! [`fake::FakeKernel`] and production uses [`LinuxKernel`]. Every
-//! `unsafe` block lives in [`ioctl`] and carries a `// SAFETY:` comment;
+//! `unsafe` block lives in this module ([`ioctl`], [`shutdown`], and
+//! [`async_fd`] for the channel's reactor registration) and carries a
+//! `// SAFETY:` comment;
 //! `scripts/check-unsafe.sh` and clippy's `undocumented_unsafe_blocks`
 //! enforce this.
 #![allow(unsafe_code)]
 
+pub mod async_fd;
 pub mod caps;
 pub mod fake;
 pub mod ioctl;

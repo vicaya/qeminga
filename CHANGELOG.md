@@ -6,6 +6,16 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Security
+
+- tokio 1.53.1 → 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd::new` and related
+  constructors violate I/O safety). qeminga's one call,
+  `Channel::from_fd`, registers an `OwnedFd` the `AsyncFd` owns and never
+  exposes mutably, so it already met the contract of the replacement
+  `unsafe` `AsyncFd::register`; the deprecated constructor is kept under
+  `#[allow(deprecated)]` with that argument at the call site. Moving to
+  `register` behind a `src/kernel/` wrapper is the long-term fix.
+
 ### Added
 
 - Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`;

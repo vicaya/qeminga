@@ -139,9 +139,20 @@ impl Channel {
         let flags = nix::fcntl::fcntl(fd.as_fd(), nix::fcntl::FcntlArg::F_GETFL)?;
         let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(fd.as_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))?;
-        Ok(Channel {
-            fd: AsyncFd::new(fd)?,
-        })
+        // RUSTSEC-2026-0386: `AsyncFd::new` is deprecated because it accepts
+        // any `T: AsRawFd`, including a descriptor the caller does not own.
+        // Here `T` is the `OwnedFd` itself: the `AsyncFd` owns it, `Channel`
+        // keeps it private, only reads and writes through a shared borrow
+        // and never calls `get_mut` or `into_inner` (which could replace
+        // or release it), and it is closed only when the `AsyncFd` (and its
+        // registration) is dropped, so it stays valid, open and unchanged
+        // for the registration's lifetime. That is the contract the
+        // replacement, `unsafe` `AsyncFd::register`, asks for; this keeps
+        // `unsafe` out of `src/` outside `src/kernel/` until that move is
+        // made (see CHANGELOG).
+        #[allow(deprecated)]
+        let fd = AsyncFd::new(fd)?;
+        Ok(Channel { fd })
     }
 
     /// The raw descriptor (diagnostics only).

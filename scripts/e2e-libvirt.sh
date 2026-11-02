@@ -10,8 +10,8 @@
 #
 #   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] DOMAIN
 #
-# Hosted CI has no nested virtualisation, so this stays a manual job; see
-# docs/testing.md for the VM recipe. tests/libvirt_script.rs runs it
+# CI runs it under QEMU TCG (scripts/ci/libvirt-tcg-smoke.sh); a KVM run
+# stays manual, see docs/testing.md. tests/libvirt_script.rs runs it
 # against a scripted `virsh` so the shell logic itself is tested.
 set -euo pipefail
 

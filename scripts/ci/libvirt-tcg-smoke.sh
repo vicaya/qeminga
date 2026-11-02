@@ -17,9 +17,14 @@
 #       --source-sha SHA --version V --run-id N --run-attempt N --runner R
 #   libvirt-tcg-smoke.sh verify-candidate DIR ARCH SHA     # prints the digest
 #   libvirt-tcg-smoke.sh domain-xml --arch ARCH --name NAME --dir DIR
+#       [--vcpus N]                                         # N above 8 -> 8
 #   libvirt-tcg-smoke.sh stale-check
+#   libvirt-tcg-smoke.sh image-key ARCH                     # cache key
+#   libvirt-tcg-smoke.sh fetch-image --sha256 HEX --dest PATH [--cache DIR]
+#       -- URL...                                           # first match wins
 #   libvirt-tcg-smoke.sh run --arch ARCH --candidate DIR --source-sha SHA
-#       --run-id N --run-attempt N --out DIR                (root)
+#       --run-id N --run-attempt N --out DIR
+#       [--expect-sha256 HEX] [--image-cache DIR]           (root)
 #   libvirt-tcg-smoke.sh result --out DIR --arch ARCH --source-sha SHA
 #       --binary-sha256 HEX --accelerator ACCEL
 #   libvirt-tcg-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
@@ -27,7 +32,8 @@
 #
 # Every libvirt resource is named qeminga-e2e-<run id>-<attempt>-<arch>
 # and lives in $QEMINGA_E2E_IMAGES/<that name>/ (default
-# /var/lib/libvirt/images); cleanup touches nothing else, and keeps the
+# /var/lib/libvirt/images; a plain absolute path, since it is written into
+# the domain XML unescaped); cleanup touches nothing else, and keeps the
 # disks while the domain's state cannot be established. Timeouts are
 # explicit and bounded (QEMINGA_E2E_BOOT_TIMEOUT_SECS, default 1800, for
 # boot plus install under emulation; QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS,
@@ -48,11 +54,16 @@ PACKAGING_FILES="packaging/systemd/qeminga.service packaging/udev/99-qeminga.rul
 CONNECT="--connect=qemu:///system"
 IMAGES="${QEMINGA_E2E_IMAGES:-/var/lib/libvirt/images}"
 
-# Guest image pin: Ubuntu 24.04 server cloud image, one dated release
-# (kept by Canonical under releases/24.04/), verified by SHA-256 before
-# every use. Bump the date and both digests together.
+# Guest image pin: Ubuntu 24.04 server cloud image, one dated release,
+# verified by SHA-256 before every use, so where the bytes come from does
+# not matter: the run's cache first, then cloud-images.ubuntu.com, then
+# the archive host Canonical moves pruned serials to (both of its layouts
+# are tried; a wrong guess is a 404). Bump the date and both digests
+# together.
 IMAGE_RELEASE="release-20261017"
-IMAGE_BASE_URL="https://cloud-images.ubuntu.com/releases/24.04/$IMAGE_RELEASE"
+IMAGE_SOURCES="https://cloud-images.ubuntu.com/releases/24.04/$IMAGE_RELEASE
+https://cloud-images-archive.ubuntu.com/releases/noble/$IMAGE_RELEASE
+https://cloud-images-archive.ubuntu.com/releases/24.04/$IMAGE_RELEASE"
 # shellcheck disable=SC2034 # read through image_sha_of
 IMAGE_SHA256_x86_64="04e8f2461a16a44e78a370284471f29616cdd9baf1893df25807b71f985b6c94"
 # shellcheck disable=SC2034 # read through image_sha_of
@@ -79,6 +90,12 @@ check_number() { [[ "$2" =~ ^[0-9]+$ ]] || die "$1 must be a decimal number: '$2
 check_name() {
     [[ "$1" =~ ^qeminga-e2e-[0-9]+-[0-9]+-[a-z0-9_]+$ ]] \
         || die "'$1' is outside the qeminga-e2e-<run>-<attempt>-<arch> namespace"
+}
+
+# The run directory (and the images root) go into the domain XML as
+# literal text: accept only characters that need no escaping there.
+check_path() {
+    [[ "$2" =~ ^/[A-Za-z0-9._/-]+$ ]] || die "$1 must be an absolute path of [A-Za-z0-9._/-] only: '$2'"
 }
 
 machine_of() { case "$1" in x86_64) echo q35 ;; aarch64) echo virt ;; esac; }
@@ -180,13 +197,17 @@ cmd_domain_xml() {
     arch="$(need arch)"; name="$(need name)"; dir="$(need dir)"
     vcpus="${opt_vcpus:-2}"
     check_arch "$arch"; check_name "$name"
+    check_path --dir "$dir"
     [ "$(basename "$dir")" = "$name" ] || die "the run directory must be named $name"
     [[ "$vcpus" =~ ^[1-9][0-9]?$ ]] || die "--vcpus must be 1 to 99: '$vcpus'"
+    # Multi-threaded TCG runs one host thread per vCPU; more than eight
+    # buys nothing on a hosted runner.
+    [ "$vcpus" -le 8 ] || vcpus=8
     local machine os cpu
     machine="$(machine_of "$arch")"
     case "$arch" in
         x86_64)
-            os="    <type arch='x86_64' machine='q35'>hvm</type>"
+            os="    <type arch='x86_64' machine='$machine'>hvm</type>"
             # qemu64 boots this guest faster under TCG than `max`, whose
             # extra emulated features cost more than they save (measured:
             # 181 s against 219 s to an installed agent, 4 vCPUs).
@@ -196,7 +217,7 @@ cmd_domain_xml() {
             # UEFI firmware from qemu-efi-aarch64; a fixed AArch64 model
             # (the `max` model's QARMA pointer authentication is slow
             # under TCG).
-            os="    <type arch='aarch64' machine='virt'>hvm</type>
+            os="    <type arch='aarch64' machine='$machine'>hvm</type>
     <loader readonly='yes' type='pflash'>$AAVMF_CODE</loader>
     <nvram template='$AAVMF_VARS'>$dir/VARS.fd</nvram>"
             cpu="  <cpu mode='custom' match='exact' check='none'><model fallback='forbid'>cortex-a57</model></cpu>"
@@ -256,7 +277,6 @@ $cpu
   </devices>
 </domain>
 EOF
-    : "$machine"
 }
 
 # ---- libvirt state --------------------------------------------------------
@@ -317,7 +337,16 @@ cmd_cleanup() {
     local name dir state
     name="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$name"
+    check_path QEMINGA_E2E_IMAGES "$IMAGES"
     dir="$IMAGES/$name"
+    # A run that failed before libvirt was installed (artifact download,
+    # apt) has neither a domain nor files: nothing to clean, and no second
+    # red step. Files without a libvirt to ask about their domain are kept.
+    if ! command -v virsh >/dev/null 2>&1; then
+        [ ! -e "$dir" ] || die "virsh is not installed, so the state of $name cannot be established; keeping $dir"
+        echo "nothing to clean up: libvirt is not installed and $dir does not exist"
+        return 0
+    fi
     [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out"
 
     state="$(domain_state "$name")" \
@@ -412,16 +441,66 @@ preflight() {
     [ "${free_kib:-0}" -ge $((10 * 1024 * 1024)) ] || die "less than 10 GiB free under $IMAGES"
 }
 
+# The first of the cache and the sources whose bytes have the expected
+# digest becomes DEST (and fills the cache); nothing else is ever used.
+# A partial or rejected download stays in DEST.part, inside the run's
+# directory, which cleanup removes.
+cmd_fetch_image() {
+    local sha="" dest="" cache=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --sha256) sha="$2"; shift 2 ;;
+            --dest) dest="$2"; shift 2 ;;
+            --cache) cache="$2"; shift 2 ;;
+            --) shift; break ;;
+            *) die "fetch-image: unexpected '$1'" ;;
+        esac
+    done
+    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || die "fetch-image needs --sha256 HEX"
+    [ -n "$dest" ] || die "fetch-image needs --dest PATH"
+    [ $# -ge 1 ] || die "fetch-image needs at least one source URL"
+    local tmp="$dest.part" cached="" url
+    if [ -n "$cache" ]; then
+        cached="$cache/$sha"
+        if [ -f "$cached" ] && [ "$(sha256_of "$cached")" = "$sha" ]; then
+            cp "$cached" "$dest"
+            echo "image sha256 $sha (cache)"
+            return 0
+        fi
+    fi
+    for url in "$@"; do
+        echo "trying $url"
+        if ! curl -fsSL --retry 3 --retry-delay 5 -o "$tmp" "$url"; then
+            echo "  unavailable"
+            continue
+        fi
+        if [ "$(sha256_of "$tmp")" != "$sha" ]; then
+            echo "  digest $(sha256_of "$tmp") is not the pinned one; ignored"
+            continue
+        fi
+        mv "$tmp" "$dest"
+        echo "image sha256 $sha (from $url)"
+        if [ -n "$cached" ]; then
+            { mkdir -p "$cache" && cp "$dest" "$cached"; } || echo "  (could not fill the cache)"
+        fi
+        return 0
+    done
+    die "no source has the pinned image $sha"
+}
+
+cmd_image_key() {
+    [ $# -eq 1 ] || die "usage: image-key ARCH"
+    check_arch "$1"
+    echo "ubuntu-24.04-$(debian_arch_of "$1")-$IMAGE_RELEASE-$(image_sha_of "$1")"
+}
+
 fetch_image() {
-    local arch="$1" dest="$2" want url
-    want="$(image_sha_of "$arch")"
-    url="$IMAGE_BASE_URL/$(image_file_of "$arch")"
-    say "guest image $url"
-    curl -fsSL --retry 4 --retry-delay 5 -o "$dest" "$url"
-    local got
-    got="$(sha256_of "$dest")"
-    [ "$got" = "$want" ] || die "guest image digest $got, pinned $want"
-    echo "image sha256 $got (pinned)"
+    local arch="$1" dest="$2" cache="$3" file url urls=()
+    file="$(image_file_of "$arch")"
+    for url in $IMAGE_SOURCES; do urls+=("$url/$file"); done
+    say "guest image $file ($IMAGE_RELEASE)"
+    cmd_fetch_image --sha256 "$(image_sha_of "$arch")" --dest "$dest" \
+        ${cache:+--cache "$cache"} -- "${urls[@]}"
 }
 
 # Polls the serial log for the guest-side verdict; fails early when the
@@ -482,11 +561,14 @@ prove_tcg() {
 
 cmd_run() {
     parse_opts "$@"
-    local arch candidate sha run_id attempt
+    local arch candidate sha run_id attempt expect cache
     arch="$(need arch)"; candidate="$(need candidate)"; sha="$(need source_sha)"
     run_id="$(need run_id)"; attempt="$(need run_attempt)"; OUT="$(need out)"
+    expect="${opt_expect_sha256:-}"; cache="${opt_image_cache:-}"
     check_arch "$arch"; check_sha "$sha"
     check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
+    [ -z "$expect" ] || [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
+    check_path QEMINGA_E2E_IMAGES "$IMAGES"
     local boot_timeout="${QEMINGA_E2E_BOOT_TIMEOUT_SECS:-1800}"
     local shutdown_timeout="${QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS:-300}"
     check_number QEMINGA_E2E_BOOT_TIMEOUT_SECS "$boot_timeout"
@@ -514,16 +596,24 @@ cmd_run() {
     cat "$OUT/versions.txt"
 
     say "candidate"
+    # The manifest travels in the same artifact as the binary, so checking
+    # one against the other proves consistency only. The anchor is the
+    # digest the build job reported as a job output (--expect-sha256),
+    # which replacing the artifact does not change.
     digest="$(cmd_verify_candidate "$candidate" "$arch" "$sha")"
     RUN_DIGEST="$digest"
-    echo "candidate sha256 $digest"
+    echo "candidate sha256 $digest (manifest consistent)"
+    if [ -n "$expect" ]; then
+        [ "$digest" = "$expect" ] || die "candidate binary $digest is not the one the build job reported ($expect)"
+        echo "candidate sha256 matches the build job's reported digest"
+    fi
     local version
     version="$(jq -er .version "$candidate/manifest.json")"
 
     say "disposable guest $name in $dir"
     [ ! -e "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
     mkdir -m 0755 "$dir"
-    fetch_image "$arch" "$dir/root.qcow2"
+    fetch_image "$arch" "$dir/root.qcow2" "$cache"
     qemu-img resize -q "$dir/root.qcow2" 8G
 
     local seed="$dir/seed" payload="$dir/payload"
@@ -547,12 +637,8 @@ EOF
     genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
     genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
 
-    # As many vCPUs as the runner has CPUs (multi-threaded TCG runs one
-    # host thread per vCPU), at most 8.
-    local vcpus
-    vcpus="$(nproc)"
-    [ "$vcpus" -le 8 ] || vcpus=8
-    cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$vcpus" >"$dir/domain.xml"
+    # As many vCPUs as the runner has CPUs; domain-xml caps them at 8.
+    cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$(nproc)" >"$dir/domain.xml"
     v define "$dir/domain.xml"
     v start "$name"
 
@@ -601,16 +687,19 @@ EOF
 
 # ---- dispatch -------------------------------------------------------------
 
-[ $# -ge 1 ] || { sed -n '2,32p' "$0"; exit 64; }
+usage() { awk 'NR > 1 && /^set -euo/ { exit } NR > 1 { print }' "$0"; }
+[ $# -ge 1 ] || { usage; exit 64; }
 sub="$1"; shift
 case "$sub" in
     manifest) cmd_manifest "$@" ;;
     verify-candidate) cmd_verify_candidate "$@" ;;
     domain-xml) cmd_domain_xml "$@" ;;
     stale-check) cmd_stale_check "$@" ;;
+    image-key) cmd_image_key "$@" ;;
+    fetch-image) cmd_fetch_image "$@" ;;
     run) cmd_run "$@" ;;
     result) cmd_result "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
-    -h | --help) sed -n '2,32p' "$0" ;;
+    -h | --help) usage ;;
     *) die "unknown subcommand '$sub'" ;;
 esac

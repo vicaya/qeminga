@@ -55,6 +55,22 @@ fn lane_with_path(args: &[&str], bin: Option<&Path>) -> Output {
     cmd.output().unwrap()
 }
 
+/// The script's `manifest`, `verify-candidate` and `result` subcommands
+/// build and read JSON with `jq` (preinstalled on GitHub's Ubuntu runners;
+/// AGENTS.md lists it). Without it those tests would fail with a bare
+/// `jq: command not found` from the script, or pass a refusal for the
+/// wrong reason, so they stop here with the fix instead.
+fn require_jq() {
+    let found = Command::new("jq")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    assert!(
+        found,
+        "jq is required by scripts/ci/libvirt-tcg-smoke.sh and these tests: install it (apt-get install jq)"
+    );
+}
+
 fn write_exec(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
     use std::os::unix::fs::PermissionsExt;
@@ -63,6 +79,7 @@ fn write_exec(path: &Path, body: &str) {
 
 /// A candidate directory as the hosted build job produces it.
 fn candidate(dir: &Path, arch: &str) -> PathBuf {
+    require_jq();
     let binary = dir.join("built-qeminga");
     std::fs::write(&binary, b"not really an ELF, but bytes with a digest\n").unwrap();
     let out = dir.join("candidate");
@@ -143,6 +160,7 @@ fn the_manifest_names_the_source_the_build_and_the_digest_of_the_binary() {
 
 #[test]
 fn the_manifest_refuses_a_short_sha_an_unknown_architecture_and_a_rerun_identity() {
+    require_jq();
     let dir = tempfile::tempdir().unwrap();
     let binary = dir.path().join("b");
     std::fs::write(&binary, b"x").unwrap();
@@ -340,11 +358,189 @@ fn the_vcpu_count_is_explicit_and_bounded() {
 }
 
 #[test]
-fn the_lane_matches_the_vcpus_to_the_runner_and_reports_the_tcg_threading() {
-    let script = std::fs::read_to_string(script()).unwrap();
-    assert!(script.contains(r#"vcpus="$(nproc)""#));
-    assert!(script.contains(r#"--vcpus "$vcpus""#));
-    assert!(script.contains("TCG threading:"));
+fn more_vcpus_than_eight_are_capped_at_eight() {
+    for (asked, got) in [
+        ("8", "<vcpu>8</vcpu>"),
+        ("9", "<vcpu>8</vcpu>"),
+        ("64", "<vcpu>8</vcpu>"),
+    ] {
+        let output = domain_xml_with_vcpus(asked);
+        assert!(output.status.success(), "{asked}: {}", text(&output));
+        assert!(
+            String::from_utf8(output.stdout).unwrap().contains(got),
+            "{asked} vCPUs"
+        );
+    }
+}
+
+#[test]
+fn the_machine_type_is_the_one_the_result_records() {
+    // One source for the machine: the domain's <type machine=...> and the
+    // result's virtualization.machine come from the same function.
+    for arch in ["x86_64", "aarch64"] {
+        let xml = String::from_utf8(domain_xml(arch).stdout).unwrap();
+        let machine = xml
+            .split("machine='")
+            .nth(1)
+            .and_then(|rest| rest.split('\'').next())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("tests")).unwrap();
+        require_jq();
+        lane(&[
+            "result",
+            "--out",
+            dir.path().to_str().unwrap(),
+            "--arch",
+            arch,
+            "--source-sha",
+            SHA,
+            "--binary-sha256",
+            &"a".repeat(64),
+            "--accelerator",
+            "tcg",
+        ]);
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(json["virtualization"]["machine"], machine, "{arch}");
+    }
+}
+
+#[test]
+fn a_run_directory_that_would_not_be_literal_xml_is_refused() {
+    // The directory is written into attributes and elements unescaped, so
+    // only a plain path character set is accepted.
+    for parent in [
+        "/srv/o'brien/images",
+        "/srv/a&b",
+        "/srv/<x>",
+        "relative/images",
+        "/srv/sp ace",
+    ] {
+        let dir = format!("{parent}/qeminga-e2e-42-1-x");
+        let output = lane(&[
+            "domain-xml",
+            "--arch",
+            "x86_64",
+            "--name",
+            "qeminga-e2e-42-1-x",
+            "--dir",
+            &dir,
+        ]);
+        assert!(!output.status.success(), "{dir}: {}", text(&output));
+    }
+}
+
+// ---- guest image ---------------------------------------------------------
+
+fn fetch(dir: &Path, sha: &str, cache: Option<&Path>, sources: &[String]) -> Output {
+    let dest = dir.join("root.qcow2");
+    let mut args: Vec<String> = vec![
+        "fetch-image".into(),
+        "--sha256".into(),
+        sha.into(),
+        "--dest".into(),
+        dest.display().to_string(),
+    ];
+    if let Some(cache) = cache {
+        args.push("--cache".into());
+        args.push(cache.display().to_string());
+    }
+    args.push("--".into());
+    args.extend(sources.iter().cloned());
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    lane(&refs)
+}
+
+/// A source directory holding `img` with the given bytes, as a file:// URL.
+fn source(dir: &Path, name: &str, bytes: &[u8]) -> String {
+    let d = dir.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("img"), bytes).unwrap();
+    format!("file://{}/img", d.display())
+}
+
+fn sha_of(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[test]
+fn a_missing_source_falls_back_to_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = b"the pinned image";
+    let gone = format!("file://{}/pruned/img", dir.path().display());
+    let mirror = source(dir.path(), "mirror", good);
+    let output = fetch(dir.path(), &sha_of(good), None, &[gone, mirror]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(std::fs::read(dir.path().join("root.qcow2")).unwrap(), good);
+}
+
+#[test]
+fn a_source_with_other_bytes_is_skipped_and_nothing_matching_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let good = b"the pinned image";
+    let wrong = source(dir.path(), "tampered", b"something else");
+    let right = source(dir.path(), "mirror", good);
+    let output = fetch(dir.path(), &sha_of(good), None, &[wrong.clone(), right]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(std::fs::read(dir.path().join("root.qcow2")).unwrap(), good);
+
+    let none = fetch(dir.path(), &sha_of(good), None, &[wrong]);
+    assert!(!none.status.success(), "{}", text(&none));
+}
+
+#[test]
+fn a_cached_image_is_used_only_when_its_digest_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let good = b"the pinned image";
+    let sha = sha_of(good);
+    let src = source(dir.path(), "mirror", good);
+    // First run fills the cache.
+    let first = fetch(dir.path(), &sha, Some(&cache), std::slice::from_ref(&src));
+    assert!(first.status.success(), "{}", text(&first));
+    // Second run needs no source at all.
+    std::fs::remove_file(dir.path().join("root.qcow2")).unwrap();
+    let gone = format!("file://{}/pruned/img", dir.path().display());
+    let cached = fetch(dir.path(), &sha, Some(&cache), std::slice::from_ref(&gone));
+    assert!(cached.status.success(), "{}", text(&cached));
+    assert_eq!(std::fs::read(dir.path().join("root.qcow2")).unwrap(), good);
+    // A corrupted cache entry is not used; with no good source it fails.
+    for entry in std::fs::read_dir(&cache).unwrap() {
+        std::fs::write(entry.unwrap().path(), b"bit rot").unwrap();
+    }
+    std::fs::remove_file(dir.path().join("root.qcow2")).unwrap();
+    let corrupt = fetch(dir.path(), &sha, Some(&cache), &[gone]);
+    assert!(!corrupt.status.success(), "{}", text(&corrupt));
+}
+
+#[test]
+fn the_image_cache_key_names_the_pinned_release_and_digest() {
+    for arch in ["x86_64", "aarch64"] {
+        let output = lane(&["image-key", arch]);
+        assert!(output.status.success(), "{}", text(&output));
+        let key = String::from_utf8(output.stdout).unwrap();
+        let script = std::fs::read_to_string(script()).unwrap();
+        let release = script
+            .lines()
+            .find_map(|l| l.strip_prefix("IMAGE_RELEASE=\""))
+            .unwrap()
+            .trim_end_matches('"');
+        assert!(key.contains(release), "{key}");
+        let var = format!("IMAGE_SHA256_{arch}=\"");
+        let digest = script
+            .lines()
+            .find_map(|l| l.strip_prefix(var.as_str()))
+            .unwrap()
+            .trim_end_matches('"');
+        assert!(key.trim_end().ends_with(digest), "{key}");
+    }
+    assert!(!lane(&["image-key", "riscv64"]).status.success());
 }
 
 // ---- stale domains and cleanup -----------------------------------------
@@ -482,6 +678,61 @@ fn cleanup_keeps_the_disks_while_the_domain_state_is_unknown() {
     );
 }
 
+/// Runs the script with a PATH that has no `virsh` (as on a runner whose
+/// libvirt install step never ran): only the few tools the cleanup path
+/// uses besides bash builtins.
+fn without_virsh(args: &[&str], images: &Path) -> Output {
+    let bin = tempfile::tempdir().unwrap();
+    for tool in ["dirname", "basename", "rm"] {
+        let real = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(tool))
+            .find(|p| p.exists())
+            .unwrap();
+        std::os::unix::fs::symlink(real, bin.path().join(tool)).unwrap();
+    }
+    let bash = ["/usr/bin/bash", "/bin/bash"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap();
+    Command::new(bash)
+        .arg(script())
+        .args(args)
+        .env("PATH", bin.path())
+        .env("QEMINGA_E2E_IMAGES", images)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cleanup_without_libvirt_and_without_files_has_nothing_to_do() {
+    let images = tempfile::tempdir().unwrap();
+    let args = [
+        "cleanup",
+        "--arch",
+        "x86_64",
+        "--run-id",
+        "42",
+        "--run-attempt",
+        "1",
+    ];
+    let output = without_virsh(&args, images.path());
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("nothing to clean up"),
+        "{}",
+        text(&output)
+    );
+
+    // Files of this run but no libvirt to ask about the domain: keep them.
+    let dir = images.path().join("qeminga-e2e-42-1-x86_64");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("disk.qcow2"), b"x").unwrap();
+    let output = without_virsh(&args, images.path());
+    assert!(!output.status.success(), "{}", text(&output));
+    assert!(dir.join("disk.qcow2").exists());
+}
+
 #[test]
 fn cleanup_removes_only_the_current_run() {
     let fake = Fake::new();
@@ -520,6 +771,7 @@ const MANDATORY: [&str; 4] = [
 ];
 
 fn result(tests: &[(&str, &str)], accelerator: &str) -> (bool, serde_json::Value) {
+    require_jq();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("tests")).unwrap();
     for (name, status) in tests {
@@ -609,8 +861,12 @@ fn a_missing_or_failed_test_or_another_accelerator_fails_the_result() {
 
 // ---- workflow ----------------------------------------------------------
 
-fn workflow() -> String {
+fn caller() -> String {
     std::fs::read_to_string(root().join(".github/workflows/libvirt-tcg.yml")).unwrap()
+}
+
+fn lane_workflow() -> String {
+    std::fs::read_to_string(root().join(".github/workflows/libvirt-tcg-lane.yml")).unwrap()
 }
 
 /// The text of one job, from its key to the next two-space-indented key.
@@ -636,22 +892,52 @@ fn job<'a>(text: &'a str, name: &str) -> &'a str {
 }
 
 #[test]
-fn both_architectures_build_and_boot_on_their_native_hosted_runner() {
-    let text = workflow();
+fn each_architecture_is_its_own_lane_on_its_native_hosted_runner() {
+    // One call of the reusable lane per architecture: an architecture's
+    // smoke job waits only for its own candidate, never for the other's.
+    let text = caller();
+    for (arch, runner, runner_arch) in [
+        ("x86_64", "ubuntu-24.04", "X64"),
+        ("aarch64", "ubuntu-24.04-arm", "ARM64"),
+    ] {
+        let job = job(&text, arch);
+        assert!(
+            job.contains("uses: ./.github/workflows/libvirt-tcg-lane.yml"),
+            "{arch}"
+        );
+        assert!(job.contains(&format!("arch: {arch}\n")), "{arch}");
+        assert!(job.contains(&format!("runner: {runner}\n")), "{arch}");
+        assert!(
+            job.contains(&format!("runner_arch: {runner_arch}\n")),
+            "{arch}"
+        );
+        assert!(job.contains("needs: changes"), "{arch}");
+        assert!(
+            job.contains("if: needs.changes.outputs.code == 'true'"),
+            "{arch}: waits for the change classification"
+        );
+    }
+    assert!(job(&text, "changes").contains("scripts/ci/docs-only.sh"));
+    assert!(
+        !text.contains("strategy:") && !lane_workflow().contains("strategy:"),
+        "no matrix couples the architectures"
+    );
+}
+
+#[test]
+fn both_lane_jobs_prove_the_runner_architecture_and_are_bounded() {
+    let text = lane_workflow();
+    assert!(text.contains("workflow_call:"));
     for name in ["candidate", "smoke"] {
         let job = job(&text, name);
-        assert!(job.contains("runs-on: ${{ matrix.arch.runner }}"), "{name}");
+        assert!(job.contains("runs-on: ${{ inputs.runner }}"), "{name}");
         assert!(
-            job.contains("- { name: x86_64, runner: ubuntu-24.04, runner_arch: X64"),
-            "{name}"
-        );
-        assert!(
-            job.contains("- { name: aarch64, runner: ubuntu-24.04-arm, runner_arch: ARM64"),
-            "{name}"
-        );
-        assert!(
-            job.contains(r#"test "$(uname -m)" = "${{ matrix.arch.name }}""#),
+            job.contains(r#"test "$(uname -m)" = "${{ inputs.arch }}""#),
             "{name}: the runner proves its architecture"
+        );
+        assert!(
+            job.contains(r#"test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}""#),
+            "{name}"
         );
         assert!(!job.contains("continue-on-error"), "{name}");
         assert!(job.contains("timeout-minutes:"), "{name}: bounded");
@@ -660,29 +946,50 @@ fn both_architectures_build_and_boot_on_their_native_hosted_runner() {
 
 #[test]
 fn the_candidate_is_the_production_build_and_the_lane_never_rebuilds_it() {
-    let text = workflow();
+    let text = lane_workflow();
     let build = job(&text, "candidate");
     assert!(build.contains("cargo build --release --locked --features seccomp\n"));
     for forbidden in ["--all-features", "test-fakes", "seccomp-log"] {
         assert!(!build.contains(forbidden), "candidate: {forbidden}");
     }
     let smoke = job(&text, "smoke");
-    assert!(
-        smoke.contains("needs: [changes, candidate]")
-            || smoke.contains("needs: [candidate, changes]")
-    );
+    assert!(smoke.contains("needs: candidate"));
     assert!(
         !smoke.contains("cargo "),
         "the lane installs the candidate, it never builds one"
     );
     assert!(!smoke.contains("rustup"), "the lane has no toolchain");
-    assert!(smoke.contains("verify-candidate"));
-    assert!(smoke.contains("--virttype") || smoke.contains("libvirt-tcg-smoke.sh run"));
+    assert!(smoke.contains("libvirt-tcg-smoke.sh run"));
+}
+
+#[test]
+fn the_installed_binary_is_anchored_to_the_digest_the_build_job_reported() {
+    // The artifact carries the binary and its manifest together, so a
+    // manifest check alone proves consistency, not provenance. The build
+    // job reports the digest of the binary it built as a job output, and
+    // the lane refuses a candidate whose binary does not have it.
+    let text = lane_workflow();
+    let build = job(&text, "candidate");
+    assert!(build.contains("sha256: ${{ steps.digest.outputs.sha256 }}"));
+    assert!(build.contains("sha256sum target/release/qeminga"));
+    let smoke = job(&text, "smoke");
+    assert!(
+        smoke.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#),
+        "{smoke}"
+    );
+}
+
+#[test]
+fn the_guest_image_is_cached_under_its_pinned_digest() {
+    let smoke = job(&lane_workflow(), "smoke").to_owned();
+    assert!(smoke.contains("libvirt-tcg-smoke.sh image-key"));
+    assert!(smoke.contains("uses: actions/cache@"));
+    assert!(smoke.contains("--image-cache"));
 }
 
 #[test]
 fn the_lane_cleans_up_and_keeps_its_evidence_whatever_happened() {
-    let text = workflow();
+    let text = lane_workflow();
     let smoke = job(&text, "smoke");
     let cleanup = smoke
         .find("libvirt-tcg-smoke.sh cleanup")
@@ -696,16 +1003,4 @@ fn the_lane_cleans_up_and_keeps_its_evidence_whatever_happened() {
     let step = &smoke[..upload];
     let step = &step[step.rfind("- name:").unwrap()..];
     assert!(step.contains("if: always()"), "{step}");
-}
-
-#[test]
-fn the_lane_waits_for_the_change_classification() {
-    let text = workflow();
-    assert!(job(&text, "changes").contains("scripts/ci/docs-only.sh"));
-    for name in ["candidate", "smoke"] {
-        assert!(
-            job(&text, name).contains("if: needs.changes.outputs.code == 'true'"),
-            "{name}"
-        );
-    }
 }

@@ -1,16 +1,16 @@
 # libvirt + QEMU TCG smoke lane (#53, AC16). Hosted runners give no usable
 # nested virtualisation on arm64, and none is relied on for x86-64 either:
-# each architecture boots a disposable Ubuntu 24.04 guest under real
-# libvirt with QEMU's TCG accelerator (`<domain type='qemu'>`), natively
-# on its own hosted runner, installs the release candidate built by the
-# `candidate` job of the same run with the shipped packaging, and runs
-# scripts/e2e-libvirt.sh against it, then shuts the guest down through
-# the agent. The lane never builds qeminga; it verifies the candidate's
-# manifest and digest before installing it. The result is TCG smoke
-# evidence (suite libvirt-tcg-smoke-v1), never KVM evidence and not a
-# release qualification. tests/libvirt_tcg_smoke.rs checks this file's
-# shape and the scripts' fail-closed logic; the scripts carry the logic,
-# this file only orders it.
+# each architecture builds its release candidate and boots a disposable
+# Ubuntu 24.04 guest under real libvirt with QEMU's TCG accelerator
+# (`<domain type='qemu'>`), natively on its own hosted runner, installs
+# the candidate with the shipped packaging, runs scripts/e2e-libvirt.sh
+# against it and shuts the guest down through the agent. The work is in
+# libvirt-tcg-lane.yml, called once per architecture: no matrix couples
+# them, so one architecture's build never holds back or skips the
+# other's lane. The result is TCG smoke evidence (suite
+# libvirt-tcg-smoke-v1), never KVM evidence and not a release
+# qualification. tests/libvirt_tcg_smoke.rs checks both files' shape and
+# the scripts' fail-closed logic.
 name: libvirt TCG smoke
 
 on:
@@ -25,11 +25,6 @@ permissions:
 concurrency:
   group: libvirt-tcg-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: -D warnings
 
 jobs:
   # Same classification as ci.yml: a change touching only Markdown no
@@ -56,113 +51,24 @@ jobs:
           fi
           echo "code=$code" | tee -a "$GITHUB_OUTPUT"
 
-  # The production build, on the hosted runner of its architecture, and
-  # nothing else: one candidate per architecture with its manifest.
-  candidate:
-    name: candidate (${{ matrix.arch.name }})
-    runs-on: ${{ matrix.arch.runner }}
+  x86_64:
+    name: x86_64
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - { name: x86_64, runner: ubuntu-24.04, runner_arch: X64 }
-          - { name: aarch64, runner: ubuntu-24.04-arm, runner_arch: ARM64 }
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Install pinned toolchain (rust-toolchain.toml)
-        run: rustup toolchain install && rustup show active-toolchain
-      - name: The runner is a native ${{ matrix.arch.name }} machine
-        run: |
-          test "$(uname -m)" = "${{ matrix.arch.name }}"
-          test "$RUNNER_ARCH" = "${{ matrix.arch.runner_arch }}"
-          rustc -vV | grep -qx "host: ${{ matrix.arch.name }}-unknown-linux-gnu"
-      - name: Release build
-        run: cargo build --release --locked --features seccomp
-      - name: Candidate and manifest
-        env:
-          ARCH: ${{ matrix.arch.name }}
-          RUNNER_LABEL: ${{ matrix.arch.runner }}
-        run: |
-          version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
-          scripts/ci/libvirt-tcg-smoke.sh manifest --out candidate \
-            --binary target/release/qeminga --arch "$ARCH" --source-sha "$GITHUB_SHA" \
-            --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --runner "$RUNNER_LABEL"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: candidate-${{ matrix.arch.name }}
-          path: candidate/
-          if-no-files-found: error
+    uses: ./.github/workflows/libvirt-tcg-lane.yml
+    with:
+      arch: x86_64
+      runner: ubuntu-24.04
+      runner_arch: X64
+      packages: qemu-system-x86
 
-  # The TCG guest on the same architecture's hosted runner. No toolchain,
-  # no build: the candidate is downloaded and verified against its
-  # manifest, the source commit and the architecture.
-  smoke:
-    name: libvirt TCG smoke (${{ matrix.arch.name }})
-    runs-on: ${{ matrix.arch.runner }}
-    needs: [changes, candidate]
+  aarch64:
+    name: aarch64
+    needs: changes
     if: needs.changes.outputs.code == 'true'
-    # Boot and install under emulation is bounded inside the script
-    # (QEMINGA_E2E_BOOT_TIMEOUT_SECS); this is the outer bound.
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        arch:
-          - { name: x86_64, runner: ubuntu-24.04, runner_arch: X64, packages: qemu-system-x86 }
-          - { name: aarch64, runner: ubuntu-24.04-arm, runner_arch: ARM64, packages: qemu-system-arm qemu-efi-aarch64 }
-    env:
-      ARCH: ${{ matrix.arch.name }}
-      OUT: ${{ github.workspace }}/libvirt-tcg-out
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: The runner is a native ${{ matrix.arch.name }} machine
-        run: |
-          test "$(uname -m)" = "${{ matrix.arch.name }}"
-          test "$RUNNER_ARCH" = "${{ matrix.arch.runner_arch }}"
-      - uses: actions/download-artifact@v4
-        with:
-          name: candidate-${{ matrix.arch.name }}
-          path: candidate
-      - name: Verify the candidate (manifest, source commit, architecture, digest)
-        run: scripts/ci/libvirt-tcg-smoke.sh verify-candidate candidate "$ARCH" "$GITHUB_SHA"
-      - name: Install libvirt and QEMU
-        run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
-            libvirt-daemon-system libvirt-clients qemu-utils genisoimage dnsmasq-base ${{ matrix.arch.packages }}
-          sudo systemctl start libvirtd.service
-      - name: Boot, install, AC16, agent shutdown
-        run: |
-          sudo env "PATH=$PATH" scripts/ci/libvirt-tcg-smoke.sh run --arch "$ARCH" \
-            --candidate candidate --source-sha "$GITHUB_SHA" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
-      - name: Clean up this run's domain and disks
-        if: always()
-        run: |
-          sudo env "PATH=$PATH" scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$ARCH" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
-      - name: Result summary
-        if: always()
-        run: |
-          {
-            echo "## libvirt TCG smoke ($ARCH)"
-            echo
-            echo '```json'
-            cat "$OUT/result.json" 2>/dev/null || echo '{"result": "missing"}'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: libvirt-tcg-smoke-${{ matrix.arch.name }}
-          path: ${{ env.OUT }}/
-          if-no-files-found: error
+    uses: ./.github/workflows/libvirt-tcg-lane.yml
+    with:
+      arch: aarch64
+      runner: ubuntu-24.04-arm
+      runner_arch: ARM64
+      packages: qemu-system-arm qemu-efi-aarch64

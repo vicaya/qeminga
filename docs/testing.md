@@ -17,7 +17,10 @@ KVM host.
 
 `.github/workflows/libvirt-tcg.yml` (#53, part) runs AC16 against real
 libvirt on GitHub-hosted runners, natively on each architecture
-(`ubuntu-24.04`, `ubuntu-24.04-arm`). Hosted arm64 runners offer no
+(`ubuntu-24.04`, `ubuntu-24.04-arm`). It calls
+`.github/workflows/libvirt-tcg-lane.yml` once per architecture, so each
+architecture's smoke job waits only for its own build, and one
+architecture's failed build never skips the other's lane. Hosted arm64 runners offer no
 nested KVM and the lane does not rely on it on x86-64 either: the guest
 is a `<domain type='qemu'>`, i.e. QEMU's TCG emulator, and the lane
 proves it (`info kvm` answers `kvm support: disabled`, the QEMU command
@@ -25,14 +28,24 @@ line carries `-accel tcg`) before it counts any result.
 
 1. **Candidate.** The `candidate` job builds
    `cargo build --release --locked --features seccomp` on the hosted
-   runner of each architecture and uploads the binary, the packaging
+   runner of its architecture and uploads the binary, the packaging
    files and a `manifest.json` (source SHA, architecture, version,
-   SHA-256 of the binary and of each packaging file, build run). The
-   `smoke` job has no toolchain and never builds: it verifies the
-   manifest against the commit, the architecture and the bytes
-   (`scripts/ci/libvirt-tcg-smoke.sh verify-candidate`).
+   SHA-256 of the binary and of each packaging file, build run). It
+   also reports the SHA-256 of the binary it built as a job output. The
+   `smoke` job has no toolchain and never builds. It checks the manifest
+   against the commit, the architecture and the files beside it, which
+   proves the artifact is *consistent*: the manifest travels in the same
+   artifact, so whoever could replace one could replace both. What ties
+   the installed binary to the build is the job output: the lane refuses
+   a binary whose digest is not the one the build job reported
+   (`run --expect-sha256`).
 2. **Guest.** A disposable Ubuntu 24.04 server cloud image, pinned by
-   release date and SHA-256 in the script (x86-64: `q35`, SeaBIOS,
+   release date and SHA-256 in the script. Because the digest is checked
+   after every fetch, the bytes may come from anywhere: the job's
+   `actions/cache` entry (keyed by `image-key`, the release and the
+   digest), then `cloud-images.ubuntu.com`, then the archive host
+   Canonical moves pruned serials to; anything with another digest is
+   ignored (x86-64: `q35`, SeaBIOS,
    `qemu64`; aarch64: `virt`, UEFI from `qemu-efi-aarch64`,
    `cortex-a57`), with the `org.qemu.guest_agent.0` virtio-serial
    channel and as many vCPUs as the runner has CPUs (at most 8).
@@ -65,11 +78,16 @@ line carries `-accel tcg`) before it counts any result.
    the libvirt/QEMU versions.
 5. **Cleanup.** Every resource is named
    `qeminga-e2e-<run id>-<attempt>-<arch>` and lives in
-   `/var/lib/libvirt/images/<that name>/`. Before starting, the lane
-   refuses a host that already has a `qeminga-e2e-*` domain or whose
-   domains cannot be listed; afterwards (`if: always()`) it destroys and
-   undefines only this run's domain and removes only its directory, and
-   keeps the disks when the domain's state cannot be established.
+   `/var/lib/libvirt/images/<that name>/` (`QEMINGA_E2E_IMAGES`
+   overrides the root; it must be a plain absolute path of
+   `[A-Za-z0-9._/-]`, because it is written into the domain XML
+   unescaped). Before starting, the lane refuses a host that already has
+   a `qeminga-e2e-*` domain or whose domains cannot be listed;
+   afterwards (`if: always()`) it destroys and undefines only this run's
+   domain and removes only its directory, and keeps the disks when the
+   domain's state cannot be established. A run that failed before
+   libvirt was installed has nothing to clean and the step says so
+   instead of failing a second time.
 
 This is smoke evidence on an emulated CPU, not KVM evidence and not a
 release qualification. Not covered yet (the rest of #53): ext4/XFS data

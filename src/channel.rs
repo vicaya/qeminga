@@ -2,7 +2,7 @@
 //! (design §4.1 I/O layer, §5.7 reconnect rules, §8.4 `EBUSY` is
 //! terminal; AC18; C-15).
 //!
-//! [`Channel`] wraps the device descriptor in a Tokio [`AsyncFd`] and
+//! [`Channel`] wraps the device descriptor in an [`OwnedAsyncFd`] and
 //! implements `AsyncRead`/`AsyncWrite`. [`run_session`] reads frames,
 //! hands each decoder event to a [`Handle`] (the dispatcher) and writes
 //! the replies back in order; it ends on EOF/HUP or an I/O error.
@@ -35,12 +35,12 @@ use std::time::Duration;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
-use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
 use crate::dispatch::Dispatcher;
 use crate::framing::{DecodeEvent, FrameDecoder};
+use crate::kernel::async_fd::OwnedAsyncFd;
 use crate::state::FreezeState;
 
 /// First delay of the open-retry and reopen backoff.
@@ -115,7 +115,7 @@ pub fn open_device(path: &Path) -> io::Result<OwnedFd> {
 /// The channel descriptor registered with the Tokio reactor.
 #[derive(Debug)]
 pub struct Channel {
-    fd: AsyncFd<OwnedFd>,
+    fd: OwnedAsyncFd,
 }
 
 impl Channel {
@@ -140,13 +140,13 @@ impl Channel {
         let flags = OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(fd.as_fd(), nix::fcntl::FcntlArg::F_SETFL(flags))?;
         Ok(Channel {
-            fd: AsyncFd::new(fd)?,
+            fd: OwnedAsyncFd::register(fd)?,
         })
     }
 
     /// The raw descriptor (diagnostics only).
     pub fn as_raw_fd(&self) -> i32 {
-        self.fd.as_raw_fd()
+        self.fd.as_fd().as_raw_fd()
     }
 }
 
@@ -156,20 +156,9 @@ impl AsyncRead for Channel {
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        loop {
-            let mut guard = ready!(self.fd.poll_read_ready(cx))?;
-            let unfilled = buf.initialize_unfilled();
-            match guard.try_io(|inner| {
-                nix::unistd::read(inner.get_ref(), unfilled).map_err(io::Error::from)
-            }) {
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(err)) => return Poll::Ready(Err(err)),
-                Err(_would_block) => continue,
-            }
-        }
+        let n = ready!(self.fd.poll_read(cx, buf.initialize_unfilled()))?;
+        buf.advance(n);
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -179,15 +168,7 @@ impl AsyncWrite for Channel {
         cx: &mut TaskContext<'_>,
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
-        loop {
-            let mut guard = ready!(self.fd.poll_write_ready(cx))?;
-            match guard
-                .try_io(|inner| nix::unistd::write(inner.get_ref(), data).map_err(io::Error::from))
-            {
-                Ok(result) => return Poll::Ready(result),
-                Err(_would_block) => continue,
-            }
-        }
+        self.fd.poll_write(cx, data)
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
@@ -2162,7 +2143,7 @@ mod tests {
         let slave_path = nix::pty::ptsname_r(&master).unwrap();
         raw_mode(&master);
         let mut channel = Channel::open(Path::new(&slave_path)).unwrap();
-        raw_mode(&channel.fd.get_ref());
+        raw_mode(&channel.fd);
         assert!(channel.as_raw_fd() >= 0);
         let mut master = Channel::from_fd(OwnedFd::from(master)).unwrap();
         // Host → guest.

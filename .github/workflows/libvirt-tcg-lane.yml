@@ -1,0 +1,153 @@
+# One architecture's libvirt + QEMU TCG smoke lane (#53, AC16), called by
+# libvirt-tcg.yml once per architecture so that neither architecture's
+# evidence waits for, or depends on, the other's build.
+#
+# `candidate` is the production build on the hosted runner of the
+# architecture, nothing else. It uploads the binary, the packaging and a
+# manifest, and reports the binary's digest as a job output. `smoke` has
+# no toolchain and never builds: it installs that candidate in a
+# disposable Ubuntu 24.04 guest under real libvirt with QEMU's TCG
+# accelerator, refuses it unless the binary has the digest the build job
+# reported (the manifest travels in the same artifact, so on its own it
+# proves consistency, not provenance), runs scripts/e2e-libvirt.sh and
+# shuts the guest down through the agent. The scripts carry the logic;
+# tests/libvirt_tcg_smoke.rs checks them and this file's shape.
+name: libvirt TCG smoke lane
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        description: uname -m of the runner (x86_64 or aarch64)
+        type: string
+        required: true
+      runner:
+        description: the GitHub-hosted runner label of that architecture
+        type: string
+        required: true
+      runner_arch:
+        description: the RUNNER_ARCH that runner reports (X64 or ARM64)
+        type: string
+        required: true
+      packages:
+        description: the architecture's QEMU (and firmware) packages
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  candidate:
+    name: candidate
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native ${{ inputs.arch }} machine
+        run: |
+          test "$(uname -m)" = "${{ inputs.arch }}"
+          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
+          rustc -vV | grep -qx "host: ${{ inputs.arch }}-unknown-linux-gnu"
+      - name: Release build
+        run: cargo build --release --locked --features seccomp
+      # Taken from the built file, not from the manifest, and handed to the
+      # smoke job through the job output, not through the artifact.
+      - name: Digest of the built binary
+        id: digest
+        run: echo "sha256=$(sha256sum target/release/qeminga | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - name: Candidate and manifest
+        env:
+          ARCH: ${{ inputs.arch }}
+          RUNNER_LABEL: ${{ inputs.runner }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
+          scripts/ci/libvirt-tcg-smoke.sh manifest --out candidate \
+            --binary target/release/qeminga --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner "$RUNNER_LABEL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-${{ inputs.arch }}
+          path: candidate/
+          if-no-files-found: error
+
+  smoke:
+    name: libvirt TCG smoke
+    runs-on: ${{ inputs.runner }}
+    needs: candidate
+    # Boot and install under emulation is bounded inside the script
+    # (QEMINGA_E2E_BOOT_TIMEOUT_SECS); this is the outer bound.
+    timeout-minutes: 60
+    env:
+      ARCH: ${{ inputs.arch }}
+      OUT: ${{ github.workspace }}/libvirt-tcg-out
+      IMAGE_CACHE: ${{ github.workspace }}/libvirt-tcg-image-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The runner is a native ${{ inputs.arch }} machine
+        run: |
+          test "$(uname -m)" = "${{ inputs.arch }}"
+          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-${{ inputs.arch }}
+          path: candidate
+      # The pinned image, keyed on its release and digest; the script
+      # checks the digest again after a restore.
+      - name: Guest image cache key
+        id: image
+        run: echo "key=$(scripts/ci/libvirt-tcg-smoke.sh image-key "$ARCH")" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.IMAGE_CACHE }}
+          key: ${{ steps.image.outputs.key }}
+      - name: Install libvirt and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libvirt-daemon-system libvirt-clients qemu-utils genisoimage dnsmasq-base ${{ inputs.packages }}
+          sudo systemctl start libvirtd.service
+      - name: Boot, install, AC16, agent shutdown
+        run: |
+          mkdir -p "$IMAGE_CACHE"
+          sudo env "PATH=$PATH" scripts/ci/libvirt-tcg-smoke.sh run --arch "$ARCH" \
+            --candidate candidate --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
+            --image-cache "$IMAGE_CACHE" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Clean up this run's domain and disks
+        if: always()
+        run: |
+          sudo env "PATH=$PATH" scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$ARCH" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Result summary
+        if: always()
+        run: |
+          {
+            echo "## libvirt TCG smoke ($ARCH)"
+            echo
+            echo '```json'
+            cat "$OUT/result.json" 2>/dev/null || echo '{"result": "missing"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvirt-tcg-smoke-${{ inputs.arch }}
+          path: ${{ env.OUT }}/
+          if-no-files-found: error

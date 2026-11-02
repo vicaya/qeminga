@@ -1,0 +1,74 @@
+# libvirt + QEMU TCG smoke lane (#53, AC16). Hosted runners give no usable
+# nested virtualisation on arm64, and none is relied on for x86-64 either:
+# each architecture builds its release candidate and boots a disposable
+# Ubuntu 24.04 guest under real libvirt with QEMU's TCG accelerator
+# (`<domain type='qemu'>`), natively on its own hosted runner, installs
+# the candidate with the shipped packaging, runs scripts/e2e-libvirt.sh
+# against it and shuts the guest down through the agent. The work is in
+# libvirt-tcg-lane.yml, called once per architecture: no matrix couples
+# them, so one architecture's build never holds back or skips the
+# other's lane. The result is TCG smoke evidence (suite
+# libvirt-tcg-smoke-v1), never KVM evidence and not a release
+# qualification. tests/libvirt_tcg_smoke.rs checks both files' shape and
+# the scripts' fail-closed logic.
+name: libvirt TCG smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libvirt-tcg-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Same classification as ci.yml: a change touching only Markdown no
+  # check reads skips the lane.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code=true
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } \
+              && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE" "$GITHUB_SHA" | tee changed.txt
+            if scripts/ci/docs-only.sh < changed.txt; then code=false; fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  x86_64:
+    name: x86_64
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/libvirt-tcg-lane.yml
+    with:
+      arch: x86_64
+      runner: ubuntu-24.04
+      runner_arch: X64
+      packages: qemu-system-x86
+
+  aarch64:
+    name: aarch64
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/libvirt-tcg-lane.yml
+    with:
+      arch: aarch64
+      runner: ubuntu-24.04-arm
+      runner_arch: ARM64
+      packages: qemu-system-arm qemu-efi-aarch64

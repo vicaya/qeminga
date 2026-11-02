@@ -51,6 +51,11 @@ cargo build --release --locked --features seccomp
 scripts/ci/coverage.sh                    # cargo llvm-cov + 85 % floor on production lines; cargo install cargo-llvm-cov --locked; rustup component add llvm-tools-preview
 ```
 
+`cargo test` also needs `jq` on `PATH` (`apt-get install jq`; GitHub's
+runners have it): `tests/libvirt_tcg_smoke.rs` drives
+`scripts/ci/libvirt-tcg-smoke.sh`, which reads and writes JSON with it,
+and those tests stop with that message when it is missing.
+
 Privileged tests (root / `CAP_SYS_ADMIN`) are `#[ignore]`d, named
 `privileged_*`, and run serially (several share one loop-mounted
 filesystem) with:
@@ -72,6 +77,14 @@ end-to-end suite (or `tests/startup.rs`) as root needs the `qeminga`
 account, since the daemon refuses to start as root without it (exit 77):
 create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf`,
 or run the tests unprivileged.
+
+A separate workflow (`.github/workflows/libvirt-tcg.yml`) runs AC16
+against real libvirt under QEMU's TCG accelerator on both architectures:
+it installs the release candidate of the same run in a disposable guest
+and never builds in the lane. It needs root, libvirt and many minutes of
+emulation, so it is not part of the local checks above; the recipe for
+running it locally is in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`
+(part of `cargo test`) covers its scripts and the workflow's shape.
 
 ## Code rules
 

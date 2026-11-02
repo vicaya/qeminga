@@ -680,7 +680,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** `packaging/README.md` documents the migration steps (stop/disable `qemu-guest-agent`, install rule, enable unit) and the suspend rule; `tests/packaging.rs` checks the tmpfiles line and `privileged_tmpfiles_rule_makes_sys_power_state_writable_for_the_service_account` applies it (T5.2 job).
 
 #### T5.4 — libvirt interoperability script (manual) ∥
-- **Status:** in-progress (script, VM recipe and a scripted-`virsh` test of the script landed; the run log from a real libvirt host is still to be attached, see §7)
+- **Status:** in-progress (script, VM recipe and a scripted-`virsh` test of the script landed; the script now runs on every code change against real libvirt under QEMU TCG on both architectures, T6.8; the KVM run is still to come, see §7)
 - **Design:** AC16, §3.
 - **Depends on:** T4.6, T5.3
 - **Files:** `scripts/e2e-libvirt.sh`, `docs/testing.md`.
@@ -820,6 +820,16 @@ the answer is a one-line change, and leave the question here.
 - **Implement (green):** the two reply bounds through `bounded_reply` (serialise, add the longest response envelope `proto::MAX_RESPONSE_ENVELOPE_BYTES` so the bound holds for the line as sent, compare, refuse with the size and the bound; test `the_reply_bound_covers_the_whole_line_envelope_included`); everything else was already bounded and is now inventoried in §5.10 with its behaviour past the bound and the failure model (recovery independent of the host; liveness assumes the runtime is scheduled and the kernel calls progress; no reply can be delivered to a peer that refuses it). Duplicate recovery requests are serialised behind the drain in progress rather than coalesced: each is answered from the kernel's own state at one `FITHAW` per drained target, the session's places bound how many wait, and recovery capacity (the watchdog, the coordinator) is independent of the queue.
 - **Done when:** AC26 is green and every row of §5.10 names its enforcing code and test.
 
+#### T6.8 — libvirt TCG smoke lane on hosted runners (#53, part) ∥
+- **Status:** done (first green run on both architectures in PR #54, latest with one lane per architecture in workflow run 41496398761 (first: 41405332125): `result: pass`, `accelerator: tcg`; the smoke job took about 3 min on x86-64 and 6 min on aarch64)
+- **Design:** AC16, §3, §8.3, §8.4, §5.4, §5.5; #53 (arm64 TCG lane, extended to x86-64 for the smoke).
+- **Depends on:** T5.3, T5.4
+- **Files:** `.github/workflows/libvirt-tcg.yml`, `.github/workflows/libvirt-tcg-lane.yml`, `scripts/ci/libvirt-tcg-smoke.sh`, `scripts/ci/libvirt-tcg-guest.sh`, `tests/libvirt_tcg_smoke.rs`, `docs/testing.md`.
+- **Tests first (red):** `tests/libvirt_tcg_smoke.rs`: the candidate manifest (source, architecture, binary and packaging digests, the production build command) and its fail-closed consistency check (wrong source, wrong architecture, a binary or packaging file that differs from the manifest, unknown schema, malformed or missing manifest; short SHA, branch name and unknown architecture refused), with the binary anchored to the digest the build job reports as a job output (review follow-up: the manifest shares the artifact, so it proves consistency, not provenance); the guest image comes from the first of the cache and the sources whose bytes have the pinned digest (a pruned source falls back, other bytes are ignored, a corrupt cache entry is not used); a run directory that is not a plain path is refused; more than eight vCPUs are capped at eight; cleanup without libvirt and without files has nothing to do, and keeps files it cannot account for; the domain is `type='qemu'` with no KVM anywhere, `q35`/`virt`, UEFI and `cortex-a57` on aarch64, the guest-agent channel, every file in the run's directory, names outside `qeminga-e2e-<run>-<attempt>-<arch>` refused; a stale test domain, or a listing that fails, stops the lane; cleanup refuses a path outside the namespace, keeps the disks while the domain's state is unknown and removes only the current run; the result is `pass` only with all four mandatory tests passing under TCG (missing → `not_run`, any other status → `fail`, `kvm` → `fail`); the workflow builds and boots each architecture on its native hosted runner, one lane per architecture so neither waits for the other (review follow-up), proves the architecture, caches the guest image under its pinned digest, never builds in the lane, never uses `--all-features`/`test-fakes`/`seccomp-log` for the candidate, cleans up and uploads evidence `if: always()`, and waits for the change classification.
+- **Implement (green):** a hosted candidate build per architecture; a lane with no toolchain that verifies the candidate, boots a pinned Ubuntu 24.04 cloud image under libvirt with TCG (proved by `info kvm` and the QEMU command line), installs with the shipped packaging from a read-only payload disk, checks the production state in the guest (digest, uid 600, `NoNewPrivs`, `Seccomp: 2`, upstream agent inactive, port ownership), runs `scripts/e2e-libvirt.sh --no-shutdown`, then `virsh shutdown --mode agent` until `shut off`; `result.json` (suite `libvirt-tcg-smoke-v1`) and diagnostics as artifacts.
+- **Not done here (rest of #53):** ext4/XFS data disks, FSTRIM, quiesced snapshot and restore, the idle watchdog through libvirt, the x86-64 KVM lane on the dedicated runner, the private controller and the release verification. The smoke suite name is deliberately not a release suite.
+- **Done when:** both architectures' lanes are green in CI with `accelerator: tcg` recorded.
+
 ---
 
 ## 6. Acceptance-criteria traceability
@@ -843,7 +853,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC13 no frozen-fs write, loss reported | T1.4, T3.6, T5.2 (`privileged_journald_pipe_full_does_not_deadlock_thaw`) | unit + privileged | green |
 | AC14 one-hour fuzz | T5.1 (`.github/workflows/fuzz.yml`, weekly) | scheduled CI | pending: the 60 s run is green on every PR; the one-hour weekly run has not executed yet, so AC14 as written is not yet demonstrated |
 | AC15 seccomp matrix both arches | T4.5, T5.2 (`privileged_seccomp_matrix_log_then_enforce`) | privileged | green on x86-64 and aarch64 (native `ubuntu-24.04-arm` leg, #51) |
-| AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`) | manual | manual, run log pending (§7) |
+| AC16 libvirt interop | T5.4 (`scripts/e2e-libvirt.sh`), T6.8 (`.github/workflows/libvirt-tcg.yml`, `tests/libvirt_tcg_smoke.rs`) | CI (real libvirt, QEMU TCG, x86-64 and aarch64) + manual (KVM) | TCG smoke lane in CI on both architectures; KVM run pending (§7) |
 | AC17 tmpfs/bind/0700/EBUSY handling | T3.2, T3.4, T5.2 (`privileged_freeze_with_tmpfs_bind_and_0700_mountpoint`) | unit + privileged | green |
 | AC18 EOF/reopen during freeze | T4.1, T4.7 (`channel_eof_then_reopen_preserves_state`), T5.2 (`privileged_channel_eof_during_freeze_preserves_marker`) | unit + E2E + privileged | green |
 | AC19 `guest-info` contract | T2.2, T4.7 (`guest_info_matches_capability_contract`) | unit + E2E | green |
@@ -862,4 +872,4 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | Gap | Detail | Owner |
 |---|---|---|
 | stuck `FITHAW` isolation | The operation deadline (T6.1) bounds the freeze walk; a `FITHAW` that blocks in the kernel still holds its drain, and with it the operation, until it returns (OQ-8, still open). | design owner |
-| libvirt run log | `scripts/e2e-libvirt.sh` and the recipe in `docs/testing.md` exist, but no run against a real libvirt host has been recorded yet (no nested virtualisation in hosted CI or the development container). AC16 stays open until a log is attached to a PR. | T5.4 / T5.5 |
+| libvirt KVM run | `scripts/e2e-libvirt.sh` runs against real libvirt in CI under QEMU's TCG accelerator on both architectures (T6.8): smoke evidence on an emulated CPU, not a KVM run and not a release qualification. No run under KVM has been recorded yet (hosted runners give no nested KVM; the x86-64 KVM lane and the release gate are the rest of #53). | T5.4 / T5.5 / #53 |

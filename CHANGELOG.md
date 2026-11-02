@@ -19,6 +19,15 @@ semantic versioning.
 
 ### Added
 
+- libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
+  part): on GitHub-hosted runners, natively on x86-64 and aarch64, the
+  release candidate built in the same run is installed with the shipped
+  packaging in a disposable Ubuntu 24.04 guest under real libvirt with
+  QEMU's TCG accelerator, its production state is checked from inside
+  the guest, `scripts/e2e-libvirt.sh` runs against it and the guest is
+  shut down through the agent; `result.json` records `accelerator: tcg`.
+  Smoke evidence, not a KVM run or a release qualification.
+
 - Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`;
   omitted it derives `min(60, fsfreeze_max_timeout_secs)`, an explicit
   value must be at most the hard cap): a `guest-fsfreeze-freeze` whose

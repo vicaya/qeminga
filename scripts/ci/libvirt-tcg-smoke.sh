@@ -176,20 +176,26 @@ cmd_verify_candidate() {
 
 cmd_domain_xml() {
     parse_opts "$@"
-    local arch name dir
+    local arch name dir vcpus
     arch="$(need arch)"; name="$(need name)"; dir="$(need dir)"
+    vcpus="${opt_vcpus:-2}"
     check_arch "$arch"; check_name "$name"
     [ "$(basename "$dir")" = "$name" ] || die "the run directory must be named $name"
+    [[ "$vcpus" =~ ^[1-9][0-9]?$ ]] || die "--vcpus must be 1 to 99: '$vcpus'"
     local machine os cpu
     machine="$(machine_of "$arch")"
     case "$arch" in
         x86_64)
             os="    <type arch='x86_64' machine='q35'>hvm</type>"
+            # qemu64 boots this guest faster under TCG than `max`, whose
+            # extra emulated features cost more than they save (measured:
+            # 181 s against 219 s to an installed agent, 4 vCPUs).
             cpu="  <cpu mode='custom' match='exact' check='none'><model fallback='forbid'>qemu64</model></cpu>"
             ;;
         aarch64)
             # UEFI firmware from qemu-efi-aarch64; a fixed AArch64 model
-            # (the `max` model's pointer authentication is slow under TCG).
+            # (the `max` model's QARMA pointer authentication is slow
+            # under TCG).
             os="    <type arch='aarch64' machine='virt'>hvm</type>
     <loader readonly='yes' type='pflash'>$AAVMF_CODE</loader>
     <nvram template='$AAVMF_VARS'>$dir/VARS.fd</nvram>"
@@ -200,7 +206,7 @@ cmd_domain_xml() {
 <domain type='qemu'>
   <name>$name</name>
   <memory unit='MiB'>2048</memory>
-  <vcpu>2</vcpu>
+  <vcpu>$vcpus</vcpu>
   <os>
 $os
     <boot dev='hd'/>
@@ -233,6 +239,7 @@ $cpu
     <interface type='network'>
       <source network='default'/>
       <model type='virtio'/>
+      <rom enabled='no'/>
     </interface>
     <channel type='unix'>
       <source mode='bind'/>
@@ -458,6 +465,19 @@ prove_tcg() {
     esac
     grep -q -- '-accel tcg' "$qemu_log" || { echo "no '-accel tcg' on the QEMU command line"; return 1; }
     if grep -qE -- '-accel kvm|accel=kvm' "$qemu_log"; then echo "KVM on the QEMU command line"; return 1; fi
+    # Multi-threaded TCG (one "CPU n/TCG" thread per vCPU) is QEMU's
+    # default for these guest/host pairs; libvirt has no knob for it, so
+    # it is observed and reported, not configured.
+    local pid threads
+    pid="$(cat "/run/libvirt/qemu/$name.pid" 2>/dev/null)" || true
+    if [ -n "$pid" ]; then
+        threads="$(cat "/proc/$pid/task/"*/comm 2>/dev/null | grep -cE '^CPU [0-9]+/TCG$' || true)"
+        if grep -qx 'ALL CPUs/TCG' "/proc/$pid/task/"*/comm 2>/dev/null; then
+            echo "TCG threading: single (one thread for all vCPUs)"
+        else
+            echo "TCG threading: multi ($threads vCPU threads)"
+        fi
+    fi
 }
 
 cmd_run() {
@@ -527,7 +547,12 @@ EOF
     genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
     genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
 
-    cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" >"$dir/domain.xml"
+    # As many vCPUs as the runner has CPUs (multi-threaded TCG runs one
+    # host thread per vCPU), at most 8.
+    local vcpus
+    vcpus="$(nproc)"
+    [ "$vcpus" -le 8 ] || vcpus=8
+    cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$vcpus" >"$dir/domain.xml"
     v define "$dir/domain.xml"
     v start "$name"
 

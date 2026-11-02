@@ -35,7 +35,15 @@ line carries `-accel tcg`) before it counts any result.
    release date and SHA-256 in the script (x86-64: `q35`, SeaBIOS,
    `qemu64`; aarch64: `virt`, UEFI from `qemu-efi-aarch64`,
    `cortex-a57`), with the `org.qemu.guest_agent.0` virtio-serial
-   channel. A read-only payload disk carries the candidate;
+   channel and as many vCPUs as the runner has CPUs (at most 8).
+   Multi-threaded TCG, one host thread per vCPU, is QEMU's default for
+   both pairs and libvirt has no setting for it; the lane reports the
+   observed threading (`TCG threading: multi (N vCPU threads)`).
+   Host-passthrough or host-model CPUs need KVM; of the TCG models,
+   `qemu64` reached an installed agent faster than `max` on x86-64
+   (181 s against 219 s with 4 vCPUs; 230 s with 2), and on aarch64
+   `max` is avoided because its QARMA pointer authentication is slow
+   under emulation. A read-only payload disk carries the candidate;
    cloud-init runs `scripts/ci/libvirt-tcg-guest.sh`, which masks
    `qemu-guest-agent` and installs qeminga with the steps of
    `packaging/README.md`, then checks from inside the guest that the

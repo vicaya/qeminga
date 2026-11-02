@@ -257,6 +257,9 @@ fn the_domain_runs_under_tcg_never_kvm_on_both_architectures() {
             xml.contains("<target type='virtio' name='org.qemu.guest_agent.0'/>"),
             "{arch}: the guest-agent channel: {xml}"
         );
+        // The guest boots from disk: no NIC option ROM, so the lane does
+        // not depend on the ROM package of the runner's QEMU.
+        assert!(xml.contains("<rom enabled='no'/>"), "{arch}: {xml}");
         assert!(
             xml.contains("<name>qeminga-e2e-42-1-x</name>"),
             "{arch}: {xml}"
@@ -301,6 +304,47 @@ fn the_domain_refuses_names_outside_the_run_namespace_and_unknown_architectures(
     ]);
     assert!(!bad_name.status.success());
     assert!(!domain_xml("riscv64").status.success());
+}
+
+fn domain_xml_with_vcpus(vcpus: &str) -> Output {
+    lane(&[
+        "domain-xml",
+        "--arch",
+        "x86_64",
+        "--name",
+        "qeminga-e2e-42-1-x",
+        "--dir",
+        "/var/lib/libvirt/images/qeminga-e2e-42-1-x",
+        "--vcpus",
+        vcpus,
+    ])
+}
+
+#[test]
+fn the_vcpu_count_is_explicit_and_bounded() {
+    assert!(
+        String::from_utf8(domain_xml("x86_64").stdout)
+            .unwrap()
+            .contains("<vcpu>2</vcpu>")
+    );
+    let four = domain_xml_with_vcpus("4");
+    assert!(four.status.success(), "{}", text(&four));
+    assert!(
+        String::from_utf8(four.stdout)
+            .unwrap()
+            .contains("<vcpu>4</vcpu>")
+    );
+    for bad in ["0", "100", "four", "4</vcpu><vcpu>8"] {
+        assert!(!domain_xml_with_vcpus(bad).status.success(), "{bad}");
+    }
+}
+
+#[test]
+fn the_lane_matches_the_vcpus_to_the_runner_and_reports_the_tcg_threading() {
+    let script = std::fs::read_to_string(script()).unwrap();
+    assert!(script.contains(r#"vcpus="$(nproc)""#));
+    assert!(script.contains(r#"--vcpus "$vcpus""#));
+    assert!(script.contains("TCG threading:"));
 }
 
 // ---- stale domains and cleanup -----------------------------------------

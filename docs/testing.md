@@ -8,11 +8,85 @@ supported architectures (`ubuntu-24.04` for x86-64, `ubuntu-24.04-arm`
 for aarch64; #51): the aarch64 privileged leg is the execution evidence
 for the aarch64 seccomp profile (AC15), and each leg proves its
 architecture (`uname -m`, `RUNNER_ARCH`, the rustc host triple) before
-it builds anything. This page covers the one check that stays manual:
-interoperability with a real libvirt/QEMU host (AC16, T5.4). Hosted CI
-runners have no nested virtualisation.
+it builds anything. This page also covers interoperability with a real
+libvirt/QEMU host (AC16, T5.4): an automated smoke lane under QEMU's TCG
+accelerator on both architectures (below), and the manual recipe for a
+KVM host.
 
-## VM recipe
+## libvirt TCG smoke lane (CI)
+
+`.github/workflows/libvirt-tcg.yml` (#53, part) runs AC16 against real
+libvirt on GitHub-hosted runners, natively on each architecture
+(`ubuntu-24.04`, `ubuntu-24.04-arm`). Hosted arm64 runners offer no
+nested KVM and the lane does not rely on it on x86-64 either: the guest
+is a `<domain type='qemu'>`, i.e. QEMU's TCG emulator, and the lane
+proves it (`info kvm` answers `kvm support: disabled`, the QEMU command
+line carries `-accel tcg`) before it counts any result.
+
+1. **Candidate.** The `candidate` job builds
+   `cargo build --release --locked --features seccomp` on the hosted
+   runner of each architecture and uploads the binary, the packaging
+   files and a `manifest.json` (source SHA, architecture, version,
+   SHA-256 of the binary and of each packaging file, build run). The
+   `smoke` job has no toolchain and never builds: it verifies the
+   manifest against the commit, the architecture and the bytes
+   (`scripts/ci/libvirt-tcg-smoke.sh verify-candidate`).
+2. **Guest.** A disposable Ubuntu 24.04 server cloud image, pinned by
+   release date and SHA-256 in the script (x86-64: `q35`, SeaBIOS,
+   `qemu64`; aarch64: `virt`, UEFI from `qemu-efi-aarch64`,
+   `cortex-a57`), with the `org.qemu.guest_agent.0` virtio-serial
+   channel. A read-only payload disk carries the candidate;
+   cloud-init runs `scripts/ci/libvirt-tcg-guest.sh`, which masks
+   `qemu-guest-agent` and installs qeminga with the steps of
+   `packaging/README.md`, then checks from inside the guest that the
+   installed binary has the candidate's digest, the service is active as
+   uid 600 with `NoNewPrivs: 1` and `Seccomp: 2`, the upstream agent is
+   not active, and the port belongs to `qeminga` with mode 0600. Its
+   verdict and the unit's journal reach the host on the serial console.
+3. **AC16.** The host checks that `guest-info` reports the candidate's
+   version, runs `scripts/e2e-libvirt.sh --no-shutdown` against the
+   domain, then `virsh shutdown --mode agent` and requires `domstate` to
+   become exactly `shut off`.
+4. **Evidence.** `result.json` (schema 1, suite `libvirt-tcg-smoke-v1`):
+   source SHA, architecture, candidate digest, `virtualization`
+   (`hypervisor: qemu`, `accelerator: tcg`, `machine`), the pinned image,
+   and `production_install`, `accelerator_tcg`, `libvirt_interop`,
+   `agent_shutdown`, each `pass`, `fail` or `not_run`; the result is
+   `pass` only when all four pass under TCG. The artifact also holds the
+   AC16 transcript, the serial console, the QEMU log, the domain XML and
+   the libvirt/QEMU versions.
+5. **Cleanup.** Every resource is named
+   `qeminga-e2e-<run id>-<attempt>-<arch>` and lives in
+   `/var/lib/libvirt/images/<that name>/`. Before starting, the lane
+   refuses a host that already has a `qeminga-e2e-*` domain or whose
+   domains cannot be listed; afterwards (`if: always()`) it destroys and
+   undefines only this run's domain and removes only its directory, and
+   keeps the disks when the domain's state cannot be established.
+
+This is smoke evidence on an emulated CPU, not KVM evidence and not a
+release qualification. Not covered yet (the rest of #53): ext4/XFS data
+disks, FSTRIM, a quiesced snapshot and its restore, the idle watchdog
+through libvirt, the x86-64 KVM lane and release verification. Timeouts
+are explicit: `QEMINGA_E2E_BOOT_TIMEOUT_SECS` (default 1800) bounds boot
+plus install under emulation, `QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS`
+(default 300) the agent shutdown, and the job has `timeout-minutes`.
+To run it on an Ubuntu 24.04 machine of either architecture:
+
+```sh
+sudo apt-get install --no-install-recommends libvirt-daemon-system libvirt-clients \
+  qemu-utils genisoimage dnsmasq-base qemu-system-x86   # aarch64: qemu-system-arm qemu-efi-aarch64
+cargo build --release --locked --features seccomp
+sha=$(git rev-parse HEAD)
+scripts/ci/libvirt-tcg-smoke.sh manifest --out /tmp/candidate --binary target/release/qeminga \
+  --arch "$(uname -m)" --source-sha "$sha" --version 0.1.0 --run-id 1 --run-attempt 1 --runner local
+sudo scripts/ci/libvirt-tcg-smoke.sh run --arch "$(uname -m)" --candidate /tmp/candidate \
+  --source-sha "$sha" --run-id 1 --run-attempt 1 --out /tmp/tcg-out
+sudo scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$(uname -m)" --run-id 1 --run-attempt 1
+```
+
+## Manual run on a KVM host
+
+### VM recipe
 
 1. **Guest image.** Any Linux 5.4+ cloud image with systemd (Debian 12,
    Fedora 40, Ubuntu 24.04). ext4 or XFS root.
@@ -59,7 +133,7 @@ runners have no nested virtualisation.
    `domfsinfo`, and a check that `guest-exec` is refused). Attach its
    output to the pull request that changes protocol-facing code.
 
-## What a passing run looks like
+### What a passing run looks like
 
 ```
 qeminga libvirt interoperability run: 2026-09-03T10:00:00Z domain=qeminga-test host=...

@@ -73,6 +73,14 @@ account, since the daemon refuses to start as root without it (exit 77):
 create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf`,
 or run the tests unprivileged.
 
+A separate workflow (`.github/workflows/libvirt-tcg.yml`) runs AC16
+against real libvirt under QEMU's TCG accelerator on both architectures:
+it installs the release candidate of the same run in a disposable guest
+and never builds in the lane. It needs root, libvirt and many minutes of
+emulation, so it is not part of the local checks above; the recipe for
+running it locally is in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`
+(part of `cargo test`) covers its scripts and the workflow's shape.
+
 ## Code rules
 
 - **No `unsafe` outside `src/kernel/`.** The crate root has

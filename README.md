@@ -13,9 +13,10 @@ the guest.
 
 **Status:** 0.1.0. Every command in the design is implemented and tested
 (unit, property, fuzz, end-to-end over a pty, and privileged tests on
-loop-mounted filesystems, natively on x86-64 and aarch64). One item stays
-open, tracked in [`docs/tasks.md`](docs/tasks.md) §7: the manual libvirt
-run log (AC16).
+loop-mounted filesystems, natively on x86-64 and aarch64) and exercised
+against real libvirt in CI under QEMU's TCG emulator on both
+architectures. One item stays open, tracked in
+[`docs/tasks.md`](docs/tasks.md) §7: a libvirt run under KVM (AC16).
 
 ## Commands
 
@@ -48,8 +49,9 @@ and nothing is unmounted (`docs/tasks.md` OQ-1).
 
 Installation files (systemd unit, udev rule, sysusers, example config) and
 the migration steps from `qemu-guest-agent` are in
-[`packaging/README.md`](packaging/README.md). Manual libvirt
-interoperability checks are described in [`docs/testing.md`](docs/testing.md).
+[`packaging/README.md`](packaging/README.md). The libvirt
+interoperability checks (the TCG smoke lane in CI and the manual KVM
+recipe) are described in [`docs/testing.md`](docs/testing.md).
 
 - [`docs/design.md`](docs/design.md) — the design document (normative).
 - [`docs/tasks.md`](docs/tasks.md) — the implementation task list, with

@@ -6,6 +6,17 @@ semantic versioning.
 
 ## [Unreleased]
 
+### Security
+
+- tokio 1.53.1 → 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd::new` and related
+  constructors violate I/O safety). The channel no longer calls the
+  deprecated constructors: `kernel::async_fd::OwnedAsyncFd` registers the
+  channel's `OwnedFd` with the `unsafe` `AsyncFd::register` (tokio's own
+  recommended pattern for an owned descriptor; no safe constructor
+  exists) and keeps its contract by construction, owning the descriptor
+  and never handing out `&mut` access to it. The `unsafe` stays in
+  `src/kernel/` (design §5.6).
+
 ### Added
 
 - Freeze operation deadline (`[agent] fsfreeze_operation_timeout_secs`;

@@ -23,8 +23,8 @@
 #   libvirt-tcg-smoke.sh fetch-image --sha256 HEX --dest PATH [--cache DIR]
 #       -- URL...                                           # first match wins
 #   libvirt-tcg-smoke.sh run --arch ARCH --candidate DIR --source-sha SHA
-#       --run-id N --run-attempt N --out DIR
-#       [--expect-sha256 HEX] [--image-cache DIR]           (root)
+#       --run-id N --run-attempt N --out DIR --expect-sha256 HEX
+#       [--image-cache DIR]                                 (root)
 #   libvirt-tcg-smoke.sh result --out DIR --arch ARCH --source-sha SHA
 #       --binary-sha256 HEX --accelerator ACCEL
 #   libvirt-tcg-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
@@ -199,7 +199,8 @@ cmd_domain_xml() {
     check_arch "$arch"; check_name "$name"
     check_path --dir "$dir"
     [ "$(basename "$dir")" = "$name" ] || die "the run directory must be named $name"
-    [[ "$vcpus" =~ ^[1-9][0-9]?$ ]] || die "--vcpus must be 1 to 99: '$vcpus'"
+    # Validated before the cap: `run` passes nproc, which can be any size.
+    [[ "$vcpus" =~ ^[1-9][0-9]{0,8}$ ]] || die "--vcpus must be a positive whole number: '$vcpus'"
     # Multi-threaded TCG runs one host thread per vCPU; more than eight
     # buys nothing on a hosted runner.
     [ "$vcpus" -le 8 ] || vcpus=8
@@ -344,7 +345,13 @@ cmd_cleanup() {
     # red step. Files without a libvirt to ask about their domain are kept.
     if ! command -v virsh >/dev/null 2>&1; then
         [ ! -e "$dir" ] || die "virsh is not installed, so the state of $name cannot be established; keeping $dir"
-        echo "nothing to clean up: libvirt is not installed and $dir does not exist"
+        local note="nothing to clean up: libvirt is not installed and $dir does not exist"
+        echo "$note"
+        # The evidence directory still exists afterwards, saying why it is
+        # nearly empty, so the always() upload has something to upload.
+        if [ -n "$out" ]; then
+            mkdir -p "$out" && echo "$note" >"$out/cleanup.txt"
+        fi
         return 0
     fi
     [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out"
@@ -564,10 +571,12 @@ cmd_run() {
     local arch candidate sha run_id attempt expect cache
     arch="$(need arch)"; candidate="$(need candidate)"; sha="$(need source_sha)"
     run_id="$(need run_id)"; attempt="$(need run_attempt)"; OUT="$(need out)"
-    expect="${opt_expect_sha256:-}"; cache="${opt_image_cache:-}"
+    # Required and non-empty: an empty value (a renamed step or output key
+    # in the workflow) must not quietly skip the anchor.
+    expect="$(need expect_sha256)"; cache="${opt_image_cache:-}"
     check_arch "$arch"; check_sha "$sha"
     check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
-    [ -z "$expect" ] || [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
+    [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     check_path QEMINGA_E2E_IMAGES "$IMAGES"
     local boot_timeout="${QEMINGA_E2E_BOOT_TIMEOUT_SECS:-1800}"
     local shutdown_timeout="${QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS:-300}"
@@ -603,10 +612,8 @@ cmd_run() {
     digest="$(cmd_verify_candidate "$candidate" "$arch" "$sha")"
     RUN_DIGEST="$digest"
     echo "candidate sha256 $digest (manifest consistent)"
-    if [ -n "$expect" ]; then
-        [ "$digest" = "$expect" ] || die "candidate binary $digest is not the one the build job reported ($expect)"
-        echo "candidate sha256 matches the build job's reported digest"
-    fi
+    [ "$digest" = "$expect" ] || die "candidate binary $digest is not the one the build job reported ($expect)"
+    echo "candidate sha256 matches the build job's reported digest"
     local version
     version="$(jq -er .version "$candidate/manifest.json")"
 

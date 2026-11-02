@@ -352,17 +352,20 @@ fn the_vcpu_count_is_explicit_and_bounded() {
             .unwrap()
             .contains("<vcpu>4</vcpu>")
     );
-    for bad in ["0", "100", "four", "4</vcpu><vcpu>8"] {
+    for bad in ["0", "07", "four", "4</vcpu><vcpu>8", "1234567890"] {
         assert!(!domain_xml_with_vcpus(bad).status.success(), "{bad}");
     }
 }
 
 #[test]
 fn more_vcpus_than_eight_are_capped_at_eight() {
+    // `run` passes nproc, which a large workstation puts well past 99.
     for (asked, got) in [
         ("8", "<vcpu>8</vcpu>"),
         ("9", "<vcpu>8</vcpu>"),
         ("64", "<vcpu>8</vcpu>"),
+        ("128", "<vcpu>8</vcpu>"),
+        ("1024", "<vcpu>8</vcpu>"),
     ] {
         let output = domain_xml_with_vcpus(asked);
         assert!(output.status.success(), "{asked}: {}", text(&output));
@@ -429,6 +432,57 @@ fn a_run_directory_that_would_not_be_literal_xml_is_refused() {
             &dir,
         ]);
         assert!(!output.status.success(), "{dir}: {}", text(&output));
+    }
+}
+
+// ---- run arguments -------------------------------------------------------
+
+fn run_args(expect: Option<&str>) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "run",
+        "--arch",
+        "x86_64",
+        "--candidate",
+        "/nonexistent/candidate",
+        "--source-sha",
+        SHA,
+        "--run-id",
+        "42",
+        "--run-attempt",
+        "1",
+        "--out",
+        "/nonexistent/out",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
+    if let Some(expect) = expect {
+        args.push("--expect-sha256".into());
+        args.push(expect.into());
+    }
+    args
+}
+
+#[test]
+fn a_run_without_the_build_jobs_digest_is_refused_before_anything_happens() {
+    // The workflow passes `needs.candidate.outputs.sha256`; if that output
+    // ever comes through empty (a renamed step or key), the anchor must not
+    // be skipped in favour of the manifest consistency check alone.
+    for expect in [None, Some(""), Some("not-a-digest")] {
+        let args = run_args(expect);
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let output = lane(&refs);
+        assert!(!output.status.success(), "{expect:?}: {}", text(&output));
+        assert!(
+            text(&output).contains("--expect-sha256"),
+            "{expect:?}: the refusal names the missing anchor: {}",
+            text(&output)
+        );
+        assert!(
+            !text(&output).contains("preflight"),
+            "{expect:?}: refused before preflight: {}",
+            text(&output)
+        );
     }
 }
 
@@ -683,7 +737,7 @@ fn cleanup_keeps_the_disks_while_the_domain_state_is_unknown() {
 /// uses besides bash builtins.
 fn without_virsh(args: &[&str], images: &Path) -> Output {
     let bin = tempfile::tempdir().unwrap();
-    for tool in ["dirname", "basename", "rm"] {
+    for tool in ["dirname", "basename", "rm", "mkdir"] {
         let real = ["/usr/bin", "/bin"]
             .iter()
             .map(|d| Path::new(d).join(tool))
@@ -723,6 +777,16 @@ fn cleanup_without_libvirt_and_without_files_has_nothing_to_do() {
         "{}",
         text(&output)
     );
+
+    // With --out, the evidence directory exists afterwards even though the
+    // lane never started, so the always() upload finds something to upload.
+    let out = images.path().join("evidence");
+    let mut with_out = args.to_vec();
+    with_out.extend(["--out", out.to_str().unwrap()]);
+    let output = without_virsh(&with_out, images.path());
+    assert!(output.status.success(), "{}", text(&output));
+    let note = std::fs::read_to_string(out.join("cleanup.txt")).unwrap();
+    assert!(note.contains("nothing to clean up"), "{note}");
 
     // Files of this run but no libvirt to ask about the domain: keep them.
     let dir = images.path().join("qeminga-e2e-42-1-x86_64");

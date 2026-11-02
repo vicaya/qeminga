@@ -821,7 +821,7 @@ the answer is a one-line change, and leave the question here.
 - **Done when:** AC26 is green and every row of §5.10 names its enforcing code and test.
 
 #### T6.8 — libvirt TCG smoke lane on hosted runners (#53, part) ∥
-- **Status:** done (first green run on both architectures in PR #54, workflow run 41405332125: `result: pass`, `accelerator: tcg`; the lane step took about 1.5 min on x86-64 and 5 min on aarch64)
+- **Status:** done (first green run on both architectures in PR #54, latest with one lane per architecture in workflow run 41496398761 (first: 41405332125): `result: pass`, `accelerator: tcg`; the smoke job took about 3 min on x86-64 and 6 min on aarch64)
 - **Design:** AC16, §3, §8.3, §8.4, §5.4, §5.5; #53 (arm64 TCG lane, extended to x86-64 for the smoke).
 - **Depends on:** T5.3, T5.4
 - **Files:** `.github/workflows/libvirt-tcg.yml`, `.github/workflows/libvirt-tcg-lane.yml`, `scripts/ci/libvirt-tcg-smoke.sh`, `scripts/ci/libvirt-tcg-guest.sh`, `tests/libvirt_tcg_smoke.rs`, `docs/testing.md`.

@@ -106,7 +106,8 @@ sha=$(git rev-parse HEAD)
 scripts/ci/libvirt-tcg-smoke.sh manifest --out /tmp/candidate --binary target/release/qeminga \
   --arch "$(uname -m)" --source-sha "$sha" --version 0.1.0 --run-id 1 --run-attempt 1 --runner local
 sudo scripts/ci/libvirt-tcg-smoke.sh run --arch "$(uname -m)" --candidate /tmp/candidate \
-  --source-sha "$sha" --run-id 1 --run-attempt 1 --out /tmp/tcg-out
+  --source-sha "$sha" --run-id 1 --run-attempt 1 --out /tmp/tcg-out \
+  --expect-sha256 "$(sha256sum target/release/qeminga | cut -d' ' -f1)"
 sudo scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$(uname -m)" --run-id 1 --run-attempt 1
 ```
 

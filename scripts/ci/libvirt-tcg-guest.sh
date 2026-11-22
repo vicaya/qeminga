@@ -29,6 +29,9 @@ install_candidate() {
     install -m 0644 "$src/packaging/tmpfiles.d/qeminga.conf" /usr/lib/tmpfiles.d/ || return 1
     systemd-tmpfiles --create qeminga.conf || return 1
     install -d -m 0755 /etc/qeminga || return 1
+    # AC16 exercises domifaddr, guest-get-osinfo, domfsinfo and shutdown, so
+    # this smoke lane installs the lifecycle profile rather than the CVM default
+    # (packaging/config-data-protection.toml).
     install -m 0644 "$src/packaging/config.toml" /etc/qeminga/config.toml || return 1
     install -m 0644 "$src/packaging/systemd/qeminga.service" /usr/lib/systemd/system/ || return 1
     systemctl daemon-reload || return 1

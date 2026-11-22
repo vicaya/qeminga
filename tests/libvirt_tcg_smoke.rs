@@ -144,6 +144,7 @@ fn the_manifest_names_the_source_the_build_and_the_digest_of_the_binary() {
         "packaging/sysusers.d/qeminga.conf",
         "packaging/tmpfiles.d/qeminga.conf",
         "packaging/config.toml",
+        "packaging/config-data-protection.toml",
     ] {
         assert_eq!(
             std::fs::read(out.join(file)).unwrap(),

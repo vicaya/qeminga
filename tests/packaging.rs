@@ -245,6 +245,51 @@ fn data_protection_example_parses_and_keeps_only_the_snapshot_authority() {
 }
 
 #[test]
+fn cvm_installation_defaults_to_data_protection_profile_and_documents_single_freezer() {
+    // #53 CVM release blockers (AC27): the documented installation ships
+    // the data-protection profile as the CVM default (disabling inventory
+    // and trim together), warns that guest-fstrim discloses eligible mount
+    // paths even when information = false, and states the v1 single-freezer
+    // assumption explicitly.
+    let readme = read("packaging/README.md");
+    let start = readme
+        .find("To migrate by hand:")
+        .expect("installation section");
+    let fence = readme[start..].find("```").unwrap() + start;
+    let body_start = readme[fence..].find('\n').unwrap() + fence + 1;
+    let end = readme[body_start..].find("```").unwrap() + body_start;
+    let install = &readme[body_start..end];
+    assert!(
+        install.contains("packaging/config-data-protection.toml /etc/qeminga/config.toml"),
+        "default install command must install config-data-protection.toml:\n{install}"
+    );
+    assert!(
+        !install.contains("packaging/config.toml /etc/qeminga/config.toml"),
+        "default install command must not install the full lifecycle config.toml:\n{install}"
+    );
+    assert!(
+        install.contains("packaging/tmpfiles.d/qeminga.conf")
+            && install.contains("systemd-tmpfiles --create"),
+        "default install command must provision tmpfiles.d/qeminga.conf:\n{install}"
+    );
+    assert!(
+        readme.contains("fstrim")
+            && readme.contains("information = false")
+            && readme.contains("mount paths"),
+        "packaging/README.md must warn that guest-fstrim discloses mount paths even when information = false"
+    );
+    let lower = readme.to_ascii_lowercase();
+    assert!(
+        lower.contains("single freezer") || lower.contains("single-freezer"),
+        "packaging/README.md must state the v1 single-freezer assumption for CVMs"
+    );
+    assert!(
+        readme.contains("EBUSY") && readme.contains("independent"),
+        "packaging/README.md must explain the independent-freezer / EBUSY / recovery-drain hazard"
+    );
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

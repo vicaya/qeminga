@@ -47,8 +47,11 @@ whether or not the host's port can be opened yet. `guest-shutdown` is a
 hard shutdown, `sync(2)` followed by `reboot(2)`: no service is stopped
 and nothing is unmounted (`docs/tasks.md` OQ-1).
 
-Installation files (systemd unit, udev rule, sysusers, example config) and
-the migration steps from `qemu-guest-agent` are in
+Installation files (systemd unit, udev rule, sysusers, tmpfiles,
+configurations), the migration steps from `qemu-guest-agent`, and the
+confidential VM (CVM) deployment guidance — using the data-protection
+profile (`packaging/config-data-protection.toml`) as the CVM default and
+noting the v1 single-freezer assumption — are in
 [`packaging/README.md`](packaging/README.md). The libvirt
 interoperability checks (the TCG smoke lane in CI and the manual KVM
 recipe) are described in [`docs/testing.md`](docs/testing.md).

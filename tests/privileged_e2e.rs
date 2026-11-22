@@ -524,6 +524,50 @@ fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
 }
 
 #[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_fsinfo_discards_sizes_on_mount_namespace_change() {
+    // Design §4.5, AC27: keeping the `/proc/self/mountinfo` descriptor open
+    // across a `guest-get-fsinfo` walk and polling it via `ppoll(POLLPRI)`
+    // detects real kernel mount-namespace events (closing unmount-and-rebind
+    // mount-ID recycling) and latches across subsequent checks even after the
+    // kernel resets `m->poll_event` on the first poll.
+    use qeminga::handlers::fsinfo::{SystemStatfs, fs_info_with_monitor};
+    use qeminga::mountinfo::{MountSource, ProcMounts};
+
+    let mount = ext4_mount();
+    let base = std::path::Path::new(&mount).parent().unwrap().to_path_buf();
+    let mut snapshot = ProcMounts.mount_snapshot().unwrap();
+    assert!(
+        !snapshot.has_changed(),
+        "unchanged mount namespace must not trip POLLPRI"
+    );
+
+    let _bind = BindMount::of(&mount, base.join("qeminga-pollpri-bind"));
+    assert!(
+        snapshot.has_changed(),
+        "creating a mount must trip POLLPRI on the open /proc/self/mountinfo fd"
+    );
+    assert!(
+        snapshot.has_changed(),
+        "ProcMountMonitor must stay latched after the first POLLPRI poll"
+    );
+
+    let (entries, monitor) = snapshot.split_mut();
+    let info = fs_info_with_monitor(entries, &SystemStatfs, monitor).unwrap();
+    assert!(!info.is_empty());
+    for entry in &info {
+        assert_eq!(
+            entry.total_bytes, None,
+            "total_bytes must be omitted after mount namespace change: {entry:?}"
+        );
+        assert_eq!(
+            entry.used_bytes, None,
+            "used_bytes must be omitted after mount namespace change: {entry:?}"
+        );
+    }
+}
+
+#[test]
 #[ignore = "needs root, a loop-mounted ext4 with a bind mount and a 0700 mountpoint (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_freeze_with_tmpfs_bind_and_0700_mountpoint() {
     let mount = ext4_mount();

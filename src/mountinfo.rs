@@ -22,7 +22,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
-use std::os::fd::{AsRawFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
@@ -167,6 +167,115 @@ fn parse_line(line: &[u8]) -> Option<MountEntry> {
     })
 }
 
+/// Observes whether the mount namespace has changed since a
+/// [`MountSnapshot`] was opened.
+///
+/// Implementations latch once a change is observed: Linux's
+/// `/proc/self/mountinfo` `POLLPRI` notification resets its per-descriptor
+/// event watermark on the first poll that reports a change
+/// (`fs/proc_namespace.c`), so callers checking before and after each target
+/// rely on the monitor staying tripped for the remainder of the walk.
+pub trait MountNamespaceMonitor: Send {
+    /// Returns `true` if any mount-namespace event occurred since the
+    /// snapshot descriptor was opened (or if change detection failed).
+    fn has_changed(&mut self) -> bool;
+}
+
+/// Static monitor that never reports a mount-namespace change (fixtures and
+/// tests).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NeverChanged;
+
+impl MountNamespaceMonitor for NeverChanged {
+    fn has_changed(&mut self) -> bool {
+        false
+    }
+}
+
+/// Keeps the `/proc/self/mountinfo` descriptor open across a sample and polls
+/// it with non-blocking `ppoll(POLLPRI)` to detect any mount, unmount, move,
+/// or `pivot_root` event (including unmount-and-rebind mount-ID recycling).
+struct ProcMountMonitor {
+    file: File,
+    changed: bool,
+}
+
+impl MountNamespaceMonitor for ProcMountMonitor {
+    fn has_changed(&mut self) -> bool {
+        if self.changed {
+            return true;
+        }
+        if poll_mountinfo_changed(self.file.as_fd()) {
+            self.changed = true;
+        }
+        self.changed
+    }
+}
+
+fn revents_indicate_mount_change(revents: nix::poll::PollFlags) -> bool {
+    use nix::poll::PollFlags;
+    revents.intersects(
+        PollFlags::POLLPRI | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL,
+    )
+}
+
+fn poll_mountinfo_changed(fd: BorrowedFd<'_>) -> bool {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, ppoll};
+    use nix::sys::time::TimeSpec;
+
+    let timeout = TimeSpec::new(0, 0);
+    loop {
+        let mut fds = [PollFd::new(fd, PollFlags::POLLPRI)];
+        match ppoll(&mut fds, Some(timeout), None) {
+            Ok(0) => return false,
+            Ok(_) => {
+                // Unknown bits or any error flag fail closed.
+                let revents = fds[0].revents().unwrap_or(PollFlags::POLLERR);
+                return revents_indicate_mount_change(revents);
+            }
+            Err(Errno::EINTR) => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// A parsed mount-table snapshot paired with a mount-namespace change
+/// monitor anchored to the `/proc/self/mountinfo` descriptor that produced
+/// it.
+pub struct MountSnapshot {
+    /// Parsed entries in mount order.
+    pub entries: Vec<MountEntry>,
+    monitor: Box<dyn MountNamespaceMonitor>,
+}
+
+impl MountSnapshot {
+    /// Wraps parsed entries with [`NeverChanged`] (fixtures and tests).
+    pub fn static_entries(entries: Vec<MountEntry>) -> Self {
+        Self {
+            entries,
+            monitor: Box::new(NeverChanged),
+        }
+    }
+
+    /// Wraps parsed entries with a custom mount-namespace monitor (tests).
+    pub fn with_monitor(entries: Vec<MountEntry>, monitor: Box<dyn MountNamespaceMonitor>) -> Self {
+        Self { entries, monitor }
+    }
+
+    /// Returns `true` if the mount namespace changed since this snapshot was
+    /// opened (latched once observed).
+    pub fn has_changed(&mut self) -> bool {
+        self.monitor.has_changed()
+    }
+
+    /// Borrows the parsed entries and change monitor disjointly so callers
+    /// can walk the snapshot while polling for namespace changes.
+    pub fn split_mut(&mut self) -> (&[MountEntry], &mut dyn MountNamespaceMonitor) {
+        (&self.entries, self.monitor.as_mut())
+    }
+}
+
 /// Where the mount table comes from; production reads
 /// `/proc/self/mountinfo`, tests use fixtures.
 pub trait MountSource: Send + Sync {
@@ -176,6 +285,12 @@ pub trait MountSource: Send + Sync {
     /// Parsed entries in mount order.
     fn mounts(&self) -> Result<Vec<MountEntry>, Error> {
         Ok(parse_mountinfo(self.read_mountinfo()?))
+    }
+
+    /// Parsed entries paired with a mount-namespace change monitor anchored
+    /// to the underlying `mountinfo` descriptor when available.
+    fn mount_snapshot(&self) -> Result<MountSnapshot, Error> {
+        Ok(MountSnapshot::static_entries(self.mounts()?))
     }
 }
 
@@ -195,16 +310,16 @@ impl MountSource for ProcMounts {
     fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
         read_mountinfo_bounded(Path::new(MOUNTINFO_PATH))
     }
+
+    fn mount_snapshot(&self) -> Result<MountSnapshot, Error> {
+        read_mountinfo_snapshot(Path::new(MOUNTINFO_PATH))
+    }
 }
 
-/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`], byte for byte.
-pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+fn read_bounded_from_file(file: &File, path: &Path) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| {
-            f.take(MOUNTINFO_MAX_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-        })
+    file.take(MOUNTINFO_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
     if bytes.len() > MOUNTINFO_MAX_BYTES {
         return Err(Error::Internal(format!(
@@ -213,6 +328,29 @@ pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
         )));
     }
     Ok(bytes)
+}
+
+/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`], byte for byte.
+pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+    let file = File::open(path)
+        .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
+    read_bounded_from_file(&file, path)
+}
+
+/// Opens `path`, reads it under [`MOUNTINFO_MAX_BYTES`], parses the mount
+/// table, and keeps the open descriptor so `ppoll(POLLPRI)` can detect any
+/// mount-namespace change from `open(2)` onward.
+pub fn read_mountinfo_snapshot(path: &Path) -> Result<MountSnapshot, Error> {
+    let file = File::open(path)
+        .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
+    let bytes = read_bounded_from_file(&file, path)?;
+    Ok(MountSnapshot {
+        entries: parse_mountinfo(&bytes),
+        monitor: Box::new(ProcMountMonitor {
+            file,
+            changed: false,
+        }),
+    })
 }
 
 /// Explicit bound on `/proc/self/fdinfo/<fd>` reads used for the Linux
@@ -544,6 +682,40 @@ mod tests {
             read_fdinfo_mnt_id_from_path(&dir.path().join("missing")),
             None
         );
+    }
+
+    #[test]
+    fn mount_snapshot_tracks_unchanged_proc_mountinfo_and_enforces_size_bound() {
+        let mut snapshot = ProcMounts.mount_snapshot().unwrap();
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|e| e.mount_point == Path::new("/"))
+        );
+        assert!(
+            !snapshot.has_changed(),
+            "unchanged /proc/self/mountinfo must not report a namespace change"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'#'; MOUNTINFO_MAX_BYTES + 1]).unwrap();
+        assert!(read_mountinfo_snapshot(&big).is_err());
+        assert!(read_mountinfo_snapshot(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn poll_mountinfo_revents_detects_change_on_pollpri_or_error() {
+        use nix::poll::PollFlags;
+        assert!(!revents_indicate_mount_change(PollFlags::empty()));
+        assert!(!revents_indicate_mount_change(PollFlags::POLLIN));
+        assert!(revents_indicate_mount_change(PollFlags::POLLPRI));
+        assert!(revents_indicate_mount_change(
+            PollFlags::POLLPRI | PollFlags::POLLERR
+        ));
+        assert!(revents_indicate_mount_change(PollFlags::POLLERR));
+        assert!(revents_indicate_mount_change(PollFlags::POLLHUP));
+        assert!(revents_indicate_mount_change(PollFlags::POLLNVAL));
     }
 
     proptest! {

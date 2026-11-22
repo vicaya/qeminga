@@ -33,7 +33,7 @@ use serde_json::Value;
 
 use crate::dispatch::Context;
 use crate::handlers::NoArgs;
-use crate::mountinfo::{MountEntry, MountSource};
+use crate::mountinfo::{MountEntry, MountNamespaceMonitor, MountSource, NeverChanged};
 use crate::proto::{Error, Request, arguments};
 
 /// The `statfs(2)` fields used for sizes.
@@ -63,8 +63,9 @@ impl Statfs {
 
 /// Where sizes come from; production opens the mount point with a
 /// metadata-only descriptor (`O_PATH | O_NOFOLLOW | O_CLOEXEC`), verifies
-/// both superblock device and mount ID via `statx(2)` (`STATX_MNT_ID`),
-/// and calls `fstatfs(2)` on that descriptor.
+/// both superblock device and mount ID (`statx(2)` `STATX_MNT_ID` on
+/// Linux 5.8+, falling back to a bounded read of `/proc/self/fdinfo/<fd>`
+/// on Linux 5.4–5.7), and calls `fstatfs(2)` on that descriptor.
 pub trait StatfsSource: Send + Sync {
     /// Sizes of the filesystem mounted at `mount_point` when its descriptor
     /// still matches `expected_dev` (`(major, minor)`) and
@@ -77,7 +78,8 @@ pub trait StatfsSource: Send + Sync {
     ) -> Result<Statfs, Error>;
 }
 
-/// Production source over `open(O_PATH)` + `statx(STATX_MNT_ID)` + `fstatfs(2)`.
+/// Production source over `open(O_PATH)` + `statx(STATX_MNT_ID)` (with
+/// `/proc/self/fdinfo/<fd>` fallback on Linux 5.4–5.7) + `fstatfs(2)`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemStatfs;
 
@@ -193,9 +195,12 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
 /// a raw non-UTF-8 directory path still reaches it, whereas one covered at
 /// every alias fails `open_target` with an error). Size queries open each
 /// mount point with a metadata-only `O_PATH | O_NOFOLLOW | O_CLOEXEC`
-/// descriptor, verify both superblock device and mount ID (`STATX_MNT_ID`)
-/// against the inventory row before calling `fstatfs(2)`, and omit sizes if
-/// either differs or cannot be verified.
+/// descriptor, verify both superblock device and mount ID (`statx(2)`
+/// `STATX_MNT_ID` on Linux 5.8+, falling back to a bounded read of
+/// `/proc/self/fdinfo/<fd>` on Linux 5.4–5.7) against the inventory row
+/// before calling `fstatfs(2)`, and omit sizes if either differs, cannot be
+/// verified, or the open `/proc/self/mountinfo` descriptor reports a
+/// mount-namespace change via `ppoll(POLLPRI)`.
 ///
 /// Each distinct advertised superblock `(major, minor)` gets an opaque
 /// `fs-<n>` identifier in order of first appearance, shared by all of its
@@ -207,9 +212,27 @@ pub fn fs_info(
     mounts: &[MountEntry],
     statfs: &dyn StatfsSource,
 ) -> Result<Vec<FilesystemInfo>, Error> {
+    fs_info_with_monitor(mounts, statfs, &mut NeverChanged)
+}
+
+/// Builds the reply for a mount table while monitoring the open
+/// `/proc/self/mountinfo` descriptor for mount-namespace changes (`POLLPRI`).
+///
+/// Checking `monitor` before and after each target's `statfs` call catches
+/// mount-namespace changes — including an unmount and same-device rebind that
+/// recycles a `mount_id` — and discards optional size fields for the affected
+/// target and any remaining rows.
+pub fn fs_info_with_monitor(
+    mounts: &[MountEntry],
+    statfs: &dyn StatfsSource,
+    monitor: &mut dyn MountNamespaceMonitor,
+) -> Result<Vec<FilesystemInfo>, Error> {
     let visible = crate::freeze_plan::visible_mounts(mounts)
         .map_err(|err| Error::Internal(format!("fsinfo: {err}")))?;
     let mut superblocks: HashMap<(u32, u32), usize> = HashMap::new();
+    // Latch locally in addition to `ProcMountMonitor`'s latch so even a
+    // one-shot monitor never resumes sampling sizes on later rows.
+    let mut namespace_changed = false;
     Ok(visible
         .into_iter()
         .filter_map(|m| {
@@ -219,9 +242,18 @@ pub fn fs_info(
             let mountpoint = m.mount_point.to_str()?;
             let next = superblocks.len() + 1;
             let id = *superblocks.entry(m.dev()).or_insert(next);
-            let sizes = sizes_are_queried(&m.fs_type)
-                .then(|| statfs.statfs(&m.mount_point, m.dev(), m.mount_id).ok())
-                .flatten();
+            let sizes = if sizes_are_queried(&m.fs_type) {
+                namespace_changed |= monitor.has_changed();
+                if namespace_changed {
+                    None
+                } else {
+                    let sampled = statfs.statfs(&m.mount_point, m.dev(), m.mount_id).ok();
+                    namespace_changed |= monitor.has_changed();
+                    if namespace_changed { None } else { sampled }
+                }
+            } else {
+                None
+            };
             Some(FilesystemInfo {
                 name: format!("fs-{id}"),
                 mountpoint: mountpoint.to_owned(),
@@ -254,8 +286,9 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let statfs: Arc<dyn StatfsSource> = Arc::clone(&ctx.statfs);
     let walk = tokio::task::spawn_blocking(move || {
         let _walk = slot;
-        let entries = mounts.mounts()?;
-        let info = fs_info(&entries, statfs.as_ref())?;
+        let mut snapshot = mounts.mount_snapshot()?;
+        let (entries, monitor) = snapshot.split_mut();
+        let info = fs_info_with_monitor(entries, statfs.as_ref(), monitor)?;
         crate::handlers::bounded_reply("fsinfo", &info, MAX_FSINFO_REPLY_BYTES)
     });
     let info = tokio::time::timeout(FSINFO_TIMEOUT, walk)
@@ -1028,5 +1061,153 @@ mod tests {
             err.to_string(),
             "fsinfo: mount table has no recognizable root mount"
         );
+    }
+
+    #[test]
+    fn fsinfo_discards_sizes_when_mount_namespace_changes_before_or_during_sample() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // One-shot flag mimicking Linux's `/proc/self/mountinfo` POLLPRI
+        // semantics, which clear the event watermark on the first poll that
+        // observes a change: `fs_info_with_monitor` must latch the change so
+        // later rows never resume querying sizes either.
+        struct OneShotMonitor(Arc<AtomicBool>);
+        impl MountNamespaceMonitor for OneShotMonitor {
+            fn has_changed(&mut self) -> bool {
+                self.0.swap(false, Ordering::SeqCst)
+            }
+        }
+
+        struct TriggeringStatfs {
+            trigger_on: &'static str,
+            flag: Arc<AtomicBool>,
+            calls: Mutex<Vec<String>>,
+        }
+        impl StatfsSource for TriggeringStatfs {
+            fn statfs(
+                &self,
+                mount_point: &Path,
+                _expected_dev: (u32, u32),
+                _expected_mount_id: u32,
+            ) -> Result<Statfs, Error> {
+                let path = mount_point.to_str().unwrap().to_owned();
+                self.calls.lock().unwrap().push(path.clone());
+                if path == self.trigger_on {
+                    // Simulate unmount + same-device XFS rebind recycling
+                    // mount_id: statfs succeeded on the replacement mount,
+                    // while the mountinfo fd now reports POLLPRI.
+                    self.flag.store(true, Ordering::SeqCst);
+                }
+                Ok(Statfs {
+                    blocks: 500,
+                    bfree: 100,
+                    bsize: 4096,
+                })
+            }
+        }
+
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:3 /proj-a /xfs-proj rw - xfs /dev/sdc1 rw\n",
+            "3 1 8:4 / /after rw - ext4 /dev/sdd1 rw\n",
+        );
+        let mounts = parse_mountinfo(table);
+
+        // Case A: mount namespace already changed before the first statfs
+        // (e.g. during mountinfo read or before opening `/`). No statfs runs
+        // and every row omits optional sizes.
+        let pre_flag = Arc::new(AtomicBool::new(true));
+        let pre_statfs = TriggeringStatfs {
+            trigger_on: "",
+            flag: Arc::clone(&pre_flag),
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut pre_monitor = OneShotMonitor(pre_flag);
+        let pre_info = fs_info_with_monitor(&mounts, &pre_statfs, &mut pre_monitor).unwrap();
+        assert_eq!(pre_info.len(), 3);
+        assert!(
+            pre_statfs.calls.lock().unwrap().is_empty(),
+            "no statfs calls should run once the mount namespace already changed"
+        );
+        for row in &pre_info {
+            assert_eq!(row.total_bytes, None, "row {row:?} must omit total_bytes");
+            assert_eq!(row.used_bytes, None, "row {row:?} must omit used_bytes");
+        }
+
+        // Case B: mount namespace changes during `/xfs-proj` (simulating an
+        // unmount + same-device rebind recycling mount_id 2). `/` (sampled
+        // while unchanged) keeps its verified sizes; `/xfs-proj`'s replacement
+        // sizes are discarded; `/after` is never even opened despite the
+        // one-shot monitor resetting on `/xfs-proj`.
+        let mid_flag = Arc::new(AtomicBool::new(false));
+        let mid_statfs = TriggeringStatfs {
+            trigger_on: "/xfs-proj",
+            flag: Arc::clone(&mid_flag),
+            calls: Mutex::new(Vec::new()),
+        };
+        let mut mid_monitor = OneShotMonitor(mid_flag);
+        let mid_info = fs_info_with_monitor(&mounts, &mid_statfs, &mut mid_monitor).unwrap();
+        assert_eq!(
+            *mid_statfs.calls.lock().unwrap(),
+            vec!["/".to_owned(), "/xfs-proj".to_owned()],
+            "rows after the namespace change must not call statfs"
+        );
+        let root = mid_info.iter().find(|f| f.mountpoint == "/").unwrap();
+        let xfs = mid_info
+            .iter()
+            .find(|f| f.mountpoint == "/xfs-proj")
+            .unwrap();
+        let after = mid_info.iter().find(|f| f.mountpoint == "/after").unwrap();
+        assert_eq!(root.total_bytes, Some(500 * 4096));
+        assert_eq!(root.used_bytes, Some(400 * 4096));
+        assert_eq!(xfs.total_bytes, None);
+        assert_eq!(xfs.used_bytes, None);
+        assert_eq!(after.total_bytes, None);
+        assert_eq!(after.used_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn handler_uses_mount_snapshot_monitor_to_discard_sizes_on_change() {
+        use crate::mountinfo::MountSnapshot;
+
+        struct AlwaysChanged;
+        impl MountNamespaceMonitor for AlwaysChanged {
+            fn has_changed(&mut self) -> bool {
+                true
+            }
+        }
+
+        struct ChangingMounts(String);
+        impl MountSource for ChangingMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Ok(self.0.clone().into_bytes())
+            }
+
+            fn mount_snapshot(&self) -> Result<MountSnapshot, Error> {
+                Ok(MountSnapshot::with_monitor(
+                    parse_mountinfo(&self.0),
+                    Box::new(AlwaysChanged),
+                ))
+            }
+        }
+
+        let ctx = Context::for_tests()
+            .with_mounts(Arc::new(ChangingMounts(fixture("simple.txt"))))
+            .with_statfs(Arc::new(fake()));
+        let req = crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+        let value = handle(&ctx, &req).await.unwrap();
+        let entries = value.as_array().unwrap();
+        assert_eq!(entries.len(), 5);
+        for entry in entries {
+            assert!(
+                entry.get("total-bytes").is_none(),
+                "wire entry must omit total-bytes when snapshot changed: {entry}"
+            );
+            assert!(
+                entry.get("used-bytes").is_none(),
+                "wire entry must omit used-bytes when snapshot changed: {entry}"
+            );
+        }
     }
 }

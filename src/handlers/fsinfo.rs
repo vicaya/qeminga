@@ -427,7 +427,11 @@ mod tests {
         use std::sync::Mutex;
         struct Recording(Mutex<Vec<(Vec<u8>, (u32, u32))>>);
         impl StatfsSource for Recording {
-            fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error> {
+            fn statfs(
+                &self,
+                mount_point: &Path,
+                expected_dev: (u32, u32),
+            ) -> Result<Statfs, Error> {
                 self.0
                     .lock()
                     .unwrap()
@@ -661,7 +665,11 @@ mod tests {
     fn fsinfo_omits_sizes_when_statfs_detects_device_mismatch() {
         struct VerifiedStatfs(HashMap<String, ((u32, u32), Statfs)>);
         impl StatfsSource for VerifiedStatfs {
-            fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error> {
+            fn statfs(
+                &self,
+                mount_point: &Path,
+                expected_dev: (u32, u32),
+            ) -> Result<Statfs, Error> {
                 let (live_dev, st) = self
                     .0
                     .get(mount_point.to_str().unwrap())

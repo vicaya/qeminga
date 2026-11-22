@@ -817,6 +817,7 @@ impl Driver {
         if let Some(token) = self.token.take() {
             self.thaw_token = Some(self.ctx.state.abort_freeze(token));
         }
+        self.op.publish(|p| p.phase = Phase::Recovering);
         self.ctx.hooks.on_thaw_claimed(&self.ctx);
         let in_flight = self.op.progress().in_flight;
         tracing::error!(
@@ -834,7 +835,6 @@ impl Driver {
             in_flight,
         }));
         self.start_recovery_if_needed();
-        self.op.publish(|p| p.phase = Phase::Recovering);
         self.refresh_pass_done();
     }
 

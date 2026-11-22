@@ -297,10 +297,11 @@ async fn join_operation(
 }
 
 /// Host-facing reply for a `guest-fsfreeze-thaw` joining an unsettled
-/// freeze operation (design §4.4, §5.9, AC27). While preparation is still
-/// running, neither the state transition in `commit_abort` nor
-/// `marker.create()` is guaranteed to have run yet, so no retained marker is
-/// claimed until preparation completes.
+/// freeze operation (design §4.4, §5.9, AC27). Across the unsettled window —
+/// preparation, transition in `commit_abort`, recovery draining, and
+/// finalisation after marker removal — the reply uses the fixed
+/// `"abort accepted, recovery pending"` wording together with the observed
+/// thawed count and in-flight activity, avoiding stale state or marker claims.
 fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
     if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
         return "thaw requested: abort accepted, recovery pending (preparation still in flight)"
@@ -311,13 +312,8 @@ fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
     } else {
         ""
     };
-    let state = if progress.phase == crate::freeze_op::Phase::Recovering {
-        "state thawing"
-    } else {
-        "state freezing"
-    };
     format!(
-        "thaw requested: abort accepted, recovery pending ({} target(s) thawed so far{activity}); {state}, marker retained until it settles",
+        "thaw requested: abort accepted, recovery pending ({} target(s) thawed so far{activity})",
         progress.recovered,
     )
 }
@@ -4334,6 +4330,126 @@ mod tests {
         assert!(rig.kernel.calls().is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn thaw_joining_during_finalisation_after_marker_unlink_does_not_claim_marker_retained() {
+        // PR #57 review [P2]: `settle_aborted` removes the marker before
+        // `conclude` runs `on_thawed` and retires the operation. A joining
+        // thaw in that finalisation window must report pending recovery with
+        // observed counts and must not falsely claim `marker retained` after
+        // unlink succeeded. Also verify `Phase::Recovering` is already
+        // published when the freeze abort reply is delivered.
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        let b = kernel.script_freeze_gate(B);
+        let _release_b = b.release_on_drop();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let hooks = Arc::new(GatedHooks {
+            reached: tokio::sync::Notify::new(),
+            release: Mutex::new(release_rx),
+        });
+        let clock = ManualClock::new();
+        let marker = Marker::open(dir.path().join("frozen")).unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                marker.clone(),
+            )
+            .with_kernel(kernel.clone())
+            .with_mounts(Arc::new(StaticMounts(fixture("nested.txt"))))
+            .with_hooks(hooks.clone())
+            .with_freeze_clock(Arc::new(clock.clone()))
+            .with_freeze_operation_timeout(Duration::from_secs(1)),
+        );
+        // Ensure `on_thawed` never deadlocks even if an assertion fails.
+        struct ReleaseOnDrop(Option<std::sync::mpsc::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(tx) = self.0.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
+        let mut release_guard = ReleaseOnDrop(Some(release_tx));
+
+        let freezing = tokio::spawn({
+            let ctx = Arc::clone(&ctx);
+            async move { freeze(&ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#)).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while b.waiting() != 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for B"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(marker.exists(), "marker created before FIFREEZE");
+
+        // Trigger deadline abort; once the freeze reply is delivered,
+        // `Phase::Recovering` must already be published.
+        clock.advance(Duration::from_secs(2));
+        let freeze_err = freezing.await.unwrap().unwrap_err();
+        assert!(
+            freeze_err
+                .to_string()
+                .contains("operation deadline expired"),
+            "{freeze_err}"
+        );
+        let op = ctx.freeze_op().expect("operation still active");
+        assert_eq!(
+            op.progress().phase,
+            crate::freeze_op::Phase::Recovering,
+            "Phase::Recovering must be published before the abort reply is sent"
+        );
+
+        // Release B so recovery drains both A and B, unlinks the marker, and
+        // pauses inside `on_thawed` before `conclude` retires the operation.
+        let entered_on_thawed = hooks.reached.notified();
+        tokio::pin!(entered_on_thawed);
+        b.release();
+        tokio::time::timeout(Duration::from_secs(5), entered_on_thawed)
+            .await
+            .expect("on_thawed reached");
+        assert!(
+            !marker.exists(),
+            "marker has already been unlinked before on_thawed"
+        );
+        assert!(
+            ctx.freeze_op().is_some(),
+            "operation is still registered during finalisation"
+        );
+
+        let join_err = thaw(&ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        let text = join_err.to_string();
+        assert_eq!(
+            text,
+            "thaw requested: abort accepted, recovery pending (2 target(s) thawed so far)"
+        );
+        assert!(
+            !text.contains("marker retained")
+                && !text.contains("state freezing")
+                && !text.contains("state thawing"),
+            "unsettled join must not make stale state or marker claims: {text}"
+        );
+
+        // Let finalisation finish and confirm clean Thawed settlement.
+        let _ = release_guard.0.take().unwrap().send(());
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while ctx.state.current() != FreezeState::Thawed {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for Thawed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(ctx.freeze_op().is_none());
+        assert!(!marker.exists());
+    }
+
     #[tokio::test]
     async fn a_blocked_recovery_drain_keeps_status_served_and_spawns_nothing_more() {
         // A's FITHAW blocks during the recovery pass: status is still
@@ -4887,9 +5003,12 @@ mod tests {
         assert!(desc.contains("1 target(s) frozen so far"), "{desc}");
         assert!(desc.contains("marker retained"), "{desc}");
         let desc = assert_host_safe("joining thaw pending", &join_pending, dir.path());
-        assert!(desc.contains("recovery pending"), "{desc}");
+        assert!(desc.contains("abort accepted, recovery pending"), "{desc}");
         assert!(desc.contains("target(s) thawed so far"), "{desc}");
-        assert!(desc.contains("marker retained"), "{desc}");
+        assert!(
+            !desc.contains("marker retained"),
+            "unsettled join must not claim marker retained: {desc}"
+        );
         let desc = assert_host_safe("joining thaw settled frozen", &join_settled, dir.path());
         assert!(desc.contains("target(s) thawed"), "{desc}");
         assert!(desc.contains("state frozen, marker retained"), "{desc}");
@@ -5204,8 +5323,9 @@ mod tests {
         assert!(short_timeout.to_string().contains("5 s"));
         assert!(long_timeout.to_string().contains("300 s"));
 
-        // Every joining-thaw pending arm (preparation unresolved, Freezing
-        // before commit_abort, and Recovering with/without in-flight FIFREEZE).
+        // Every joining-thaw pending arm across the unsettled window uses the
+        // fixed "abort accepted, recovery pending" wording with observed count
+        // and activity, never making stale state or marker claims.
         let joining_cases = [
             (
                 crate::freeze_op::Progress {
@@ -5241,7 +5361,7 @@ mod tests {
                     unrecoverable_reason: None,
                     settled: None,
                 },
-                "thaw requested: abort accepted, recovery pending (0 target(s) thawed so far, a FIFREEZE is still in flight); state freezing, marker retained until it settles",
+                "thaw requested: abort accepted, recovery pending (0 target(s) thawed so far, a FIFREEZE is still in flight)",
             ),
             (
                 crate::freeze_op::Progress {
@@ -5253,7 +5373,7 @@ mod tests {
                     unrecoverable_reason: None,
                     settled: None,
                 },
-                "thaw requested: abort accepted, recovery pending (1 target(s) thawed so far, a FIFREEZE is still in flight); state thawing, marker retained until it settles",
+                "thaw requested: abort accepted, recovery pending (1 target(s) thawed so far, a FIFREEZE is still in flight)",
             ),
             (
                 crate::freeze_op::Progress {
@@ -5265,7 +5385,7 @@ mod tests {
                     unrecoverable_reason: None,
                     settled: None,
                 },
-                "thaw requested: abort accepted, recovery pending (2 target(s) thawed so far); state thawing, marker retained until it settles",
+                "thaw requested: abort accepted, recovery pending (2 target(s) thawed so far)",
             ),
         ];
         for (progress, expected) in &joining_cases {

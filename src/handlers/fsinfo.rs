@@ -425,7 +425,8 @@ mod tests {
     fn non_utf8_mount_points_are_omitted_and_prefer_utf8_alias_without_fffd_collision() {
         use std::os::unix::ffi::OsStrExt;
         use std::sync::Mutex;
-        struct Recording(Mutex<Vec<(Vec<u8>, (u32, u32))>>);
+        type RecordedStatfs = (Vec<u8>, (u32, u32));
+        struct Recording(Mutex<Vec<RecordedStatfs>>);
         impl StatfsSource for Recording {
             fn statfs(
                 &self,

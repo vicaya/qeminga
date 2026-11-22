@@ -600,17 +600,17 @@ mod tests {
         // credentials in mountinfo's source field, and local device names or
         // major:minor pairs must not leak either. Aliases of one superblock
         // share one opaque identifier; distinct superblocks get distinct ones.
-        let table = "\
-10 1 8:1 / / rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw
-11 10 8:1 /srv/www /var/www rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw
-12 10 8:2 / /data rw,relatime - xfs /dev/nvme0n1p2 rw
-13 10 8:2 /exports /srv/exports rw,relatime - xfs /dev/nvme0n1p2 rw
-14 10 0:41 / /mnt/ftp rw,nosuid - fuse.curlftpfs curlftpfs#ftp://alice:super-secret-pass@ftp.internal/vault rw
-15 10 0:42 / /mnt/share rw - cifs //storage.internal/tenant-secret rw
-16 10 0:43 / /mnt/nfs rw - nfs4 filer.internal:/exports/tenant rw
-17 10 0:44 / /run rw - tmpfs tmpfs-custom-label-a rw
-18 10 0:45 / /tmp rw - tmpfs tmpfs-custom-label-b rw
-";
+        let table = concat!(
+            "10 1 8:1 / / rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw\n",
+            "11 10 8:1 /srv/www /var/www rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw\n",
+            "12 10 8:2 / /data rw,relatime - xfs /dev/nvme0n1p2 rw\n",
+            "13 10 8:2 /exports /srv/exports rw,relatime - xfs /dev/nvme0n1p2 rw\n",
+            "14 10 0:41 / /mnt/ftp rw,nosuid - fuse.curlftpfs curlftpfs#ftp://alice:super-secret-pass@ftp.internal/vault rw\n",
+            "15 10 0:42 / /mnt/share rw - cifs //storage.internal/tenant-secret rw\n",
+            "16 10 0:43 / /mnt/nfs rw - nfs4 filer.internal:/exports/tenant rw\n",
+            "17 10 0:44 / /run rw - tmpfs tmpfs-custom-label-a rw\n",
+            "18 10 0:45 / /tmp rw - tmpfs tmpfs-custom-label-b rw\n",
+        );
         let mounts = parse_mountinfo(table);
         let info = fs_info(&mounts, &fake());
         assert_eq!(info.len(), 9);

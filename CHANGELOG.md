@@ -14,35 +14,41 @@ semantic versioning.
     as the CVM installation default (disabling inventory and `guest-fstrim`
     together), documents that `guest-fstrim` replies independently list
     eligible mount paths even when `information = false`, and states the v1
-    single-freezer assumption explicitly (`OQ-11`).
-    `packaging/config-data-protection.toml` is bundled in the release
-    candidate manifest.
-  - `guest-get-fsinfo` omits mounts covered in the mount tree (reusing
-    `FreezePlan::restrict_to`'s visibility resolution so every advertised
-    `mountpoint` selects its row's superblock and `statfs` never attributes
-    covering sizes) and emits an opaque per-superblock `fs-N` identifier
-    valid within that single reply instead of raw mount sources or device
-    numbers.
+    single-freezer (`OQ-11`) and mount-binding (§§4.5, 5.9) assumptions
+    explicitly. `packaging/config-data-protection.toml` is bundled in the
+    release candidate manifest.
+  - `guest-get-fsinfo` lists only mounts that are both visible in the mount
+    tree (reusing `FreezePlan::restrict_to`'s visibility resolution and
+    returning an explicit error on a non-empty mount table lacking a `/`
+    root) and valid UTF-8 (preferring visible UTF-8 bind aliases and
+    omitting non-representable mounts so every advertised `mountpoint`
+    round-trips byte-exact without lossy `U+FFFD` collisions, while
+    full-guest freeze remains byte-exact), opens each target once and
+    verifies `fstat(2)` device identity before calling `fstatfs(2)`
+    (omitting sizes if the live mount changed), and emits an opaque
+    per-superblock `fs-N` identifier valid within that single reply instead
+    of raw mount sources or device numbers.
   - All freeze/thaw lifecycle errors (`guest-fsfreeze-freeze`,
     `guest-fsfreeze-freeze-list`, `guest-fsfreeze-thaw`, including in-flight
     abort/join, rollback, marker failure, and recovery thaw) emit only
     `GenericError`, a fixed reason (without configured timeout durations),
-    accurate recovery state (reporting pending recovery without claiming a
-    retained marker while preparation is unresolved), and target counts;
-    mount names, alternate paths, device numbers, marker paths, and
-    configured timeouts remain in guest-local diagnostics only.
-    `guest-fstrim` similarly keeps alternate aliases and device numbers out
-    of per-path open-failure wire errors.
+    accurate recovery state (using fixed `abort accepted, recovery pending`
+    wording without stale state or marker claims across the unsettled join
+    window and during unresolved preparation), and target counts; mount
+    names, alternate paths, device numbers, marker paths, and configured
+    timeouts remain in guest-local diagnostics only. `guest-fstrim`
+    similarly keeps alternate aliases and device numbers out of per-path
+    open-failure wire errors.
 - `rustix` 1.1.4 → 1.1.6 in `Cargo.lock` for RUSTSEC-2026-0486 (xattr
   zero-length buffer soundness; dev-dependency-only via `tempfile`/`proptest`).
-- tokio 1.53.1 → 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd::new` and related
-  constructors violate I/O safety). The channel no longer calls the
-  deprecated constructors: `kernel::async_fd::OwnedAsyncFd` registers the
-  channel's `OwnedFd` with the `unsafe` `AsyncFd::register` (tokio's own
-  recommended pattern for an owned descriptor; no safe constructor
-  exists) and keeps its contract by construction, owning the descriptor
-  and never handing out `&mut` access to it. The `unsafe` stays in
-  `src/kernel/` (design §5.6).
+- tokio 1.53.1 → 1.53.3 in `Cargo.lock` and `fuzz/Cargo.lock` for
+  RUSTSEC-2026-0386 (`AsyncFd::new` and related constructors violate I/O
+  safety). The channel no longer calls the deprecated constructors:
+  `kernel::async_fd::OwnedAsyncFd` registers the channel's `OwnedFd` with
+  the `unsafe` `AsyncFd::register` (tokio's own recommended pattern for an
+  owned descriptor; no safe constructor exists) and keeps its contract by
+  construction, owning the descriptor and never handing out `&mut` access to
+  it. The `unsafe` stays in `src/kernel/` (design §5.6).
 
 ### Added
 

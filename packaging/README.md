@@ -98,9 +98,14 @@ mount names, alternate paths, device numbers or marker paths).
   open-failure errors still keep alternate aliases and device numbers in
   guest-local logs only). If a deployment opts into
   `[features] information = true`, `guest-get-fsinfo` lists only mounts
-  visible in the mount tree (so each advertised path selects that row's
-  superblock) and emits an opaque per-superblock identifier (`fs-1`,
-  `fs-2`, …) in `name` shared by all visible aliases of a superblock and
+  visible in the mount tree with valid UTF-8 mount points (preferring
+  visible UTF-8 bind aliases, omitting non-representable mounts so each
+  advertised path round-trips byte-exact to its row without lossy
+  `U+FFFD` collisions while full-guest freeze stays byte-exact,
+  verifying descriptor device identity before `fstatfs(2)`, and
+  erroring on a non-empty mount table with no recognizable `/` root)
+  and emits an opaque per-superblock identifier (`fs-1`, `fs-2`, …) in
+  `name` shared by all visible valid-UTF-8 aliases of a superblock and
   never publishes raw mount sources (such as FUSE or network URLs) or
   device numbers. Each `fs-N` identifier is valid only within that
   single reply (rebuilt in mount-table order on each call, so removing
@@ -108,6 +113,14 @@ mount names, alternate paths, device numbers or marker paths).
   controllers should group aliases within one reply and use provisioned
   mount paths across requests. Enabling `information` also enables
   `guest-get-osinfo` and `guest-network-get-interfaces`.
+- **Mount-binding assumption (v1).** Whether required mount paths come
+  from provisioning (`config-data-protection.toml`) or from
+  `guest-get-fsinfo`, the guest must keep each required path bound to
+  its intended volume from provisioning or discovery through the freeze,
+  or invalidate the cycle when the binding changes (design §§4.5, 5.9).
+  Replacing a required path with another eligible filesystem before
+  `guest-fsfreeze-freeze-list` still yields a matching freeze and thaw
+  count because reply-local `fs-N` identifiers cannot detect remounts.
 - **Single-freezer assumption (v1).** Design §4.2 assumes qeminga is the
   sole freezer in the guest. A host-requested `guest-fsfreeze-thaw`
   while qeminga is already `Thawed` runs a discovery drain over all

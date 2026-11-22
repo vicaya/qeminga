@@ -292,18 +292,34 @@ async fn join_operation(
                 progress.recovered,
             )))
         }
-        None => {
-            let activity = match progress.in_flight.as_deref() {
-                Some(crate::freeze_op::PREPARING) => ", preparation still in flight",
-                Some(_) => ", a FIFREEZE is still in flight",
-                None => "",
-            };
-            Err(Error::Internal(format!(
-                "thaw requested: freeze operation aborted, recovery pending ({} target(s) thawed so far{activity}); state thawing, marker retained until it settles",
-                progress.recovered,
-            )))
-        }
+        None => Err(Error::Internal(format_joining_pending(&progress))),
     }
+}
+
+/// Host-facing reply for a `guest-fsfreeze-thaw` joining an unsettled
+/// freeze operation (design §4.4, §5.9, AC27). While preparation is still
+/// running, neither the state transition in `commit_abort` nor
+/// `marker.create()` is guaranteed to have run yet, so no retained marker is
+/// claimed until preparation completes.
+fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
+    if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
+        return "thaw requested: abort accepted, recovery pending (preparation still in flight)"
+            .to_owned();
+    }
+    let activity = if progress.in_flight.is_some() {
+        ", a FIFREEZE is still in flight"
+    } else {
+        ""
+    };
+    let state = if progress.phase == crate::freeze_op::Phase::Recovering {
+        "state thawing"
+    } else {
+        "state freezing"
+    };
+    format!(
+        "thaw requested: abort accepted, recovery pending ({} target(s) thawed so far{activity}); {state}, marker retained until it settles",
+        progress.recovered,
+    )
 }
 
 /// The freeze algorithm shared by `freeze` and `freeze-list`: claim
@@ -694,19 +710,26 @@ impl FreezeFailure {
             ),
             FreezeFailure::Aborted {
                 cause,
-                timeout_secs,
                 frozen,
                 in_flight,
+                ..
             } => {
-                let activity = match in_flight.as_deref() {
-                    Some(crate::freeze_op::PREPARING) => " while preparing",
-                    Some(_) => " with a FIFREEZE in flight",
-                    None => "",
-                };
-                format!(
-                    "freeze aborted: {}{activity}; {frozen} target(s) frozen so far are being thawed; state thawing, marker retained",
-                    cause.describe(*timeout_secs),
-                )
+                if in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
+                    format!(
+                        "freeze aborted: {} while preparing; abort accepted, recovery pending",
+                        cause.host_reason(),
+                    )
+                } else {
+                    let activity = if in_flight.is_some() {
+                        " with a FIFREEZE in flight"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "freeze aborted: {}{activity}; {frozen} target(s) frozen so far are being thawed; state thawing, marker retained",
+                        cause.host_reason(),
+                    )
+                }
             }
         }
     }
@@ -3704,13 +3727,6 @@ mod tests {
             progress.unrecoverable_reason,
             Some(RecoveryReason::WorkerLost)
         );
-        assert!(
-            progress
-                .unrecoverable
-                .as_deref()
-                .is_some_and(|detail| detail.contains("freeze worker lost")),
-            "{progress:?}"
-        );
         let joined = join_operation(&rig.ctx, &op).await.unwrap_err().to_string();
         assert!(
             joined.contains("freeze worker lost; target outcome unknown")
@@ -3920,14 +3936,14 @@ mod tests {
         let (rig, gate, err) = (&ab.rig, &ab.gate, &ab.err);
         let text = err.to_string();
         assert!(
-            text.contains("deadline of 1 s expired with a FIFREEZE in flight")
+            text.contains("operation deadline expired with a FIFREEZE in flight")
                 && text.contains("1 target(s) frozen so far are being thawed")
                 && text.contains("state thawing, marker retained"),
             "{text}"
         );
         assert!(
-            !text.contains(B),
-            "wire error must hide in-flight target: {text}"
+            !text.contains(B) && !text.contains("1 s"),
+            "wire error must hide in-flight target and timeout: {text}"
         );
         assert_eq!(gate.waiting(), 1, "B is still inside FIFREEZE");
         assert_eq!(rig.fifreezes(), paths(&[A, B]));
@@ -4064,10 +4080,9 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("deadline of 0 s expired while preparing"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "freeze aborted: operation deadline expired while preparing; abort accepted, recovery pending"
         );
         rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
             .await;
@@ -4119,7 +4134,11 @@ mod tests {
         hold.release();
         holder.join().unwrap();
         let err = freezing.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("deadline of 1 s expired"), "{err}");
+        assert!(
+            err.to_string().contains("operation deadline expired")
+                && !err.to_string().contains("1 s"),
+            "{err}"
+        );
         rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
             .await;
         assert_eq!(rig.opens(), paths(&[A]), "B never authorised");
@@ -4156,7 +4175,11 @@ mod tests {
         hold.release();
         holder.join().unwrap();
         let err = freezing.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("deadline of 1 s expired"), "{err}");
+        assert!(
+            err.to_string().contains("operation deadline expired")
+                && !err.to_string().contains("1 s"),
+            "{err}"
+        );
         rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
             .await;
         assert_eq!(rig.fifreezes(), paths(&[A, B, C, D]));
@@ -4226,8 +4249,10 @@ mod tests {
     async fn expiry_during_preparation_freezes_nothing_and_leaves_no_marker() {
         // The deadline expires while the mount table is still being read:
         // the preparation stays owned to its end, no target is ever
-        // authorised, the marker it created is removed, and `Thawed` is
-        // published after the finalisation hook.
+        // authorised, neither reply claims a marker is retained before
+        // preparation creates one nor leaks the configured timeout duration,
+        // the late marker is removed, and `Thawed` is published after the
+        // finalisation hook.
         let gate = Gate::new();
         let _release = gate.release_on_drop();
         let mounts = Arc::new(GatedMounts {
@@ -4240,9 +4265,30 @@ mod tests {
         rig.wait_for("preparing", |_| gate.waiting() == 1).await;
         rig.expire();
         let err = freezing.await.unwrap().unwrap_err();
-        assert!(err.to_string().contains("while preparing"), "{err}");
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "freeze aborted: operation deadline expired while preparing; abort accepted, recovery pending"
+        );
+        assert!(
+            !text.contains("1 s") && !text.contains("marker retained"),
+            "must not disclose timeout or claim a marker before one exists: {text}"
+        );
         assert_eq!(gate.waiting(), 1, "the preparation is still running");
         assert_eq!(rig.state(), FreezeState::Thawing);
+        assert!(!rig.marker().exists(), "no marker exists yet");
+        let join_err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        let join_text = join_err.to_string();
+        assert_eq!(
+            join_text,
+            "thaw requested: abort accepted, recovery pending (preparation still in flight)"
+        );
+        assert!(
+            !join_text.contains("marker retained"),
+            "joining thaw during preparation must not claim marker retained: {join_text}"
+        );
         assert!(rig.kernel.calls().is_empty());
         gate.release();
         rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
@@ -4251,6 +4297,41 @@ mod tests {
         assert!(!rig.marker().exists(), "the late marker was removed");
         assert_eq!(rig.hooks.events(), ["freezing", "thaw_claimed", "thawed"]);
         assert!(rig.ctx.freeze_op().is_none());
+    }
+
+    #[tokio::test]
+    async fn thaw_during_preparation_reports_abort_accepted_without_claiming_marker_retained() {
+        // A thaw arrives while preparation is still reading the mount table
+        // (before `commit_abort` and before `marker.create()`): both the
+        // immediate join reply and the freeze-abort reply report pending
+        // recovery without claiming a marker is retained.
+        let gate = Gate::new();
+        let _release = gate.release_on_drop();
+        let mounts = Arc::new(GatedMounts {
+            table: fixture("nested.txt"),
+            gate: gate.clone(),
+        });
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts);
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("preparing", |_| gate.waiting() == 1).await;
+        assert!(!rig.marker().exists(), "no marker exists yet");
+        let join_err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            join_err.to_string(),
+            "thaw requested: abort accepted, recovery pending (preparation still in flight)"
+        );
+        let freeze_err = freezing.await.unwrap().unwrap_err();
+        assert_eq!(
+            freeze_err.to_string(),
+            "freeze aborted: thaw requested while preparing; abort accepted, recovery pending"
+        );
+        gate.release();
+        rig.wait_for("settled", |r| r.state() == FreezeState::Thawed)
+            .await;
+        assert!(!rig.marker().exists());
+        assert!(rig.kernel.calls().is_empty());
     }
 
     #[tokio::test]
@@ -4799,7 +4880,10 @@ mod tests {
             });
         });
         let desc = assert_host_safe("in-flight deadline abort", &abort_reply, dir.path());
-        assert!(desc.contains("deadline of 1 s expired"), "{desc}");
+        assert!(
+            desc.contains("operation deadline expired") && !desc.contains("1 s"),
+            "{desc}"
+        );
         assert!(desc.contains("1 target(s) frozen so far"), "{desc}");
         assert!(desc.contains("marker retained"), "{desc}");
         let desc = assert_host_safe("joining thaw pending", &join_pending, dir.path());
@@ -4810,8 +4894,8 @@ mod tests {
         assert!(desc.contains("target(s) thawed"), "{desc}");
         assert!(desc.contains("state frozen, marker retained"), "{desc}");
         assert!(
-            logs.contains(PRIMARY),
-            "local log keeps in-flight target: {logs}"
+            logs.contains(PRIMARY) && logs.contains("\"timeout_secs\":1"),
+            "local log keeps in-flight target and timeout_secs: {logs}"
         );
         let _ = std::fs::remove_file(dir.path().join(MARKER_NAME));
 
@@ -5066,7 +5150,7 @@ mod tests {
                     in_flight: Some(crate::freeze_op::PREPARING.into()),
                 },
                 false,
-                "freeze aborted: operation deadline of 30 s expired while preparing; 0 target(s) frozen so far are being thawed; state thawing, marker retained",
+                "freeze aborted: operation deadline expired while preparing; abort accepted, recovery pending",
             ),
             (
                 FreezeFailure::Aborted {
@@ -5086,14 +5170,108 @@ mod tests {
                     in_flight: None,
                 },
                 false,
-                "freeze aborted: operation deadline of 10 s expired; 1 target(s) frozen so far are being thawed; state thawing, marker retained",
+                "freeze aborted: operation deadline expired; 1 target(s) frozen so far are being thawed; state thawing, marker retained",
             ),
         ];
         for (failure, retains, expected) in &freeze_cases {
             assert_eq!(failure.retains_frozen_state(), *retains, "{failure:?}");
             let desc = failure.host_description();
             assert_eq!(desc, *expected);
+            assert!(
+                !desc.contains("30 s") && !desc.contains("10 s"),
+                "wire error must not disclose timeout duration: {desc}"
+            );
             assert_clean("FreezeFailure", &desc);
+        }
+        // Two different timeout configurations reaching the same deadline
+        // outcome produce identical host-facing wire text (PR #57).
+        let short_timeout = FreezeFailure::Aborted {
+            cause: crate::freeze_op::AbortCause::Deadline,
+            timeout_secs: 5,
+            frozen: 1,
+            in_flight: Some(GUEST_MOUNT.into()),
+        };
+        let long_timeout = FreezeFailure::Aborted {
+            cause: crate::freeze_op::AbortCause::Deadline,
+            timeout_secs: 300,
+            frozen: 1,
+            in_flight: Some(GUEST_MOUNT.into()),
+        };
+        assert_eq!(
+            short_timeout.host_description(),
+            long_timeout.host_description()
+        );
+        assert!(short_timeout.to_string().contains("5 s"));
+        assert!(long_timeout.to_string().contains("300 s"));
+
+        // Every joining-thaw pending arm (preparation unresolved, Freezing
+        // before commit_abort, and Recovering with/without in-flight FIFREEZE).
+        let joining_cases = [
+            (
+                crate::freeze_op::Progress {
+                    phase: crate::freeze_op::Phase::Freezing,
+                    frozen: 0,
+                    in_flight: Some(crate::freeze_op::PREPARING.into()),
+                    recovery_pass_done: false,
+                    recovered: 0,
+                    unrecoverable_reason: None,
+                    settled: None,
+                },
+                "thaw requested: abort accepted, recovery pending (preparation still in flight)",
+            ),
+            (
+                crate::freeze_op::Progress {
+                    phase: crate::freeze_op::Phase::Recovering,
+                    frozen: 0,
+                    in_flight: Some(crate::freeze_op::PREPARING.into()),
+                    recovery_pass_done: false,
+                    recovered: 0,
+                    unrecoverable_reason: None,
+                    settled: None,
+                },
+                "thaw requested: abort accepted, recovery pending (preparation still in flight)",
+            ),
+            (
+                crate::freeze_op::Progress {
+                    phase: crate::freeze_op::Phase::Freezing,
+                    frozen: 1,
+                    in_flight: Some(GUEST_MOUNT.into()),
+                    recovery_pass_done: false,
+                    recovered: 0,
+                    unrecoverable_reason: None,
+                    settled: None,
+                },
+                "thaw requested: abort accepted, recovery pending (0 target(s) thawed so far, a FIFREEZE is still in flight); state freezing, marker retained until it settles",
+            ),
+            (
+                crate::freeze_op::Progress {
+                    phase: crate::freeze_op::Phase::Recovering,
+                    frozen: 1,
+                    in_flight: Some(GUEST_MOUNT.into()),
+                    recovery_pass_done: false,
+                    recovered: 1,
+                    unrecoverable_reason: None,
+                    settled: None,
+                },
+                "thaw requested: abort accepted, recovery pending (1 target(s) thawed so far, a FIFREEZE is still in flight); state thawing, marker retained until it settles",
+            ),
+            (
+                crate::freeze_op::Progress {
+                    phase: crate::freeze_op::Phase::Recovering,
+                    frozen: 2,
+                    in_flight: None,
+                    recovery_pass_done: false,
+                    recovered: 2,
+                    unrecoverable_reason: None,
+                    settled: None,
+                },
+                "thaw requested: abort accepted, recovery pending (2 target(s) thawed so far); state thawing, marker retained until it settles",
+            ),
+        ];
+        for (progress, expected) in &joining_cases {
+            let desc = format_joining_pending(progress);
+            assert_eq!(desc, *expected);
+            assert_clean("format_joining_pending", &desc);
         }
 
         // Every ThawFailure arm in both Frozen and Thawed final states.

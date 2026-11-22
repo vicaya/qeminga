@@ -278,11 +278,9 @@ async fn status_and_ping_are_served_while_a_recovery_drain_is_blocked() {
     let (b, _release_b) = rig.freeze_blocked_at_b().await;
     rig.expire();
     let freeze = rig.json_reply().await;
+    let desc = freeze["error"]["desc"].as_str().unwrap();
     assert!(
-        freeze["error"]["desc"]
-            .as_str()
-            .unwrap()
-            .contains("deadline of 1 s expired"),
+        desc.contains("operation deadline expired") && !desc.contains("1 s"),
         "{freeze}"
     );
     let g = a_thaw.clone();

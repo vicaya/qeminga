@@ -202,12 +202,22 @@ pub enum AbortCause {
 }
 
 impl AbortCause {
-    /// The cause for a reply, with the deadline where it applies.
+    /// Guest-local diagnostic cause, including the configured deadline.
     pub fn describe(self, timeout_secs: u64) -> String {
         match self {
             AbortCause::Deadline => format!("operation deadline of {timeout_secs} s expired"),
             AbortCause::ThawRequested => "thaw requested".to_owned(),
             AbortCause::WorkerLost => "freeze worker lost".to_owned(),
+        }
+    }
+
+    /// Fixed host-facing cause without disclosing the guest's configured
+    /// operation timeout (design §5.9, AC27).
+    pub const fn host_reason(self) -> &'static str {
+        match self {
+            AbortCause::Deadline => "operation deadline expired",
+            AbortCause::ThawRequested => "thaw requested",
+            AbortCause::WorkerLost => "freeze worker lost",
         }
     }
 }
@@ -241,9 +251,8 @@ pub struct Progress {
     pub recovery_pass_done: bool,
     /// Targets on which a recovery drain succeeded at least once.
     pub recovered: u64,
-    /// A drain that did not complete (target and reason, guest-local diagnostic).
-    pub unrecoverable: Option<String>,
-    /// Host-safe classification of the unrecoverable failure, if any.
+    /// Host-safe classification of the unrecoverable failure, if any;
+    /// detailed path/errno diagnostics stay on the driver for guest logs.
     pub unrecoverable_reason: Option<RecoveryReason>,
     /// The state published when the operation settled.
     pub settled: Option<FreezeState>,
@@ -257,7 +266,6 @@ impl Progress {
             in_flight: Some(PREPARING.to_owned()),
             recovery_pass_done: false,
             recovered: 0,
-            unrecoverable: None,
             unrecoverable_reason: None,
             settled: None,
         }
@@ -637,7 +645,7 @@ impl Driver {
                         kind: RecoveryReason::WorkerLost,
                         detail: format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
                     });
-                    self.publish_unrecoverable();
+                    self.publish_recovery_progress();
                     self.commit_abort(AbortCause::WorkerLost);
                     break;
                 }
@@ -814,6 +822,7 @@ impl Driver {
         tracing::error!(
             event = "fsfreeze_aborted",
             cause = %cause,
+            timeout_secs = self.timeout.as_secs(),
             frozen = self.frozen,
             in_flight = in_flight.as_deref().unwrap_or("-"),
             "freeze aborted; recovering the targets frozen so far"
@@ -858,15 +867,15 @@ impl Driver {
         }));
     }
 
-    fn publish_unrecoverable(&self) {
-        let unrecoverable = self
-            .unrecoverable
-            .as_ref()
-            .map(|u| format!("{}: {}", u.mountpoint, u.detail));
-        let unrecoverable_reason = self.unrecoverable.as_ref().map(|u| u.kind);
+    /// Publishes the single typed recovery progress view (`recovered` and
+    /// `unrecoverable_reason`); detailed diagnostics stay on `self.unrecoverable`
+    /// for guest-local logging.
+    fn publish_recovery_progress(&self) {
+        let recovered = self.recovered;
+        let reason = self.unrecoverable.as_ref().map(|u| u.kind);
         self.op.publish(|p| {
-            p.unrecoverable = unrecoverable;
-            p.unrecoverable_reason = unrecoverable_reason;
+            p.recovered = recovered;
+            p.unrecoverable_reason = reason;
         });
     }
 
@@ -891,17 +900,7 @@ impl Driver {
                 });
             }
         }
-        let recovered = self.recovered;
-        let unrecoverable = self
-            .unrecoverable
-            .as_ref()
-            .map(|u| format!("{}: {}", u.mountpoint, u.detail));
-        let unrecoverable_reason = self.unrecoverable.as_ref().map(|u| u.kind);
-        self.op.publish(|p| {
-            p.recovered = recovered;
-            p.unrecoverable = unrecoverable;
-            p.unrecoverable_reason = unrecoverable_reason;
-        });
+        self.publish_recovery_progress();
     }
 
     /// Nothing was frozen (the plan or the marker failed, or the
@@ -1033,16 +1032,22 @@ impl Driver {
             }
             Ok(Err(err)) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "recovery drained but the marker cannot be removed; staying frozen");
-                self.op.publish(|p| {
-                    p.unrecoverable_reason = Some(RecoveryReason::MarkerRetained);
+                self.unrecoverable.get_or_insert(IncompleteDrain {
+                    mountpoint: "(marker)".to_owned(),
+                    kind: RecoveryReason::MarkerRetained,
+                    detail: err.to_string(),
                 });
+                self.publish_recovery_progress();
                 self.conclude(Terminal::Frozen, Err(aborted));
             }
             Err(err) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
-                self.op.publish(|p| {
-                    p.unrecoverable_reason = Some(RecoveryReason::MarkerRetained);
+                self.unrecoverable.get_or_insert(IncompleteDrain {
+                    mountpoint: "(marker)".to_owned(),
+                    kind: RecoveryReason::MarkerRetained,
+                    detail: err.to_string(),
                 });
+                self.publish_recovery_progress();
                 self.conclude(Terminal::Frozen, Err(aborted));
             }
         }
@@ -1180,5 +1185,21 @@ mod tests {
             .unwrap();
         // A sleep that starts past its deadline resolves at once.
         clock.sleep_until(deadline).await;
+    }
+
+    #[test]
+    fn abort_cause_host_reason_is_fixed_while_describe_retains_timeout() {
+        assert_eq!(
+            AbortCause::Deadline.host_reason(),
+            "operation deadline expired"
+        );
+        assert_eq!(AbortCause::ThawRequested.host_reason(), "thaw requested");
+        assert_eq!(AbortCause::WorkerLost.host_reason(), "freeze worker lost");
+        assert_eq!(
+            AbortCause::Deadline.describe(42),
+            "operation deadline of 42 s expired"
+        );
+        assert_eq!(AbortCause::ThawRequested.describe(42), "thaw requested");
+        assert_eq!(AbortCause::WorkerLost.describe(42), "freeze worker lost");
     }
 }

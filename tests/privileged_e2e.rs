@@ -493,17 +493,22 @@ fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
     LinuxKernel
         .fithaw(&raw)
         .expect("FITHAW on the raw-byte path");
-    // The daemon: startup, fsinfo (lossy name), freeze-list, thaw.
+    // The daemon: startup, fsinfo (omits non-UTF-8 alias so no lossy U+FFFD
+    // path is advertised for selection; advertises valid UTF-8 `mount`),
+    // freeze-list, thaw.
     let mut agent = Agent::spawn_with(real_kernel(""));
     let lossy = dir.to_string_lossy().into_owned();
     assert!(lossy.contains('\u{fffd}'));
     let fsinfo = agent.execute("guest-get-fsinfo");
-    let reported = fsinfo["return"]
-        .as_array()
-        .unwrap()
+    let entries = fsinfo["return"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|fs| fs["mountpoint"] == lossy),
+        "fsinfo must not advertise non-UTF-8 mountpoint lossily: {fsinfo}"
+    );
+    let reported = entries
         .iter()
-        .find(|fs| fs["mountpoint"] == lossy)
-        .unwrap_or_else(|| panic!("fsinfo lists the mount lossily: {fsinfo}"));
+        .find(|fs| fs["mountpoint"] == mount)
+        .unwrap_or_else(|| panic!("fsinfo advertises the valid UTF-8 mountpoint: {fsinfo}"));
     assert_eq!(reported["type"], "ext4");
     let reply = freeze_list(&mut agent, &[mount.clone(), lossy]);
     assert_eq!(

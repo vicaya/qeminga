@@ -61,20 +61,41 @@ impl Statfs {
     }
 }
 
-/// Where sizes come from; production calls `statfs(2)`.
+/// Where sizes come from; production opens the mount point, verifies its
+/// superblock device against the inventory row, and calls `fstatfs(2)`.
 pub trait StatfsSource: Send + Sync {
-    /// Sizes of the filesystem mounted at `mount_point`.
-    fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error>;
+    /// Sizes of the filesystem mounted at `mount_point` when its descriptor
+    /// still matches `expected_dev` (`(major, minor)` from the inventory row).
+    fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error>;
 }
 
-/// Production source over `nix::sys::statfs::statfs`.
+/// Production source over `open(2)` + `fstat(2)` + `fstatfs(2)`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemStatfs;
 
 impl StatfsSource for SystemStatfs {
-    fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error> {
-        let st = nix::sys::statfs::statfs(mount_point)
-            .map_err(|errno| Error::Internal(format!("statfs failed: {errno}")))?;
+    fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error> {
+        let fd = nix::fcntl::open(
+            mount_point,
+            nix::fcntl::OFlag::O_RDONLY
+                | nix::fcntl::OFlag::O_DIRECTORY
+                | nix::fcntl::OFlag::O_CLOEXEC
+                | nix::fcntl::OFlag::O_NOFOLLOW,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(|errno| Error::Internal(format!("statfs open failed: {errno}")))?;
+        let st_dev = nix::sys::stat::fstat(&fd)
+            .map_err(|errno| Error::Internal(format!("statfs fstat failed: {errno}")))?
+            .st_dev;
+        let found = (
+            u32::try_from(nix::sys::stat::major(st_dev)).unwrap_or(u32::MAX),
+            u32::try_from(nix::sys::stat::minor(st_dev)).unwrap_or(u32::MAX),
+        );
+        if found != expected_dev {
+            return Err(Error::Internal("statfs device mismatch".into()));
+        }
+        let st = nix::sys::statfs::fstatfs(&fd)
+            .map_err(|errno| Error::Internal(format!("fstatfs failed: {errno}")))?;
         Ok(Statfs {
             blocks: st.blocks(),
             bfree: st.blocks_free(),
@@ -87,17 +108,21 @@ impl StatfsSource for SystemStatfs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilesystemInfo {
     /// Opaque per-superblock identifier (`fs-1`, `fs-2`, …), shared by all
-    /// aliases of the same superblock; never the raw mount source.
+    /// visible valid-UTF-8 aliases of the same superblock within a single
+    /// reply; never the raw mount source.
     pub name: String,
-    /// Mount point, unescaped.
+    /// Mount point, unescaped valid UTF-8 that round-trips byte-exact to its
+    /// visible mount row.
     pub mountpoint: String,
     /// Filesystem type.
     #[serde(rename = "type")]
     pub fs_type: String,
-    /// `(blocks - bfree) * bsize`; omitted when `statfs` failed.
+    /// `(blocks - bfree) * bsize`; omitted when `statfs` failed or the live
+    /// mount identity changed.
     #[serde(rename = "used-bytes", skip_serializing_if = "Option::is_none")]
     pub used_bytes: Option<u64>,
-    /// `blocks * bsize`; omitted when `statfs` failed.
+    /// `blocks * bsize`; omitted when `statfs` failed or the live mount
+    /// identity changed.
     #[serde(rename = "total-bytes", skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
     /// Always empty.
@@ -145,17 +170,23 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
 
 /// Builds the reply for a mount table.
 ///
-/// Only mounts visible at their own mount point in the mount tree
-/// ([`crate::freeze_plan::visible_mounts`]) are emitted, so every advertised
-/// `mountpoint` selects the superblock named in its row and `statfs` never
-/// attributes a covering filesystem's sizes to a covered row.
+/// Only mounts that are both visible at their own mount point in the mount
+/// tree ([`crate::freeze_plan::visible_mounts`]) and valid UTF-8 are emitted,
+/// so every advertised `mountpoint` round-trips byte-exact to its row in
+/// `guest-fsfreeze-freeze-list` and never collides via lossy `U+FFFD`
+/// substitution. A filesystem mounted at a non-UTF-8 path with a visible
+/// valid-UTF-8 bind alias is advertised via that alias; one with no visible
+/// valid-UTF-8 mount point is omitted (full-guest `guest-fsfreeze-freeze`
+/// remains byte-exact). Size queries verify the opened descriptor's device
+/// against the inventory row before calling `fstatfs(2)` and omit sizes if
+/// the mount identity changed.
 ///
-/// Each distinct visible superblock `(major, minor)` gets an opaque `fs-<n>`
-/// identifier in order of first appearance, shared by all of its visible
-/// aliases (bind mounts, subvolumes). The identifier is valid only within a
-/// single reply (rebuilt on each call); controllers group aliases from one
-/// reply and use provisioned mount paths across requests. Raw mount sources
-/// and device numbers are never placed in the reply (design §4.5, §5.9, AC27).
+/// Each distinct advertised superblock `(major, minor)` gets an opaque
+/// `fs-<n>` identifier in order of first appearance, shared by all of its
+/// visible valid-UTF-8 aliases. The identifier is valid only within a single
+/// reply (rebuilt on each call); controllers group aliases from one reply and
+/// use provisioned mount paths across requests. Raw mount sources and device
+/// numbers are never placed in the reply (design §4.5, §5.9, AC27).
 pub fn fs_info(
     mounts: &[MountEntry],
     statfs: &dyn StatfsSource,
@@ -165,20 +196,24 @@ pub fn fs_info(
     let mut superblocks: HashMap<(u32, u32), usize> = HashMap::new();
     Ok(visible
         .into_iter()
-        .map(|m| {
+        .filter_map(|m| {
+            // Only advertise rows whose mount point is valid UTF-8 so the
+            // JSON wire spelling round-trips byte-exact to this row in
+            // `FreezePlan::restrict_to` without lossy U+FFFD collisions.
+            let mountpoint = m.mount_point.to_str()?;
             let next = superblocks.len() + 1;
             let id = *superblocks.entry(m.dev()).or_insert(next);
             let sizes = sizes_are_queried(&m.fs_type)
-                .then(|| statfs.statfs(&m.mount_point).ok())
+                .then(|| statfs.statfs(&m.mount_point, m.dev()).ok())
                 .flatten();
-            FilesystemInfo {
+            Some(FilesystemInfo {
                 name: format!("fs-{id}"),
-                mountpoint: m.mount_point.to_string_lossy().into_owned(),
+                mountpoint: mountpoint.to_owned(),
                 fs_type: m.fs_type.clone(),
                 used_bytes: sizes.map(|s| s.used_bytes()),
                 total_bytes: sizes.map(|s| s.total_bytes()),
                 disk: Vec::new(),
-            }
+            })
         })
         .collect())
 }
@@ -238,7 +273,7 @@ mod tests {
     struct FakeStatfs(HashMap<String, Statfs>);
 
     impl StatfsSource for FakeStatfs {
-        fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error> {
+        fn statfs(&self, mount_point: &Path, _expected_dev: (u32, u32)) -> Result<Statfs, Error> {
             self.0
                 .get(mount_point.to_string_lossy().as_ref())
                 .copied()
@@ -387,32 +422,92 @@ mod tests {
     }
 
     #[test]
-    fn non_utf8_mount_points_are_reported_lossily_but_queried_byte_exact() {
+    fn non_utf8_mount_points_are_omitted_and_prefer_utf8_alias_without_fffd_collision() {
         use std::os::unix::ffi::OsStrExt;
         use std::sync::Mutex;
-        struct Recording(Mutex<Vec<Vec<u8>>>);
+        struct Recording(Mutex<Vec<(Vec<u8>, (u32, u32))>>);
         impl StatfsSource for Recording {
-            fn statfs(&self, mount_point: &Path) -> Result<Statfs, Error> {
+            fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error> {
                 self.0
                     .lock()
                     .unwrap()
-                    .push(mount_point.as_os_str().as_bytes().to_vec());
+                    .push((mount_point.as_os_str().as_bytes().to_vec(), expected_dev));
                 Err(Error::Internal("EIO".into()))
             }
         }
+        // escaped_paths.txt: /mnt/caf\351 (8:9) has no valid UTF-8 alias and
+        // must be omitted rather than emitted lossily with U+FFFD, while valid
+        // escaped UTF-8 paths remain listed.
         let mounts = parse_mountinfo(fixture("escaped_paths.txt"));
         let recording = Recording(Mutex::new(Vec::new()));
         let info = fs_info(&mounts, &recording).unwrap();
-        assert_eq!(info.last().unwrap().mountpoint, "/mnt/caf\u{fffd}");
+        let paths: Vec<&str> = info.iter().map(|f| f.mountpoint.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/",
+                "/mnt/with space",
+                "/mnt/tab\there",
+                "/mnt/back\\slash",
+                "/mnt/nl\ninside",
+            ]
+        );
         let asked = recording.0.lock().unwrap();
-        assert!(asked.contains(&b"/mnt/caf\xe9".to_vec()), "{asked:?}");
+        assert!(
+            !asked.iter().any(|(p, _)| p == b"/mnt/caf\xe9"),
+            "omitted non-UTF-8 mount must not be statfs'd: {asked:?}"
+        );
+        drop(asked);
+
+        // Collision table: 8:9 is mounted at raw `/mnt/caf\351` AND bound at
+        // valid UTF-8 `/mnt/cafe-alias`; 8:10 is mounted at literal UTF-8
+        // `/mnt/caf\u{fffd}`; 8:11 is mounted only at raw `/mnt/raw\377`.
+        // Discovery must prefer `/mnt/cafe-alias` for 8:9, advertise
+        // `/mnt/caf\u{fffd}` once under 8:10's distinct `fs-N`, and omit 8:11.
+        let table = concat!(
+            "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+            "54 27 8:9 / /mnt/caf\\351 rw,relatime - ext4 /dev/sda9 rw\n",
+            "55 27 8:9 / /mnt/cafe-alias rw,relatime - ext4 /dev/sda9 rw\n",
+            "56 27 8:10 / /mnt/caf\u{fffd} rw,relatime - ext4 /dev/sda10 rw\n",
+            "57 27 8:11 / /mnt/raw\\377 rw,relatime - ext4 /dev/sda11 rw\n",
+        );
+        let collision_mounts = parse_mountinfo(table);
+        let recording = Recording(Mutex::new(Vec::new()));
+        let info = fs_info(&collision_mounts, &recording).unwrap();
+        let paths: Vec<&str> = info.iter().map(|f| f.mountpoint.as_str()).collect();
+        assert_eq!(paths, ["/", "/mnt/cafe-alias", "/mnt/caf\u{fffd}"]);
+        assert_eq!(
+            info.iter()
+                .filter(|f| f.mountpoint == "/mnt/caf\u{fffd}")
+                .count(),
+            1,
+            "literal U+FFFD mountpoint must not collide with raw non-UTF-8 row: {info:?}"
+        );
+        let alias = info
+            .iter()
+            .find(|f| f.mountpoint == "/mnt/cafe-alias")
+            .unwrap();
+        let literal_fffd = info
+            .iter()
+            .find(|f| f.mountpoint == "/mnt/caf\u{fffd}")
+            .unwrap();
+        assert_ne!(alias.name, literal_fffd.name);
+        let asked = recording.0.lock().unwrap();
+        assert_eq!(
+            *asked,
+            [
+                (b"/".to_vec(), (8, 1)),
+                (b"/mnt/cafe-alias".to_vec(), (8, 9)),
+                ("/mnt/caf\u{fffd}".as_bytes().to_vec(), (8, 10)),
+            ]
+        );
     }
 
     #[tokio::test(start_paused = true)]
     async fn a_stuck_statfs_fails_the_command_instead_of_the_session() {
         struct Stuck(std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>);
         impl StatfsSource for Stuck {
-            fn statfs(&self, _: &Path) -> Result<Statfs, Error> {
+            fn statfs(&self, _: &Path, _: (u32, u32)) -> Result<Statfs, Error> {
                 // Blocks until the test drops the sender (a D-state statfs).
                 let rx = self.0.lock().unwrap().take();
                 if let Some(rx) = rx {
@@ -455,7 +550,7 @@ mod tests {
             walks: AtomicUsize,
         }
         impl StatfsSource for Gate {
-            fn statfs(&self, _: &Path) -> Result<Statfs, Error> {
+            fn statfs(&self, _: &Path, _: (u32, u32)) -> Result<Statfs, Error> {
                 let mut released = self.released.lock().unwrap();
                 if !*released {
                     self.walks.fetch_add(1, Ordering::SeqCst);
@@ -539,15 +634,82 @@ mod tests {
     }
 
     #[test]
-    fn system_statfs_reads_root() {
-        let st = SystemStatfs.statfs(Path::new("/")).unwrap();
+    fn system_statfs_reads_root_and_rejects_mismatched_device() {
+        let meta = nix::sys::stat::stat(Path::new("/")).unwrap();
+        let root_dev = (
+            u32::try_from(nix::sys::stat::major(meta.st_dev)).unwrap(),
+            u32::try_from(nix::sys::stat::minor(meta.st_dev)).unwrap(),
+        );
+        let st = SystemStatfs.statfs(Path::new("/"), root_dev).unwrap();
         assert!(st.bsize > 0);
         assert!(st.blocks >= st.bfree);
+        // A racing mount replacement whose st_dev no longer matches the
+        // inventory row must be rejected before fstatfs.
+        let wrong_dev = (root_dev.0.wrapping_add(1), root_dev.1);
+        assert!(
+            SystemStatfs.statfs(Path::new("/"), wrong_dev).is_err(),
+            "device mismatch must omit sizes"
+        );
         assert!(
             SystemStatfs
-                .statfs(Path::new("/nonexistent/qeminga"))
+                .statfs(Path::new("/nonexistent/qeminga"), (0, 0))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fsinfo_omits_sizes_when_statfs_detects_device_mismatch() {
+        struct VerifiedStatfs(HashMap<String, ((u32, u32), Statfs)>);
+        impl StatfsSource for VerifiedStatfs {
+            fn statfs(&self, mount_point: &Path, expected_dev: (u32, u32)) -> Result<Statfs, Error> {
+                let (live_dev, st) = self
+                    .0
+                    .get(mount_point.to_str().unwrap())
+                    .copied()
+                    .ok_or_else(|| Error::Internal("ENOENT".into()))?;
+                if live_dev != expected_dev {
+                    return Err(Error::Internal("statfs device mismatch".into()));
+                }
+                Ok(st)
+            }
+        }
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+        );
+        let mounts = parse_mountinfo(table);
+        let statfs = VerifiedStatfs(HashMap::from([
+            (
+                "/".to_owned(),
+                (
+                    (8, 1),
+                    Statfs {
+                        blocks: 100,
+                        bfree: 40,
+                        bsize: 4096,
+                    },
+                ),
+            ),
+            // Simulate /data replaced live by a different filesystem (e.g. FUSE 0:99)
+            // after mountinfo was read.
+            (
+                "/data".to_owned(),
+                (
+                    (0, 99),
+                    Statfs {
+                        blocks: 9999,
+                        bfree: 0,
+                        bsize: 4096,
+                    },
+                ),
+            ),
+        ]));
+        let info = fs_info(&mounts, &statfs).unwrap();
+        let root = info.iter().find(|f| f.mountpoint == "/").unwrap();
+        let data = info.iter().find(|f| f.mountpoint == "/data").unwrap();
+        assert_eq!(root.total_bytes, Some(100 * 4096));
+        assert_eq!(data.total_bytes, None);
+        assert_eq!(data.used_bytes, None);
     }
 
     #[tokio::test]

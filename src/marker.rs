@@ -487,38 +487,38 @@ mod tests {
 
     #[test]
     fn host_reason_never_discloses_marker_path() {
-        let secret = PathBuf::from("/run/tenant-alpha/secret-marker");
+        let marker_path = PathBuf::from("/run/tenant-alpha/frozen-marker");
         let cases = [
             MarkerError::InvalidPath {
-                path: secret.clone(),
+                path: marker_path.clone(),
             },
             MarkerError::Directory {
-                path: secret.clone(),
+                path: marker_path.clone(),
                 errno: Errno::EACCES,
             },
             MarkerError::AlreadyPresent {
-                path: secret.clone(),
+                path: marker_path.clone(),
             },
             MarkerError::Absent {
-                path: secret.clone(),
+                path: marker_path.clone(),
             },
             MarkerError::Io {
-                path: secret.clone(),
+                path: marker_path.clone(),
                 op: "open",
                 errno: Errno::EIO,
             },
             MarkerError::Io {
-                path: secret.clone(),
+                path: marker_path.clone(),
                 op: "fsync",
                 errno: Errno::EIO,
             },
             MarkerError::Io {
-                path: secret.clone(),
+                path: marker_path.clone(),
                 op: "unlink",
                 errno: Errno::EPERM,
             },
             MarkerError::Io {
-                path: secret.clone(),
+                path: marker_path.clone(),
                 op: "other",
                 errno: Errno::EIO,
             },
@@ -527,9 +527,9 @@ mod tests {
             let reason = err.host_reason();
             assert!(!reason.is_empty(), "{err:?}");
             assert!(!reason.contains("tenant-alpha"), "{reason}");
-            assert!(!reason.contains("secret-marker"), "{reason}");
+            assert!(!reason.contains("frozen-marker"), "{reason}");
             assert!(
-                err.to_string().contains("secret-marker"),
+                err.to_string().contains("frozen-marker"),
                 "Display still carries full guest-local diagnostic: {err}"
             );
         }

@@ -1491,8 +1491,12 @@ mod tests {
         let sink = Sink::default();
         let router = Router::new(Box::new(sink.clone()));
         tracing::subscriber::with_default(
-            crate::audit::subscriber(tracing::Level::WARN, router),
+            crate::audit::subscriber(tracing::Level::WARN, router.clone()),
             f,
+        );
+        assert!(
+            router.settle(Duration::from_secs(1)),
+            "audit writer did not settle"
         );
         String::from_utf8(sink.0.lock().unwrap().clone()).unwrap()
     }
@@ -2147,8 +2151,8 @@ mod tests {
             text,
             "thaw incomplete: target unreachable; no FITHAW issued (3 target(s) thawed); state frozen, marker retained"
         );
-        for secret in ["8:2", "/data"] {
-            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        for forbidden in ["8:2", "/data"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden} in {text}");
         }
         assert_eq!(
             rig.fithaws(),
@@ -2201,8 +2205,8 @@ mod tests {
             text,
             "freeze failed: target unreachable; no FIFREEZE issued; rolled back (0 target(s) thawed); state thawed"
         );
-        for secret in ["/data", "8:2", "8:5"] {
-            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        for forbidden in ["/data", "8:2", "8:5"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden} in {text}");
         }
         assert!(
             rig.fifreezes().is_empty(),
@@ -3241,8 +3245,8 @@ mod tests {
             text,
             "thaw incomplete: target unreachable; no FITHAW issued (1 target(s) thawed); state frozen, marker retained"
         );
-        for secret in ["/data", "/srv/exports", "8:2", "8:9"] {
-            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        for forbidden in ["/data", "/srv/exports", "8:2", "8:9"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden} in {text}");
         }
         assert_eq!(
             rig.fithaws(),
@@ -3283,8 +3287,8 @@ mod tests {
             text,
             "freeze failed: target open permission denied; no FIFREEZE issued; rolled back (1 target(s) thawed); state thawed"
         );
-        for secret in ["/var/www", "/mnt/rootbind", "/srv/exports"] {
-            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        for forbidden in ["/var/www", "/mnt/rootbind", "/srv/exports"] {
+            assert!(!text.contains(forbidden), "leaked {forbidden} in {text}");
         }
         assert_eq!(rig.fifreezes(), paths(&["/srv/exports"]));
         assert_eq!(rig.fithaws(), paths(&["/srv/exports", "/srv/exports"]));
@@ -3665,6 +3669,55 @@ mod tests {
             rig.opens()
         );
         assert!(rig.fithaws().contains(&PathBuf::from("/home/data")));
+    }
+
+    #[tokio::test]
+    async fn a_first_target_worker_loss_publishes_worker_lost_reason_without_leaking_path() {
+        // When the first target's worker panics, nothing was frozen before it
+        // so no recovery pass runs: `Driver::publish_unrecoverable` is the
+        // only path that publishes `WorkerLost` on `op.progress()` for a
+        // joining thaw.
+        let rig = Rig::nested();
+        let gate = Gate::new();
+        let _release = gate.release_on_drop();
+        let wait_gate = gate.clone();
+        rig.kernel.set_hook(Box::new(move |call| {
+            if matches!(call, Call::Fifreeze(p) if p == Path::new(A)) {
+                wait_gate.wait();
+                panic!("first worker lost");
+            }
+        }));
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("first worker paused", |_| gate.waiting() == 1)
+            .await;
+        let op = rig.ctx.freeze_op().expect("operation registered");
+        gate.release();
+        let err = freezing.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("worker lost"), "{err}");
+        assert!(
+            !err.to_string().contains(A),
+            "wire error hides target: {err}"
+        );
+        let progress = op.wait_for_settlement().await;
+        assert_eq!(progress.settled, Some(FreezeState::Frozen));
+        assert_eq!(
+            progress.unrecoverable_reason,
+            Some(RecoveryReason::WorkerLost)
+        );
+        assert!(
+            progress
+                .unrecoverable
+                .as_deref()
+                .is_some_and(|detail| detail.contains("freeze worker lost")),
+            "{progress:?}"
+        );
+        let joined = join_operation(&rig.ctx, &op).await.unwrap_err().to_string();
+        assert!(
+            joined.contains("freeze worker lost; target outcome unknown")
+                && joined.contains("state frozen, marker retained"),
+            "{joined}"
+        );
+        assert!(!joined.contains(A), "joining error hides target: {joined}");
     }
 
     #[tokio::test]
@@ -4587,10 +4640,10 @@ mod tests {
                 .as_str()
                 .unwrap_or_else(|| panic!("{label}: missing error.desc: {reply}"))
                 .to_owned();
-            for secret in forbidden(marker_dir) {
+            for item in forbidden(marker_dir) {
                 assert!(
-                    !desc.contains(&secret),
-                    "{label}: wire error.desc disclosed {secret:?}: {desc:?}"
+                    !desc.contains(&item),
+                    "{label}: wire error.desc disclosed {item:?}: {desc:?}"
                 );
             }
             desc
@@ -4838,29 +4891,29 @@ mod tests {
 
     #[test]
     fn all_host_descriptions_are_fixed_and_redact_guest_secrets() {
-        const SECRET_MOUNT: &str = "/srv/tenant-secret/vault";
-        const SECRET_ALIAS: &str = "/mnt/tenant-secret-alias";
-        const SECRET_MARKER: &str = "/run/qeminga-secret/frozen";
-        const SECRET_DEV: &str = "253:77";
-        const SECRET_DETAIL: &str = "secret-internal-detail";
+        const GUEST_MOUNT: &str = "/srv/tenant-alpha/vault";
+        const GUEST_ALIAS: &str = "/mnt/tenant-alpha-alias";
+        const GUEST_MARKER: &str = "/run/qeminga-tenant/frozen";
+        const GUEST_DEV: &str = "253:77";
+        const GUEST_DETAIL: &str = "internal-diagnostic-detail";
 
         let marker_err = || MarkerError::Io {
-            path: PathBuf::from(SECRET_MARKER),
+            path: PathBuf::from(GUEST_MARKER),
             op: "unlink",
             errno: Errno::EACCES,
         };
         let assert_clean = |label: &str, text: &str| {
-            for secret in [
-                SECRET_MOUNT,
-                SECRET_ALIAS,
-                SECRET_MARKER,
-                SECRET_DEV,
-                SECRET_DETAIL,
+            for forbidden in [
+                GUEST_MOUNT,
+                GUEST_ALIAS,
+                GUEST_MARKER,
+                GUEST_DEV,
+                GUEST_DETAIL,
                 "/proc/self/mountinfo",
             ] {
                 assert!(
-                    !text.contains(secret),
-                    "{label}: leaked {secret:?} in {text:?}"
+                    !text.contains(forbidden),
+                    "{label}: leaked {forbidden:?} in {text:?}"
                 );
             }
         };
@@ -4888,14 +4941,14 @@ mod tests {
             ),
             (
                 FreezeStop::Unreachable {
-                    attempts: format!("{SECRET_MOUNT}: EACCES; {SECRET_ALIAS}: EACCES"),
+                    attempts: format!("{GUEST_MOUNT}: EACCES; {GUEST_ALIAS}: EACCES"),
                     permission_denied: true,
                 },
                 "target open permission denied; no FIFREEZE issued",
             ),
             (
                 FreezeStop::Unreachable {
-                    attempts: format!("{SECRET_MOUNT}: on {SECRET_DEV}; {SECRET_ALIAS}: ENOENT"),
+                    attempts: format!("{GUEST_MOUNT}: on {GUEST_DEV}; {GUEST_ALIAS}: ENOENT"),
                     permission_denied: false,
                 },
                 "target unreachable; no FIFREEZE issued",
@@ -4926,20 +4979,20 @@ mod tests {
         // Every FreezeFailure arm + retains_frozen_state.
         let freeze_cases: Vec<(FreezeFailure, bool, &str)> = vec![
             (
-                FreezeFailure::Plan(format!("/proc/self/mountinfo: {SECRET_DETAIL}")),
+                FreezeFailure::Plan(format!("/proc/self/mountinfo: {GUEST_DETAIL}")),
                 false,
                 "cannot build freeze plan; state thawed",
             ),
             (
                 FreezeFailure::Marker(MarkerError::AlreadyPresent {
-                    path: PathBuf::from(SECRET_MARKER),
+                    path: PathBuf::from(GUEST_MARKER),
                 }),
                 false,
                 "cannot create recovery marker: recovery marker already exists; state thawed",
             ),
             (
                 FreezeFailure::Hard {
-                    mountpoint: SECRET_MOUNT.into(),
+                    mountpoint: GUEST_MOUNT.into(),
                     cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
                     rolled_back: 2,
                 },
@@ -4948,11 +5001,11 @@ mod tests {
             ),
             (
                 FreezeFailure::RollbackIncomplete {
-                    failed: SECRET_MOUNT.into(),
+                    failed: GUEST_MOUNT.into(),
                     cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
-                    mountpoint: SECRET_ALIAS.into(),
+                    mountpoint: GUEST_ALIAS.into(),
                     recovery_reason: RecoveryReason::PermissionDenied,
-                    reason: format!("{SECRET_ALIAS}: {SECRET_DEV}: {SECRET_DETAIL}"),
+                    reason: format!("{GUEST_ALIAS}: {GUEST_DEV}: {GUEST_DETAIL}"),
                     rolled_back: 1,
                 },
                 true,
@@ -4960,7 +5013,7 @@ mod tests {
             ),
             (
                 FreezeFailure::MarkerRetained {
-                    failed: SECRET_MOUNT.into(),
+                    failed: GUEST_MOUNT.into(),
                     cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
                     marker: marker_err(),
                     rolled_back: 3,
@@ -4970,7 +5023,7 @@ mod tests {
             ),
             (
                 FreezeFailure::PreparationMarkerRetained {
-                    cause: SECRET_DETAIL.into(),
+                    cause: GUEST_DETAIL.into(),
                     marker: marker_err(),
                 },
                 true,
@@ -4979,7 +5032,7 @@ mod tests {
             (
                 FreezeFailure::Task {
                     stage: FreezeTaskStage::Preparation,
-                    detail: SECRET_DETAIL.into(),
+                    detail: GUEST_DETAIL.into(),
                 },
                 false,
                 "freeze preparation failed; state thawed",
@@ -4987,7 +5040,7 @@ mod tests {
             (
                 FreezeFailure::Task {
                     stage: FreezeTaskStage::Rollback,
-                    detail: SECRET_DETAIL.into(),
+                    detail: GUEST_DETAIL.into(),
                 },
                 true,
                 "freeze rollback failed; state frozen, marker retained",
@@ -4995,7 +5048,7 @@ mod tests {
             (
                 FreezeFailure::Task {
                     stage: FreezeTaskStage::MarkerRemoval,
-                    detail: SECRET_DETAIL.into(),
+                    detail: GUEST_DETAIL.into(),
                 },
                 true,
                 "nothing was frozen (0 target(s) frozen) and marker removal failed; state frozen, marker retained",
@@ -5020,7 +5073,7 @@ mod tests {
                     cause: crate::freeze_op::AbortCause::ThawRequested,
                     timeout_secs: 30,
                     frozen: 2,
-                    in_flight: Some(SECRET_MOUNT.into()),
+                    in_flight: Some(GUEST_MOUNT.into()),
                 },
                 false,
                 "freeze aborted: thaw requested with a FIFREEZE in flight; 2 target(s) frozen so far are being thawed; state thawing, marker retained",
@@ -5047,7 +5100,7 @@ mod tests {
         let thaw_cases = [
             (
                 ThawFailure::Plan {
-                    detail: format!("/proc/self/mountinfo: {SECRET_DETAIL}"),
+                    detail: format!("/proc/self/mountinfo: {GUEST_DETAIL}"),
                     thawed: 2,
                 },
                 "cannot build thaw plan (2 target(s) thawed); state frozen, marker retained",
@@ -5055,9 +5108,9 @@ mod tests {
             ),
             (
                 ThawFailure::Incomplete {
-                    mountpoint: SECRET_MOUNT.into(),
+                    mountpoint: GUEST_MOUNT.into(),
                     kind: RecoveryReason::TargetOpenFailed,
-                    reason: format!("{SECRET_MOUNT}: {SECRET_DEV}: {SECRET_DETAIL}"),
+                    reason: format!("{GUEST_MOUNT}: {GUEST_DEV}: {GUEST_DETAIL}"),
                     thawed: 1,
                 },
                 "thaw incomplete: target open failed; no FITHAW issued (1 target(s) thawed); state frozen, marker retained",
@@ -5072,7 +5125,7 @@ mod tests {
                 "drain complete (4 target(s) thawed) but cannot remove recovery marker: recovery marker unlink failed; state thawed",
             ),
             (
-                ThawFailure::Task(SECRET_DETAIL.into()),
+                ThawFailure::Task(GUEST_DETAIL.into()),
                 "thaw task failed; state frozen, marker retained",
                 "thaw task failed; state thawed",
             ),

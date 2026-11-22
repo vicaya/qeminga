@@ -287,6 +287,10 @@ fn cvm_installation_defaults_to_data_protection_profile_and_documents_single_fre
         readme.contains("EBUSY") && readme.contains("independent"),
         "packaging/README.md must explain the independent-freezer / EBUSY / recovery-drain hazard"
     );
+    assert!(
+        readme.contains("single reply") && readme.contains("fs-N"),
+        "packaging/README.md must document that fs-N is valid only within one reply"
+    );
 }
 
 #[test]

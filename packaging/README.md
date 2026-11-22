@@ -94,12 +94,19 @@ mount names, alternate paths, device numbers or marker paths).
   `information = false` alone does not disable `guest-fstrim`:
   `guest-fstrim` replies independently list eligible mount paths even
   when `information = false`, so keep `[features] fstrim = false` in
-  CVMs unless the guest explicitly opts into block discard. If a
-  deployment opts into `[features] information = true`,
-  `guest-get-fsinfo` emits an opaque per-superblock identifier
-  (`fs-1`, `fs-2`, …) in `name` shared by all aliases of a superblock
-  and never publishes raw mount sources (such as FUSE or network URLs)
-  or device numbers; enabling `information` also enables
+  CVMs unless the guest explicitly opts into block discard (trim
+  open-failure errors still keep alternate aliases and device numbers in
+  guest-local logs only). If a deployment opts into
+  `[features] information = true`, `guest-get-fsinfo` lists only mounts
+  visible in the mount tree (so each advertised path selects that row's
+  superblock) and emits an opaque per-superblock identifier (`fs-1`,
+  `fs-2`, …) in `name` shared by all visible aliases of a superblock and
+  never publishes raw mount sources (such as FUSE or network URLs) or
+  device numbers. Each `fs-N` identifier is valid only within that
+  single reply (rebuilt in mount-table order on each call, so removing
+  an earlier mount can assign an old number to a different filesystem);
+  controllers should group aliases within one reply and use provisioned
+  mount paths across requests. Enabling `information` also enables
   `guest-get-osinfo` and `guest-network-get-interfaces`.
 - **Single-freezer assumption (v1).** Design §4.2 assumes qeminga is the
   sole freezer in the guest. A host-requested `guest-fsfreeze-thaw`

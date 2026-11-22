@@ -8,6 +8,33 @@ semantic versioning.
 
 ### Security
 
+- CVM first-release disclosure boundaries and single-freezer guidance
+  (design §4.2, §4.4, §4.5, §5.9, AC27, T6.9, #53):
+  - `packaging/README.md` now installs `packaging/config-data-protection.toml`
+    as the CVM installation default (disabling inventory and `guest-fstrim`
+    together), documents that `guest-fstrim` replies independently list
+    eligible mount paths even when `information = false`, and states the v1
+    single-freezer assumption explicitly (`OQ-11`).
+    `packaging/config-data-protection.toml` is bundled in the release
+    candidate manifest.
+  - `guest-get-fsinfo` omits mounts covered in the mount tree (reusing
+    `FreezePlan::restrict_to`'s visibility resolution so every advertised
+    `mountpoint` selects its row's superblock and `statfs` never attributes
+    covering sizes) and emits an opaque per-superblock `fs-N` identifier
+    valid within that single reply instead of raw mount sources or device
+    numbers.
+  - All freeze/thaw lifecycle errors (`guest-fsfreeze-freeze`,
+    `guest-fsfreeze-freeze-list`, `guest-fsfreeze-thaw`, including in-flight
+    abort/join, rollback, marker failure, and recovery thaw) emit only
+    `GenericError`, a fixed reason (without configured timeout durations),
+    accurate recovery state (reporting pending recovery without claiming a
+    retained marker while preparation is unresolved), and target counts;
+    mount names, alternate paths, device numbers, marker paths, and
+    configured timeouts remain in guest-local diagnostics only.
+    `guest-fstrim` similarly keeps alternate aliases and device numbers out
+    of per-path open-failure wire errors.
+- `rustix` 1.1.4 → 1.1.6 in `Cargo.lock` for RUSTSEC-2026-0486 (xattr
+  zero-length buffer soundness; dev-dependency-only via `tempfile`/`proptest`).
 - tokio 1.53.1 → 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd::new` and related
   constructors violate I/O safety). The channel no longer calls the
   deprecated constructors: `kernel::async_fd::OwnedAsyncFd` registers the
@@ -34,9 +61,12 @@ semantic versioning.
   walk is still inside `FIFREEZE` when the deadline expires is aborted;
   the targets frozen so far are thawed through their descriptors while
   the blocked call is still awaited, the request fails with a
-  `GenericError` naming the target in flight, and the marker, the frozen
-  gate and the freeze-safe audit mode stay until the operation settles
-  (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
+  `GenericError` carrying a fixed cause, recovery state and counts (with
+  the in-flight target and configured timeout duration logged locally in
+  guest diagnostics), and once preparation has created the marker, the
+  marker, the frozen gate and the freeze-safe audit mode stay until the
+  operation settles (design §4.4 "Operation deadline", §5.9, OQ-8
+  freeze-walk part, #39, #53).
 
 ### Added
 

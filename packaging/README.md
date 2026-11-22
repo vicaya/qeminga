@@ -103,9 +103,12 @@ mount names, alternate paths, device numbers or marker paths).
   advertised path round-trips byte-exact to its row without lossy
   `U+FFFD` collisions while full-guest freeze stays byte-exact for
   still-reachable raw non-UTF-8 directory paths, opening targets with
-  metadata-only `O_PATH` and verifying both device and mount ID via
-  `statx(STATX_MNT_ID)` before `fstatfs(2)`, and erroring on a non-empty
-  mount table with no recognizable `/` root) and emits an opaque
+  metadata-only `O_PATH`, verifying both device and mount ID via
+  `statx(STATX_MNT_ID)` with `/proc/self/fdinfo/<fd>` fallback on Linux
+  5.4–5.7 before `fstatfs(2)`, discarding sizes if the open
+  `/proc/self/mountinfo` descriptor reports a mount-namespace change via
+  `ppoll(POLLPRI)`, and erroring on a non-empty mount table with no
+  recognizable `/` root) and emits an opaque
   per-superblock identifier (`fs-1`, `fs-2`, …) in `name` shared by all
   visible valid-UTF-8 aliases of a superblock and never publishes raw
   mount sources (such as FUSE or network URLs) or device numbers. Each

@@ -2,11 +2,13 @@
 //!
 //! `guest-get-fsinfo` opens each advertised mount point with `O_PATH |
 //! O_NOFOLLOW | O_CLOEXEC` and checks both the superblock `(major, minor)`
-//! and the mount ID (`STATX_MNT_ID`, column 1 of `/proc/self/mountinfo`) on
-//! that descriptor before issuing `fstatfs(2)`. Verifying the mount ID in
-//! addition to `st_dev` catches same-device mount replacements such as two
-//! XFS bind mounts carrying different project quotas, whose `fstatfs(2)`
-//! block counts differ despite sharing `st_dev`.
+//! and the mount ID (`STATX_MNT_ID`, column 1 of `/proc/self/mountinfo`,
+//! falling back to a bounded read of `/proc/self/fdinfo/<fd>` on stock
+//! Linux 5.4–5.7 where `STATX_MNT_ID` is absent) on that descriptor before
+//! issuing `fstatfs(2)`. Verifying the mount ID in addition to `st_dev`
+//! catches same-device mount replacements such as two XFS bind mounts
+//! carrying different project quotas, whose `fstatfs(2)` block counts differ
+//! despite sharing `st_dev`.
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 

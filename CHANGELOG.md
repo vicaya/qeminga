@@ -24,13 +24,17 @@ semantic versioning.
     omitting non-representable mounts so every advertised `mountpoint`
     round-trips byte-exact without lossy `U+FFFD` collisions, while
     full-guest freeze stays byte-exact for still-reachable raw non-UTF-8
-    directory paths), opens each target once with a metadata-only
-    `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor and verifies both
-    superblock device and mount ID (`statx(STATX_MNT_ID)`) before calling
-    `fstatfs(2)` (preserving sizes on regular-file bind mounts, avoiding
-    automount activation, and omitting sizes if either differs or cannot
-    be verified), and emits an opaque per-superblock `fs-N` identifier
-    valid within that single reply instead of raw mount sources or device
+    directory paths), keeps `/proc/self/mountinfo` open across the walk,
+    opens each target once with a metadata-only
+    `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor, verifies both superblock
+    device and mount ID (`statx(STATX_MNT_ID)` on Linux 5.8+, falling back
+    to a bounded 4 KiB read of `/proc/self/fdinfo/<fd>` on Linux 5.4–5.7)
+    before calling `fstatfs(2)` (preserving sizes on regular-file bind
+    mounts and avoiding automount activation), checks `ppoll(POLLPRI)`
+    (latched on first change) before and after each target so racing
+    replacements — including unmount-and-rebind mount-ID recycling — omit
+    sizes, and emits an opaque per-superblock `fs-N` identifier valid
+    within that single reply instead of raw mount sources or device
     numbers.
   - All freeze/thaw lifecycle errors (`guest-fsfreeze-freeze`,
     `guest-fsfreeze-freeze-list`, `guest-fsfreeze-thaw`, including in-flight

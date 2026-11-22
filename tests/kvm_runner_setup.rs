@@ -231,6 +231,7 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "SystemCallErrorNumber=EPERM",
         "SystemCallFilter=@system-service",
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+        "RemoveIPC=yes",
         "UMask=0077",
         "KillMode=control-group",
         "MemoryMax=80%",

@@ -8,9 +8,10 @@
 #   - Unprivileged per-user libvirt (qemu:///session) with user-mode networking
 #     (libslirp): zero root privileges, zero host bridges, completely isolated
 #     from any qemu:///system VMs on the donor's machine.
-#   - Kernel-enforced systemd sandboxing: NoNewPrivs, empty CapabilityBoundingSet,
-#     ProtectSystem=strict, ProtectHome=yes, PrivateTmp=yes, ProtectProc=invisible,
-#     DevicePolicy=closed + DeviceAllow=/dev/kvm rw, RestrictNamespaces=yes,
+#   - Kernel-enforced systemd sandboxing: NoNewPrivileges=yes, empty
+#     CapabilityBoundingSet=, ProtectSystem=strict, ProtectHome=yes,
+#     PrivateTmp=yes, ProtectProc=invisible, DevicePolicy=closed +
+#     DeviceAllow=/dev/kvm rw, RestrictNamespaces=yes, RemoveIPC=yes,
 #     SystemCallArchitectures=native, SystemCallFilter=@system-service, UMask=0077,
 #     MemoryMax=80%, TasksMax=512, and cgroup IPAddressDeny blocking cloud
 #     instance metadata (169.254.0.0/16, fe80::/10, fc00::/7) and RFC1918 LANs.
@@ -943,6 +944,7 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 RestrictRealtime=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RemoveIPC=yes
 SystemCallArchitectures=native
 SystemCallErrorNumber=EPERM
 SystemCallFilter=@system-service
@@ -1137,7 +1139,7 @@ ensure_service_user() {
         groups="$(id -nG "$OPT_USER")"
         for g in $groups; do
             case "$g" in
-                root | sudo | wheel | admin | docker | libvirt | adm | disk | shadow | lxd | podman)
+                root | sudo | wheel | admin | docker | libvirt | libvirt-qemu | adm | disk | shadow | lxd | podman | systemd-journal)
                     die "existing user $OPT_USER belongs to privileged group '$g'; refusing to reuse"
                     ;;
             esac
@@ -1252,14 +1254,13 @@ cmd_install() {
     fi
 
     # Download, SHA-256 verify, and extract actions/runner.
-    local tarball
+    local tarball fetch_args=()
     tarball="$(mktemp /tmp/qeminga-actions-runner.XXXXXX.tar.gz)"
     trap 'rm -f "${tarball:-}"' EXIT
-    OPT_DEST="$tarball"
-    cmd_fetch_runner --arch "$arch" --dest "$tarball" \
-        --version "$OPT_RUNNER_VERSION" \
-        ${OPT_RUNNER_SHA256:+--sha256 "$OPT_RUNNER_SHA256"} \
-        ${OPT_URL:+--url "$OPT_URL"}
+    fetch_args=(--arch "$arch" --dest "$tarball" --version "$OPT_RUNNER_VERSION")
+    if [ -n "$OPT_RUNNER_SHA256" ]; then fetch_args+=(--sha256 "$OPT_RUNNER_SHA256"); fi
+    if [ -n "$OPT_URL" ]; then fetch_args+=(--url "$OPT_URL"); fi
+    cmd_fetch_runner "${fetch_args[@]}"
 
     install -d -m 0755 -o root -g root "$OPT_INSTALL_DIR"
     tar --no-same-owner -xzf "$tarball" -C "$OPT_INSTALL_DIR"
@@ -1335,8 +1336,13 @@ cmd_install() {
 
     systemctl daemon-reload
     if [ "$OPT_NO_START" -eq 0 ]; then
-        systemctl enable --now "${OPT_SERVICE}.service"
-        say "${OPT_SERVICE}.service is enabled and started"
+        if [ "$OPT_EPHEMERAL" -eq 1 ]; then
+            systemctl start "${OPT_SERVICE}.service"
+            say "${OPT_SERVICE}.service started (ephemeral one-shot; not enabled across reboot)"
+        else
+            systemctl enable --now "${OPT_SERVICE}.service"
+            say "${OPT_SERVICE}.service is enabled and started"
+        fi
     else
         say "--no-start set; inspect ${unit_path}, then run: sudo systemctl enable --now ${OPT_SERVICE}.service"
     fi
@@ -1387,13 +1393,13 @@ cmd_update() {
     local arch
     arch="$(normalize_arch "$(uname -m)")"
 
-    local tarball
+    local tarball fetch_args=()
     tarball="$(mktemp /tmp/qeminga-actions-runner-update.XXXXXX.tar.gz)"
     trap 'rm -f "${tarball:-}"' EXIT
-    cmd_fetch_runner --arch "$arch" --dest "$tarball" \
-        --version "$OPT_RUNNER_VERSION" \
-        ${OPT_RUNNER_SHA256:+--sha256 "$OPT_RUNNER_SHA256"} \
-        ${OPT_URL:+--url "$OPT_URL"}
+    fetch_args=(--arch "$arch" --dest "$tarball" --version "$OPT_RUNNER_VERSION")
+    if [ -n "$OPT_RUNNER_SHA256" ]; then fetch_args+=(--sha256 "$OPT_RUNNER_SHA256"); fi
+    if [ -n "$OPT_URL" ]; then fetch_args+=(--url "$OPT_URL"); fi
+    cmd_fetch_runner "${fetch_args[@]}"
 
     local was_active=0
     if systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then

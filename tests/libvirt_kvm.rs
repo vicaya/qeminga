@@ -538,7 +538,9 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
 
     let kvm = job(&text, "kvm");
     assert!(kvm.contains("needs: candidate"));
-    assert!(kvm.contains("runs-on: [self-hosted, linux, ${{ inputs.runner_arch }}, qeminga-kvm]"));
+    assert!(
+        kvm.contains(r#"runs-on: [self-hosted, linux, "${{ inputs.runner_arch }}", qeminga-kvm]"#)
+    );
     assert!(kvm.contains("cancel-in-progress: false"));
     assert!(kvm.contains("timeout-minutes:"));
     assert!(kvm.contains("persist-credentials: false"));
@@ -564,4 +566,28 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     let upload_idx = kvm.find("actions/upload-artifact").unwrap();
     let upload_step = &kvm[kvm[..upload_idx].rfind("- name:").unwrap()..upload_idx];
     assert!(upload_step.contains("if: always()"), "{upload_step}");
+
+    // Validate strict YAML syntax for both workflow files when Ruby Psych is installed.
+    let has_ruby = Command::new("ruby")
+        .args(["-ryaml", "-e", "exit 0"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if has_ruby {
+        for rel in [
+            ".github/workflows/libvirt-kvm.yml",
+            ".github/workflows/libvirt-kvm-lane.yml",
+        ] {
+            let path = root().join(rel);
+            let out = Command::new("ruby")
+                .args(["-ryaml", "-e", "YAML.load_file(ARGV[0])"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "invalid YAML in {rel}:\n{}",
+                self::text(&out)
+            );
+        }
+    }
 }

@@ -82,7 +82,7 @@ jobs:
 
   kvm:
     name: libvirt KVM smoke
-    runs-on: [self-hosted, linux, ${{ inputs.runner_arch }}, qeminga-kvm]
+    runs-on: [self-hosted, linux, "${{ inputs.runner_arch }}", qeminga-kvm]
     needs: candidate
     concurrency:
       group: qeminga-kvm-${{ inputs.arch }}

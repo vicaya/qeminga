@@ -529,6 +529,7 @@ cmd_fetch_image() {
         fi
         if [ "$(sha256_of "$tmp")" != "$sha" ]; then
             echo "  digest $(sha256_of "$tmp") is not the pinned one; ignored"
+            rm -f "$tmp"
             continue
         fi
         mv "$tmp" "$dest"
@@ -538,6 +539,7 @@ cmd_fetch_image() {
         fi
         return 0
     done
+    rm -f "$tmp"
     die "no source has the pinned image $sha"
 }
 
@@ -548,12 +550,15 @@ cmd_image_key() {
 }
 
 fetch_image() {
-    local arch="$1" dest="$2" cache="$3" file url urls=()
+    local arch="$1" dest="$2" cache="$3" file url urls=() fetch_args=()
     file="$(image_file_of "$arch")"
     for url in $IMAGE_SOURCES; do urls+=("$url/$file"); done
     say "guest image $file ($IMAGE_RELEASE)"
-    cmd_fetch_image --sha256 "$(image_sha_of "$arch")" --dest "$dest" \
-        ${cache:+--cache "$cache"} -- "${urls[@]}"
+    fetch_args=(--sha256 "$(image_sha_of "$arch")" --dest "$dest")
+    if [ -n "$cache" ]; then
+        fetch_args+=(--cache "$cache")
+    fi
+    cmd_fetch_image "${fetch_args[@]}" -- "${urls[@]}"
 }
 
 wait_for_guest() {

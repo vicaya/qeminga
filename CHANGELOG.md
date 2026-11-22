@@ -8,14 +8,55 @@ semantic versioning.
 
 ### Security
 
-- tokio 1.53.1 → 1.53.3 for RUSTSEC-2026-0386 (`AsyncFd::new` and related
-  constructors violate I/O safety). The channel no longer calls the
-  deprecated constructors: `kernel::async_fd::OwnedAsyncFd` registers the
-  channel's `OwnedFd` with the `unsafe` `AsyncFd::register` (tokio's own
-  recommended pattern for an owned descriptor; no safe constructor
-  exists) and keeps its contract by construction, owning the descriptor
-  and never handing out `&mut` access to it. The `unsafe` stays in
-  `src/kernel/` (design §5.6).
+- CVM first-release disclosure boundaries and single-freezer guidance
+  (design §4.2, §4.4, §4.5, §5.9, AC27, T6.9, #53):
+  - `packaging/README.md` now installs `packaging/config-data-protection.toml`
+    as the CVM installation default (disabling inventory and `guest-fstrim`
+    together), documents that `guest-fstrim` replies independently list
+    eligible mount paths even when `information = false`, and states the v1
+    single-freezer (`OQ-11`) and mount-binding (§§4.5, 5.9) assumptions
+    explicitly. `packaging/config-data-protection.toml` is bundled in the
+    release candidate manifest.
+  - `guest-get-fsinfo` lists only mounts that are both visible in the mount
+    tree (reusing `FreezePlan::restrict_to`'s visibility resolution and
+    returning an explicit error on a non-empty mount table lacking a `/`
+    root) and valid UTF-8 (preferring visible UTF-8 bind aliases and
+    omitting non-representable mounts so every advertised `mountpoint`
+    round-trips byte-exact without lossy `U+FFFD` collisions, while
+    full-guest freeze stays byte-exact for still-reachable raw non-UTF-8
+    directory paths), keeps `/proc/self/mountinfo` open across the walk,
+    opens each target once with a metadata-only
+    `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor, verifies both superblock
+    device and mount ID (`statx(STATX_MNT_ID)` on Linux 5.8+, falling back
+    to a bounded 4 KiB read of `/proc/self/fdinfo/<fd>` on Linux 5.4–5.7)
+    before calling `fstatfs(2)` (preserving sizes on regular-file bind
+    mounts and avoiding automount activation), checks `ppoll(POLLPRI)`
+    (latched on first change) before and after each target so racing
+    replacements — including unmount-and-rebind mount-ID recycling — omit
+    sizes, and emits an opaque per-superblock `fs-N` identifier valid
+    within that single reply instead of raw mount sources or device
+    numbers.
+  - All freeze/thaw lifecycle errors (`guest-fsfreeze-freeze`,
+    `guest-fsfreeze-freeze-list`, `guest-fsfreeze-thaw`, including in-flight
+    abort/join, rollback, marker failure, and recovery thaw) emit only
+    `GenericError`, a fixed reason (without configured timeout durations),
+    accurate recovery state (using fixed `abort accepted, recovery pending`
+    wording without stale state or marker claims across the unsettled join
+    window and during unresolved preparation), and target counts; mount
+    names, alternate paths, device numbers, marker paths, and configured
+    timeouts remain in guest-local diagnostics only. `guest-fstrim`
+    similarly keeps alternate aliases and device numbers out of per-path
+    open-failure wire errors.
+- `rustix` 1.1.4 → 1.1.6 in `Cargo.lock` for RUSTSEC-2026-0486 (xattr
+  zero-length buffer soundness; dev-dependency-only via `tempfile`/`proptest`).
+- tokio 1.53.1 → 1.53.3 in `Cargo.lock` and `fuzz/Cargo.lock` for
+  RUSTSEC-2026-0386 (`AsyncFd::new` and related constructors violate I/O
+  safety). The channel no longer calls the deprecated constructors:
+  `kernel::async_fd::OwnedAsyncFd` registers the channel's `OwnedFd` with
+  the `unsafe` `AsyncFd::register` (tokio's own recommended pattern for an
+  owned descriptor; no safe constructor exists) and keeps its contract by
+  construction, owning the descriptor and never handing out `&mut` access to
+  it. The `unsafe` stays in `src/kernel/` (design §5.6).
 
 ### Added
 
@@ -34,9 +75,12 @@ semantic versioning.
   walk is still inside `FIFREEZE` when the deadline expires is aborted;
   the targets frozen so far are thawed through their descriptors while
   the blocked call is still awaited, the request fails with a
-  `GenericError` naming the target in flight, and the marker, the frozen
-  gate and the freeze-safe audit mode stay until the operation settles
-  (design §4.4 "Operation deadline", OQ-8 freeze-walk part, #39).
+  `GenericError` carrying a fixed cause, recovery state and counts (with
+  the in-flight target and configured timeout duration logged locally in
+  guest diagnostics), and once preparation has created the marker, the
+  marker, the frozen gate and the freeze-safe audit mode stay until the
+  operation settles (design §4.4 "Operation deadline", §5.9, OQ-8
+  freeze-walk part, #39, #53).
 
 ### Added
 

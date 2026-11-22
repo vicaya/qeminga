@@ -161,7 +161,11 @@ fn channel_eof_then_reopen_preserves_state() {
     } else {
         let desc = thawed["error"]["desc"].as_str().unwrap_or_default();
         assert!(
-            desc.contains("EPERM") || desc.contains("EACCES"),
+            (desc.contains("permission denied")
+                || desc.contains("target unreachable; no FITHAW issued"))
+                && desc.contains("state frozen, marker retained")
+                && !desc.contains("/frozen")
+                && !desc.contains("/etc/"),
             "unexpected thaw failure: {thawed}"
         );
         assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");

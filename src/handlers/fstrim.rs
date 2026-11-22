@@ -67,8 +67,22 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
                 let mountpoint = target.mountpoint.as_path();
                 let path = mountpoint.to_string_lossy().into_owned();
                 let outcome = match open_target(kernel, target) {
-                    Ok(mount) => kernel.fitrim(&mount, minimum).map_err(|err| err.to_string()),
-                    Err(attempts) => Err(format!("no mount point leads to it ({attempts})")),
+                    Ok(mount) => kernel.fitrim(&mount, minimum).map_err(|err| {
+                        let detail = err.to_string();
+                        (detail.clone(), detail)
+                    }),
+                    Err(err) => {
+                        let host = if err.permission_denied {
+                            "target open permission denied; no FITRIM issued"
+                        } else {
+                            "target unreachable; no FITRIM issued"
+                        };
+                        let detail = format!(
+                            "no mount point leads to {}:{} ({}); no FITRIM issued",
+                            target.dev.0, target.dev.1, err.detail
+                        );
+                        Err((host.to_owned(), detail))
+                    }
                 };
                 match outcome {
                     Ok(trimmed) => TrimResult {
@@ -77,13 +91,18 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
                         minimum: Some(trimmed.minimum),
                         error: None,
                     },
-                    Err(error) => {
-                        tracing::warn!(event = "fstrim_failed", mountpoint = %mountpoint.display(), error, "trim failed");
+                    Err((host_error, detail)) => {
+                        tracing::warn!(
+                            event = "fstrim_failed",
+                            mountpoint = %mountpoint.display(),
+                            error = %detail,
+                            "trim failed"
+                        );
                         TrimResult {
                             path,
                             trimmed: None,
                             minimum: None,
-                            error: Some(error),
+                            error: Some(host_error),
                         }
                     }
                 }
@@ -304,29 +323,66 @@ mod tests {
     #[tokio::test]
     async fn a_hidden_target_is_trimmed_through_an_alias_and_an_unreachable_one_reports_it() {
         // bind_mounts.txt: / (8:1; /var/www, /mnt/rootbind) and /data
-        // (8:2; /srv/exports). /data now leads elsewhere, so 8:2 is
-        // trimmed through /srv/exports and still reported as /data; no
-        // pathname of 8:1 opens on it, which is that entry's error.
-        let (ctx, kernel) = rig_with(FreezeState::Thawed, Config::default(), "bind_mounts.txt");
+        // (8:2; /srv/exports). With `information = false` and `fstrim = true`,
+        // /data leads elsewhere so 8:2 is trimmed through /srv/exports and
+        // still reported as /data; no pathname of 8:1 opens on it, which
+        // reports a fixed open-failure reason on the wire while keeping
+        // alternate aliases and device numbers in guest-local logs (PR #57).
+        #[derive(Clone, Default)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let cfg = Config::parse("[features]\ninformation = false\nfstrim = true\n").unwrap();
+        let (ctx, kernel) = rig_with(FreezeState::Thawed, cfg.clone(), "bind_mounts.txt");
         kernel.script_mount_device("/data", (8, 9));
-        for path in ["/", "/var/www", "/mnt/rootbind"] {
+        kernel.script_mount_device("/", (8, 7));
+        for path in ["/var/www", "/mnt/rootbind"] {
             kernel.script_open_error(path, Errno::ENOENT);
         }
         kernel.script_trim("/srv/exports", Ok(77));
-        let value = handle(&ctx, &req(r#"{"execute":"guest-fstrim"}"#))
-            .await
-            .unwrap();
+        let sink = Sink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::WARN,
+            router.clone(),
+        ));
+        let value = {
+            use tracing::instrument::WithSubscriber;
+            handle(&ctx, &req(r#"{"execute":"guest-fstrim"}"#))
+                .with_subscriber(dispatch)
+                .await
+                .unwrap()
+        };
+        assert!(
+            router.settle(std::time::Duration::from_secs(1)),
+            "audit writer did not settle"
+        );
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+
         let paths = value["paths"].as_array().unwrap();
         assert_eq!(paths.len(), 2);
         assert_eq!(paths[0]["path"], "/");
         let error = paths[0]["error"].as_str().unwrap();
+        assert_eq!(error, "target unreachable; no FITRIM issued");
+        for forbidden in ["/var/www", "/mnt/rootbind", "8:1", "8:7", "ENOENT"] {
+            assert!(
+                !error.contains(forbidden),
+                "trim wire error disclosed {forbidden:?}: {error:?}"
+            );
+        }
         assert!(
-            error.starts_with("no mount point leads to it (/: cannot open mountpoint: ENOENT"),
-            "{error}"
-        );
-        assert!(
-            error.contains("/mnt/rootbind: cannot open mountpoint: ENOENT"),
-            "{error}"
+            logs.contains("/var/www")
+                && logs.contains("/mnt/rootbind")
+                && logs.contains("8:1")
+                && logs.contains("8:7"),
+            "guest-local log must retain alias and device diagnostics: {logs}"
         );
         assert_eq!(paths[1]["path"], "/data");
         assert_eq!(paths[1]["trimmed"], 77);
@@ -335,6 +391,24 @@ mod tests {
             kernel.calls().contains(&Call::Open("/data".into(), (8, 2))),
             "the first pathname was tried and refused"
         );
+
+        // When every mount point fails with EACCES/EPERM, emit the fixed
+        // permission-denied open reason without aliases.
+        let (ctx, kernel) = rig_with(FreezeState::Thawed, cfg, "bind_mounts.txt");
+        for path in ["/", "/var/www", "/mnt/rootbind"] {
+            kernel.script_open_error(path, Errno::EACCES);
+        }
+        let value = handle(&ctx, &req(r#"{"execute":"guest-fstrim"}"#))
+            .await
+            .unwrap();
+        let error = value["paths"][0]["error"].as_str().unwrap();
+        assert_eq!(error, "target open permission denied; no FITRIM issued");
+        for forbidden in ["/var/www", "/mnt/rootbind", "8:1", "EACCES"] {
+            assert!(
+                !error.contains(forbidden),
+                "trim wire error disclosed {forbidden:?}: {error:?}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
@@ -166,6 +167,115 @@ fn parse_line(line: &[u8]) -> Option<MountEntry> {
     })
 }
 
+/// Observes whether the mount namespace has changed since a
+/// [`MountSnapshot`] was opened.
+///
+/// Implementations latch once a change is observed: Linux's
+/// `/proc/self/mountinfo` `POLLPRI` notification resets its per-descriptor
+/// event watermark on the first poll that reports a change
+/// (`fs/proc_namespace.c`), so callers checking before and after each target
+/// rely on the monitor staying tripped for the remainder of the walk.
+pub trait MountNamespaceMonitor: Send {
+    /// Returns `true` if any mount-namespace event occurred since the
+    /// snapshot descriptor was opened (or if change detection failed).
+    fn has_changed(&mut self) -> bool;
+}
+
+/// Static monitor that never reports a mount-namespace change (fixtures and
+/// tests).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NeverChanged;
+
+impl MountNamespaceMonitor for NeverChanged {
+    fn has_changed(&mut self) -> bool {
+        false
+    }
+}
+
+/// Keeps the `/proc/self/mountinfo` descriptor open across a sample and polls
+/// it with non-blocking `ppoll(POLLPRI)` to detect any mount, unmount, move,
+/// or `pivot_root` event (including unmount-and-rebind mount-ID recycling).
+struct ProcMountMonitor {
+    file: File,
+    changed: bool,
+}
+
+impl MountNamespaceMonitor for ProcMountMonitor {
+    fn has_changed(&mut self) -> bool {
+        if self.changed {
+            return true;
+        }
+        if poll_mountinfo_changed(self.file.as_fd()) {
+            self.changed = true;
+        }
+        self.changed
+    }
+}
+
+fn revents_indicate_mount_change(revents: nix::poll::PollFlags) -> bool {
+    use nix::poll::PollFlags;
+    revents.intersects(
+        PollFlags::POLLPRI | PollFlags::POLLERR | PollFlags::POLLHUP | PollFlags::POLLNVAL,
+    )
+}
+
+fn poll_mountinfo_changed(fd: BorrowedFd<'_>) -> bool {
+    use nix::errno::Errno;
+    use nix::poll::{PollFd, PollFlags, ppoll};
+    use nix::sys::time::TimeSpec;
+
+    let timeout = TimeSpec::new(0, 0);
+    loop {
+        let mut fds = [PollFd::new(fd, PollFlags::POLLPRI)];
+        match ppoll(&mut fds, Some(timeout), None) {
+            Ok(0) => return false,
+            Ok(_) => {
+                // Unknown bits or any error flag fail closed.
+                let revents = fds[0].revents().unwrap_or(PollFlags::POLLERR);
+                return revents_indicate_mount_change(revents);
+            }
+            Err(Errno::EINTR) => continue,
+            Err(_) => return true,
+        }
+    }
+}
+
+/// A parsed mount-table snapshot paired with a mount-namespace change
+/// monitor anchored to the `/proc/self/mountinfo` descriptor that produced
+/// it.
+pub struct MountSnapshot {
+    /// Parsed entries in mount order.
+    pub entries: Vec<MountEntry>,
+    monitor: Box<dyn MountNamespaceMonitor>,
+}
+
+impl MountSnapshot {
+    /// Wraps parsed entries with [`NeverChanged`] (fixtures and tests).
+    pub fn static_entries(entries: Vec<MountEntry>) -> Self {
+        Self {
+            entries,
+            monitor: Box::new(NeverChanged),
+        }
+    }
+
+    /// Wraps parsed entries with a custom mount-namespace monitor (tests).
+    pub fn with_monitor(entries: Vec<MountEntry>, monitor: Box<dyn MountNamespaceMonitor>) -> Self {
+        Self { entries, monitor }
+    }
+
+    /// Returns `true` if the mount namespace changed since this snapshot was
+    /// opened (latched once observed).
+    pub fn has_changed(&mut self) -> bool {
+        self.monitor.has_changed()
+    }
+
+    /// Borrows the parsed entries and change monitor disjointly so callers
+    /// can walk the snapshot while polling for namespace changes.
+    pub fn split_mut(&mut self) -> (&[MountEntry], &mut dyn MountNamespaceMonitor) {
+        (&self.entries, self.monitor.as_mut())
+    }
+}
+
 /// Where the mount table comes from; production reads
 /// `/proc/self/mountinfo`, tests use fixtures.
 pub trait MountSource: Send + Sync {
@@ -175,6 +285,12 @@ pub trait MountSource: Send + Sync {
     /// Parsed entries in mount order.
     fn mounts(&self) -> Result<Vec<MountEntry>, Error> {
         Ok(parse_mountinfo(self.read_mountinfo()?))
+    }
+
+    /// Parsed entries paired with a mount-namespace change monitor anchored
+    /// to the underlying `mountinfo` descriptor when available.
+    fn mount_snapshot(&self) -> Result<MountSnapshot, Error> {
+        Ok(MountSnapshot::static_entries(self.mounts()?))
     }
 }
 
@@ -194,16 +310,16 @@ impl MountSource for ProcMounts {
     fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
         read_mountinfo_bounded(Path::new(MOUNTINFO_PATH))
     }
+
+    fn mount_snapshot(&self) -> Result<MountSnapshot, Error> {
+        read_mountinfo_snapshot(Path::new(MOUNTINFO_PATH))
+    }
 }
 
-/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`], byte for byte.
-pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+fn read_bounded_from_file(file: &File, path: &Path) -> Result<Vec<u8>, Error> {
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| {
-            f.take(MOUNTINFO_MAX_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)
-        })
+    file.take(MOUNTINFO_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
         .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
     if bytes.len() > MOUNTINFO_MAX_BYTES {
         return Err(Error::Internal(format!(
@@ -212,6 +328,83 @@ pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
         )));
     }
     Ok(bytes)
+}
+
+/// Reads a mount table under [`MOUNTINFO_MAX_BYTES`], byte for byte.
+pub fn read_mountinfo_bounded(path: &Path) -> Result<Vec<u8>, Error> {
+    let file = File::open(path)
+        .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
+    read_bounded_from_file(&file, path)
+}
+
+/// Opens `path`, reads it under [`MOUNTINFO_MAX_BYTES`], parses the mount
+/// table, and keeps the open descriptor so `ppoll(POLLPRI)` can detect any
+/// mount-namespace change from `open(2)` onward.
+pub fn read_mountinfo_snapshot(path: &Path) -> Result<MountSnapshot, Error> {
+    let file = File::open(path)
+        .map_err(|err| Error::Internal(format!("cannot read {}: {err}", path.display())))?;
+    let bytes = read_bounded_from_file(&file, path)?;
+    Ok(MountSnapshot {
+        entries: parse_mountinfo(&bytes),
+        monitor: Box::new(ProcMountMonitor {
+            file,
+            changed: false,
+        }),
+    })
+}
+
+/// Explicit bound on `/proc/self/fdinfo/<fd>` reads used for the Linux
+/// 5.4–5.7 `mnt_id` fallback. The kernel emits `pos`, `flags` and `mnt_id`
+/// in the first ~100 bytes ahead of any per-fd lock lines; reading a fixed
+/// prefix keeps memory bounded even on files carrying many locks.
+pub const FDINFO_MAX_BYTES: usize = 4096;
+
+/// Extracts the `mnt_id` field from `/proc/self/fdinfo/<fd>` bytes.
+///
+/// Looks for a line starting with `mnt_id:` followed by ASCII whitespace and
+/// a base-10 `u32`. Never panics on arbitrary bytes.
+pub fn parse_fdinfo_mnt_id(bytes: &[u8]) -> Option<u32> {
+    for raw_line in bytes.split(|&b| b == b'\n') {
+        let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+        let Some(rest) = line.strip_prefix(b"mnt_id:") else {
+            continue;
+        };
+        let trimmed = rest.trim_ascii();
+        if trimmed.is_empty() || !trimmed.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        return std::str::from_utf8(trimmed).ok()?.parse().ok();
+    }
+    None
+}
+
+/// Reads `mnt_id` for an open descriptor from `/proc/self/fdinfo/<fd>`
+/// under [`FDINFO_MAX_BYTES`].
+///
+/// Used as the Linux 5.4–5.7 fallback when `statx(2)` succeeds without
+/// setting `STATX_MNT_ID` (which arrived in Linux 5.8). Returns `None` on
+/// any I/O or parse failure so callers fail closed.
+pub fn read_fdinfo_mnt_id(fd: BorrowedFd<'_>) -> Option<u32> {
+    let path = format!("/proc/self/fdinfo/{}", fd.as_raw_fd());
+    read_fdinfo_mnt_id_from_path(Path::new(&path))
+}
+
+fn read_fdinfo_mnt_id_from_path(path: &Path) -> Option<u32> {
+    let file = File::open(path).ok()?;
+    let mut bytes = Vec::new();
+    // Read one extra byte so we know whether the prefix truncated a line.
+    file.take(FDINFO_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    let slice = if bytes.len() > FDINFO_MAX_BYTES {
+        let end = bytes[..FDINFO_MAX_BYTES]
+            .iter()
+            .rposition(|&b| b == b'\n')?;
+        &bytes[..end]
+    } else {
+        &bytes[..]
+    };
+    parse_fdinfo_mnt_id(slice)
 }
 
 /// A fixed mount table (tests and fixtures).
@@ -421,6 +614,110 @@ mod tests {
         assert!(entries.iter().any(|e| e.fs_type == "proc"));
     }
 
+    #[test]
+    fn parse_fdinfo_mnt_id_extracts_id_and_rejects_malformed_lines() {
+        assert_eq!(
+            parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t010000000\nmnt_id:\t308\nino:\t1\n"),
+            Some(308)
+        );
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:   0\r\n"), Some(0));
+        assert_eq!(parse_fdinfo_mnt_id(b"pos:\t0\nflags:\t0\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t-1\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t+42\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t42 extra\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t4294967296\n"), None);
+        assert_eq!(parse_fdinfo_mnt_id(b"mnt_id:\t\n"), None);
+    }
+
+    #[test]
+    fn read_fdinfo_mnt_id_is_bounded_and_reads_real_o_path_descriptors() {
+        use std::os::fd::AsFd;
+
+        // Real O_PATH descriptors on `/` and on a regular file.
+        let mounts = ProcMounts.mounts().unwrap();
+        let visible = crate::freeze_plan::visible_mounts(&mounts).unwrap();
+        let root = visible
+            .into_iter()
+            .find(|m| m.mount_point == Path::new("/"))
+            .expect("visible `/` row");
+        let root_fd = nix::fcntl::open(
+            Path::new("/"),
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        assert_eq!(read_fdinfo_mnt_id(root_fd.as_fd()), Some(root.mount_id));
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let file_fd = nix::fcntl::open(
+            file.path(),
+            nix::fcntl::OFlag::O_PATH
+                | nix::fcntl::OFlag::O_NOFOLLOW
+                | nix::fcntl::OFlag::O_CLOEXEC,
+            nix::sys::stat::Mode::empty(),
+        )
+        .unwrap();
+        assert!(read_fdinfo_mnt_id(file_fd.as_fd()).is_some());
+
+        // Bounded prefix still parses `mnt_id:` ahead of many lock lines.
+        let dir = tempfile::tempdir().unwrap();
+        let with_locks = dir.path().join("with_locks");
+        let mut content = b"pos:\t0\nflags:\t010000000\nmnt_id:\t42\n".to_vec();
+        content.extend(std::iter::repeat_n(b'x', FDINFO_MAX_BYTES * 2));
+        std::fs::write(&with_locks, &content).unwrap();
+        assert_eq!(read_fdinfo_mnt_id_from_path(&with_locks), Some(42));
+
+        // A `mnt_id:` line straddling the FDINFO_MAX_BYTES boundary is dropped
+        // rather than parsed as a truncated integer.
+        let truncated = dir.path().join("truncated");
+        let mut trunc_bytes = vec![b'a'; FDINFO_MAX_BYTES - 12];
+        trunc_bytes.push(b'\n');
+        trunc_bytes.extend_from_slice(b"mnt_id:\t123456\n");
+        std::fs::write(&truncated, &trunc_bytes).unwrap();
+        assert_eq!(read_fdinfo_mnt_id_from_path(&truncated), None);
+
+        assert_eq!(
+            read_fdinfo_mnt_id_from_path(&dir.path().join("missing")),
+            None
+        );
+    }
+
+    #[test]
+    fn mount_snapshot_tracks_unchanged_proc_mountinfo_and_enforces_size_bound() {
+        let mut snapshot = ProcMounts.mount_snapshot().unwrap();
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|e| e.mount_point == Path::new("/"))
+        );
+        assert!(
+            !snapshot.has_changed(),
+            "unchanged /proc/self/mountinfo must not report a namespace change"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'#'; MOUNTINFO_MAX_BYTES + 1]).unwrap();
+        assert!(read_mountinfo_snapshot(&big).is_err());
+        assert!(read_mountinfo_snapshot(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn poll_mountinfo_revents_detects_change_on_pollpri_or_error() {
+        use nix::poll::PollFlags;
+        assert!(!revents_indicate_mount_change(PollFlags::empty()));
+        assert!(!revents_indicate_mount_change(PollFlags::POLLIN));
+        assert!(revents_indicate_mount_change(PollFlags::POLLPRI));
+        assert!(revents_indicate_mount_change(
+            PollFlags::POLLPRI | PollFlags::POLLERR
+        ));
+        assert!(revents_indicate_mount_change(PollFlags::POLLERR));
+        assert!(revents_indicate_mount_change(PollFlags::POLLHUP));
+        assert!(revents_indicate_mount_change(PollFlags::POLLNVAL));
+    }
+
     proptest! {
         #[test]
         fn parser_never_panics(text in "\\PC*") {
@@ -433,6 +730,13 @@ mod tests {
             let entries = parse_mountinfo(&bytes);
             prop_assert!(entries.len() <= bytes.iter().filter(|&&b| b == b'\n').count() + 1);
             let _ = unescape(&bytes);
+            let _ = parse_fdinfo_mnt_id(&bytes);
+        }
+
+        #[test]
+        fn fdinfo_mnt_id_round_trips(id in any::<u32>()) {
+            let sample = format!("pos:\t0\nflags:\t010000000\nmnt_id:\t{id}\nino:\t1\n");
+            prop_assert_eq!(parse_fdinfo_mnt_id(sample.as_bytes()), Some(id));
         }
 
         #[test]

@@ -50,7 +50,7 @@ SOURCE_REPOSITORY="vicaya/qeminga"
 BUILD_COMMAND="cargo build --release --locked --features seccomp"
 SUITE="libvirt-tcg-smoke-v1"
 MANDATORY_TESTS="production_install accelerator_tcg libvirt_interop agent_shutdown"
-PACKAGING_FILES="packaging/systemd/qeminga.service packaging/udev/99-qeminga.rules packaging/sysusers.d/qeminga.conf packaging/tmpfiles.d/qeminga.conf packaging/config.toml"
+PACKAGING_FILES="packaging/systemd/qeminga.service packaging/udev/99-qeminga.rules packaging/sysusers.d/qeminga.conf packaging/tmpfiles.d/qeminga.conf packaging/config.toml packaging/config-data-protection.toml"
 CONNECT="--connect=qemu:///system"
 IMAGES="${QEMINGA_E2E_IMAGES:-/var/lib/libvirt/images}"
 

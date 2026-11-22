@@ -493,17 +493,22 @@ fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
     LinuxKernel
         .fithaw(&raw)
         .expect("FITHAW on the raw-byte path");
-    // The daemon: startup, fsinfo (lossy name), freeze-list, thaw.
+    // The daemon: startup, fsinfo (omits non-UTF-8 alias so no lossy U+FFFD
+    // path is advertised for selection; advertises valid UTF-8 `mount`),
+    // freeze-list, thaw.
     let mut agent = Agent::spawn_with(real_kernel(""));
     let lossy = dir.to_string_lossy().into_owned();
     assert!(lossy.contains('\u{fffd}'));
     let fsinfo = agent.execute("guest-get-fsinfo");
-    let reported = fsinfo["return"]
-        .as_array()
-        .unwrap()
+    let entries = fsinfo["return"].as_array().unwrap();
+    assert!(
+        !entries.iter().any(|fs| fs["mountpoint"] == lossy),
+        "fsinfo must not advertise non-UTF-8 mountpoint lossily: {fsinfo}"
+    );
+    let reported = entries
         .iter()
-        .find(|fs| fs["mountpoint"] == lossy)
-        .unwrap_or_else(|| panic!("fsinfo lists the mount lossily: {fsinfo}"));
+        .find(|fs| fs["mountpoint"] == mount)
+        .unwrap_or_else(|| panic!("fsinfo advertises the valid UTF-8 mountpoint: {fsinfo}"));
     assert_eq!(reported["type"], "ext4");
     let reply = freeze_list(&mut agent, &[mount.clone(), lossy]);
     assert_eq!(
@@ -516,6 +521,50 @@ fn privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze() {
     assert!(thawed["return"].as_u64().unwrap() >= 1, "{thawed}");
     std::fs::write(dir.join("after"), b"ok").unwrap();
     assert!(agent.stop().success());
+}
+
+#[test]
+#[ignore = "needs root and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_fsinfo_discards_sizes_on_mount_namespace_change() {
+    // Design §4.5, AC27: keeping the `/proc/self/mountinfo` descriptor open
+    // across a `guest-get-fsinfo` walk and polling it via `ppoll(POLLPRI)`
+    // detects real kernel mount-namespace events (closing unmount-and-rebind
+    // mount-ID recycling) and latches across subsequent checks even after the
+    // kernel resets `m->poll_event` on the first poll.
+    use qeminga::handlers::fsinfo::{SystemStatfs, fs_info_with_monitor};
+    use qeminga::mountinfo::{MountSource, ProcMounts};
+
+    let mount = ext4_mount();
+    let base = std::path::Path::new(&mount).parent().unwrap().to_path_buf();
+    let mut snapshot = ProcMounts.mount_snapshot().unwrap();
+    assert!(
+        !snapshot.has_changed(),
+        "unchanged mount namespace must not trip POLLPRI"
+    );
+
+    let _bind = BindMount::of(&mount, base.join("qeminga-pollpri-bind"));
+    assert!(
+        snapshot.has_changed(),
+        "creating a mount must trip POLLPRI on the open /proc/self/mountinfo fd"
+    );
+    assert!(
+        snapshot.has_changed(),
+        "ProcMountMonitor must stay latched after the first POLLPRI poll"
+    );
+
+    let (entries, monitor) = snapshot.split_mut();
+    let info = fs_info_with_monitor(entries, &SystemStatfs, monitor).unwrap();
+    assert!(!info.is_empty());
+    for entry in &info {
+        assert_eq!(
+            entry.total_bytes, None,
+            "total_bytes must be omitted after mount namespace change: {entry:?}"
+        );
+        assert_eq!(
+            entry.used_bytes, None,
+            "used_bytes must be omitted after mount namespace change: {entry:?}"
+        );
+    }
 }
 
 #[test]
@@ -715,9 +764,20 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
     let desc = reply["error"]["desc"]
         .as_str()
         .unwrap_or_else(|| panic!("{reply}"));
-    assert!(desc.contains("no mount point leads to"), "{desc}");
-    assert!(desc.contains("not on the planned"), "{desc}");
-    assert!(desc.contains("marker retained"), "{desc}");
+    assert!(
+        desc.contains("target unreachable; no FITHAW issued"),
+        "{desc}"
+    );
+    assert!(desc.contains("state frozen, marker retained"), "{desc}");
+    assert!(!desc.contains(&mount), "wire error must hide mount: {desc}");
+    assert!(
+        !desc.contains(&format!("{}:{}", ext4.0, ext4.1)),
+        "wire error must hide device numbers: {desc}"
+    );
+    assert!(
+        !desc.contains("/frozen"),
+        "wire error must hide marker path: {desc}"
+    );
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
     assert!(agent.state_dir().join("frozen").exists(), "marker retained");
     drop(hidden);
@@ -736,6 +796,9 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         ),
         "thawed once reachable"
     );
+    // The successful thaw flushed the audit ring; the unreachable-target
+    // detail stays in guest-local diagnostics.
+    agent.wait_for_stderr("not on the planned", e2e::REPLY_TIMEOUT);
     assert!(agent.stop().success());
 }
 

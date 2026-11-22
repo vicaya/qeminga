@@ -79,6 +79,24 @@ pub enum MarkerError {
     },
 }
 
+impl MarkerError {
+    /// Fixed host-facing reason without the configured marker path (design
+    /// §5.9, AC27). The full [`std::fmt::Display`] text belongs in
+    /// guest-local diagnostics only.
+    pub fn host_reason(&self) -> &'static str {
+        match self {
+            MarkerError::InvalidPath { .. } => "invalid recovery marker path",
+            MarkerError::Directory { .. } => "recovery marker directory unavailable",
+            MarkerError::AlreadyPresent { .. } => "recovery marker already exists",
+            MarkerError::Absent { .. } => "recovery marker is absent",
+            MarkerError::Io { op: "open", .. } => "recovery marker open failed",
+            MarkerError::Io { op: "fsync", .. } => "recovery marker fsync failed",
+            MarkerError::Io { op: "unlink", .. } => "recovery marker unlink failed",
+            MarkerError::Io { .. } => "recovery marker I/O failed",
+        }
+    }
+}
+
 /// Handle to the marker file: its pinned directory and its name in it.
 #[derive(Debug, Clone)]
 pub struct Marker {
@@ -465,5 +483,55 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent", marker.path()).unwrap();
         assert!(marker.exists());
         assert_eq!(marker.path(), dir.path().join("frozen"));
+    }
+
+    #[test]
+    fn host_reason_never_discloses_marker_path() {
+        let marker_path = PathBuf::from("/run/tenant-alpha/frozen-marker");
+        let cases = [
+            MarkerError::InvalidPath {
+                path: marker_path.clone(),
+            },
+            MarkerError::Directory {
+                path: marker_path.clone(),
+                errno: Errno::EACCES,
+            },
+            MarkerError::AlreadyPresent {
+                path: marker_path.clone(),
+            },
+            MarkerError::Absent {
+                path: marker_path.clone(),
+            },
+            MarkerError::Io {
+                path: marker_path.clone(),
+                op: "open",
+                errno: Errno::EIO,
+            },
+            MarkerError::Io {
+                path: marker_path.clone(),
+                op: "fsync",
+                errno: Errno::EIO,
+            },
+            MarkerError::Io {
+                path: marker_path.clone(),
+                op: "unlink",
+                errno: Errno::EPERM,
+            },
+            MarkerError::Io {
+                path: marker_path.clone(),
+                op: "other",
+                errno: Errno::EIO,
+            },
+        ];
+        for err in cases {
+            let reason = err.host_reason();
+            assert!(!reason.is_empty(), "{err:?}");
+            assert!(!reason.contains("tenant-alpha"), "{reason}");
+            assert!(!reason.contains("frozen-marker"), "{reason}");
+            assert!(
+                err.to_string().contains("frozen-marker"),
+                "Display still carries full guest-local diagnostic: {err}"
+            );
+        }
     }
 }

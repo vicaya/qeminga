@@ -71,8 +71,8 @@ struct Guest {
     /// Signalled when the connection to the agent is lost (a crash, a
     /// reboot): an in-flight request fails instead of waiting for ever.
     lost: Notify,
-    /// The guest's mount table (a fixture name).
-    mounts: &'static str,
+    /// The guest's mount table contents.
+    mounts: String,
     /// The data-protection profile (§5.9): information, shutdown and trim
     /// off, so `guest-get-fsinfo` is not there to discover with.
     data_protection: bool,
@@ -85,15 +85,19 @@ impl Guest {
     }
 
     fn with_mounts(mounts: &'static str) -> Arc<Guest> {
+        Self::build(fixture(mounts), false)
+    }
+
+    fn with_mount_table(mounts: String) -> Arc<Guest> {
         Self::build(mounts, false)
     }
 
     /// A guest under `packaging/config-data-protection.toml`'s switches.
     fn data_protection() -> Arc<Guest> {
-        Self::build("simple.txt", true)
+        Self::build(fixture("simple.txt"), true)
     }
 
-    fn build(mounts: &'static str, data_protection: bool) -> Arc<Guest> {
+    fn build(mounts: String, data_protection: bool) -> Arc<Guest> {
         let kernel = Arc::new(FakeKernel::new());
         kernel.track_freeze_depth();
         let guest = Arc::new(Guest {
@@ -135,7 +139,7 @@ impl Guest {
                 marker,
             )
             .with_kernel(self.kernel.clone() as Arc<dyn KernelOps>)
-            .with_mounts(Arc::new(StaticMounts(fixture(self.mounts))))
+            .with_mounts(Arc::new(StaticMounts(self.mounts.clone())))
             .with_freeze_clock(Arc::new(self.clock.clone()))
             .with_freeze_operation_timeout(Duration::from_secs(OPERATION_SECS)),
         );
@@ -936,4 +940,173 @@ async fn a_hidden_mount_point_cannot_stand_in_for_an_unprotected_requirement() {
     assert_eq!(guest.state(), FreezeState::Thawed);
     assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
     assert!(!guest.dir.path().join("frozen").exists());
+}
+
+#[tokio::test(start_paused = true)]
+async fn inventory_selection_through_freeze_protects_covered_superblock_via_visible_alias() {
+    // PR #57 review [P1]: on `hidden_mount.txt` (8:3 mounted over 8:2 at
+    // /data, while 8:2 remains reachable at /data-alias), a controller
+    // following §4.5 picks one mount point per opaque `fs-N` from
+    // `guest-get-fsinfo` and passes those names to `guest-fsfreeze-freeze-list`.
+    // Every advertised mount point must select the superblock named by its
+    // row, so choosing the advertised mount points for all three superblocks
+    // freezes 8:1 (/), 8:2 (/data-alias) and 8:3 (/data) — never leaving 8:2
+    // writable behind a duplicate /data entry.
+    let guest = Guest::with_mounts("hidden_mount.txt");
+    let reply = guest
+        .request(r#"{"execute":"guest-get-fsinfo"}"#)
+        .await
+        .unwrap();
+    let entries = reply["return"].as_array().expect("fsinfo array");
+    // Group by opaque `name` within this single reply (§4.5 step 1), keeping
+    // the first mount point for each distinct superblock.
+    let mut selected_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let id = entry["name"].as_str().unwrap().to_owned();
+        let mp = entry["mountpoint"].as_str().unwrap().to_owned();
+        selected_by_id.entry(id).or_insert(mp);
+    }
+    let mountpoints: Vec<String> = selected_by_id.into_values().collect();
+    assert_eq!(
+        mountpoints.iter().filter(|m| m.as_str() == "/data").count(),
+        1,
+        "covered /data must not be advertised under two opaque IDs: {entries:?}"
+    );
+    assert!(
+        mountpoints.iter().any(|m| m == "/data-alias"),
+        "covered superblock must be selected via its visible alias: {mountpoints:?}"
+    );
+    let req_paths: Vec<&str> = mountpoints.iter().map(String::as_str).collect();
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &req_paths).await.unwrap();
+    let opened_before_thaw: Vec<(std::path::PathBuf, (u32, u32))> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open(p, dev) => Some((p, dev)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        opened_before_thaw.contains(&(std::path::PathBuf::from("/data-alias"), (8, 2))),
+        "8:2 frozen through /data-alias: {opened_before_thaw:?}"
+    );
+    assert!(
+        opened_before_thaw.contains(&(std::path::PathBuf::from("/data"), (8, 3))),
+        "8:3 frozen through /data: {opened_before_thaw:?}"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 3);
+    cycle.cut("vol-all", Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-all".to_owned()]
+        }
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn inventory_selection_through_freeze_avoids_non_utf8_fffd_collision_and_full_freeze_stays_byte_exact()
+ {
+    // PR #57 review [P1]: if 8:2 is mounted at raw non-UTF-8 `/mnt/caf\351`
+    // (with a valid UTF-8 bind alias `/mnt/cafe-utf8`) while 8:3 is mounted at
+    // literal UTF-8 `/mnt/caf\u{fffd}`, advertising a lossy `/mnt/caf\u{fffd}`
+    // for 8:2 would collide with 8:3 and let a controller accept a snapshot
+    // while 8:2 remained writable. Discovery must advertise `/mnt/cafe-utf8`
+    // for 8:2, omit `/mnt/only-raw\377` (8:4, no representable UTF-8 alias),
+    // and never emit a non-round-tripping mountpoint; full-guest freeze stays
+    // byte-exact and still freezes 8:4.
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let table = concat!(
+        "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+        "54 27 8:2 / /mnt/caf\\351 rw,relatime - ext4 /dev/sda2 rw\n",
+        "55 27 8:2 / /mnt/cafe-utf8 rw,relatime - ext4 /dev/sda2 rw\n",
+        "56 27 8:3 / /mnt/caf\u{fffd} rw,relatime - ext4 /dev/sda3 rw\n",
+        "57 27 8:4 / /mnt/only-raw\\377 rw,relatime - ext4 /dev/sda4 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::with_mount_table(table);
+    let reply = guest
+        .request(r#"{"execute":"guest-get-fsinfo"}"#)
+        .await
+        .unwrap();
+    let entries = reply["return"].as_array().expect("fsinfo array");
+    let mut selected_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let id = entry["name"].as_str().unwrap().to_owned();
+        let mp = entry["mountpoint"].as_str().unwrap().to_owned();
+        selected_by_id.entry(id).or_insert(mp);
+    }
+    let mountpoints: Vec<String> = selected_by_id.into_values().collect();
+    assert_eq!(
+        mountpoints,
+        vec![
+            "/".to_owned(),
+            "/mnt/cafe-utf8".to_owned(),
+            "/mnt/caf\u{fffd}".to_owned(),
+        ]
+    );
+    let req_paths: Vec<&str> = mountpoints.iter().map(String::as_str).collect();
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &req_paths).await.unwrap();
+    let opened: Vec<(std::path::PathBuf, (u32, u32))> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open(p, dev) => Some((p, dev)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        opened.contains(&(std::path::PathBuf::from("/mnt/cafe-utf8"), (8, 2))),
+        "8:2 must be frozen via its valid UTF-8 alias: {opened:?}"
+    );
+    assert!(
+        opened.contains(&(std::path::PathBuf::from("/mnt/caf\u{fffd}"), (8, 3))),
+        "8:3 must be frozen via its literal U+FFFD mountpoint: {opened:?}"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 3);
+    cycle.cut("vol-utf8", Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-utf8".to_owned()]
+        }
+    );
+
+    // Full-guest freeze (no mountpoints filter) stays byte-exact and freezes
+    // all 4 superblocks, including 8:4 at raw bytes `/mnt/only-raw\xff`.
+    let frozen = guest
+        .request(r#"{"execute":"guest-fsfreeze-freeze"}"#)
+        .await
+        .unwrap();
+    assert_eq!(frozen["return"], json!(4));
+    let opened_all: Vec<(std::path::PathBuf, (u32, u32))> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open(p, dev) => Some((p, dev)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        opened_all.contains(&(
+            std::path::PathBuf::from(OsStr::from_bytes(b"/mnt/only-raw\xff")),
+            (8, 4),
+        )),
+        "full-guest freeze must open raw non-UTF-8 mountpoint byte-exact: {opened_all:?}"
+    );
+    let thawed = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(thawed["return"], json!(4));
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
 }

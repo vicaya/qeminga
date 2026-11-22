@@ -45,15 +45,18 @@ fn flood_of_1000_pings_within_one_second_is_rate_limited_and_status_still_served
     let status = agent.execute("guest-fsfreeze-status");
     assert_eq!(status["return"], "thawed");
     // The thaw is a recovery drain from Thawed: with CAP_SYS_ADMIN it
-    // succeeds; unprivileged (CI runner) FITHAW is denied, which is
-    // reported but leaves the state Thawed.
+    // succeeds; unprivileged (CI runner) FITHAW is denied, and in
+    // containers with single-file bind mounts opening that target is
+    // unreachable. Either way the failure is reported without disclosing
+    // paths and leaves the state Thawed.
     let thaw = agent.execute("guest-fsfreeze-thaw");
+    let desc = thaw["error"]["desc"].as_str().unwrap_or("");
     assert!(
         thaw.get("return").is_some()
-            || thaw["error"]["desc"]
-                .as_str()
-                .unwrap_or("")
-                .contains("EPERM"),
+            || ((desc.contains("permission denied")
+                || desc.contains("target unreachable; no FITHAW issued"))
+                && desc.contains("state thawed")
+                && !desc.contains("/etc/")),
         "{thaw}"
     );
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "thawed");

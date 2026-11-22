@@ -1,0 +1,76 @@
+# libvirt + QEMU KVM smoke lane (#53, AC16) on self-hosted x86_64 and aarch64
+# KVM runners (provisioned with scripts/setup-kvm-runner.sh).
+#
+# Security: NEVER triggered by pull_request, pull_request_target, or comments
+# because this repository is public and community members may donate runners.
+# Only maintainers with write access can dispatch it via workflow_dispatch,
+# and each runner additionally enforces a root-owned pre-job allowlist hook.
+#
+# Each architecture builds its release candidate on a GitHub-hosted ephemeral
+# runner, then exercises that exact SHA-256-anchored binary on the matching
+# self-hosted KVM runner (no sudo, no Rust toolchain, unprivileged
+# qemu:///session). tests/libvirt_kvm.rs checks both workflow files' shape and
+# scripts/ci/libvirt-kvm-smoke.sh's fail-closed logic.
+name: libvirt KVM smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: Architecture(s) to exercise on self-hosted KVM runners
+        type: choice
+        default: both
+        options:
+          - both
+          - x86_64
+          - aarch64
+      source_sha:
+        description: Optional full 40-char commit SHA to build and test (defaults to dispatched commit)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate dispatch inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - name: Validate source_sha
+        id: resolve
+        env:
+          INPUT_SOURCE_SHA: ${{ inputs.source_sha }}
+          DEFAULT_SHA: ${{ github.sha }}
+        run: |
+          sha="${INPUT_SOURCE_SHA:-$DEFAULT_SHA}"
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha must be a full 40-character lowercase hex commit SHA"
+            exit 1
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  x86_64:
+    name: x86_64
+    needs: validate
+    if: inputs.arch == 'both' || inputs.arch == 'x86_64'
+    uses: ./.github/workflows/libvirt-kvm-lane.yml
+    with:
+      arch: x86_64
+      build_runner: ubuntu-24.04
+      runner_arch: X64
+      source_sha: ${{ needs.validate.outputs.sha }}
+
+  aarch64:
+    name: aarch64
+    needs: validate
+    if: inputs.arch == 'both' || inputs.arch == 'aarch64'
+    uses: ./.github/workflows/libvirt-kvm-lane.yml
+    with:
+      arch: aarch64
+      build_runner: ubuntu-24.04-arm
+      runner_arch: ARM64
+      source_sha: ${{ needs.validate.outputs.sha }}

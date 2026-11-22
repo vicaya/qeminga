@@ -1,0 +1,139 @@
+# One architecture's libvirt + QEMU KVM smoke lane (#53, AC16), called by
+# libvirt-kvm.yml once per architecture so neither architecture waits for or
+# depends on the other.
+#
+# `candidate` builds the production binary on a GitHub-hosted ephemeral runner
+# and reports its SHA-256 as a job output. `kvm` runs completely unprivileged
+# on a self-hosted KVM runner (no sudo, no apt-get, no Rust toolchain),
+# refuses any binary whose digest differs from the build job's output, boots
+# a disposable Ubuntu 24.04 guest under qemu:///session + KVM, proves KVM is
+# active, installs the candidate, runs scripts/e2e-libvirt.sh, shuts the guest
+# down through the agent, cleans up, and uploads result.json + diagnostics.
+name: libvirt KVM smoke lane
+
+on:
+  workflow_call:
+    inputs:
+      arch:
+        description: uname -m of the target architecture (x86_64 or aarch64)
+        type: string
+        required: true
+      build_runner:
+        description: GitHub-hosted runner label that builds the release candidate
+        type: string
+        required: true
+      runner_arch:
+        description: RUNNER_ARCH value (X64 or ARM64)
+        type: string
+        required: true
+      source_sha:
+        description: Exact 40-hex commit SHA to build and test
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  candidate:
+    name: candidate
+    runs-on: ${{ inputs.build_runner }}
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native ${{ inputs.arch }} machine
+        run: |
+          test "$(uname -m)" = "${{ inputs.arch }}"
+          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
+          rustc -vV | grep -qx "host: ${{ inputs.arch }}-unknown-linux-gnu"
+      - name: Release build
+        run: cargo build --release --locked --features seccomp
+      - name: Digest of the built binary
+        id: digest
+        run: echo "sha256=$(sha256sum target/release/qeminga | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - name: Candidate and manifest
+        env:
+          ARCH: ${{ inputs.arch }}
+          RUNNER_LABEL: ${{ inputs.build_runner }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
+          scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
+            --binary target/release/qeminga --arch "$ARCH" --source-sha "$SOURCE_SHA" \
+            --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner "$RUNNER_LABEL"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-kvm-${{ inputs.arch }}
+          path: candidate/
+          if-no-files-found: error
+
+  kvm:
+    name: libvirt KVM smoke
+    runs-on: [self-hosted, linux, ${{ inputs.runner_arch }}, qeminga-kvm]
+    needs: candidate
+    concurrency:
+      group: qeminga-kvm-${{ inputs.arch }}
+      cancel-in-progress: false
+    timeout-minutes: 30
+    env:
+      ARCH: ${{ inputs.arch }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      OUT: ${{ github.workspace }}/libvirt-kvm-out
+      QEMINGA_E2E_CONNECT: qemu:///session
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: The runner is a native ${{ inputs.arch }} machine
+        run: |
+          test "$(uname -m)" = "${{ inputs.arch }}"
+          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-kvm-${{ inputs.arch }}
+          path: candidate
+      - name: Boot, prove KVM, install, AC16, agent shutdown
+        run: |
+          cache="${QEMINGA_E2E_IMAGE_CACHE:-$GITHUB_WORKSPACE/libvirt-kvm-image-cache}"
+          mkdir -p "$cache"
+          scripts/ci/libvirt-kvm-smoke.sh run --arch "$ARCH" \
+            --candidate candidate --source-sha "$SOURCE_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
+            --image-cache "$cache" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Clean up this run's domain and disks
+        if: always()
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$ARCH" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Result summary
+        if: always()
+        run: |
+          {
+            echo "## libvirt KVM smoke ($ARCH)"
+            echo
+            echo '```json'
+            cat "$OUT/result.json" 2>/dev/null || echo '{"result": "missing"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvirt-kvm-smoke-${{ inputs.arch }}
+          path: ${{ env.OUT }}/
+          if-no-files-found: error

@@ -19,9 +19,13 @@ use nix::errno::Errno;
 pub struct MountIdentity {
     /// Superblock `(major, minor)` (`stx_dev_major`, `stx_dev_minor`).
     pub dev: (u32, u32),
-    /// Mount ID matching column 1 of `/proc/self/mountinfo` (`stx_mnt_id`),
-    /// `Some` only when the kernel sets `STATX_MNT_ID` in `stx_mask` and
-    /// the value fits in `u32`.
+    /// Mount ID matching column 1 of `/proc/self/mountinfo`.
+    ///
+    /// Populated from `statx(2)`'s `stx_mnt_id` when the kernel sets
+    /// `STATX_MNT_ID` in `stx_mask` (Linux 5.8+, provided the value fits
+    /// in `u32`), or from a bounded read of `/proc/self/fdinfo/<fd>` when
+    /// `STATX_MNT_ID` is absent in `stx_mask` (stock Linux 5.4–5.7).
+    /// `None` if neither source yields a `u32` mount ID.
     pub mount_id: Option<u32>,
 }
 

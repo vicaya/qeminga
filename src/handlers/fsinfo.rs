@@ -182,32 +182,15 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
     !(SKIPPED.contains(&fs_type) || fs_type.starts_with("fuse"))
 }
 
-/// Builds the reply for a mount table.
+/// Builds the reply for a static or stable mount table (convenience wrapper
+/// calling [`fs_info_with_monitor`] with [`NeverChanged`]).
 ///
-/// Only mounts that are both visible at their own mount point in the mount
-/// tree ([`crate::freeze_plan::visible_mounts`]) and valid UTF-8 are emitted,
-/// so every advertised `mountpoint` round-trips byte-exact to its row in
-/// `guest-fsfreeze-freeze-list` and never collides via lossy `U+FFFD`
-/// substitution. A filesystem mounted at a non-UTF-8 path with a visible
-/// valid-UTF-8 bind alias is advertised via that alias; one with no visible
-/// valid-UTF-8 mount point is omitted (full-guest `guest-fsfreeze-freeze`
-/// stays byte-exact and can still freeze an omitted eligible filesystem when
-/// a raw non-UTF-8 directory path still reaches it, whereas one covered at
-/// every alias fails `open_target` with an error). Size queries open each
-/// mount point with a metadata-only `O_PATH | O_NOFOLLOW | O_CLOEXEC`
-/// descriptor, verify both superblock device and mount ID (`statx(2)`
-/// `STATX_MNT_ID` on Linux 5.8+, falling back to a bounded read of
-/// `/proc/self/fdinfo/<fd>` on Linux 5.4–5.7) against the inventory row
-/// before calling `fstatfs(2)`, and omit sizes if either differs, cannot be
-/// verified, or the open `/proc/self/mountinfo` descriptor reports a
-/// mount-namespace change via `ppoll(POLLPRI)`.
-///
-/// Each distinct advertised superblock `(major, minor)` gets an opaque
-/// `fs-<n>` identifier in order of first appearance, shared by all of its
-/// visible valid-UTF-8 aliases. The identifier is valid only within a single
-/// reply (rebuilt on each call); controllers group aliases from one reply and
-/// use provisioned mount paths across requests. Raw mount sources and device
-/// numbers are never placed in the reply (design §4.5, §5.9, AC27).
+/// This helper performs no `/proc/self/mountinfo` `POLLPRI` monitoring and
+/// assumes the mount table stays stable for the duration of the call (e.g.,
+/// fixture tests). Live inventory collection — including [`handle`] — should
+/// use [`fs_info_with_monitor`] paired with [`MountSource::mount_snapshot`]
+/// so mount-namespace changes (including unmount-and-rebind mount-ID
+/// recycling) discard optional sizes.
 pub fn fs_info(
     mounts: &[MountEntry],
     statfs: &dyn StatfsSource,
@@ -218,10 +201,33 @@ pub fn fs_info(
 /// Builds the reply for a mount table while monitoring the open
 /// `/proc/self/mountinfo` descriptor for mount-namespace changes (`POLLPRI`).
 ///
-/// Checking `monitor` before and after each target's `statfs` call catches
-/// mount-namespace changes — including an unmount and same-device rebind that
-/// recycles a `mount_id` — and discards optional size fields for the affected
-/// target and any remaining rows.
+/// Only mounts that are both visible at their own mount point in the mount
+/// tree ([`crate::freeze_plan::visible_mounts`]) and valid UTF-8 are emitted,
+/// so every advertised `mountpoint` round-trips byte-exact to its row in
+/// `guest-fsfreeze-freeze-list` and never collides via lossy `U+FFFD`
+/// substitution. A filesystem mounted at a non-UTF-8 path with a visible
+/// valid-UTF-8 bind alias is advertised via that alias; one with no visible
+/// valid-UTF-8 mount point is omitted (full-guest `guest-fsfreeze-freeze`
+/// stays byte-exact and can still freeze an omitted eligible filesystem when
+/// a raw non-UTF-8 directory path still reaches it, whereas one covered at
+/// every alias fails `open_target` with an error).
+///
+/// Size queries open each mount point with a metadata-only
+/// `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor, verify both superblock
+/// device and mount ID (`statx(2)` `STATX_MNT_ID` on Linux 5.8+, falling
+/// back to a bounded read of `/proc/self/fdinfo/<fd>` on Linux 5.4–5.7)
+/// against the inventory row before calling `fstatfs(2)`, and check
+/// `monitor` before and after each target's `statfs` call so any
+/// mount-namespace change (`ppoll(POLLPRI)`, including an unmount and
+/// same-device rebind that recycles a `mount_id`) discards optional sizes
+/// for that target and skips further size queries for remaining rows.
+///
+/// Each distinct advertised superblock `(major, minor)` gets an opaque
+/// `fs-<n>` identifier in order of first appearance, shared by all of its
+/// visible valid-UTF-8 aliases. The identifier is valid only within a single
+/// reply (rebuilt on each call); controllers group aliases from one reply and
+/// use provisioned mount paths across requests. Raw mount sources and device
+/// numbers are never placed in the reply (design §4.5, §5.9, AC27).
 pub fn fs_info_with_monitor(
     mounts: &[MountEntry],
     statfs: &dyn StatfsSource,

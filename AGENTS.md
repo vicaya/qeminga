@@ -81,10 +81,16 @@ or run the tests unprivileged.
 A separate workflow (`.github/workflows/libvirt-tcg.yml`) runs AC16
 against real libvirt under QEMU's TCG accelerator on both architectures:
 it installs the release candidate of the same run in a disposable guest
-and never builds in the lane. It needs root, libvirt and many minutes of
-emulation, so it is not part of the local checks above; the recipe for
-running it locally is in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`
-(part of `cargo test`) covers its scripts and the workflow's shape.
+and never builds in the lane. A companion `workflow_dispatch`-only
+workflow (`.github/workflows/libvirt-kvm.yml`) runs the same release
+candidate under real KVM on self-hosted `x86_64` and `aarch64` runners
+provisioned with `scripts/setup-kvm-runner.sh` (unprivileged
+`qemu:///session`, zero `sudo`, hardened systemd sandbox and pre-job
+allowlist hook). Neither workflow is part of the local checks above;
+recipes for running them locally and donating a KVM runner are in
+`docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`,
+`tests/libvirt_kvm.rs`, and `tests/kvm_runner_setup.rs` (part of
+`cargo test`) cover their scripts and workflow shapes.
 
 ## Code rules
 

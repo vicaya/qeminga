@@ -24,9 +24,12 @@ pub struct MountIdentity {
 }
 
 /// Queries the superblock device and mount ID of `fd` via `statx(2)` with
-/// `AT_EMPTY_PATH | AT_STATX_DONT_SYNC` and `STATX_MNT_ID`. Works on
-/// metadata-only (`O_PATH`) descriptors for both directories and regular
-/// files without touching backing storage or triggering automounts.
+/// `AT_EMPTY_PATH | AT_STATX_DONT_SYNC` and `STATX_MNT_ID`, falling back to
+/// a bounded read of `/proc/self/fdinfo/<fd>` when `statx(2)` succeeds with
+/// `STATX_MNT_ID` clear (stock Linux 5.4–5.7, before `STATX_MNT_ID` arrived
+/// in Linux 5.8). Works on metadata-only (`O_PATH`) descriptors for both
+/// directories and regular files without touching backing storage or
+/// triggering automounts.
 pub fn fd_mount_identity(fd: BorrowedFd<'_>) -> Result<MountIdentity, Errno> {
     // SAFETY: `nix::libc::statx` is a plain C struct of integer fields, so
     // zero-initialisation is valid; the kernel overwrites it on success.
@@ -47,13 +50,19 @@ pub fn fd_mount_identity(fd: BorrowedFd<'_>) -> Result<MountIdentity, Errno> {
     if rc != 0 {
         return Err(Errno::last());
     }
-    let mount_id = ((stx.stx_mask & nix::libc::STATX_MNT_ID) != 0)
-        .then(|| u32::try_from(stx.stx_mnt_id).ok())
-        .flatten();
+    let mount_id = resolve_mount_id(fd, stx.stx_mask, stx.stx_mnt_id);
     Ok(MountIdentity {
         dev: (stx.stx_dev_major, stx.stx_dev_minor),
         mount_id,
     })
+}
+
+fn resolve_mount_id(fd: BorrowedFd<'_>, stx_mask: u32, stx_mnt_id: u64) -> Option<u32> {
+    if (stx_mask & nix::libc::STATX_MNT_ID) != 0 {
+        u32::try_from(stx_mnt_id).ok()
+    } else {
+        crate::mountinfo::read_fdinfo_mnt_id(fd)
+    }
 }
 
 #[cfg(test)]
@@ -97,7 +106,58 @@ mod tests {
         let file_id = fd_mount_identity(file_fd.as_fd()).unwrap();
         assert!(
             file_id.mount_id.is_some(),
-            "regular-file O_PATH descriptor should report STATX_MNT_ID: {file_id:?}"
+            "regular-file O_PATH descriptor should report mount_id: {file_id:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_mount_id_falls_back_to_fdinfo_when_statx_mnt_id_is_clear() {
+        // On stock Linux 5.4-5.7, statx(2) succeeds with STATX_MNT_ID clear
+        // in stx_mask. Falling back to /proc/self/fdinfo/<fd> preserves sizes
+        // while keeping mount-ID verification on the supported 5.4+ baseline.
+        let mounts = ProcMounts.mounts().unwrap();
+        let visible = crate::freeze_plan::visible_mounts(&mounts).unwrap();
+        let root = visible
+            .into_iter()
+            .find(|m| m.mount_point == Path::new("/"))
+            .expect("visible `/` row in /proc/self/mountinfo");
+        let root_fd = open(
+            Path::new("/"),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_mount_id(root_fd.as_fd(), 0, 0),
+            Some(root.mount_id),
+            "clear STATX_MNT_ID must fall back to /proc/self/fdinfo/<fd> for directories"
+        );
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let file_fd = open(
+            file.path(),
+            OFlag::O_PATH | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let direct = fd_mount_identity(file_fd.as_fd()).unwrap();
+        assert_eq!(
+            resolve_mount_id(file_fd.as_fd(), 0, 0),
+            direct.mount_id,
+            "clear STATX_MNT_ID must fall back to /proc/self/fdinfo/<fd> for regular files"
+        );
+        // When STATX_MNT_ID IS set, trust statx directly and fail closed if out of range.
+        assert_eq!(
+            resolve_mount_id(file_fd.as_fd(), nix::libc::STATX_MNT_ID, 77),
+            Some(77)
+        );
+        assert_eq!(
+            resolve_mount_id(
+                file_fd.as_fd(),
+                nix::libc::STATX_MNT_ID,
+                u64::from(u32::MAX) + 1
+            ),
+            None
         );
     }
 }

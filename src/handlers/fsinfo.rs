@@ -699,7 +699,10 @@ mod tests {
         assert_eq!(paths, ["/", "/data-alias", "/data"]);
         let alias = info.iter().find(|f| f.mountpoint == "/data-alias").unwrap();
         let data = info.iter().find(|f| f.mountpoint == "/data").unwrap();
-        assert_ne!(alias.name, data.name, "8:2 and 8:3 have distinct opaque ids");
+        assert_ne!(
+            alias.name, data.name,
+            "8:2 and 8:3 have distinct opaque ids"
+        );
         assert_eq!(alias.total_bytes, Some(200 * 4096));
         assert_eq!(data.total_bytes, Some(999 * 4096));
         assert_eq!(

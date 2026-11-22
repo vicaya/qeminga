@@ -10,8 +10,9 @@
 //! stale-domain and cleanup namespace guards, the `libvirt-kvm-smoke-v1`
 //! result contract (refusing TCG as a pass), and workflow security invariants
 //! (never triggered by `pull_request` / `pull_request_target`, no `sudo` or
-//! build tools on the self-hosted runner, explicit SHA validation, bounded
-//! concurrency with `cancel-in-progress: false`).
+//! build tools on the self-hosted runner, checks out `$GITHUB_SHA` directly
+//! without a user-controlled ref input, bounded concurrency with
+//! `cancel-in-progress: false`).
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -495,6 +496,22 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         );
     }
     assert!(text.contains("permissions:\n  contents: read"), "{text}");
+    // Never accept a user-controlled ref/SHA input in workflow_dispatch: checking out an
+    // arbitrary SHA in the default branch context risks cache poisoning (CodeQL) and could
+    // check out a commit outside the donor runner's ALLOWED_REFS allowlist.
+    assert!(
+        !text.contains("source_sha:"),
+        "libvirt-kvm.yml must not accept a user-controlled source_sha input:\n{text}"
+    );
+    let lane = lane_workflow();
+    assert!(
+        !lane.contains("source_sha:"),
+        "libvirt-kvm-lane.yml must not accept a source_sha ref input:\n{lane}"
+    );
+    assert!(
+        !lane.contains("ref:"),
+        "libvirt-kvm-lane.yml must check out the dispatched commit without overriding ref:\n{lane}"
+    );
 
     for (arch, build_runner, runner_arch) in [
         ("x86_64", "ubuntu-24.04", "X64"),
@@ -516,7 +533,7 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         );
     }
     assert!(
-        !text.contains("strategy:") && !lane_workflow().contains("strategy:"),
+        !text.contains("strategy:") && !lane.contains("strategy:"),
         "no matrix couples x86_64 and aarch64"
     );
 }
@@ -532,6 +549,10 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     assert!(build.contains("cargo build --release --locked --features seccomp\n"));
     assert!(build.contains("sha256: ${{ steps.digest.outputs.sha256 }}"));
     assert!(build.contains("persist-credentials: false"));
+    assert!(
+        build.contains(r#"--source-sha "$GITHUB_SHA""#),
+        "candidate must stamp manifest with $GITHUB_SHA:\n{build}"
+    );
     for forbidden in ["--all-features", "test-fakes", "seccomp-log"] {
         assert!(!build.contains(forbidden), "candidate: {forbidden}");
     }
@@ -546,6 +567,10 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     assert!(kvm.contains("persist-credentials: false"));
     assert!(kvm.contains(r#"test "$(uname -m)" = "${{ inputs.arch }}""#));
     assert!(kvm.contains(r#"test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}""#));
+    assert!(
+        kvm.contains(r#"--source-sha "$GITHUB_SHA""#),
+        "kvm job must verify candidate against $GITHUB_SHA:\n{kvm}"
+    );
     assert!(kvm.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#));
     assert!(kvm.contains("libvirt-kvm-smoke.sh run"));
     assert!(kvm.contains("libvirt-kvm-smoke.sh cleanup"));

@@ -195,9 +195,10 @@ the host with `render-unit` and `render-hooks`.
    `--cpu-quota`). (`MemoryDenyWriteExecute` is omitted because `.NET`,
    Node.js, and QEMU need JIT mappings.)
 4. **Cgroup BPF egress firewall:** denies cloud instance metadata
-   (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254` via `fc00::/7`),
-   multicast, and private LANs (`10.0.0.0/8`, `172.16.0.0/12`,
-   `192.168.0.0/16`, `100.64.0.0/10`) by default while allowing `localhost`
+   (`169.254.0.0/16`, `fe80::/10`, and AWS IPv6 IMDS `fd00:ec2::254/128`
+   unconditionally, even with `--no-lan-deny`), multicast, and private LANs
+   (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`,
+   `fc00::/7`) by default while allowing `localhost`
    (`systemd-resolved` at `127.0.0.53`). Because QEMU runs in the same
    cgroup, disposable guest VMs inherit the same block. Hosts with a
    private DNS resolver can pass `--allow-ip <ip>/32` (IMDS ranges and

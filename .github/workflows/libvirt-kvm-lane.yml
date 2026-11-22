@@ -26,10 +26,6 @@ on:
         description: RUNNER_ARCH value (X64 or ARM64)
         type: string
         required: true
-      source_sha:
-        description: Exact 40-hex commit SHA to build and test
-        type: string
-        required: true
 
 permissions:
   contents: read
@@ -49,7 +45,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
@@ -67,11 +62,10 @@ jobs:
         env:
           ARCH: ${{ inputs.arch }}
           RUNNER_LABEL: ${{ inputs.build_runner }}
-          SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
           scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
-            --binary target/release/qeminga --arch "$ARCH" --source-sha "$SOURCE_SHA" \
+            --binary target/release/qeminga --arch "$ARCH" --source-sha "$GITHUB_SHA" \
             --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --runner "$RUNNER_LABEL"
       - uses: actions/upload-artifact@v4
@@ -90,13 +84,11 @@ jobs:
     timeout-minutes: 30
     env:
       ARCH: ${{ inputs.arch }}
-      SOURCE_SHA: ${{ inputs.source_sha }}
       OUT: ${{ github.workspace }}/libvirt-kvm-out
       QEMINGA_E2E_CONNECT: qemu:///session
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_sha }}
           persist-credentials: false
       - name: The runner is a native ${{ inputs.arch }} machine
         run: |
@@ -111,7 +103,7 @@ jobs:
           cache="${QEMINGA_E2E_IMAGE_CACHE:-$GITHUB_WORKSPACE/libvirt-kvm-image-cache}"
           mkdir -p "$cache"
           scripts/ci/libvirt-kvm-smoke.sh run --arch "$ARCH" \
-            --candidate candidate --source-sha "$SOURCE_SHA" \
+            --candidate candidate --source-sha "$GITHUB_SHA" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
             --image-cache "$cache" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"

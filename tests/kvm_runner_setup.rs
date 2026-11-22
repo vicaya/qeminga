@@ -245,6 +245,8 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "IPAddressDeny=100.64.0.0/10",
         "IPAddressDeny=fc00::/7",
         "IPAddressDeny=fe80::/10",
+        "IPAddressDeny=fd00:ec2::254/128",
+        "ExecStart=/opt/qeminga-runner/bin/runsvc.sh",
         "Environment=XDG_RUNTIME_DIR=/run/qeminga-kvm-runner",
         "Environment=QEMINGA_E2E_CONNECT=qemu:///session",
         "Environment=LIBVIRT_DEFAULT_URI=qemu:///session",
@@ -258,7 +260,8 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         assert!(unit.contains(required), "missing {required:?} in:\n{unit}");
     }
 
-    // Never root, never docker/libvirt/sudo groups, never MDWE=yes (breaks .NET/Node/QEMU JIT).
+    // Never root, never docker/libvirt/sudo groups, never MDWE=yes (breaks .NET/Node/QEMU JIT),
+    // and never run.sh (which tries to copy run-helper.sh into the read-only install dir).
     for forbidden in [
         "User=root",
         "SupplementaryGroups=libvirt",
@@ -266,6 +269,7 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "SupplementaryGroups=sudo",
         "MemoryDenyWriteExecute=yes",
         "ReadWritePaths=/opt/qeminga-runner\n",
+        "ExecStart=/opt/qeminga-runner/run.sh",
     ] {
         assert!(
             !unit.contains(forbidden),
@@ -305,6 +309,9 @@ fn rendered_units_pass_systemd_analyze_verify() {
     for f in ["run.sh", "config.sh", "env.sh"] {
         write_exec(&fake_install.join(f), "#!/bin/sh\nexit 0\n");
     }
+    std::fs::write(fake_install.join(".env"), b"").unwrap();
+    write_exec(&fake_bin.join("runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_bin.join("Runner.Listener"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_hooks.join("run-jit.sh"), "#!/bin/sh\nexit 0\n");
     let jit_cfg = fake_cfg.join("jitconfig");
     std::fs::write(&jit_cfg, "dummy").unwrap();
@@ -313,6 +320,10 @@ fn rendered_units_pass_systemd_analyze_verify() {
     for (name, extra) in [
         ("default-x86_64.service", vec!["--arch", "x86_64"]),
         ("default-aarch64.service", vec!["--arch", "aarch64"]),
+        (
+            "no-lan-deny.service",
+            vec!["--arch", "aarch64", "--no-lan-deny"],
+        ),
         (
             "ephemeral.service",
             vec!["--arch", "aarch64", "--ephemeral"],
@@ -382,13 +393,14 @@ fn rendered_units_pass_systemd_analyze_verify() {
                 "{rendered}"
             );
             assert!(rendered.contains("Restart=no"), "{rendered}");
+            assert!(rendered.contains("KillSignal=SIGINT"), "{rendered}");
         }
     }
 }
 
 #[test]
 fn unit_options_preserve_security_invariants() {
-    // --ephemeral runs once without restarting and keeps runner binaries read-only.
+    // --ephemeral runs once without restarting and keeps runner binaries and .env read-only.
     let eph = run_setup(&[
         "render-unit",
         "--repo",
@@ -401,6 +413,10 @@ fn unit_options_preserve_security_invariants() {
     let unit = String::from_utf8(eph.stdout).unwrap();
     assert!(unit.contains("Restart=no"), "{unit}");
     assert!(
+        unit.contains("ExecStart=/opt/qeminga-runner/bin/runsvc.sh"),
+        "{unit}"
+    );
+    assert!(
         unit.contains("ReadOnlyPaths=/opt/qeminga-runner/bin"),
         "{unit}"
     );
@@ -408,8 +424,12 @@ fn unit_options_preserve_security_invariants() {
         unit.contains("ReadOnlyPaths=/opt/qeminga-runner/externals"),
         "{unit}"
     );
+    assert!(
+        unit.contains("ReadOnlyPaths=/opt/qeminga-runner/.env"),
+        "{unit}"
+    );
 
-    // --no-lan-deny drops RFC1918 denies while STILL denying cloud IMDS (link-local).
+    // --no-lan-deny drops RFC1918/ULA denies while STILL denying IPv4 and IPv6 cloud IMDS.
     let no_lan = run_setup(&[
         "render-unit",
         "--repo",
@@ -422,8 +442,10 @@ fn unit_options_preserve_security_invariants() {
     let unit = String::from_utf8(no_lan.stdout).unwrap();
     assert!(unit.contains("IPAddressDeny=link-local"), "{unit}");
     assert!(unit.contains("IPAddressDeny=fe80::/10"), "{unit}");
+    assert!(unit.contains("IPAddressDeny=fd00:ec2::254/128"), "{unit}");
     assert!(unit.contains("IPAddressDeny=multicast"), "{unit}");
     assert!(!unit.contains("IPAddressDeny=10.0.0.0/8"), "{unit}");
+    assert!(!unit.contains("IPAddressDeny=fc00::/7"), "{unit}");
 
     // --allow-ip allows a specific private resolver, never cloud IMDS, supernets, or 0.0.0.0/0.
     let ok_ip = run_setup(&[
@@ -1089,4 +1111,392 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
             assert!(!no_fw.status.success(), "aarch64 without AAVMF must fail");
         }
     }
+}
+
+// ---- symlink safety, token-argv hygiene, and read-only launcher -----------
+
+const FAKE_CHOWN: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_CHOWN_LOG:?}"
+exit 0
+"#;
+
+const FAKE_INSTALL: &str = r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_INSTALL_LOG:?}"
+is_dir=0
+mode=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d) is_dir=1; shift ;;
+        -m) mode="$2"; shift 2 ;;
+        -o|-g) shift 2 ;;
+        --) shift; break ;;
+        -*) shift ;;
+        *) break ;;
+    esac
+done
+if [ "$is_dir" -eq 1 ]; then
+    for d in "$@"; do
+        mkdir -p "$d"
+        [ -n "$mode" ] && chmod "$mode" "$d"
+    done
+else
+    src="$1"; dst="$2"
+    cp "$src" "$dst"
+    [ -n "$mode" ] && chmod "$mode" "$dst"
+fi
+"#;
+
+#[test]
+fn lock_runner_permissions_refuses_symlinks_and_non_regular_files() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(&bin.join("chown"), FAKE_CHOWN);
+    write_exec(&bin.join("install"), FAKE_INSTALL);
+
+    let run_lock = |install_dir: &Path, chown_log: &Path, install_log: &Path| -> Output {
+        let path_env = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_USER="qeminga-runner"; OPT_ALLOW_AUTO_UPDATE=0; OPT_EPHEMERAL=0; lock_runner_permissions"#,
+                "_",
+                script().to_str().unwrap(),
+                install_dir.to_str().unwrap(),
+            ])
+            .env("PATH", path_env)
+            .env("FAKE_CHOWN_LOG", chown_log)
+            .env("FAKE_INSTALL_LOG", install_log)
+            .output()
+            .unwrap()
+    };
+
+    // Planted symlinks for any config file, .env, or _diag must fail closed without touching targets.
+    for entry in [
+        ".runner",
+        ".credentials",
+        ".credentials_rsaparams",
+        ".path",
+        ".env",
+    ] {
+        let case_dir = dir
+            .path()
+            .join(format!("sym-{}", entry.trim_start_matches('.')));
+        let install_dir = case_dir.join("runner");
+        std::fs::create_dir_all(&install_dir).unwrap();
+        let victim = case_dir.join("victim");
+        std::fs::write(&victim, b"root-secret").unwrap();
+        std::fs::set_permissions(&victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+        symlink(&victim, install_dir.join(entry)).unwrap();
+
+        let chown_log = case_dir.join("chown.log");
+        let install_log = case_dir.join("install.log");
+        let out = run_lock(&install_dir, &chown_log, &install_log);
+        assert!(
+            !out.status.success(),
+            "symlinked {entry} must be refused: {}",
+            text(&out)
+        );
+        let victim_mode = std::fs::metadata(&victim).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            victim_mode, 0o644,
+            "victim mode must stay untouched for symlinked {entry}"
+        );
+    }
+
+    // Symlinked _diag directory must be refused.
+    let diag_case = dir.path().join("sym-diag");
+    let diag_install = diag_case.join("runner");
+    let victim_dir = diag_case.join("victim-dir");
+    std::fs::create_dir_all(&diag_install).unwrap();
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::set_permissions(&victim_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&victim_dir, diag_install.join("_diag")).unwrap();
+    let out = run_lock(
+        &diag_install,
+        &diag_case.join("chown.log"),
+        &diag_case.join("install.log"),
+    );
+    assert!(
+        !out.status.success(),
+        "symlinked _diag must be refused: {}",
+        text(&out)
+    );
+    assert_eq!(
+        std::fs::metadata(&victim_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+
+    // Symlinked OPT_INSTALL_DIR and symlinked bin/runsvc.sh must be refused.
+    let top_case = dir.path().join("sym-top");
+    let real_top = top_case.join("real");
+    let link_top = top_case.join("link");
+    std::fs::create_dir_all(&real_top).unwrap();
+    symlink(&real_top, &link_top).unwrap();
+    let out = run_lock(
+        &link_top,
+        &top_case.join("chown.log"),
+        &top_case.join("install.log"),
+    );
+    assert!(
+        !out.status.success(),
+        "symlinked OPT_INSTALL_DIR must be refused: {}",
+        text(&out)
+    );
+
+    let svc_case = dir.path().join("sym-runsvc");
+    let svc_install = svc_case.join("runner");
+    std::fs::create_dir_all(svc_install.join("bin")).unwrap();
+    let svc_victim = svc_case.join("victim");
+    std::fs::write(&svc_victim, b"x").unwrap();
+    symlink(&svc_victim, svc_install.join("bin/runsvc.sh")).unwrap();
+    let out = run_lock(
+        &svc_install,
+        &svc_case.join("chown.log"),
+        &svc_case.join("install.log"),
+    );
+    assert!(
+        !out.status.success(),
+        "symlinked bin/runsvc.sh must be refused: {}",
+        text(&out)
+    );
+
+    // Non-regular entries (directories) at .runner or .env must be refused.
+    for entry in [".runner", ".env"] {
+        let case_dir = dir
+            .path()
+            .join(format!("dir-{}", entry.trim_start_matches('.')));
+        let install_dir = case_dir.join("runner");
+        std::fs::create_dir_all(install_dir.join(entry)).unwrap();
+        let out = run_lock(
+            &install_dir,
+            &case_dir.join("chown.log"),
+            &case_dir.join("install.log"),
+        );
+        assert!(
+            !out.status.success(),
+            "non-regular {entry} must be refused: {}",
+            text(&out)
+        );
+    }
+
+    // Clean install directory succeeds, uses chown -h everywhere, and creates .env via install.
+    let clean_case = dir.path().join("clean");
+    let clean_install = clean_case.join("runner");
+    std::fs::create_dir_all(clean_install.join("bin")).unwrap();
+    std::fs::write(clean_install.join(".runner"), b"{}").unwrap();
+    std::fs::write(clean_install.join(".credentials"), b"{}").unwrap();
+    std::fs::write(clean_install.join("bin/runsvc.sh"), b"#!/bin/sh\n").unwrap();
+    let chown_log = clean_case.join("chown.log");
+    let install_log = clean_case.join("install.log");
+    let out = run_lock(&clean_install, &chown_log, &install_log);
+    assert!(out.status.success(), "clean lock failed: {}", text(&out));
+    assert!(clean_install.join(".env").is_file(), ".env created");
+    let chowns = std::fs::read_to_string(&chown_log).unwrap();
+    for line in chowns.lines() {
+        assert!(
+            line.starts_with("-h "),
+            "every chown in lock_runner_permissions must pass -h: {line}"
+        );
+    }
+    let installs = std::fs::read_to_string(&install_log).unwrap();
+    assert!(
+        installs.contains("/dev/null") && installs.contains(".env"),
+        "missing .env must be created via install: {installs}"
+    );
+}
+
+#[test]
+fn registration_and_uninstall_pass_tokens_only_via_inherited_env_never_argv() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // Fake id reports root (uid 0) and existing service user; fake systemctl/chown are no-ops.
+    write_exec(
+        &bin.join("id"),
+        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
+    );
+    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" > "${FAKE_RUNUSER_ARGV:?}"
+printf '%s' "${ACTIONS_RUNNER_INPUT_TOKEN:-}" > "${FAKE_RUNUSER_ENV:?}"
+exit 0
+"#,
+    );
+
+    let install_dir = dir.path().join("runner");
+    let state_dir = dir.path().join("state");
+    let hook_dir = dir.path().join("hooks");
+    let cfg_dir = dir.path().join("cfg");
+    for d in [&install_dir, &state_dir, &hook_dir, &cfg_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_exec(&install_dir.join("config.sh"), "#!/bin/sh\nexit 0\n");
+
+    // 1. Direct test of registration helper run_runner_config_with_token.
+    let reg_argv_log = dir.path().join("runuser-reg.argv");
+    let reg_env_log = dir.path().join("runuser-reg.env");
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let reg = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_USER="qeminga-runner"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; run_runner_config_with_token "SECRET_REG_TOKEN_12345" --unattended --replace --url "https://github.com/vicaya/qeminga""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_RUNUSER_ARGV", &reg_argv_log)
+        .env("FAKE_RUNUSER_ENV", &reg_env_log)
+        .output()
+        .unwrap();
+    assert!(
+        reg.status.success(),
+        "registration helper failed: {}",
+        text(&reg)
+    );
+    let reg_argv = std::fs::read_to_string(&reg_argv_log).unwrap();
+    let reg_env = std::fs::read_to_string(&reg_env_log).unwrap();
+    assert!(
+        !reg_argv.contains("SECRET_REG_TOKEN_12345"),
+        "registration token must NEVER appear in runuser argv: {reg_argv}"
+    );
+    assert!(
+        reg_argv.contains("-w ACTIONS_RUNNER_INPUT_TOKEN"),
+        "runuser must explicitly whitelist ACTIONS_RUNNER_INPUT_TOKEN: {reg_argv}"
+    );
+    assert_eq!(
+        reg_env, "SECRET_REG_TOKEN_12345",
+        "registration token must be delivered via inherited environment"
+    );
+
+    // 2. End-to-end uninstall deregistration test.
+    let token_file = dir.path().join("rm-token");
+    std::fs::write(&token_file, "SECRET_RM_TOKEN_98765\n").unwrap();
+    std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let argv_log = dir.path().join("runuser-uninstall.argv");
+    let env_log = dir.path().join("runuser-uninstall.env");
+    let out = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-test-nonexistent-unit",
+            "--install-dir",
+            install_dir.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--hook-dir",
+            hook_dir.to_str().unwrap(),
+            "--config-dir",
+            cfg_dir.to_str().unwrap(),
+            "--token-file",
+            token_file.to_str().unwrap(),
+        ],
+        &[
+            ("FAKE_RUNUSER_ARGV", argv_log.to_str().unwrap()),
+            ("FAKE_RUNUSER_ENV", env_log.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(out.status.success(), "uninstall failed: {}", text(&out));
+    let argv = std::fs::read_to_string(&argv_log).unwrap();
+    let env_token = std::fs::read_to_string(&env_log).unwrap();
+    assert!(
+        !argv.contains("SECRET_RM_TOKEN_98765"),
+        "removal token must NEVER appear in runuser argv: {argv}"
+    );
+    assert!(
+        argv.contains("-w ACTIONS_RUNNER_INPUT_TOKEN"),
+        "runuser must explicitly whitelist ACTIONS_RUNNER_INPUT_TOKEN: {argv}"
+    );
+    assert_eq!(
+        env_token, "SECRET_RM_TOKEN_98765",
+        "removal token must be delivered via inherited environment"
+    );
+
+    // Registration/deregistration script must never expand ACTIONS_RUNNER_INPUT_TOKEN into command argv.
+    let body = std::fs::read_to_string(script()).unwrap();
+    for line in body.lines() {
+        let trimmed = line.trim();
+        assert!(
+            !(trimmed.contains("ACTIONS_RUNNER_INPUT_TOKEN=$") && !trimmed.starts_with("export ")),
+            "token must never be expanded into command argv: {trimmed}"
+        );
+    }
+}
+
+#[test]
+fn jit_launcher_execs_runner_listener_directly_without_writing_install_dir() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path().join("runner");
+    let bin_dir = install_dir.join("bin");
+    let cred_dir = dir.path().join("creds");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&cred_dir).unwrap();
+
+    let listener_args = dir.path().join("listener.args");
+    let listener_jit = dir.path().join("listener.jit");
+    write_exec(
+        &bin_dir.join("Runner.Listener"),
+        r#"#!/bin/sh
+printf '%s' "$*" > "${FAKE_LISTENER_ARGS:?}"
+printf '%s' "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}" > "${FAKE_LISTENER_JIT:?}"
+exit 0
+"#,
+    );
+    write_exec(
+        &install_dir.join("run.sh"),
+        "#!/bin/sh\necho 'run.sh must not be invoked' >&2\nexit 99\n",
+    );
+    std::fs::write(cred_dir.join("jitconfig"), "JIT_SECRET_VALUE\n").unwrap();
+
+    let launcher = dir.path().join("run-jit.sh");
+    let generated = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; write_jit_launcher "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            launcher.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(generated.status.success(), "{}", text(&generated));
+
+    // Make install_dir read-only to prove the launcher never writes run-helper.sh.
+    std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let run = Command::new(&launcher)
+        .env("CREDENTIALS_DIRECTORY", &cred_dir)
+        .env("FAKE_LISTENER_ARGS", &listener_args)
+        .env("FAKE_LISTENER_JIT", &listener_jit)
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(run.status.success(), "run-jit.sh failed: {}", text(&run));
+    assert_eq!(
+        std::fs::read_to_string(&listener_args).unwrap(),
+        "run --startuptype service"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&listener_jit).unwrap(),
+        "JIT_SECRET_VALUE"
+    );
 }

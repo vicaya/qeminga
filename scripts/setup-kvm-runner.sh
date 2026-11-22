@@ -14,7 +14,8 @@
 #     DeviceAllow=/dev/kvm rw, RestrictNamespaces=yes, RemoveIPC=yes,
 #     SystemCallArchitectures=native, SystemCallFilter=@system-service, UMask=0077,
 #     MemoryMax=80%, TasksMax=512, and cgroup IPAddressDeny blocking cloud
-#     instance metadata (169.254.0.0/16, fe80::/10, fc00::/7) and RFC1918 LANs.
+#     instance metadata (169.254.0.0/16, fe80::/10, fd00:ec2::254/128) and
+#     private RFC1918/CGNAT/ULA LANs.
 #   - Host-enforced root-owned runner hooks (ACTIONS_RUNNER_HOOK_JOB_STARTED /
 #     COMPLETED) configured via systemd Environment= (never runner-writable):
 #     exact whole-string allowlists for repository, event (workflow_dispatch by
@@ -113,7 +114,7 @@ Hardening & resource bounds:
   --tasks-max N          Systemd TasksMax (default: 512)
   --cpu-quota QUOTA      Optional systemd CPUQuota (e.g. 200%)
   --allow-ip CIDR        Repeatable IPAddressAllow CIDR (e.g. private DNS; IMDS and 0.0.0.0/0 refused)
-  --no-lan-deny          Do not deny RFC1918/CGNAT/ULA (cloud IMDS link-local is STILL denied)
+  --no-lan-deny          Do not deny RFC1918/CGNAT/ULA (IPv4 & IPv6 cloud IMDS are STILL denied)
   --skip-packages        Skip apt-get/dnf package installation during install
   --no-start             Do not enable/start the systemd service at the end of install
   --purge-user           (uninstall only) Also remove the dedicated service user and group
@@ -776,14 +777,15 @@ write_jit_launcher() {
     cat >"$dest" <<EOF
 #!/usr/bin/env bash
 # Root-owned one-shot JIT runner launcher: reads the single-use JIT config
-# from systemd LoadCredential= into ACTIONS_RUNNER_INPUT_JITCONFIG (which
-# Runner.Listener removes from its environment immediately after reading).
+# from systemd LoadCredential= into ACTIONS_RUNNER_INPUT_JITCONFIG and execs
+# Runner.Listener directly so no intermediate shell/Node wrapper retains the
+# secret in its environment and no run-helper.sh copy is written to the root.
 set -euo pipefail
 cred="\${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/jitconfig"
 [ -r "\$cred" ] || { echo "missing jitconfig credential" >&2; exit 1; }
 ACTIONS_RUNNER_INPUT_JITCONFIG="\$(tr -d '\r\n' <"\$cred")"
 export ACTIONS_RUNNER_INPUT_JITCONFIG
-exec "${OPT_INSTALL_DIR}/run.sh"
+exec "${OPT_INSTALL_DIR}/bin/Runner.Listener" run --startuptype service
 EOF
     chmod 0755 "$dest"
 }
@@ -809,11 +811,17 @@ render_unit_text() {
     local restart_policy="on-failure"
     [ "$OPT_EPHEMERAL" -eq 1 ] && restart_policy="no"
 
-    local exec_start="${OPT_INSTALL_DIR}/run.sh"
+    # Use upstream's service launcher (bin/runsvc.sh -> RunnerService.js ->
+    # Runner.Listener) rather than interactive run.sh, which tries to copy
+    # run-helper.sh.template into the read-only runner root on every launch.
+    local exec_start="${OPT_INSTALL_DIR}/bin/runsvc.sh"
+    local kill_signal="SIGTERM"
     local cred_line=""
     local stop_post_line=""
     if [ -n "$OPT_JITCONFIG_FILE" ]; then
         exec_start="${OPT_HOOK_DIR}/run-jit.sh"
+        # run-jit.sh execs Runner.Listener directly, which drains on SIGINT.
+        kill_signal="SIGINT"
         cred_line="LoadCredential=jitconfig:${OPT_CONFIG_DIR}/jitconfig"
         stop_post_line="ExecStopPost=+/usr/bin/rm -f ${OPT_CONFIG_DIR}/jitconfig"
     fi
@@ -831,16 +839,17 @@ StateDirectoryMode=0700"
         runner_fs_directives="# Auto-update opted in: runner root is writable; hooks and policy remain read-only.
 ReadWritePaths=${OPT_INSTALL_DIR}"
     elif [ "$OPT_EPHEMERAL" -eq 1 ]; then
-        runner_fs_directives="# Ephemeral mode deletes .runner/.credentials on exit; binaries remain read-only.
+        runner_fs_directives="# Ephemeral/JIT mode writes/deletes .runner/.credentials; binaries and .env remain read-only.
 ReadWritePaths=${OPT_INSTALL_DIR}
 ReadOnlyPaths=${OPT_INSTALL_DIR}/bin
 ReadOnlyPaths=${OPT_INSTALL_DIR}/externals
 ReadOnlyPaths=${OPT_INSTALL_DIR}/run.sh
 ReadOnlyPaths=${OPT_INSTALL_DIR}/config.sh
-ReadOnlyPaths=${OPT_INSTALL_DIR}/env.sh"
+ReadOnlyPaths=${OPT_INSTALL_DIR}/env.sh
+ReadOnlyPaths=${OPT_INSTALL_DIR}/.env"
     else
-        runner_fs_directives="# --disableupdate (default): runner binaries and credentials stay read-only;
-# only _diag logs are writable inside ${OPT_INSTALL_DIR}.
+        runner_fs_directives="# --disableupdate (default): bin/runsvc.sh needs no writes in ${OPT_INSTALL_DIR};
+# runner binaries and credentials stay read-only and only _diag logs are writable.
 ReadWritePaths=${OPT_INSTALL_DIR}/_diag"
     fi
 
@@ -856,7 +865,8 @@ IPAddressAllow=${ip}"
 
     local ip_deny_lines="IPAddressDeny=link-local
 IPAddressDeny=multicast
-IPAddressDeny=fe80::/10"
+IPAddressDeny=fe80::/10
+IPAddressDeny=fd00:ec2::254/128"
     if [ "$OPT_NO_LAN_DENY" -eq 0 ]; then
         ip_deny_lines="${ip_deny_lines}
 IPAddressDeny=10.0.0.0/8
@@ -896,7 +906,7 @@ ${stop_post_line}
 Restart=${restart_policy}
 RestartSec=5s
 KillMode=control-group
-KillSignal=SIGTERM
+KillSignal=${kill_signal}
 TimeoutStopSec=120s
 StandardOutput=journal
 StandardError=journal
@@ -955,8 +965,8 @@ MemoryMax=${OPT_MEMORY_MAX}
 TasksMax=${OPT_TASKS_MAX}
 ${cpu_line}
 
-# Cgroup BPF egress firewall: block cloud IMDS (169.254.0.0/16, fe80::/10,
-# fd00:ec2::254 in fc00::/7) and private LAN ranges by default.
+# Cgroup BPF egress firewall: unconditionally block cloud IMDS (169.254.0.0/16,
+# fe80::/10, fd00:ec2::254/128) and multicast; block private LANs by default.
 ${ip_allow_lines}
 ${ip_deny_lines}
 
@@ -1157,26 +1167,70 @@ ensure_service_user() {
 }
 
 lock_runner_permissions() {
+    [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
+    [ -d "$OPT_INSTALL_DIR" ] || die "runner directory does not exist: $OPT_INSTALL_DIR"
     if [ "$OPT_ALLOW_AUTO_UPDATE" -eq 1 ]; then
-        chown -R "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
     else
-        chown -R root:root "$OPT_INSTALL_DIR"
+        chown -h -R -P root:root "$OPT_INSTALL_DIR"
         chmod 0755 "$OPT_INSTALL_DIR"
-        install -d -m 0700 -o "$OPT_USER" -g "$OPT_USER" "$OPT_INSTALL_DIR/_diag"
-        local f
+
+        local diag_dir="$OPT_INSTALL_DIR/_diag"
+        [ ! -L "$diag_dir" ] || die "refusing symlinked runner diag directory: $diag_dir"
+        if [ -e "$diag_dir" ] && [ ! -d "$diag_dir" ]; then
+            die "refusing non-directory runner diag entry: $diag_dir"
+        fi
+        install -d -m 0700 -o "$OPT_USER" -g "$OPT_USER" "$diag_dir"
+
+        local f p
         for f in .runner .credentials .credentials_rsaparams .path; do
-            if [ -f "$OPT_INSTALL_DIR/$f" ]; then
-                chown "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR/$f"
-                chmod 0600 "$OPT_INSTALL_DIR/$f"
+            p="$OPT_INSTALL_DIR/$f"
+            [ ! -L "$p" ] || die "refusing symlinked runner file: $p"
+            if [ -e "$p" ]; then
+                [ -f "$p" ] || die "refusing non-regular runner file: $p"
+                chown -h "${OPT_USER}:${OPT_USER}" "$p"
+                chmod 0600 "$p"
             fi
         done
-        # Keep .env root-owned and empty/read-only so jobs cannot inject hooks or env vars.
-        if [ ! -e "$OPT_INSTALL_DIR/.env" ]; then
-            : >"$OPT_INSTALL_DIR/.env"
+
+        # Keep .env root-owned and read-only so jobs cannot inject hooks or env vars.
+        local env_file="$OPT_INSTALL_DIR/.env"
+        [ ! -L "$env_file" ] || die "refusing symlinked runner env file: $env_file"
+        if [ -e "$env_file" ]; then
+            [ -f "$env_file" ] || die "refusing non-regular runner env file: $env_file"
+            chown -h "root:${OPT_USER}" "$env_file"
+            chmod 0640 "$env_file"
+        else
+            install -m 0640 -o root -g "$OPT_USER" /dev/null "$env_file"
         fi
-        chown "root:${OPT_USER}" "$OPT_INSTALL_DIR/.env"
-        chmod 0640 "$OPT_INSTALL_DIR/.env"
+
+        local bin_dir="$OPT_INSTALL_DIR/bin"
+        local runsvc="$bin_dir/runsvc.sh"
+        [ ! -L "$bin_dir" ] || die "refusing symlinked runner bin directory: $bin_dir"
+        [ ! -L "$runsvc" ] || die "refusing symlinked runner launcher: $runsvc"
+        if [ -f "$runsvc" ]; then
+            chmod 0755 "$runsvc"
+        fi
+
+        # Ephemeral/JIT mode needs the runner user to create/remove .runner/.credentials*
+        # in the root directory while bin/, externals/, scripts, and .env stay ReadOnlyPaths.
+        if [ "$OPT_EPHEMERAL" -eq 1 ]; then
+            chown -h "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+            chmod 0750 "$OPT_INSTALL_DIR"
+        fi
     fi
+}
+
+run_runner_config_with_token() {
+    local token="$1"
+    shift
+    # Pass the token solely via the inherited environment (never in argv / ps).
+    (
+        export ACTIONS_RUNNER_INPUT_TOKEN="$token"
+        runuser -w ACTIONS_RUNNER_INPUT_TOKEN -u "$OPT_USER" -- env \
+            "HOME=$OPT_STATE_DIR" \
+            "$OPT_INSTALL_DIR/config.sh" "$@"
+    )
 }
 
 # ---- install --------------------------------------------------------------
@@ -1262,7 +1316,9 @@ cmd_install() {
     if [ -n "$OPT_URL" ]; then fetch_args+=(--url "$OPT_URL"); fi
     cmd_fetch_runner "${fetch_args[@]}"
 
+    [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     install -d -m 0755 -o root -g root "$OPT_INSTALL_DIR"
+    rm -rf --one-file-system -- "${OPT_INSTALL_DIR:?}/bin" "${OPT_INSTALL_DIR:?}/externals"
     tar --no-same-owner -xzf "$tarball" -C "$OPT_INSTALL_DIR"
     rm -f "$tarball"
     trap - EXIT
@@ -1296,9 +1352,9 @@ cmd_install() {
     else
         command -v runuser >/dev/null 2>&1 || die "runuser (util-linux) is required to register the runner as $OPT_USER"
         # Register as the unprivileged runner user, passing the token via
-        # ACTIONS_RUNNER_INPUT_TOKEN (never in argv / ps).
+        # inherited ACTIONS_RUNNER_INPUT_TOKEN (never in argv / ps).
         say "registering runner '${runner_name}' (${arch}, labels=${OPT_LABELS}) against ${OPT_REPO}"
-        chown -R "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
         local cfg_args=(
             --unattended
             --replace
@@ -1310,14 +1366,7 @@ cmd_install() {
         [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && cfg_args+=(--disableupdate)
         [ "$OPT_EPHEMERAL" -eq 1 ] && cfg_args+=(--ephemeral)
 
-        (
-            export ACTIONS_RUNNER_INPUT_TOKEN="$reg_token"
-            export HOME="$OPT_STATE_DIR"
-            runuser -u "$OPT_USER" -- env \
-                "ACTIONS_RUNNER_INPUT_TOKEN=$ACTIONS_RUNNER_INPUT_TOKEN" \
-                "HOME=$OPT_STATE_DIR" \
-                "$OPT_INSTALL_DIR/config.sh" "${cfg_args[@]}"
-        )
+        run_runner_config_with_token "$reg_token" "${cfg_args[@]}"
         unset reg_token
     fi
 
@@ -1389,6 +1438,7 @@ cmd_status() {
 cmd_update() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "update must run as root"
+    [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR does not exist"
     local arch
     arch="$(normalize_arch "$(uname -m)")"
@@ -1448,16 +1498,14 @@ cmd_uninstall() {
     fi
 
     # Optional deregistration from GitHub if a removal token was supplied.
-    if [ -n "$OPT_TOKEN_FILE" ] && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
+    if [ -n "$OPT_TOKEN_FILE" ] && [ ! -L "$OPT_INSTALL_DIR" ] && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
         command -v runuser >/dev/null 2>&1 || die "runuser is required to deregister the runner as $OPT_USER"
         local rm_token
         rm_token="$(read_secret_file --token-file "$OPT_TOKEN_FILE")"
         say "deregistering runner from GitHub"
-        chown -R "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
-        runuser -u "$OPT_USER" -- env \
-            "ACTIONS_RUNNER_INPUT_TOKEN=$rm_token" \
-            "HOME=$OPT_STATE_DIR" \
-            "$OPT_INSTALL_DIR/config.sh" remove --unattended || warn "deregistration failed (remove manually in GitHub Settings -> Actions -> Runners)"
+        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        run_runner_config_with_token "$rm_token" remove --unattended \
+            || warn "deregistration failed (remove manually in GitHub Settings -> Actions -> Runners)"
         unset rm_token
     fi
 
@@ -1478,17 +1526,19 @@ cmd_uninstall() {
 
 # ---- dispatch -------------------------------------------------------------
 
-[ $# -ge 1 ] || { usage; exit 64; }
-sub="$1"; shift
-case "$sub" in
-    preflight) cmd_preflight "$@" ;;
-    install) cmd_install "$@" ;;
-    render-unit) cmd_render_unit "$@" ;;
-    render-hooks) cmd_render_hooks "$@" ;;
-    fetch-runner) cmd_fetch_runner "$@" ;;
-    status) cmd_status "$@" ;;
-    update) cmd_update "$@" ;;
-    uninstall) cmd_uninstall "$@" ;;
-    -h | --help) usage ;;
-    *) die "unknown subcommand '$sub' (run with --help)" ;;
-esac
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    [ $# -ge 1 ] || { usage; exit 64; }
+    sub="$1"; shift
+    case "$sub" in
+        preflight) cmd_preflight "$@" ;;
+        install) cmd_install "$@" ;;
+        render-unit) cmd_render_unit "$@" ;;
+        render-hooks) cmd_render_hooks "$@" ;;
+        fetch-runner) cmd_fetch_runner "$@" ;;
+        status) cmd_status "$@" ;;
+        update) cmd_update "$@" ;;
+        uninstall) cmd_uninstall "$@" ;;
+        -h | --help) usage ;;
+        *) die "unknown subcommand '$sub' (run with --help)" ;;
+    esac
+fi

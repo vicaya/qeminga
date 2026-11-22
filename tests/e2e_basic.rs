@@ -182,7 +182,10 @@ fn guest_get_osinfo_and_interfaces_and_fsinfo_return_well_formed_json() {
     let entries = fs["return"].as_array().unwrap();
     assert!(!entries.is_empty());
     for e in entries {
-        assert!(e["name"].is_string());
+        assert!(
+            e["name"].as_str().is_some_and(|n| n.starts_with("fs-")),
+            "opaque superblock id expected: {e}"
+        );
         assert!(e["mountpoint"].is_string());
         assert!(e["type"].is_string());
         assert_eq!(e["disk"], json!([]));

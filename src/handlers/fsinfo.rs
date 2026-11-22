@@ -1,10 +1,15 @@
-//! `guest-get-fsinfo` (design §3; C-5).
+//! `guest-get-fsinfo` (design §3, §4.5, §5.9; C-5, C-27).
 //!
 //! Lists every mounted filesystem (pseudo filesystems included, as
-//! upstream does) with its source, type, mount point and sizes from
-//! `statfs(2)`. A `statfs` failure omits the size fields of that entry
-//! rather than dropping the entry or failing the command. `disk` is always
-//! an empty array: qeminga does not walk sysfs for the backing devices.
+//! upstream does) with an opaque per-superblock identifier in `name`,
+//! its type, mount point and sizes from `statfs(2)`. Raw mount sources
+//! are never emitted because FUSE and network mount helpers can embed
+//! credentials in the kernel-visible source field; aliases of the same
+//! superblock share the same `fs-<n>` identifier so a snapshot
+//! controller can still group them. A `statfs` failure omits the size
+//! fields of that entry rather than dropping the entry or failing the
+//! command. `disk` is always an empty array: qeminga does not walk sysfs
+//! for the backing devices.
 //!
 //! Liveness (a deviation from upstream, recorded in `docs/tasks.md`):
 //! `statfs` is not issued on network, FUSE and autofs mounts, whose server
@@ -18,6 +23,7 @@
 //! command is refused at once rather than adding another stuck thread.
 #![forbid(unsafe_code)]
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,10 +83,11 @@ impl StatfsSource for SystemStatfs {
     }
 }
 
-/// One `GuestFilesystemInfo` (C-5).
+/// One `GuestFilesystemInfo` (C-5, C-27).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct FilesystemInfo {
-    /// Mount source (`/dev/sda1`, `tmpfs`, ...).
+    /// Opaque per-superblock identifier (`fs-1`, `fs-2`, …), shared by all
+    /// aliases of the same superblock; never the raw mount source.
     pub name: String,
     /// Mount point, unescaped.
     pub mountpoint: String,
@@ -137,15 +144,23 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
 }
 
 /// Builds the reply for a mount table.
+///
+/// Each distinct superblock `(major, minor)` gets an opaque `fs-<n>`
+/// identifier in order of first appearance, shared by all of its aliases
+/// (bind mounts, subvolumes). Raw mount sources and device numbers are
+/// never placed in the reply (design §4.5, §5.9, AC27).
 pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<FilesystemInfo> {
+    let mut superblocks: HashMap<(u32, u32), usize> = HashMap::new();
     mounts
         .iter()
         .map(|m| {
+            let next = superblocks.len() + 1;
+            let id = *superblocks.entry(m.dev()).or_insert(next);
             let sizes = sizes_are_queried(&m.fs_type)
                 .then(|| statfs.statfs(&m.mount_point).ok())
                 .flatten();
             FilesystemInfo {
-                name: m.source.clone(),
+                name: format!("fs-{id}"),
                 mountpoint: m.mount_point.to_string_lossy().into_owned(),
                 fs_type: m.fs_type.clone(),
                 used_bytes: sizes.map(|s| s.used_bytes()),
@@ -253,12 +268,12 @@ mod tests {
         let mounts = parse_mountinfo(fixture("simple.txt"));
         let info = fs_info(&mounts, &fake());
         let root = info.iter().find(|f| f.mountpoint == "/").unwrap();
-        assert_eq!(root.name, "/dev/sda1");
+        assert_eq!(root.name, "fs-4");
         assert_eq!(root.fs_type, "ext4");
         assert_eq!(root.total_bytes, Some(1000 * 4096));
         assert_eq!(root.used_bytes, Some(750 * 4096));
         let home = info.iter().find(|f| f.mountpoint == "/home").unwrap();
-        assert_eq!(home.name, "/dev/sda2");
+        assert_eq!(home.name, "fs-5");
         assert_eq!(home.fs_type, "xfs");
         assert_eq!(home.total_bytes, Some(5120));
         assert_eq!(home.used_bytes, Some(0));
@@ -307,7 +322,7 @@ mod tests {
         let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
         let info = fs_info(&mounts, &fake());
         let nfs = info.iter().find(|f| f.fs_type == "nfs4").unwrap();
-        assert_eq!(nfs.name, "filer:/export");
+        assert_eq!(nfs.name, "fs-5");
         assert_eq!(nfs.used_bytes, None);
         assert_eq!(nfs.total_bytes, None);
         let value = json!(nfs);
@@ -567,7 +582,7 @@ mod tests {
         let value = handle(&ctx, &req).await.unwrap();
         let list = value.as_array().unwrap();
         assert_eq!(list.len(), 5);
-        assert_eq!(list[3]["name"], "/dev/sda1");
+        assert_eq!(list[3]["name"], "fs-4");
         assert_eq!(list[3]["type"], "ext4");
         assert_eq!(list[3]["total-bytes"], 1000 * 4096);
         let req =
@@ -577,5 +592,65 @@ mod tests {
             handle(&ctx, &req).await,
             Err(Error::InvalidArguments(_))
         ));
+    }
+
+    #[test]
+    fn fsinfo_uses_opaque_superblock_ids_and_never_discloses_mount_sources() {
+        // CVM Blocker 1 (#53, AC27): FUSE/network mount helpers can put live
+        // credentials in mountinfo's source field, and local device names or
+        // major:minor pairs must not leak either. Aliases of one superblock
+        // share one opaque identifier; distinct superblocks get distinct ones.
+        let table = "\
+10 1 8:1 / / rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw
+11 10 8:1 /srv/www /var/www rw,relatime - ext4 /dev/mapper/tenant-alpha-root rw
+12 10 8:2 / /data rw,relatime - xfs /dev/nvme0n1p2 rw
+13 10 8:2 /exports /srv/exports rw,relatime - xfs /dev/nvme0n1p2 rw
+14 10 0:41 / /mnt/ftp rw,nosuid - fuse.curlftpfs curlftpfs#ftp://alice:super-secret-pass@ftp.internal/vault rw
+15 10 0:42 / /mnt/share rw - cifs //storage.internal/tenant-secret rw
+16 10 0:43 / /mnt/nfs rw - nfs4 filer.internal:/exports/tenant rw
+17 10 0:44 / /run rw - tmpfs tmpfs-custom-label-a rw
+18 10 0:45 / /tmp rw - tmpfs tmpfs-custom-label-b rw
+";
+        let mounts = parse_mountinfo(table);
+        let info = fs_info(&mounts, &fake());
+        assert_eq!(info.len(), 9);
+        // Aliases of the same superblock share one opaque identifier.
+        assert_eq!(info[0].name, info[1].name, "bind aliases of 8:1 share name");
+        assert_eq!(info[2].name, info[3].name, "bind aliases of 8:2 share name");
+        // Distinct superblocks — including two tmpfs mounts — get distinct ids.
+        assert_ne!(info[0].name, info[2].name);
+        assert_ne!(info[7].name, info[8].name);
+        // Every name is an opaque `fs-<n>` identifier and never discloses raw
+        // mount sources, credentials, hostnames, device paths or major:minor.
+        let serialized = serde_json::to_string(&info).unwrap();
+        for forbidden in [
+            "tenant-alpha-root",
+            "/dev/mapper",
+            "/dev/nvme0n1p2",
+            "curlftpfs#",
+            "alice",
+            "super-secret-pass",
+            "ftp.internal",
+            "vault",
+            "storage.internal",
+            "tenant-secret",
+            "filer.internal",
+            "tmpfs-custom-label",
+            "8:1",
+            "8:2",
+            "0:41",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "fsinfo reply must not disclose {forbidden:?}: {serialized}"
+            );
+        }
+        for entry in &info {
+            let suffix = entry
+                .name
+                .strip_prefix("fs-")
+                .unwrap_or_else(|| panic!("expected opaque fs-<n> name, got {:?}", entry.name));
+            assert!(suffix.parse::<usize>().is_ok(), "{:?}", entry.name);
+        }
     }
 }

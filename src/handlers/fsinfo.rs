@@ -145,14 +145,21 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
 
 /// Builds the reply for a mount table.
 ///
-/// Each distinct superblock `(major, minor)` gets an opaque `fs-<n>`
-/// identifier in order of first appearance, shared by all of its aliases
-/// (bind mounts, subvolumes). Raw mount sources and device numbers are
-/// never placed in the reply (design §4.5, §5.9, AC27).
+/// Only mounts visible at their own mount point in the mount tree
+/// ([`crate::freeze_plan::visible_mounts`]) are emitted, so every advertised
+/// `mountpoint` selects the superblock named in its row and `statfs` never
+/// attributes a covering filesystem's sizes to a covered row.
+///
+/// Each distinct visible superblock `(major, minor)` gets an opaque `fs-<n>`
+/// identifier in order of first appearance, shared by all of its visible
+/// aliases (bind mounts, subvolumes). The identifier is valid only within a
+/// single reply (rebuilt on each call); controllers group aliases from one
+/// reply and use provisioned mount paths across requests. Raw mount sources
+/// and device numbers are never placed in the reply (design §4.5, §5.9, AC27).
 pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<FilesystemInfo> {
     let mut superblocks: HashMap<(u32, u32), usize> = HashMap::new();
-    mounts
-        .iter()
+    crate::freeze_plan::visible_mounts(mounts)
+        .into_iter()
         .map(|m| {
             let next = superblocks.len() + 1;
             let id = *superblocks.entry(m.dev()).or_insert(next);
@@ -545,14 +552,14 @@ mod tests {
         // naming the bound and truncates nothing. A large but ordinary
         // table is answered whole.
         let table = |n: usize| -> String {
-            (0..n)
-                .map(|i| {
+            std::iter::once("1 0 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n".to_owned())
+                .chain((0..n - 1).map(|i| {
                     format!(
                         "{} 1 0:{} / /var/lib/containers/overlay/{i:06}/merged rw,relatime - overlay overlay rw\n",
                         i + 10,
                         i + 100
                     )
-                })
+                }))
                 .collect()
         };
         let ctx = Context::for_tests()
@@ -652,5 +659,88 @@ mod tests {
                 .unwrap_or_else(|| panic!("expected opaque fs-<n> name, got {:?}", entry.name));
             assert!(suffix.parse::<usize>().is_ok(), "{:?}", entry.name);
         }
+    }
+
+    #[test]
+    fn fsinfo_omits_covered_mounts_and_never_attributes_covering_sizes() {
+        // hidden_mount.txt: 8:2 is mounted at /data (covered by 8:3 at /data)
+        // and reachable at /data-alias. Only the visible mounts (/, /data-alias,
+        // /data on 8:3) may be advertised; /data must appear once with 8:3's
+        // sizes, never under 8:2's opaque id.
+        let mounts = parse_mountinfo(fixture("hidden_mount.txt"));
+        let sizes = FakeStatfs(HashMap::from([
+            (
+                "/".to_owned(),
+                Statfs {
+                    blocks: 100,
+                    bfree: 50,
+                    bsize: 4096,
+                },
+            ),
+            (
+                "/data".to_owned(),
+                Statfs {
+                    blocks: 999,
+                    bfree: 0,
+                    bsize: 4096,
+                },
+            ),
+            (
+                "/data-alias".to_owned(),
+                Statfs {
+                    blocks: 200,
+                    bfree: 100,
+                    bsize: 4096,
+                },
+            ),
+        ]));
+        let info = fs_info(&mounts, &sizes);
+        let paths: Vec<&str> = info.iter().map(|f| f.mountpoint.as_str()).collect();
+        assert_eq!(paths, ["/", "/data-alias", "/data"]);
+        let alias = info.iter().find(|f| f.mountpoint == "/data-alias").unwrap();
+        let data = info.iter().find(|f| f.mountpoint == "/data").unwrap();
+        assert_ne!(alias.name, data.name, "8:2 and 8:3 have distinct opaque ids");
+        assert_eq!(alias.total_bytes, Some(200 * 4096));
+        assert_eq!(data.total_bytes, Some(999 * 4096));
+        assert_eq!(
+            info.iter().filter(|f| f.mountpoint == "/data").count(),
+            1,
+            "covered /data must not be advertised"
+        );
+
+        // moved_mount.txt: 8:5 moved over 8:2 at /data; 8:2 remains visible at /b-alias.
+        let moved = fs_info(&parse_mountinfo(fixture("moved_mount.txt")), &fake());
+        let moved_paths: Vec<(&str, &str)> = moved
+            .iter()
+            .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
+            .collect();
+        assert_eq!(
+            moved_paths,
+            [("/", "ext4"), ("/data", "xfs"), ("/b-alias", "ext4")]
+        );
+
+        // directory_overmount.txt: 8:2 at /data/nested is hidden under 8:3 at /data;
+        // 8:4 (xfs) is mounted at /data/nested under 8:3.
+        let dir_over = fs_info(
+            &parse_mountinfo(fixture("directory_overmount.txt")),
+            &fake(),
+        );
+        let dir_paths: Vec<(&str, &str)> = dir_over
+            .iter()
+            .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
+            .collect();
+        assert_eq!(
+            dir_paths,
+            [("/", "ext4"), ("/data", "ext4"), ("/data/nested", "xfs")]
+        );
+
+        // hidden_nested.txt: 8:2 at /data and its child 8:3 at /data/nested are
+        // both hidden by 8:4 (xfs) mounted at /data.
+        let nested = fs_info(&parse_mountinfo(fixture("hidden_nested.txt")), &fake());
+        let nested_paths: Vec<(&str, &str)> = nested
+            .iter()
+            .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
+            .collect();
+        assert_eq!(nested_paths, [("/", "ext4"), ("/data", "xfs")]);
     }
 }

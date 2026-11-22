@@ -118,7 +118,7 @@ impl<'a> MountTree<'a> {
         }
     }
 
-    /// The superblock mounted at exactly `path` now. From the root mount,
+    /// The mount row visible at exactly `path` now. From the root mount,
     /// the walk crosses into the child attached at the shortest prefix of
     /// `path` at or below the current mount's own mount point (the first
     /// mount point the kernel meets on the way: a mount stacked on the
@@ -129,7 +129,7 @@ impl<'a> MountTree<'a> {
     /// table is inconsistent at some step (two mounts attached at one
     /// point under one parent: refused rather than guessed), or when it
     /// cannot be walked at all. Proportional to the length of `path`.
-    fn resolve(&self, path: &[u8]) -> Option<(u32, u32)> {
+    fn resolve_row(&self, path: &[u8]) -> Option<&'a MountRow> {
         if path.first() != Some(&b'/') {
             return None;
         }
@@ -154,8 +154,38 @@ impl<'a> MountTree<'a> {
                 }
             }
         }
-        (settled && current.mount_point.as_os_str().as_bytes() == path).then_some(current.dev)
+        (settled && current.mount_point.as_os_str().as_bytes() == path).then_some(current)
     }
+
+    /// The superblock mounted at exactly `path` now.
+    fn resolve(&self, path: &[u8]) -> Option<(u32, u32)> {
+        self.resolve_row(path).map(|row| row.dev)
+    }
+}
+
+/// Returns the entries of `mounts` that are currently visible at their own
+/// mount point in the mount tree (reusing the same visibility resolution as
+/// [`FreezePlan::restrict_to`]). Rows hidden beneath a stacked, moved, or
+/// ancestor overmount are omitted so every returned row's mount point selects
+/// that row's superblock (design §4.5, AC27).
+pub fn visible_mounts(mounts: &[MountEntry]) -> Vec<&MountEntry> {
+    let rows: Vec<MountRow> = mounts
+        .iter()
+        .map(|e| MountRow {
+            id: e.mount_id,
+            parent: e.parent_id,
+            mount_point: e.mount_point.clone(),
+            dev: e.dev(),
+        })
+        .collect();
+    let tree = MountTree::index(&rows);
+    mounts
+        .iter()
+        .filter(|entry| {
+            tree.resolve_row(entry.mount_point.as_os_str().as_bytes())
+                .is_some_and(|row| row.id == entry.mount_id)
+        })
+        .collect()
 }
 
 /// The prefixes of an absolute `path` at which a mount point could be,

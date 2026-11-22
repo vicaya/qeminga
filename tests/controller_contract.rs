@@ -937,3 +937,69 @@ async fn a_hidden_mount_point_cannot_stand_in_for_an_unprotected_requirement() {
     assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
     assert!(!guest.dir.path().join("frozen").exists());
 }
+
+#[tokio::test(start_paused = true)]
+async fn inventory_selection_through_freeze_protects_covered_superblock_via_visible_alias() {
+    // PR #57 review [P1]: on `hidden_mount.txt` (8:3 mounted over 8:2 at
+    // /data, while 8:2 remains reachable at /data-alias), a controller
+    // following §4.5 picks one mount point per opaque `fs-N` from
+    // `guest-get-fsinfo` and passes those names to `guest-fsfreeze-freeze-list`.
+    // Every advertised mount point must select the superblock named by its
+    // row, so choosing the advertised mount points for all three superblocks
+    // freezes 8:1 (/), 8:2 (/data-alias) and 8:3 (/data) — never leaving 8:2
+    // writable behind a duplicate /data entry.
+    let guest = Guest::with_mounts("hidden_mount.txt");
+    let reply = guest
+        .request(r#"{"execute":"guest-get-fsinfo"}"#)
+        .await
+        .unwrap();
+    let entries = reply["return"].as_array().expect("fsinfo array");
+    // Group by opaque `name` within this single reply (§4.5 step 1), keeping
+    // the first mount point for each distinct superblock.
+    let mut selected_by_id: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        let id = entry["name"].as_str().unwrap().to_owned();
+        let mp = entry["mountpoint"].as_str().unwrap().to_owned();
+        selected_by_id.entry(id).or_insert(mp);
+    }
+    let mountpoints: Vec<String> = selected_by_id.into_values().collect();
+    assert_eq!(
+        mountpoints.iter().filter(|m| m.as_str() == "/data").count(),
+        1,
+        "covered /data must not be advertised under two opaque IDs: {entries:?}"
+    );
+    assert!(
+        mountpoints.iter().any(|m| m == "/data-alias"),
+        "covered superblock must be selected via its visible alias: {mountpoints:?}"
+    );
+    let req_paths: Vec<&str> = mountpoints.iter().map(String::as_str).collect();
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &req_paths).await.unwrap();
+    let opened_before_thaw: Vec<(std::path::PathBuf, (u32, u32))> = guest
+        .kernel
+        .calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open(p, dev) => Some((p, dev)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        opened_before_thaw.contains(&(std::path::PathBuf::from("/data-alias"), (8, 2))),
+        "8:2 frozen through /data-alias: {opened_before_thaw:?}"
+    );
+    assert!(
+        opened_before_thaw.contains(&(std::path::PathBuf::from("/data"), (8, 3))),
+        "8:3 frozen through /data: {opened_before_thaw:?}"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 3);
+    cycle.cut("vol-all", Duration::from_secs(5)).await.unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-all".to_owned()]
+        }
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+}

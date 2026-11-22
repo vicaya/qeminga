@@ -282,21 +282,27 @@ async fn join_operation(
     let progress = op.progress();
     match progress.settled {
         Some(FreezeState::Thawed) => Ok(json!(progress.recovered)),
-        Some(state) => Err(Error::Internal(format!(
-            "thaw joined the aborted freeze: {} target(s) thawed; {}; state {state}, marker retained",
-            progress.recovered,
-            progress
-                .unrecoverable
-                .unwrap_or_else(|| "recovery incomplete".to_owned())
-        ))),
-        None => Err(Error::Internal(format!(
-            "thaw requested: freeze operation aborted, recovery pending ({} target(s) thawed so far{}); marker retained until it settles",
-            progress.recovered,
-            progress
-                .in_flight
-                .map(|target| format!(", FIFREEZE of {target} still in flight"))
-                .unwrap_or_default()
-        ))),
+        Some(state) => {
+            let reason = progress
+                .unrecoverable_reason
+                .map(RecoveryReason::host_reason)
+                .unwrap_or("recovery incomplete");
+            Err(Error::Internal(format!(
+                "thaw joined the aborted freeze: {} target(s) thawed; {reason}; state {state}, marker retained",
+                progress.recovered,
+            )))
+        }
+        None => {
+            let activity = match progress.in_flight.as_deref() {
+                Some(crate::freeze_op::PREPARING) => ", preparation still in flight",
+                Some(_) => ", a FIFREEZE is still in flight",
+                None => "",
+            };
+            Err(Error::Internal(format!(
+                "thaw requested: freeze operation aborted, recovery pending ({} target(s) thawed so far{activity}); state thawing, marker retained until it settles",
+                progress.recovered,
+            )))
+        }
     }
 }
 
@@ -314,7 +320,7 @@ async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result
     let reply = crate::freeze_op::start(Arc::clone(ctx), token, restrict);
     match reply.await {
         Ok(Ok(frozen)) => Ok(json!(frozen)),
-        Ok(Err(failure)) => Err(Error::Internal(failure.to_string())),
+        Ok(Err(failure)) => Err(Error::Internal(failure.host_description())),
         Err(_) => Err(Error::Internal(
             "freeze operation ended without a result".to_owned(),
         )),
@@ -378,7 +384,9 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             ctx.set_thaw_scope(ThawScope::Discovery);
             ctx.state.thaw_succeeded(token);
             tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
-            Err(Error::Internal(failure.to_string()))
+            Err(Error::Internal(
+                failure.host_description(FreezeState::Thawed),
+            ))
         }
         Err(failure) => {
             // `Thawing → Frozen` (§4.2): the state is `Frozen` again, so
@@ -387,9 +395,71 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             ctx.state.thaw_failed(token);
             ctx.hooks.on_frozen(ctx);
             tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; marker retained");
-            Err(Error::Internal(failure.to_string()))
+            Err(Error::Internal(
+                failure.host_description(FreezeState::Frozen),
+            ))
         }
     }
+}
+
+/// Host-safe classification of why a thaw or recovery drain did not
+/// complete (design §5.9, AC27). Guest-local diagnostics keep mount
+/// points, alternate paths, device numbers and kernel errnos; wire
+/// replies carry only [`RecoveryReason::host_reason`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryReason {
+    /// None of the target's mount points opened on its planned superblock;
+    /// no `FITHAW` was issued.
+    TargetUnreachable,
+    /// Opening the target failed before `FITHAW`; no `FITHAW` was issued.
+    TargetOpenFailed,
+    /// Opening the target was denied (`EPERM`/`EACCES`); no `FITHAW` issued.
+    TargetOpenPermissionDenied,
+    /// `FITHAW` was denied (`EPERM`/`EACCES`).
+    PermissionDenied,
+    /// `FITHAW` failed with another kernel error; filesystem may remain frozen.
+    IoctlFailed,
+    /// `FITHAW` kept succeeding up to [`MAX_THAW_ITERATIONS`].
+    DrainDidNotConverge,
+    /// A freeze worker was lost; target outcome is unknown.
+    WorkerLost,
+    /// A recovery drain worker was lost; targets remain uncertain.
+    DrainLost,
+    /// The recovery marker could not be removed after the drain.
+    MarkerRetained,
+}
+
+impl RecoveryReason {
+    /// Fixed host-facing reason without guest paths, device numbers or
+    /// marker paths.
+    pub const fn host_reason(self) -> &'static str {
+        match self {
+            RecoveryReason::TargetUnreachable => "target unreachable; no FITHAW issued",
+            RecoveryReason::TargetOpenFailed => "target open failed; no FITHAW issued",
+            RecoveryReason::TargetOpenPermissionDenied => {
+                "target open permission denied; no FITHAW issued"
+            }
+            RecoveryReason::PermissionDenied => "FITHAW permission denied",
+            RecoveryReason::IoctlFailed => "FITHAW failed; filesystem may still be frozen",
+            RecoveryReason::DrainDidNotConverge => {
+                "drain did not converge; filesystem may still be frozen"
+            }
+            RecoveryReason::WorkerLost => "freeze worker lost; target outcome unknown",
+            RecoveryReason::DrainLost => "recovery drain lost; targets uncertain",
+            RecoveryReason::MarkerRetained => "cannot remove recovery marker",
+        }
+    }
+}
+
+/// Which blocking stage of a freeze operation failed to join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreezeTaskStage {
+    /// Plan/marker preparation before any ioctl; settles `Thawed`.
+    Preparation,
+    /// Rollback after a hard error; settles `Frozen`, marker retained.
+    Rollback,
+    /// Marker removal after a zero-work freeze; settles `Frozen`, marker retained.
+    MarkerRemoval,
 }
 
 /// What stopped a freeze at a target: the kernel's answer to `FIFREEZE`,
@@ -399,15 +469,45 @@ pub enum FreezeStop {
     /// `FIFREEZE` failed with this error.
     Ioctl(KernelError),
     /// None of the target's mount points opens on its planned device (the
-    /// attempts, in order); no ioctl was issued.
-    Unreachable(String),
+    /// attempts, in order, for guest-local diagnostics); no ioctl was issued.
+    Unreachable {
+        /// Diagnostic attempt log (`path: err; ...`).
+        attempts: String,
+        /// `true` when every attempt failed with `EPERM`/`EACCES`.
+        permission_denied: bool,
+    },
+}
+
+impl FreezeStop {
+    /// Fixed host-facing reason without guest paths or device numbers
+    /// (design §5.9, AC27).
+    pub fn host_reason(&self) -> &'static str {
+        match self {
+            FreezeStop::Ioctl(err) if err.is_permission() => "FIFREEZE permission denied",
+            FreezeStop::Ioctl(err) if err.is_open_failure() => {
+                "target open failed; no FIFREEZE issued"
+            }
+            FreezeStop::Ioctl(err) if err.is_wrong_filesystem() => {
+                "target unreachable; no FIFREEZE issued"
+            }
+            FreezeStop::Ioctl(_) => "FIFREEZE failed",
+            FreezeStop::Unreachable {
+                permission_denied: true,
+                ..
+            } => "target open permission denied; no FIFREEZE issued",
+            FreezeStop::Unreachable {
+                permission_denied: false,
+                ..
+            } => "target unreachable; no FIFREEZE issued",
+        }
+    }
 }
 
 impl std::fmt::Display for FreezeStop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FreezeStop::Ioctl(err) => write!(f, "{err}"),
-            FreezeStop::Unreachable(attempts) => {
+            FreezeStop::Unreachable { attempts, .. } => {
                 write!(
                     f,
                     "no mount point leads to it ({attempts}); no FIFREEZE issued"
@@ -417,7 +517,9 @@ impl std::fmt::Display for FreezeStop {
     }
 }
 
-/// Why a freeze failed; the `Display` text is the wire description.
+/// Why a freeze failed; `Display` is for guest-local diagnostics, and
+/// [`FreezeFailure::host_description`] produces the wire description
+/// (design §5.9, AC27).
 #[derive(Debug, thiserror::Error)]
 pub enum FreezeFailure {
     /// The mount table could not be read.
@@ -428,12 +530,14 @@ pub enum FreezeFailure {
     Marker(#[from] MarkerError),
     /// A target stopped the freeze with a hard error (or could not be
     /// reached); processed targets were rolled back.
-    #[error("freeze of {mountpoint} failed: {cause}; rolled back")]
+    #[error("freeze of {mountpoint} failed: {cause}; rolled back ({rolled_back} target(s) thawed)")]
     Hard {
         /// The target that failed.
         mountpoint: String,
         /// What stopped it.
         cause: FreezeStop,
+        /// Targets thawed during rollback.
+        rolled_back: u64,
     },
     /// A target stopped the freeze and the rollback could not thaw
     /// `mountpoint` (its drain did not end on the kernel's "not frozen"
@@ -449,13 +553,17 @@ pub enum FreezeFailure {
         cause: FreezeStop,
         /// The processed target that could not be thawed.
         mountpoint: String,
-        /// Why the drain did not complete.
+        /// Host-safe classification of the incomplete rollback.
+        recovery_reason: RecoveryReason,
+        /// Detailed guest-local diagnostic for why the drain did not complete.
         reason: String,
+        /// Targets thawed during rollback.
+        rolled_back: u64,
     },
     /// The rollback thawed every processed target but the marker could not
     /// be removed: the state stays `Frozen` and the marker is retained.
     #[error(
-        "freeze of {failed} failed: {cause}; rolled back but cannot remove recovery marker: {marker}"
+        "freeze of {failed} failed: {cause}; rolled back ({rolled_back} target(s) thawed) but cannot remove recovery marker: {marker}"
     )]
     MarkerRetained {
         /// The target that stopped the freeze.
@@ -464,10 +572,26 @@ pub enum FreezeFailure {
         cause: FreezeStop,
         /// The removal error.
         marker: MarkerError,
+        /// Targets thawed during rollback.
+        rolled_back: u64,
     },
-    /// The blocking task could not be joined.
-    #[error("freeze task failed: {0}")]
-    Task(String),
+    /// Preparation failed (task lost) and cleanup could not remove the
+    /// recovery marker: the state stays `Frozen` and the marker is retained.
+    #[error("freeze preparation failed ({cause}); cannot remove recovery marker: {marker}")]
+    PreparationMarkerRetained {
+        /// Guest-local preparation failure detail.
+        cause: String,
+        /// The removal error.
+        marker: MarkerError,
+    },
+    /// A blocking task could not be joined.
+    #[error("freeze task failed: {detail}")]
+    Task {
+        /// Which stage failed to join.
+        stage: FreezeTaskStage,
+        /// Guest-local join error detail.
+        detail: String,
+    },
     /// Nothing was frozen and nothing is held (an empty or entirely
     /// skipped plan, #43 §2), but the marker could not be removed: the
     /// state stays `Frozen` and the marker is retained, so the reply is
@@ -490,7 +614,7 @@ pub enum FreezeFailure {
         timeout_secs: u64,
         /// Successful `FIFREEZE` calls before the abort.
         frozen: u64,
-        /// The target whose call was in flight, if any.
+        /// The target whose call was in flight, if any (guest-local diagnostic).
         in_flight: Option<String>,
     },
 }
@@ -503,17 +627,105 @@ impl FreezeFailure {
             self,
             FreezeFailure::RollbackIncomplete { .. }
                 | FreezeFailure::MarkerRetained { .. }
+                | FreezeFailure::PreparationMarkerRetained { .. }
                 | FreezeFailure::NothingFrozenMarkerRetained(_)
+                | FreezeFailure::Task {
+                    stage: FreezeTaskStage::Rollback | FreezeTaskStage::MarkerRemoval,
+                    ..
+                }
         )
+    }
+
+    /// Host-facing wire description (design §5.9, AC27): preserves a fixed
+    /// reason, recovery state and counts while keeping guest mount names,
+    /// alternate paths, device numbers and marker paths in guest-local
+    /// diagnostics.
+    pub fn host_description(&self) -> String {
+        match self {
+            FreezeFailure::Plan(_) => "cannot build freeze plan; state thawed".to_owned(),
+            FreezeFailure::Marker(err) => format!(
+                "cannot create recovery marker: {}; state thawed",
+                err.host_reason()
+            ),
+            FreezeFailure::Hard {
+                cause, rolled_back, ..
+            } => format!(
+                "freeze failed: {}; rolled back ({rolled_back} target(s) thawed); state thawed",
+                cause.host_reason()
+            ),
+            FreezeFailure::RollbackIncomplete {
+                cause,
+                recovery_reason,
+                rolled_back,
+                ..
+            } => format!(
+                "freeze failed: {}; rollback incomplete ({}, {rolled_back} target(s) thawed); state frozen, marker retained",
+                cause.host_reason(),
+                recovery_reason.host_reason()
+            ),
+            FreezeFailure::MarkerRetained {
+                cause,
+                marker,
+                rolled_back,
+                ..
+            } => format!(
+                "freeze failed: {}; rolled back ({rolled_back} target(s) thawed) but cannot remove recovery marker: {}; state frozen, marker retained",
+                cause.host_reason(),
+                marker.host_reason()
+            ),
+            FreezeFailure::PreparationMarkerRetained { marker, .. } => format!(
+                "freeze preparation failed; cannot remove recovery marker: {}; state frozen, marker retained",
+                marker.host_reason()
+            ),
+            FreezeFailure::Task { stage, .. } => match stage {
+                FreezeTaskStage::Preparation => {
+                    "freeze preparation failed; state thawed".to_owned()
+                }
+                FreezeTaskStage::Rollback => {
+                    "freeze rollback failed; state frozen, marker retained".to_owned()
+                }
+                FreezeTaskStage::MarkerRemoval => {
+                    "nothing was frozen (0 target(s) frozen) and marker removal failed; state frozen, marker retained".to_owned()
+                }
+            },
+            FreezeFailure::NothingFrozenMarkerRetained(err) => format!(
+                "nothing was frozen (0 target(s) frozen) but cannot remove recovery marker: {}; state frozen, marker retained",
+                err.host_reason()
+            ),
+            FreezeFailure::Aborted {
+                cause,
+                timeout_secs,
+                frozen,
+                in_flight,
+            } => {
+                let activity = match in_flight.as_deref() {
+                    Some(crate::freeze_op::PREPARING) => " while preparing",
+                    Some(_) => " with a FIFREEZE in flight",
+                    None => "",
+                };
+                format!(
+                    "freeze aborted: {}{activity}; {frozen} target(s) frozen so far are being thawed; state thawing, marker retained",
+                    cause.describe(*timeout_secs),
+                )
+            }
+        }
     }
 }
 
-/// Why a thaw failed unrecoverably (the state returns to `Frozen`).
+/// Why a thaw failed unrecoverably (the state returns to `Frozen` unless
+/// started as a recovery drain from `Thawed`). `Display` is for
+/// guest-local diagnostics; [`ThawFailure::host_description`] produces the
+/// wire description (design §5.9, AC27).
 #[derive(Debug, thiserror::Error)]
 pub enum ThawFailure {
     /// The mount table could not be read.
-    #[error("cannot build thaw plan: {0}")]
-    Plan(String),
+    #[error("cannot build thaw plan: {detail}")]
+    Plan {
+        /// Guest-local mount-table read error.
+        detail: String,
+        /// Targets thawed through held handles before reporting the failure.
+        thawed: u64,
+    },
     /// A target may still be frozen after its drain (OQ-3): a denied or
     /// failed `FITHAW`, a superblock none of whose mount points opens on
     /// it any more (no `FITHAW` issued), or a drain that never converged.
@@ -522,15 +734,62 @@ pub enum ThawFailure {
     Incomplete {
         /// The target that may still be frozen.
         mountpoint: String,
-        /// Why the drain did not complete.
+        /// Host-safe classification of the incomplete drain.
+        kind: RecoveryReason,
+        /// Detailed guest-local diagnostic for why the drain did not complete.
         reason: String,
+        /// Targets thawed during this attempt.
+        thawed: u64,
     },
     /// The marker could not be removed after the drain.
-    #[error("drain complete but cannot remove recovery marker: {0}")]
-    Marker(MarkerError),
+    #[error("drain complete but cannot remove recovery marker: {err}")]
+    Marker {
+        /// The removal error.
+        err: MarkerError,
+        /// Targets thawed during this attempt.
+        thawed: u64,
+    },
     /// The blocking task could not be joined.
     #[error("thaw task failed: {0}")]
     Task(String),
+}
+
+impl ThawFailure {
+    /// Records the total number of targets thawed during this attempt.
+    fn with_thawed(mut self, count: u64) -> Self {
+        match &mut self {
+            ThawFailure::Plan { thawed, .. }
+            | ThawFailure::Incomplete { thawed, .. }
+            | ThawFailure::Marker { thawed, .. } => *thawed = count,
+            ThawFailure::Task(_) => {}
+        }
+        self
+    }
+
+    /// Host-facing wire description (design §5.9, AC27): preserves a fixed
+    /// reason, recovery state and counts while keeping guest mount names,
+    /// alternate paths, device numbers and marker paths in guest-local
+    /// diagnostics.
+    pub fn host_description(&self, final_state: FreezeState) -> String {
+        let state_suffix = match final_state {
+            FreezeState::Thawed => "state thawed",
+            _ => "state frozen, marker retained",
+        };
+        match self {
+            ThawFailure::Plan { thawed, .. } => {
+                format!("cannot build thaw plan ({thawed} target(s) thawed); {state_suffix}")
+            }
+            ThawFailure::Incomplete { kind, thawed, .. } => format!(
+                "thaw incomplete: {} ({thawed} target(s) thawed); {state_suffix}",
+                kind.host_reason()
+            ),
+            ThawFailure::Marker { err, thawed } => format!(
+                "drain complete ({thawed} target(s) thawed) but cannot remove recovery marker: {}; {state_suffix}",
+                err.host_reason()
+            ),
+            ThawFailure::Task(_) => format!("thaw task failed; {state_suffix}"),
+        }
+    }
 }
 
 pub(crate) fn build_plan<E: From<String>>(
@@ -552,9 +811,19 @@ impl From<String> for FreezeFailure {
 }
 
 impl From<String> for ThawFailure {
-    fn from(message: String) -> Self {
-        ThawFailure::Plan(message)
+    fn from(detail: String) -> Self {
+        ThawFailure::Plan { detail, thawed: 0 }
     }
+}
+
+/// Why none of a target's mount points could be opened on its planned
+/// superblock: `detail` carries paths, device numbers and errnos for
+/// guest-local diagnostics; `permission_denied` distinguishes a pure
+/// permission denial for host-facing classification.
+#[derive(Debug, Clone)]
+pub(crate) struct OpenTargetError {
+    pub(crate) detail: String,
+    pub(crate) permission_denied: bool,
 }
 
 /// Opens `target` on its planned device. A target a request selected
@@ -565,16 +834,23 @@ impl From<String> for ThawFailure {
 /// rescued by reaching another name of a wrongly selected superblock).
 /// Otherwise, through the first of its mount points that still leads
 /// there (a mount placed over a pathname is seen, not frozen or thawed by
-/// mistake). When none does, the attempts are reported in order: `/data:
-/// mountpoint is on 8:3, not on the planned 8:2; /data-alias: cannot open
-/// mountpoint: ENOENT`.
-pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mount, String> {
+/// mistake). When none does, the attempts are recorded in order for
+/// guest-local diagnostics: `/data: mountpoint is on 8:3, not on the
+/// planned 8:2; /data-alias: cannot open mountpoint: ENOENT`.
+pub(crate) fn open_target(
+    kernel: &dyn KernelOps,
+    target: &Target,
+) -> Result<Mount, OpenTargetError> {
     if let Some(requested) = &target.requested {
         return kernel
             .open_mount(requested, target.dev)
-            .map_err(|err| format!("{}: {err}", lossy(requested)));
+            .map_err(|err| OpenTargetError {
+                detail: format!("{}: {err}", lossy(requested)),
+                permission_denied: err.is_permission(),
+            });
     }
     let mut attempts = Vec::new();
+    let mut all_permission_denied = true;
     for path in target.mountpoints() {
         match kernel.open_mount(path, target.dev) {
             Ok(mount) => {
@@ -588,10 +864,27 @@ pub(crate) fn open_target(kernel: &dyn KernelOps, target: &Target) -> Result<Mou
                 }
                 return Ok(mount);
             }
-            Err(err) => attempts.push(format!("{}: {err}", lossy(path))),
+            Err(err) => {
+                if !err.is_permission() {
+                    all_permission_denied = false;
+                }
+                attempts.push(format!("{}: {err}", lossy(path)));
+            }
         }
     }
-    Err(attempts.join("; "))
+    Err(OpenTargetError {
+        permission_denied: !attempts.is_empty() && all_permission_denied,
+        detail: attempts.join("; "),
+    })
+}
+
+/// First target whose drain did not complete, carrying both the
+/// guest-local diagnostic and the host-safe [`RecoveryReason`].
+#[derive(Debug, Clone)]
+pub(crate) struct IncompleteDrain {
+    pub(crate) mountpoint: String,
+    pub(crate) kind: RecoveryReason,
+    pub(crate) detail: String,
 }
 
 /// Drains every processed target through the handle its freeze opened, in
@@ -607,26 +900,35 @@ pub(crate) fn rollback(
     failed: &Path,
     cause: FreezeStop,
 ) -> FreezeFailure {
-    let (_, keep, incomplete) = drain_held(kernel, std::mem::take(held));
+    let (rolled_back, keep, incomplete) = drain_held(kernel, std::mem::take(held));
     *held = keep;
     let failed = lossy(failed);
-    if let Some((mountpoint, reason)) = incomplete {
+    if let Some(IncompleteDrain {
+        mountpoint,
+        kind,
+        detail,
+    }) = incomplete
+    {
         return FreezeFailure::RollbackIncomplete {
             failed,
             cause,
             mountpoint,
-            reason,
+            recovery_reason: kind,
+            reason: detail,
+            rolled_back,
         };
     }
     match marker.remove() {
         Ok(()) | Err(MarkerError::Absent { .. }) => FreezeFailure::Hard {
             mountpoint: failed,
             cause,
+            rolled_back,
         },
         Err(marker) => FreezeFailure::MarkerRetained {
             failed,
             cause,
             marker,
+            rolled_back,
         },
     }
 }
@@ -638,9 +940,9 @@ pub(crate) fn rollback(
 pub(crate) fn drain_held(
     kernel: &dyn KernelOps,
     held: Vec<Mount>,
-) -> (u64, Vec<Mount>, Option<(String, String)>) {
+) -> (u64, Vec<Mount>, Option<IncompleteDrain>) {
     let mut recovered = 0;
-    let mut incomplete: Option<(String, String)> = None;
+    let mut incomplete: Option<IncompleteDrain> = None;
     let mut keep = Vec::new();
     for mount in held.into_iter().rev() {
         let drained = drain(kernel, &mount);
@@ -653,14 +955,18 @@ pub(crate) fn drain_held(
             successes = drained.successes,
             "rolled back"
         );
-        if let Some(reason) = drained.incomplete() {
+        if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
             tracing::error!(
                 event = "fsfreeze_rollback_incomplete",
                 mountpoint = %mount.mountpoint().display(),
-                reason,
+                reason = %detail,
                 "rollback target may still be frozen"
             );
-            incomplete.get_or_insert((lossy(mount.mountpoint()), reason));
+            incomplete.get_or_insert(IncompleteDrain {
+                mountpoint: lossy(mount.mountpoint()),
+                kind,
+                detail,
+            });
             keep.push(mount);
         }
     }
@@ -718,13 +1024,20 @@ fn thaw_blocking(
                     Some(index) => retained.remove(index),
                     None => match open_target(kernel, target) {
                         Ok(mount) => mount,
-                        Err(attempts) => {
+                        Err(err) => {
+                            let kind = if err.permission_denied {
+                                RecoveryReason::TargetOpenPermissionDenied
+                            } else {
+                                RecoveryReason::TargetUnreachable
+                            };
                             let failure = ThawFailure::Incomplete {
                                 mountpoint: lossy(&target.mountpoint),
+                                kind,
                                 reason: format!(
-                                    "no mount point leads to {}:{} ({attempts}); no FITHAW issued",
-                                    target.dev.0, target.dev.1
+                                    "no mount point leads to {}:{} ({}); no FITHAW issued",
+                                    target.dev.0, target.dev.1, err.detail
                                 ),
+                                thawed: 0,
                             };
                             tracing::error!(
                                 event = "fsfreeze_thaw_target_failed",
@@ -770,14 +1083,14 @@ fn thaw_blocking(
     } = state;
     *held = keep;
     if let Some(failure) = unrecoverable {
-        return Err(failure);
+        return Err(failure.with_thawed(thawed));
     }
     if let Some(failure) = discovery {
-        return Err(failure);
+        return Err(failure.with_thawed(thawed));
     }
     match marker.remove() {
         Ok(()) | Err(MarkerError::Absent { .. }) => Ok(thawed),
-        Err(err) => Err(ThawFailure::Marker(err)),
+        Err(err) => Err(ThawFailure::Marker { err, thawed }),
     }
 }
 
@@ -799,10 +1112,12 @@ impl ThawState {
         if drained.successes > 0 {
             self.thawed += 1;
         }
-        if let Some(reason) = drained.incomplete() {
+        if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
             let failure = ThawFailure::Incomplete {
                 mountpoint: lossy(mount.mountpoint()),
-                reason,
+                kind,
+                reason: detail,
+                thawed: 0,
             };
             tracing::error!(
                 event = "fsfreeze_thaw_target_failed",
@@ -816,7 +1131,7 @@ impl ThawState {
     }
 }
 
-/// A mount point for an error message or a wire description.
+/// A mount point for guest-local error diagnostics.
 fn lossy(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -861,6 +1176,14 @@ struct Drained {
     capped: bool,
 }
 
+/// Both the host-safe classification and the guest-local diagnostic for
+/// an incomplete drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DrainIncomplete {
+    kind: RecoveryReason,
+    detail: String,
+}
+
 impl Drained {
     /// Why the target may still be frozen, if it may.
     ///
@@ -872,25 +1195,47 @@ impl Drained {
     /// whatever its errno), a denied `FITHAW`, any other errno (Linux
     /// keeps a filesystem frozen when its unfreeze fails), or a drain
     /// that never converged.
-    fn incomplete(&self) -> Option<String> {
+    fn incomplete(&self) -> Option<DrainIncomplete> {
         if self.capped {
-            return Some(format!(
-                "drain did not converge after {MAX_THAW_ITERATIONS} FITHAW calls (still succeeding)"
-            ));
+            return Some(DrainIncomplete {
+                kind: RecoveryReason::DrainDidNotConverge,
+                detail: format!(
+                    "drain did not converge after {MAX_THAW_ITERATIONS} FITHAW calls (still succeeding)"
+                ),
+            });
         }
         let err = self.first_error.as_ref()?;
         if !err.is_ioctl_answer() {
-            return Some(format!("{err}: no FITHAW issued"));
+            let kind = if err.is_permission() {
+                RecoveryReason::TargetOpenPermissionDenied
+            } else if err.is_wrong_filesystem() {
+                RecoveryReason::TargetUnreachable
+            } else {
+                RecoveryReason::TargetOpenFailed
+            };
+            return Some(DrainIncomplete {
+                kind,
+                detail: format!("{err}: no FITHAW issued"),
+            });
         }
         if err.is_invalid() || err.is_not_supported() {
             return None;
         }
         Some(if err.is_permission() && self.successes == 0 {
-            format!("first FITHAW denied: {err}")
+            DrainIncomplete {
+                kind: RecoveryReason::PermissionDenied,
+                detail: format!("first FITHAW denied: {err}"),
+            }
         } else if err.is_permission() {
-            format!("FITHAW denied after {} successes: {err}", self.successes)
+            DrainIncomplete {
+                kind: RecoveryReason::PermissionDenied,
+                detail: format!("FITHAW denied after {} successes: {err}", self.successes),
+            }
         } else {
-            format!("FITHAW failed: {err}; the filesystem may still be frozen")
+            DrainIncomplete {
+                kind: RecoveryReason::IoctlFailed,
+                detail: format!("FITHAW failed: {err}; the filesystem may still be frozen"),
+            }
         })
     }
 }
@@ -1230,13 +1575,14 @@ mod tests {
             )));
         });
         let err = result.unwrap().unwrap_err();
-        assert!(
-            err.to_string().contains("freeze of /home/data failed"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "freeze failed: FIFREEZE failed; rolled back (1 target(s) thawed); state thawed"
         );
         assert_eq!(rig.state(), FreezeState::Thawed);
         assert!(!rig.marker().exists());
         assert!(text.contains("\"event\":\"fsfreeze_rollback\""), "{text}");
+        assert!(text.contains("/home/data"), "local log keeps path: {text}");
         assert!(!text.contains("marker_remove_failed"), "{text}");
     }
 
@@ -1440,7 +1786,7 @@ mod tests {
         assert_eq!(err.class(), ErrorClass::GenericError);
         assert_eq!(
             err.to_string(),
-            "freeze of /home/data failed: EIO: I/O error; rolled back"
+            "freeze failed: FIFREEZE failed; rolled back (1 target(s) thawed); state thawed"
         );
         assert_eq!(rig.fifreezes(), paths(&["/home/data/deep", "/home/data"]));
         // Only the processed target is drained (once, then EINVAL).
@@ -1476,7 +1822,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "freeze of /home/data failed: EIO: I/O error; rolled back"
+            "freeze failed: FIFREEZE failed; rolled back (0 target(s) thawed); state thawed"
         );
         assert_eq!(rig.fithaws(), paths(&["/home/data/deep"]));
         assert!(!rig.marker().exists(), "nothing is frozen: the marker goes");
@@ -1500,14 +1846,23 @@ mod tests {
         assert_eq!(drained(0, e(Errno::ENOTTY), false).incomplete(), None);
         // A denied FITHAW leaves the target frozen (OQ-3), whether first...
         let denied = drained(0, e(Errno::EPERM), false).incomplete().unwrap();
-        assert!(denied.starts_with("first FITHAW denied: EPERM"), "{denied}");
+        assert_eq!(denied.kind, RecoveryReason::PermissionDenied);
+        assert!(
+            denied.detail.starts_with("first FITHAW denied: EPERM"),
+            "{denied:?}"
+        );
         // ...or after successes: the remaining depth is unknown.
         let denied = drained(2, e(Errno::EACCES), false).incomplete().unwrap();
-        assert!(denied.contains("denied after 2 successes"), "{denied}");
+        assert_eq!(denied.kind, RecoveryReason::PermissionDenied);
+        assert!(
+            denied.detail.contains("denied after 2 successes"),
+            "{denied:?}"
+        );
         // Any other errno is uncertain: Linux keeps a filesystem frozen
         // when its unfreeze fails.
         let failed = drained(0, e(Errno::EIO), false).incomplete().unwrap();
-        assert!(failed.contains("FITHAW failed: EIO"), "{failed}");
+        assert_eq!(failed.kind, RecoveryReason::IoctlFailed);
+        assert!(failed.detail.contains("FITHAW failed: EIO"), "{failed:?}");
         assert!(drained(1, e(Errno::ENOSPC), false).incomplete().is_some());
         // An error from before the ioctl means no FITHAW was issued, so
         // nothing is known about the filesystem: incomplete, whatever the
@@ -1515,11 +1870,16 @@ mod tests {
         let unopened = drained(0, Some(KernelError::Open(Errno::EMFILE)), false)
             .incomplete()
             .unwrap();
+        assert_eq!(unopened.kind, RecoveryReason::TargetOpenFailed);
         assert!(
-            unopened.contains("cannot open mountpoint: EMFILE"),
-            "{unopened}"
+            unopened.detail.contains("cannot open mountpoint: EMFILE"),
+            "{unopened:?}"
         );
-        assert!(unopened.contains("no FITHAW issued"), "{unopened}");
+        assert!(unopened.detail.contains("no FITHAW issued"), "{unopened:?}");
+        let denied_open = drained(0, Some(KernelError::Open(Errno::EACCES)), false)
+            .incomplete()
+            .unwrap();
+        assert_eq!(denied_open.kind, RecoveryReason::TargetOpenPermissionDenied);
         for errno in [
             Errno::EINVAL,
             Errno::EOPNOTSUPP,
@@ -1529,13 +1889,15 @@ mod tests {
             let reason = drained(0, Some(KernelError::Open(errno)), false)
                 .incomplete()
                 .unwrap_or_else(|| panic!("Open({errno}) must not complete a drain"));
-            assert!(reason.contains("no FITHAW issued"), "{reason}");
+            assert_eq!(reason.kind, RecoveryReason::TargetOpenFailed);
+            assert!(reason.detail.contains("no FITHAW issued"), "{reason:?}");
             let reason = drained(2, Some(KernelError::Open(errno)), false)
                 .incomplete()
                 .unwrap_or_else(|| {
                     panic!("Open({errno}) after successes must not complete a drain")
                 });
-            assert!(reason.contains("no FITHAW issued"), "{reason}");
+            assert_eq!(reason.kind, RecoveryReason::TargetOpenFailed);
+            assert!(reason.detail.contains("no FITHAW issued"), "{reason:?}");
         }
         let elsewhere = drained(
             0,
@@ -1547,12 +1909,20 @@ mod tests {
         )
         .incomplete()
         .unwrap();
-        assert!(elsewhere.contains("not on the planned 8:2"), "{elsewhere}");
-        assert!(elsewhere.contains("no FITHAW issued"), "{elsewhere}");
+        assert_eq!(elsewhere.kind, RecoveryReason::TargetUnreachable);
+        assert!(
+            elsewhere.detail.contains("not on the planned 8:2"),
+            "{elsewhere:?}"
+        );
+        assert!(
+            elsewhere.detail.contains("no FITHAW issued"),
+            "{elsewhere:?}"
+        );
         // A drain that never converged is incomplete whatever else happened.
         let capped = drained(u32::MAX, None, true).incomplete().unwrap();
-        assert!(capped.contains("did not converge"), "{capped}");
-        assert!(capped.contains("still succeeding"), "{capped}");
+        assert_eq!(capped.kind, RecoveryReason::DrainDidNotConverge);
+        assert!(capped.detail.contains("did not converge"), "{capped:?}");
+        assert!(capped.detail.contains("still succeeding"), "{capped:?}");
     }
 
     #[tokio::test]
@@ -1567,10 +1937,14 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "freeze failed: FIFREEZE failed; rollback incomplete (FITHAW failed; filesystem may still be frozen, 1 target(s) thawed); state frozen, marker retained"
+        );
         assert!(
-            err.to_string()
-                .contains("rollback of /home/data incomplete (FITHAW failed: EIO"),
-            "{err}"
+            !text.contains("/home/data"),
+            "wire error must hide mounts: {text}"
         );
         assert_eq!(
             rig.fithaws(),
@@ -1769,10 +2143,13 @@ mod tests {
             .await
             .unwrap_err();
         let text = err.to_string();
-        assert!(
-            text.contains("8:2") && text.contains("marker retained"),
-            "{text}"
+        assert_eq!(
+            text,
+            "thaw incomplete: target unreachable; no FITHAW issued (3 target(s) thawed); state frozen, marker retained"
         );
+        for secret in ["8:2", "/data"] {
+            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        }
         assert_eq!(
             rig.fithaws(),
             paths(&["/", "/", "/data", "/data", "/data/nested", "/data/nested"]),
@@ -1820,10 +2197,13 @@ mod tests {
         .await
         .unwrap_err();
         let text = err.to_string();
-        assert!(
-            text.contains("/data") && text.contains("8:2") && text.contains("8:5"),
-            "{text}"
+        assert_eq!(
+            text,
+            "freeze failed: target unreachable; no FIFREEZE issued; rolled back (0 target(s) thawed); state thawed"
         );
+        for secret in ["/data", "8:2", "8:5"] {
+            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        }
         assert!(
             rig.fifreezes().is_empty(),
             "nothing frozen through an alias"
@@ -2124,12 +2504,10 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("thaw of / incomplete: FITHAW failed: EIO"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "thaw incomplete: FITHAW failed; filesystem may still be frozen (1 target(s) thawed); state frozen, marker retained"
         );
-        assert!(err.to_string().contains("marker retained"), "{err}");
         assert_eq!(rig.fithaws(), paths(&["/", "/home", "/home"]));
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
@@ -2143,12 +2521,15 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("no mount point leads to 8:2 (/home: cannot open mountpoint: EMFILE"),
-            "{err}"
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "thaw incomplete: target unreachable; no FITHAW issued (1 target(s) thawed); state frozen, marker retained"
         );
-        assert!(err.to_string().contains("no FITHAW issued"), "{err}");
+        assert!(
+            !text.contains("/home") && !text.contains("8:2"),
+            "wire error must hide mount and device: {text}"
+        );
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
 
@@ -2216,10 +2597,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("thaw of / incomplete: first FITHAW denied"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "thaw incomplete: FITHAW permission denied (3 target(s) thawed); state frozen, marker retained"
         );
         assert_eq!(
             rig.fithaws(),
@@ -2323,10 +2703,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("did not converge after 1024 FITHAW calls"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "thaw incomplete: drain did not converge; filesystem may still be frozen (2 target(s) thawed); state frozen, marker retained"
         );
         let root_calls = rig
             .fithaws()
@@ -2352,10 +2731,14 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "freeze failed: FIFREEZE failed; rollback incomplete (FITHAW permission denied, 1 target(s) thawed); state frozen, marker retained"
+        );
         assert!(
-            err.to_string()
-                .contains("rollback of /home/data incomplete (first FITHAW denied"),
-            "{err}"
+            !text.contains("/home"),
+            "wire error must hide mounts: {text}"
         );
         assert_eq!(
             rig.fifreezes(),
@@ -2425,10 +2808,14 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "freeze failed: FIFREEZE failed; rollback incomplete (FITHAW permission denied, 0 target(s) thawed); state frozen, marker retained"
+        );
         assert!(
-            err.to_string()
-                .contains("rollback of /home/data/deep incomplete"),
-            "{err}"
+            !text.contains("/home/data"),
+            "wire error must hide mounts: {text}"
         );
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists(), "marker retained");
@@ -2437,7 +2824,10 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("denied: EPERM"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "thaw incomplete: FITHAW permission denied (0 target(s) thawed); state frozen, marker retained"
+        );
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
     }
@@ -2459,10 +2849,14 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "freeze failed: FIFREEZE failed; rolled back (1 target(s) thawed) but cannot remove recovery marker: recovery marker unlink failed; state frozen, marker retained"
+        );
         assert!(
-            err.to_string()
-                .contains("rolled back but cannot remove recovery marker"),
-            "{err}"
+            !text.contains("/home/data") && !text.contains("/frozen"),
+            "wire error must hide paths: {text}"
         );
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().path().exists(), "marker path retained");
@@ -2833,8 +3227,8 @@ mod tests {
         // Every pathname of 8:2 fails (one leads elsewhere, the other
         // cannot be opened): nothing was asked of that filesystem, so the
         // thaw is incomplete; the other target is still drained, the
-        // marker and the frozen gate are retained, and the reason names
-        // every attempt.
+        // marker and the frozen gate are retained, and the wire error keeps
+        // paths and device numbers out of host replies (§5.9).
         let rig = Rig::new(FreezeState::Frozen, "bind_mounts.txt");
         rig.marker().create().unwrap();
         rig.kernel.script_mount_device("/data", (8, 9));
@@ -2843,15 +3237,13 @@ mod tests {
             .await
             .unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("thaw of /data incomplete"), "{text}");
-        assert!(
-            text.contains(
-                "no mount point leads to 8:2 (/data: mountpoint is on 8:9, not on the planned 8:2; /srv/exports: cannot open mountpoint: ENOENT"
-            ),
-            "{text}"
+        assert_eq!(
+            text,
+            "thaw incomplete: target unreachable; no FITHAW issued (1 target(s) thawed); state frozen, marker retained"
         );
-        assert!(text.contains("); no FITHAW issued"), "{text}");
-        assert!(text.contains("marker retained"), "{text}");
+        for secret in ["/data", "/srv/exports", "8:2", "8:9"] {
+            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        }
         assert_eq!(
             rig.fithaws(),
             paths(&["/", "/"]),
@@ -2887,24 +3279,13 @@ mod tests {
             .await
             .unwrap_err();
         let text = err.to_string();
-        assert!(
-            text.starts_with(
-                "freeze of / failed: no mount point leads to it (/: cannot open mountpoint: EACCES"
-            ),
-            "{text}"
+        assert_eq!(
+            text,
+            "freeze failed: target open permission denied; no FIFREEZE issued; rolled back (1 target(s) thawed); state thawed"
         );
-        assert!(
-            text.contains("; /var/www: cannot open mountpoint: EACCES"),
-            "{text}"
-        );
-        assert!(
-            text.contains("; /mnt/rootbind: cannot open mountpoint: EACCES"),
-            "{text}"
-        );
-        assert!(
-            text.ends_with("); no FIFREEZE issued; rolled back"),
-            "{text}"
-        );
+        for secret in ["/var/www", "/mnt/rootbind", "/srv/exports"] {
+            assert!(!text.contains(secret), "leaked {secret} in {text}");
+        }
         assert_eq!(rig.fifreezes(), paths(&["/srv/exports"]));
         assert_eq!(rig.fithaws(), paths(&["/srv/exports", "/srv/exports"]));
         let reopened = rig
@@ -2930,12 +3311,14 @@ mod tests {
             .await
             .unwrap_err();
         let text = err.to_string();
-        assert!(text.contains("freeze of /home/data failed"), "{text}");
-        assert!(
-            text.contains("cannot open mountpoint: EOPNOTSUPP"),
-            "{text}"
+        assert_eq!(
+            text,
+            "freeze failed: target unreachable; no FIFREEZE issued; rolled back (1 target(s) thawed); state thawed"
         );
-        assert!(text.contains("rolled back"), "{text}");
+        assert!(
+            !text.contains("/home/data"),
+            "wire error must hide mount: {text}"
+        );
         assert_eq!(rig.fifreezes(), paths(&["/home/data/deep"]));
         assert_eq!(
             rig.fithaws(),
@@ -3067,10 +3450,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().starts_with("cannot build thaw plan: ")
-                && err.to_string().contains("Too many open files"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cannot build thaw plan (4 target(s) thawed); state frozen, marker retained"
         );
         assert!(rig.opens().is_empty(), "no pathname was consulted");
         assert_eq!(
@@ -3119,9 +3501,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().starts_with("cannot build thaw plan: "),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cannot build thaw plan (0 target(s) thawed); state frozen, marker retained"
         );
         assert!(rig.kernel.calls().is_empty());
         assert_eq!(rig.state(), FreezeState::Frozen);
@@ -3185,7 +3567,10 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("thaw worker lost"), "{err}");
+        assert_eq!(
+            err.to_string(),
+            "thaw task failed; state frozen, marker retained"
+        );
         assert_eq!(rig.state(), FreezeState::Frozen);
         assert!(rig.marker().exists());
         assert_eq!(rig.held(), 0, "the descriptors were lost with the task");
@@ -3297,10 +3682,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("thaw of /home incomplete: first FITHAW denied: EACCES"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "thaw incomplete: FITHAW permission denied (3 target(s) thawed); state frozen, marker retained"
         );
         assert_eq!(rig.held(), 1, "only the incomplete handle is kept");
         assert_eq!(rig.state(), FreezeState::Frozen);
@@ -3386,11 +3770,9 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("cannot build thaw plan: cannot read /proc/self/mountinfo:")
-                && err.to_string().contains("os error 24"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "cannot build thaw plan (4 target(s) thawed); state frozen, marker retained"
         );
         assert_eq!(rig.fithaws().len(), 8, "every held target is drained");
         assert_eq!(rig.held(), 0);
@@ -3483,11 +3865,16 @@ mod tests {
         // `frozen` hook ever fires.
         let ab = aborted_at_b().await;
         let (rig, gate, err) = (&ab.rig, &ab.gate, &ab.err);
+        let text = err.to_string();
         assert!(
-            err.to_string().contains("deadline of 1 s expired")
-                && err.to_string().contains(B)
-                && err.to_string().contains("marker retained"),
-            "{err}"
+            text.contains("deadline of 1 s expired with a FIFREEZE in flight")
+                && text.contains("1 target(s) frozen so far are being thawed")
+                && text.contains("state thawing, marker retained"),
+            "{text}"
+        );
+        assert!(
+            !text.contains(B),
+            "wire error must hide in-flight target: {text}"
         );
         assert_eq!(gate.waiting(), 1, "B is still inside FIFREEZE");
         assert_eq!(rig.fifreezes(), paths(&[A, B]));
@@ -3839,13 +4226,16 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
+        let text = err.to_string();
         assert!(
-            err.to_string()
-                .contains("recovery pending (0 target(s) thawed so far")
-                && err
-                    .to_string()
-                    .contains(&format!("FIFREEZE of {B} still in flight")),
-            "{err}"
+            text.contains(
+                "recovery pending (0 target(s) thawed so far, a FIFREEZE is still in flight)"
+            ),
+            "{text}"
+        );
+        assert!(
+            !text.contains(B),
+            "wire error must hide in-flight target: {text}"
         );
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
@@ -3946,7 +4336,12 @@ mod tests {
         let err = thaw(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-thaw"}"#))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains(A), "{err}");
+        let text = err.to_string();
+        assert_eq!(
+            text,
+            "thaw incomplete: FITHAW permission denied (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert!(!text.contains(A), "wire error must hide mount: {text}");
         assert_eq!(rig.state(), FreezeState::Frozen);
     }
 
@@ -4000,10 +4395,9 @@ mod tests {
         assert_eq!(rig.state(), FreezeState::Freezing);
         a_thaw.release();
         let err = freezing.await.unwrap().unwrap_err();
-        assert!(
-            err.to_string().starts_with("freeze of /home failed: EIO")
-                && err.to_string().contains("rolled back"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "freeze failed: FIFREEZE failed; rolled back (2 target(s) thawed); state thawed"
         );
         assert_eq!(rig.state(), FreezeState::Thawed);
         assert!(!rig.marker().exists());
@@ -4020,7 +4414,7 @@ mod tests {
         let err = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
             .await
             .unwrap_err();
-        assert!(err.to_string().starts_with("freeze task failed:"), "{err}");
+        assert_eq!(err.to_string(), "freeze preparation failed; state thawed");
         assert!(rig.kernel.calls().is_empty());
         assert_eq!(rig.state(), FreezeState::Thawed);
         assert!(!rig.marker().exists());
@@ -4133,5 +4527,563 @@ mod tests {
         assert_eq!(rig.fithaws(), paths(&[C, C, B, B, A, A, D, D]));
         assert!(!rig.hooks.events().contains(&"frozen"));
         assert!(!rig.marker().exists());
+    }
+
+    #[test]
+    fn lifecycle_errors_hide_guest_paths_devices_and_marker_paths_on_wire_while_logging_locally() {
+        // CVM Blocker 2 (#53, AC27): under the data-protection profile (and
+        // unconditionally across profiles), freeze, freeze-list, rollback,
+        // marker failure, in-flight abort/join, and recovery thaw errors emit
+        // only GenericError, a fixed reason, recovery state, and counts on
+        // the wire. Guest mount names, aliases, device numbers, and marker
+        // paths stay in guest-local diagnostics only.
+        use crate::dispatch::Dispatcher;
+        use crate::framing::DecodeEvent;
+
+        const PRIMARY: &str = "/srv/tenant-alpha/db";
+        const ALIAS: &str = "/mnt/alias-vol";
+        const ALT: &str = "/srv/tenant-alpha/alt";
+        const SECOND: &str = "/srv/tenant-beta/app";
+        const MARKER_NAME: &str = "tenant-secret-marker";
+        const TABLE: &str = concat!(
+            "10 1 8:1 / / rw,relatime - ext4 /dev/vda1 rw\n",
+            "11 10 8:42 / /srv/tenant-alpha/db rw,relatime - ext4 /dev/vdb1 rw\n",
+            "12 10 8:42 / /mnt/alias-vol rw,relatime - ext4 /dev/vdb1 rw\n",
+            "13 10 8:42 / /srv/tenant-alpha/alt rw,relatime - ext4 /dev/vdb1 rw\n",
+            "14 10 8:43 / /srv/tenant-beta/app rw,relatime - xfs /dev/vdc1 rw\n",
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let dp_config = || {
+            let mut cfg = Config::default();
+            cfg.features.information = false;
+            cfg.features.fstrim = false;
+            cfg.features.shutdown = false;
+            cfg
+        };
+        let forbidden = |marker_dir: &Path| {
+            vec![
+                PRIMARY.to_owned(),
+                ALIAS.to_owned(),
+                ALT.to_owned(),
+                SECOND.to_owned(),
+                "tenant-alpha".to_owned(),
+                "tenant-beta".to_owned(),
+                "8:42".to_owned(),
+                "8:43".to_owned(),
+                "8:99".to_owned(),
+                MARKER_NAME.to_owned(),
+                marker_dir.to_string_lossy().into_owned(),
+                "/proc/self/mountinfo".to_owned(),
+            ]
+        };
+        let assert_host_safe = |label: &str, reply: &Value, marker_dir: &Path| -> String {
+            assert_eq!(reply["error"]["class"], "GenericError", "{label}: {reply}");
+            let desc = reply["error"]["desc"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{label}: missing error.desc: {reply}"))
+                .to_owned();
+            for secret in forbidden(marker_dir) {
+                assert!(
+                    !desc.contains(&secret),
+                    "{label}: wire error.desc disclosed {secret:?}: {desc:?}"
+                );
+            }
+            desc
+        };
+        let dispatch_json = |dispatcher: &Dispatcher, json_req: &str| -> Value {
+            let raw = runtime
+                .block_on(dispatcher.handle(DecodeEvent::Frame {
+                    bytes: json_req.as_bytes().to_vec(),
+                    sentinel: false,
+                }))
+                .expect("reply");
+            serde_json::from_slice(&raw[..raw.len() - 1]).unwrap()
+        };
+
+        // 1. freeze-list via bind alias failing on primary superblock + inventory/trim disabled.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = Marker::open(dir.path().join(MARKER_NAME)).unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.script_freeze_error(ALIAS, Errno::EIO);
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(dp_config()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(TABLE.to_owned()))),
+        );
+        let dispatcher = Dispatcher::new(Arc::clone(&ctx));
+        for disabled in ["guest-get-fsinfo", "guest-fstrim"] {
+            let reply = dispatch_json(&dispatcher, &format!(r#"{{"execute":"{disabled}"}}"#));
+            assert_eq!(reply["error"]["class"], "CommandNotFound", "{reply}");
+        }
+        let mut reply = Value::Null;
+        let logs = capture_warnings(|| {
+            reply = dispatch_json(
+                &dispatcher,
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/mnt/alias-vol"]}}"#,
+            );
+        });
+        let desc = assert_host_safe("freeze-list hard error", &reply, dir.path());
+        assert!(
+            desc.contains("rolled back") && desc.contains("0 target(s) thawed"),
+            "{desc}"
+        );
+        assert!(desc.contains("state thawed"), "{desc}");
+        assert!(logs.contains(PRIMARY), "local log keeps mountpoint: {logs}");
+
+        // 2. Pre-existing marker failure with sensitive custom marker path.
+        ctx.marker.create().unwrap();
+        let mut reply = Value::Null;
+        let logs = capture_warnings(|| {
+            reply = dispatch_json(&dispatcher, r#"{"execute":"guest-fsfreeze-freeze"}"#);
+        });
+        let desc = assert_host_safe("marker create error", &reply, dir.path());
+        assert!(desc.contains("cannot create recovery marker"), "{desc}");
+        assert!(desc.contains("state thawed"), "{desc}");
+        assert!(
+            logs.contains(MARKER_NAME),
+            "local log keeps marker path: {logs}"
+        );
+        ctx.marker.remove().unwrap();
+
+        // 3. Hard error with rollback incomplete (stays Frozen, marker retained).
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.script_freeze_error(PRIMARY, Errno::EIO);
+        kernel.script_thaw_error(SECOND, Errno::EIO);
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(dp_config()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir.path().join(MARKER_NAME)).unwrap(),
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(TABLE.to_owned()))),
+        );
+        let dispatcher = Dispatcher::new(Arc::clone(&ctx));
+        let mut reply = Value::Null;
+        let logs = capture_warnings(|| {
+            reply = dispatch_json(&dispatcher, r#"{"execute":"guest-fsfreeze-freeze"}"#);
+        });
+        let desc = assert_host_safe("rollback incomplete", &reply, dir.path());
+        assert!(desc.contains("rollback incomplete"), "{desc}");
+        assert!(desc.contains("state frozen, marker retained"), "{desc}");
+        assert!(
+            logs.contains(PRIMARY) && logs.contains(SECOND),
+            "local log keeps targets: {logs}"
+        );
+        let _ = std::fs::remove_file(dir.path().join(MARKER_NAME));
+
+        // 4. In-flight deadline abort + joining thaw (in-flight and after settling Frozen).
+        let clock = ManualClock::new();
+        let kernel = Arc::new(FakeKernel::new());
+        let gate = kernel.script_freeze_gate(PRIMARY);
+        let _release = gate.release_on_drop();
+        kernel.script_thaw_error(SECOND, Errno::EACCES);
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(dp_config()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir.path().join(MARKER_NAME)).unwrap(),
+            )
+            .with_kernel(Arc::clone(&kernel) as Arc<dyn KernelOps>)
+            .with_mounts(Arc::new(StaticMounts(TABLE.to_owned())))
+            .with_freeze_clock(Arc::new(clock.clone()))
+            .with_freeze_operation_timeout(Duration::from_secs(1)),
+        );
+        let dispatcher = Arc::new(Dispatcher::new(Arc::clone(&ctx)));
+        let mut abort_reply = Value::Null;
+        let mut join_pending = Value::Null;
+        let mut join_settled = Value::Null;
+        let logs = capture_warnings(|| {
+            use tracing::instrument::WithSubscriber;
+            let sub = tracing::dispatcher::get_default(Clone::clone);
+            let d = Arc::clone(&dispatcher);
+            let freezing = runtime.spawn(
+                async move {
+                    let raw = d
+                        .handle(DecodeEvent::Frame {
+                            bytes: br#"{"execute":"guest-fsfreeze-freeze"}"#.to_vec(),
+                            sentinel: false,
+                        })
+                        .await
+                        .unwrap();
+                    serde_json::from_slice::<Value>(&raw[..raw.len() - 1]).unwrap()
+                }
+                .with_subscriber(sub),
+            );
+            runtime.block_on(async {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while gate.waiting() == 0 {
+                    assert!(std::time::Instant::now() < deadline);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            clock.advance(Duration::from_secs(1));
+            abort_reply = runtime.block_on(freezing).unwrap();
+            join_pending = dispatch_json(&dispatcher, r#"{"execute":"guest-fsfreeze-thaw"}"#);
+            let op = ctx.freeze_op().unwrap();
+            gate.release();
+            runtime.block_on(op.wait_for_settlement());
+            // Calling join_operation directly on the settled Frozen operation
+            // exercises the `Some(state)` arm as well.
+            let settled_err = runtime.block_on(join_operation(&ctx, &op)).unwrap_err();
+            join_settled = json!({
+                "error": {
+                    "class": settled_err.class().as_str(),
+                    "desc": settled_err.to_string(),
+                }
+            });
+        });
+        let desc = assert_host_safe("in-flight deadline abort", &abort_reply, dir.path());
+        assert!(desc.contains("deadline of 1 s expired"), "{desc}");
+        assert!(desc.contains("1 target(s) frozen so far"), "{desc}");
+        assert!(desc.contains("marker retained"), "{desc}");
+        let desc = assert_host_safe("joining thaw pending", &join_pending, dir.path());
+        assert!(desc.contains("recovery pending"), "{desc}");
+        assert!(desc.contains("target(s) thawed so far"), "{desc}");
+        assert!(desc.contains("marker retained"), "{desc}");
+        let desc = assert_host_safe("joining thaw settled frozen", &join_settled, dir.path());
+        assert!(desc.contains("target(s) thawed"), "{desc}");
+        assert!(desc.contains("state frozen, marker retained"), "{desc}");
+        assert!(
+            logs.contains(PRIMARY),
+            "local log keeps in-flight target: {logs}"
+        );
+        let _ = std::fs::remove_file(dir.path().join(MARKER_NAME));
+
+        // 5. Recovery thaw with unreachable overmounted superblock and aliases.
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.script_mount_device(PRIMARY, (8, 99));
+        kernel.script_open_error(ALIAS, Errno::ENOENT);
+        kernel.script_open_error(ALT, Errno::EACCES);
+        let marker = Marker::open(dir.path().join(MARKER_NAME)).unwrap();
+        marker.create().unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(dp_config()),
+                Arc::new(FreezeStateMachine::starting_frozen()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(TABLE.to_owned()))),
+        );
+        let dispatcher = Dispatcher::new(Arc::clone(&ctx));
+        let mut reply = Value::Null;
+        let logs = capture_warnings(|| {
+            reply = dispatch_json(&dispatcher, r#"{"execute":"guest-fsfreeze-thaw"}"#);
+        });
+        let desc = assert_host_safe("recovery thaw unreachable", &reply, dir.path());
+        assert!(
+            desc.contains("target unreachable; no FITHAW issued"),
+            "{desc}"
+        );
+        assert!(desc.contains("2 target(s) thawed"), "{desc}");
+        assert!(desc.contains("state frozen, marker retained"), "{desc}");
+        assert!(
+            logs.contains(PRIMARY)
+                && logs.contains(ALIAS)
+                && logs.contains(ALT)
+                && logs.contains("8:42"),
+            "local log keeps unreachable diagnostics: {logs}"
+        );
+        let _ = std::fs::remove_file(dir.path().join(MARKER_NAME));
+
+        // 6. Recovery thaw when mountinfo cannot be read.
+        struct FailingMounts;
+        impl MountSource for FailingMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Err(Error::Internal(
+                    "cannot read /proc/self/mountinfo: Too many open files".to_owned(),
+                ))
+            }
+        }
+        let marker = Marker::open(dir.path().join(MARKER_NAME)).unwrap();
+        marker.create().unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(dp_config()),
+                Arc::new(FreezeStateMachine::starting_frozen()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(Arc::new(FakeKernel::new()))
+            .with_mounts(Arc::new(FailingMounts)),
+        );
+        let dispatcher = Dispatcher::new(Arc::clone(&ctx));
+        let mut reply = Value::Null;
+        let logs = capture_warnings(|| {
+            reply = dispatch_json(&dispatcher, r#"{"execute":"guest-fsfreeze-thaw"}"#);
+        });
+        let desc = assert_host_safe("recovery thaw plan error", &reply, dir.path());
+        assert!(desc.contains("cannot build thaw plan"), "{desc}");
+        assert!(desc.contains("0 target(s) thawed"), "{desc}");
+        assert!(desc.contains("state frozen, marker retained"), "{desc}");
+        assert!(
+            logs.contains("/proc/self/mountinfo"),
+            "local log keeps mountinfo error: {logs}"
+        );
+    }
+
+    #[test]
+    fn all_host_descriptions_are_fixed_and_redact_guest_secrets() {
+        const SECRET_MOUNT: &str = "/srv/tenant-secret/vault";
+        const SECRET_ALIAS: &str = "/mnt/tenant-secret-alias";
+        const SECRET_MARKER: &str = "/run/qeminga-secret/frozen";
+        const SECRET_DEV: &str = "253:77";
+        const SECRET_DETAIL: &str = "secret-internal-detail";
+
+        let marker_err = || MarkerError::Io {
+            path: PathBuf::from(SECRET_MARKER),
+            op: "unlink",
+            errno: Errno::EACCES,
+        };
+        let assert_clean = |label: &str, text: &str| {
+            for secret in [
+                SECRET_MOUNT,
+                SECRET_ALIAS,
+                SECRET_MARKER,
+                SECRET_DEV,
+                SECRET_DETAIL,
+                "/proc/self/mountinfo",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "{label}: leaked {secret:?} in {text:?}"
+                );
+            }
+        };
+
+        // Every FreezeStop arm.
+        let stops = [
+            (
+                FreezeStop::Ioctl(KernelError::Errno(Errno::EPERM)),
+                "FIFREEZE permission denied",
+            ),
+            (
+                FreezeStop::Ioctl(KernelError::Open(Errno::EMFILE)),
+                "target open failed; no FIFREEZE issued",
+            ),
+            (
+                FreezeStop::Ioctl(KernelError::WrongFilesystem {
+                    expected: (253, 77),
+                    found: (8, 9),
+                }),
+                "target unreachable; no FIFREEZE issued",
+            ),
+            (
+                FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
+                "FIFREEZE failed",
+            ),
+            (
+                FreezeStop::Unreachable {
+                    attempts: format!("{SECRET_MOUNT}: EACCES; {SECRET_ALIAS}: EACCES"),
+                    permission_denied: true,
+                },
+                "target open permission denied; no FIFREEZE issued",
+            ),
+            (
+                FreezeStop::Unreachable {
+                    attempts: format!("{SECRET_MOUNT}: on {SECRET_DEV}; {SECRET_ALIAS}: ENOENT"),
+                    permission_denied: false,
+                },
+                "target unreachable; no FIFREEZE issued",
+            ),
+        ];
+        for (stop, expected) in &stops {
+            assert_eq!(stop.host_reason(), *expected);
+            assert_clean("FreezeStop", stop.host_reason());
+        }
+
+        // Every RecoveryReason arm.
+        for reason in [
+            RecoveryReason::TargetUnreachable,
+            RecoveryReason::TargetOpenFailed,
+            RecoveryReason::TargetOpenPermissionDenied,
+            RecoveryReason::PermissionDenied,
+            RecoveryReason::IoctlFailed,
+            RecoveryReason::DrainDidNotConverge,
+            RecoveryReason::WorkerLost,
+            RecoveryReason::DrainLost,
+            RecoveryReason::MarkerRetained,
+        ] {
+            let text = reason.host_reason();
+            assert!(!text.is_empty());
+            assert_clean("RecoveryReason", text);
+        }
+
+        // Every FreezeFailure arm + retains_frozen_state.
+        let freeze_cases: Vec<(FreezeFailure, bool, &str)> = vec![
+            (
+                FreezeFailure::Plan(format!("/proc/self/mountinfo: {SECRET_DETAIL}")),
+                false,
+                "cannot build freeze plan; state thawed",
+            ),
+            (
+                FreezeFailure::Marker(MarkerError::AlreadyPresent {
+                    path: PathBuf::from(SECRET_MARKER),
+                }),
+                false,
+                "cannot create recovery marker: recovery marker already exists; state thawed",
+            ),
+            (
+                FreezeFailure::Hard {
+                    mountpoint: SECRET_MOUNT.into(),
+                    cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
+                    rolled_back: 2,
+                },
+                false,
+                "freeze failed: FIFREEZE failed; rolled back (2 target(s) thawed); state thawed",
+            ),
+            (
+                FreezeFailure::RollbackIncomplete {
+                    failed: SECRET_MOUNT.into(),
+                    cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
+                    mountpoint: SECRET_ALIAS.into(),
+                    recovery_reason: RecoveryReason::PermissionDenied,
+                    reason: format!("{SECRET_ALIAS}: {SECRET_DEV}: {SECRET_DETAIL}"),
+                    rolled_back: 1,
+                },
+                true,
+                "freeze failed: FIFREEZE failed; rollback incomplete (FITHAW permission denied, 1 target(s) thawed); state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::MarkerRetained {
+                    failed: SECRET_MOUNT.into(),
+                    cause: FreezeStop::Ioctl(KernelError::Errno(Errno::EIO)),
+                    marker: marker_err(),
+                    rolled_back: 3,
+                },
+                true,
+                "freeze failed: FIFREEZE failed; rolled back (3 target(s) thawed) but cannot remove recovery marker: recovery marker unlink failed; state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::PreparationMarkerRetained {
+                    cause: SECRET_DETAIL.into(),
+                    marker: marker_err(),
+                },
+                true,
+                "freeze preparation failed; cannot remove recovery marker: recovery marker unlink failed; state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::Task {
+                    stage: FreezeTaskStage::Preparation,
+                    detail: SECRET_DETAIL.into(),
+                },
+                false,
+                "freeze preparation failed; state thawed",
+            ),
+            (
+                FreezeFailure::Task {
+                    stage: FreezeTaskStage::Rollback,
+                    detail: SECRET_DETAIL.into(),
+                },
+                true,
+                "freeze rollback failed; state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::Task {
+                    stage: FreezeTaskStage::MarkerRemoval,
+                    detail: SECRET_DETAIL.into(),
+                },
+                true,
+                "nothing was frozen (0 target(s) frozen) and marker removal failed; state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::NothingFrozenMarkerRetained(marker_err()),
+                true,
+                "nothing was frozen (0 target(s) frozen) but cannot remove recovery marker: recovery marker unlink failed; state frozen, marker retained",
+            ),
+            (
+                FreezeFailure::Aborted {
+                    cause: crate::freeze_op::AbortCause::Deadline,
+                    timeout_secs: 30,
+                    frozen: 0,
+                    in_flight: Some(crate::freeze_op::PREPARING.into()),
+                },
+                false,
+                "freeze aborted: operation deadline of 30 s expired while preparing; 0 target(s) frozen so far are being thawed; state thawing, marker retained",
+            ),
+            (
+                FreezeFailure::Aborted {
+                    cause: crate::freeze_op::AbortCause::ThawRequested,
+                    timeout_secs: 30,
+                    frozen: 2,
+                    in_flight: Some(SECRET_MOUNT.into()),
+                },
+                false,
+                "freeze aborted: thaw requested with a FIFREEZE in flight; 2 target(s) frozen so far are being thawed; state thawing, marker retained",
+            ),
+            (
+                FreezeFailure::Aborted {
+                    cause: crate::freeze_op::AbortCause::Deadline,
+                    timeout_secs: 10,
+                    frozen: 1,
+                    in_flight: None,
+                },
+                false,
+                "freeze aborted: operation deadline of 10 s expired; 1 target(s) frozen so far are being thawed; state thawing, marker retained",
+            ),
+        ];
+        for (failure, retains, expected) in &freeze_cases {
+            assert_eq!(failure.retains_frozen_state(), *retains, "{failure:?}");
+            let desc = failure.host_description();
+            assert_eq!(desc, *expected);
+            assert_clean("FreezeFailure", &desc);
+        }
+
+        // Every ThawFailure arm in both Frozen and Thawed final states.
+        let thaw_cases = [
+            (
+                ThawFailure::Plan {
+                    detail: format!("/proc/self/mountinfo: {SECRET_DETAIL}"),
+                    thawed: 2,
+                },
+                "cannot build thaw plan (2 target(s) thawed); state frozen, marker retained",
+                "cannot build thaw plan (2 target(s) thawed); state thawed",
+            ),
+            (
+                ThawFailure::Incomplete {
+                    mountpoint: SECRET_MOUNT.into(),
+                    kind: RecoveryReason::TargetOpenFailed,
+                    reason: format!("{SECRET_MOUNT}: {SECRET_DEV}: {SECRET_DETAIL}"),
+                    thawed: 1,
+                },
+                "thaw incomplete: target open failed; no FITHAW issued (1 target(s) thawed); state frozen, marker retained",
+                "thaw incomplete: target open failed; no FITHAW issued (1 target(s) thawed); state thawed",
+            ),
+            (
+                ThawFailure::Marker {
+                    err: marker_err(),
+                    thawed: 4,
+                },
+                "drain complete (4 target(s) thawed) but cannot remove recovery marker: recovery marker unlink failed; state frozen, marker retained",
+                "drain complete (4 target(s) thawed) but cannot remove recovery marker: recovery marker unlink failed; state thawed",
+            ),
+            (
+                ThawFailure::Task(SECRET_DETAIL.into()),
+                "thaw task failed; state frozen, marker retained",
+                "thaw task failed; state thawed",
+            ),
+        ];
+        for (failure, frozen_expected, thawed_expected) in &thaw_cases {
+            let frozen_desc = failure.host_description(FreezeState::Frozen);
+            let thawed_desc = failure.host_description(FreezeState::Thawed);
+            assert_eq!(frozen_desc, *frozen_expected);
+            assert_eq!(thawed_desc, *thawed_expected);
+            assert_clean("ThawFailure(Frozen)", &frozen_desc);
+            assert_clean("ThawFailure(Thawed)", &thawed_desc);
+        }
     }
 }

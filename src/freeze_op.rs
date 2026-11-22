@@ -67,7 +67,8 @@ use tracing::instrument::WithSubscriber;
 use crate::dispatch::{Context, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
-    FreezeFailure, FreezeStop, build_plan, drain_held, open_target, rollback,
+    FreezeFailure, FreezeStop, FreezeTaskStage, IncompleteDrain, RecoveryReason, build_plan,
+    drain_held, open_target, rollback,
 };
 use crate::kernel::{KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
@@ -240,8 +241,10 @@ pub struct Progress {
     pub recovery_pass_done: bool,
     /// Targets on which a recovery drain succeeded at least once.
     pub recovered: u64,
-    /// A drain that did not complete (target and reason).
+    /// A drain that did not complete (target and reason, guest-local diagnostic).
     pub unrecoverable: Option<String>,
+    /// Host-safe classification of the unrecoverable failure, if any.
+    pub unrecoverable_reason: Option<RecoveryReason>,
     /// The state published when the operation settled.
     pub settled: Option<FreezeState>,
 }
@@ -255,6 +258,7 @@ impl Progress {
             recovery_pass_done: false,
             recovered: 0,
             unrecoverable: None,
+            unrecoverable_reason: None,
             settled: None,
         }
     }
@@ -512,7 +516,7 @@ enum TargetOutcome {
 struct RecoveryPass {
     recovered: u64,
     keep: Vec<Mount>,
-    incomplete: Option<(String, String)>,
+    incomplete: Option<IncompleteDrain>,
 }
 
 /// What ended a tracked wait.
@@ -544,7 +548,7 @@ struct Driver {
     recovery: Option<JoinHandle<RecoveryPass>>,
     /// Handles whose drain did not complete, kept for the watchdog.
     kept: Vec<Mount>,
-    unrecoverable: Option<(String, String)>,
+    unrecoverable: Option<IncompleteDrain>,
     /// A target's outcome is unknown and no descriptor shows for it (a
     /// worker, a drain or a rollback lost): the thaw of what this
     /// operation leaves must discover its targets (§4.2 "Thaw scope").
@@ -570,7 +574,10 @@ impl Driver {
                 // Whether the marker was created is unknown; its removal
                 // tolerates its absence.
                 return self
-                    .settle_before_ioctl(FreezeFailure::Task(err.to_string()))
+                    .settle_before_ioctl(FreezeFailure::Task {
+                        stage: FreezeTaskStage::Preparation,
+                        detail: err.to_string(),
+                    })
                     .await;
             }
         };
@@ -625,10 +632,12 @@ impl Driver {
                     // by pathname reaches it.
                     tracing::error!(event = "fsfreeze_worker_lost", mountpoint = %mountpoint, error = %err, "freeze worker lost; target uncertain");
                     self.uncertain = true;
-                    self.unrecoverable.get_or_insert((
-                        mountpoint.clone(),
-                        format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
-                    ));
+                    self.unrecoverable.get_or_insert(IncompleteDrain {
+                        mountpoint: mountpoint.clone(),
+                        kind: RecoveryReason::WorkerLost,
+                        detail: format!("freeze worker lost ({err}); FIFREEZE outcome unknown"),
+                    });
+                    self.publish_unrecoverable();
                     self.commit_abort(AbortCause::WorkerLost);
                     break;
                 }
@@ -693,7 +702,10 @@ impl Driver {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
                 self.conclude(
                     Terminal::Frozen,
-                    Err(FreezeFailure::Task(format!("marker removal lost: {err}"))),
+                    Err(FreezeFailure::Task {
+                        stage: FreezeTaskStage::MarkerRemoval,
+                        detail: format!("marker removal lost: {err}"),
+                    }),
                 );
             }
         }
@@ -725,8 +737,11 @@ impl Driver {
         self.spawn_blocking(move || {
             let mount = match open_target(kernel.as_ref(), &target) {
                 Ok(mount) => mount,
-                Err(attempts) => {
-                    return TargetOutcome::Failed(FreezeStop::Unreachable(attempts));
+                Err(err) => {
+                    return TargetOutcome::Failed(FreezeStop::Unreachable {
+                        attempts: err.detail,
+                        permission_denied: err.permission_denied,
+                    });
                 }
             };
             if !op.authorises() {
@@ -843,6 +858,18 @@ impl Driver {
         }));
     }
 
+    fn publish_unrecoverable(&self) {
+        let unrecoverable = self
+            .unrecoverable
+            .as_ref()
+            .map(|u| format!("{}: {}", u.mountpoint, u.detail));
+        let unrecoverable_reason = self.unrecoverable.as_ref().map(|u| u.kind);
+        self.op.publish(|p| {
+            p.unrecoverable = unrecoverable;
+            p.unrecoverable_reason = unrecoverable_reason;
+        });
+    }
+
     fn record_recovery(&mut self, res: Result<RecoveryPass, JoinError>) {
         match res {
             Ok(pass) => {
@@ -857,20 +884,23 @@ impl Driver {
                 // uncertain and the watchdog's drain by pathname follows.
                 tracing::error!(event = "fsfreeze_drain_lost", error = %err, "recovery drain lost; targets uncertain");
                 self.uncertain = true;
-                self.unrecoverable.get_or_insert((
-                    "(recovery drain)".to_owned(),
-                    format!("recovery drain lost ({err})"),
-                ));
+                self.unrecoverable.get_or_insert(IncompleteDrain {
+                    mountpoint: "(recovery drain)".to_owned(),
+                    kind: RecoveryReason::DrainLost,
+                    detail: format!("recovery drain lost ({err})"),
+                });
             }
         }
         let recovered = self.recovered;
         let unrecoverable = self
             .unrecoverable
             .as_ref()
-            .map(|(mountpoint, reason)| format!("{mountpoint}: {reason}"));
+            .map(|u| format!("{}: {}", u.mountpoint, u.detail));
+        let unrecoverable_reason = self.unrecoverable.as_ref().map(|u| u.kind);
         self.op.publish(|p| {
             p.recovered = recovered;
             p.unrecoverable = unrecoverable;
+            p.unrecoverable_reason = unrecoverable_reason;
         });
     }
 
@@ -886,7 +916,7 @@ impl Driver {
         // No ioctl was issued, so the marker exists only if its creation
         // succeeded and something later failed; `Task` is the one such
         // case, and a marker that cannot be removed retains the state.
-        if matches!(failure, FreezeFailure::Task(_)) {
+        if matches!(failure, FreezeFailure::Task { .. }) {
             let marker = self.marker.clone();
             let removed = self
                 .await_tracked(self.spawn_blocking(move || marker.remove()), false)
@@ -894,11 +924,16 @@ impl Driver {
             if let Ok(Err(err)) = removed
                 && !matches!(err, MarkerError::Absent { .. })
             {
+                tracing::error!(
+                    event = "fsfreeze_marker_retained",
+                    error = %err,
+                    cause = %failure,
+                    "preparation failed and the marker cannot be removed; staying frozen"
+                );
                 self.conclude(
                     Terminal::Frozen,
-                    Err(FreezeFailure::MarkerRetained {
-                        failed: "(preparation)".to_owned(),
-                        cause: FreezeStop::Unreachable(failure.to_string()),
+                    Err(FreezeFailure::PreparationMarkerRetained {
+                        cause: failure.to_string(),
                         marker: err,
                     }),
                 );
@@ -938,10 +973,13 @@ impl Driver {
             }
             Err(err) => {
                 self.uncertain = true;
-                FreezeFailure::Task(format!("rollback lost: {err}"))
+                FreezeFailure::Task {
+                    stage: FreezeTaskStage::Rollback,
+                    detail: format!("rollback lost: {err}"),
+                }
             }
         };
-        if failure.retains_frozen_state() || matches!(failure, FreezeFailure::Task(_)) {
+        if failure.retains_frozen_state() {
             tracing::error!(event = "fsfreeze_failed_frozen", error = %failure, "freeze failed and the rollback is incomplete; staying frozen");
             self.conclude(Terminal::Frozen, Err(failure));
             return;
@@ -966,9 +1004,15 @@ impl Driver {
         }
         // The reply went out when the abort committed; the value here only
         // matters if it did not (it never reaches anyone).
-        let aborted = FreezeFailure::Task("aborted".to_owned());
-        if let Some((mountpoint, reason)) = self.unrecoverable.take() {
-            tracing::error!(event = "fsfreeze_recovery_incomplete", mountpoint = %mountpoint, reason = %reason, "recovery incomplete; marker retained");
+        let aborted = FreezeFailure::Task {
+            stage: FreezeTaskStage::Rollback,
+            detail: "aborted".to_owned(),
+        };
+        if let Some(IncompleteDrain {
+            mountpoint, detail, ..
+        }) = self.unrecoverable.take()
+        {
+            tracing::error!(event = "fsfreeze_recovery_incomplete", mountpoint = %mountpoint, reason = %detail, "recovery incomplete; marker retained");
             let kept = std::mem::take(&mut self.kept);
             self.ctx.hold_frozen_mounts(kept);
             self.conclude(Terminal::Frozen, Err(aborted));
@@ -989,10 +1033,16 @@ impl Driver {
             }
             Ok(Err(err)) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "recovery drained but the marker cannot be removed; staying frozen");
+                self.op.publish(|p| {
+                    p.unrecoverable_reason = Some(RecoveryReason::MarkerRetained);
+                });
                 self.conclude(Terminal::Frozen, Err(aborted));
             }
             Err(err) => {
                 tracing::error!(event = "fsfreeze_marker_retained", error = %err, "marker removal lost; staying frozen");
+                self.op.publish(|p| {
+                    p.unrecoverable_reason = Some(RecoveryReason::MarkerRetained);
+                });
                 self.conclude(Terminal::Frozen, Err(aborted));
             }
         }

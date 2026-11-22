@@ -715,9 +715,20 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
     let desc = reply["error"]["desc"]
         .as_str()
         .unwrap_or_else(|| panic!("{reply}"));
-    assert!(desc.contains("no mount point leads to"), "{desc}");
-    assert!(desc.contains("not on the planned"), "{desc}");
-    assert!(desc.contains("marker retained"), "{desc}");
+    assert!(
+        desc.contains("target unreachable; no FITHAW issued"),
+        "{desc}"
+    );
+    assert!(desc.contains("state frozen, marker retained"), "{desc}");
+    assert!(!desc.contains(&mount), "wire error must hide mount: {desc}");
+    assert!(
+        !desc.contains(&format!("{}:{}", ext4.0, ext4.1)),
+        "wire error must hide device numbers: {desc}"
+    );
+    assert!(
+        !desc.contains("/frozen"),
+        "wire error must hide marker path: {desc}"
+    );
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
     assert!(agent.state_dir().join("frozen").exists(), "marker retained");
     drop(hidden);
@@ -736,6 +747,9 @@ fn privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount() {
         ),
         "thawed once reachable"
     );
+    // The successful thaw flushed the audit ring; the unreachable-target
+    // detail stays in guest-local diagnostics.
+    agent.wait_for_stderr("not on the planned", e2e::REPLY_TIMEOUT);
     assert!(agent.stop().success());
 }
 

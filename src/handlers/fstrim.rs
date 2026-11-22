@@ -68,7 +68,7 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
                 let path = mountpoint.to_string_lossy().into_owned();
                 let outcome = match open_target(kernel, target) {
                     Ok(mount) => kernel.fitrim(&mount, minimum).map_err(|err| err.to_string()),
-                    Err(attempts) => Err(format!("no mount point leads to it ({attempts})")),
+                    Err(err) => Err(format!("no mount point leads to it ({})", err.detail)),
                 };
                 match outcome {
                     Ok(trimmed) => TrimResult {

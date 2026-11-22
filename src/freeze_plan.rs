@@ -163,12 +163,29 @@ impl<'a> MountTree<'a> {
     }
 }
 
+/// Failure resolving a mount table's visible rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum VisibleMountsError {
+    /// A non-empty mount table has no recognizable `/` root mount (for
+    /// example a process chrooted below a mount root), so mount-tree
+    /// visibility cannot be resolved without silently dropping visible mounts.
+    #[error("mount table has no recognizable root mount")]
+    MissingRoot,
+}
+
 /// Returns the entries of `mounts` that are currently visible at their own
 /// mount point in the mount tree (reusing the same visibility resolution as
 /// [`FreezePlan::restrict_to`]). Rows hidden beneath a stacked, moved, or
 /// ancestor overmount are omitted so every returned row's mount point selects
 /// that row's superblock (design §4.5, AC27).
-pub fn visible_mounts(mounts: &[MountEntry]) -> Vec<&MountEntry> {
+///
+/// An empty table returns `Ok(Vec::new())`. A non-empty table with no
+/// recognizable `/` root returns [`VisibleMountsError::MissingRoot`] rather
+/// than silently turning a populated table into an empty inventory.
+pub fn visible_mounts(mounts: &[MountEntry]) -> Result<Vec<&MountEntry>, VisibleMountsError> {
+    if mounts.is_empty() {
+        return Ok(Vec::new());
+    }
     let rows: Vec<MountRow> = mounts
         .iter()
         .map(|e| MountRow {
@@ -179,13 +196,23 @@ pub fn visible_mounts(mounts: &[MountEntry]) -> Vec<&MountEntry> {
         })
         .collect();
     let tree = MountTree::index(&rows);
-    mounts
+    if tree.root.is_none() {
+        return Err(VisibleMountsError::MissingRoot);
+    }
+    // Cache visibility by distinct raw pathname, mirroring
+    // `FreezePlan::restrict_to`, so a stack of mounts at one path walks the
+    // tree once rather than once per row.
+    let mut resolved: HashMap<&[u8], Option<u32>> = HashMap::new();
+    Ok(mounts
         .iter()
         .filter(|entry| {
-            tree.resolve_row(entry.mount_point.as_os_str().as_bytes())
-                .is_some_and(|row| row.id == entry.mount_id)
+            let path = entry.mount_point.as_os_str().as_bytes();
+            let top_id = *resolved
+                .entry(path)
+                .or_insert_with(|| tree.resolve_row(path).map(|row| row.id));
+            top_id == Some(entry.mount_id)
         })
-        .collect()
+        .collect())
 }
 
 /// The prefixes of an absolute `path` at which a mount point could be,
@@ -713,5 +740,36 @@ mod tests {
         // (ext4) is planned even though the subvolumes are device-backed.
         let plan = plan_from("btrfs_subvols.txt");
         assert_eq!(mountpoints(&plan), ["/boot"]);
+    }
+
+    #[test]
+    fn visible_mounts_errors_on_nonempty_rootless_table_and_allows_empty_table() {
+        // An empty mount table is legitimately empty.
+        assert_eq!(visible_mounts(&[]), Ok(Vec::new()));
+        // Linux can omit the `/` row in a chroot below a mount root while still
+        // listing child mounts inside the chroot (proc_namespace.c). That must
+        // be an explicit error rather than silently returning `Ok([])`.
+        let chroot_table = "40 27 8:2 / /data rw,relatime - ext4 /dev/sdb1 rw\n";
+        let entries = parse_mountinfo(chroot_table);
+        assert_eq!(
+            visible_mounts(&entries),
+            Err(VisibleMountsError::MissingRoot)
+        );
+    }
+
+    #[test]
+    fn visible_mounts_returns_only_top_row_for_deep_stack() {
+        let mut table = String::from("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
+        let mut parent = 1;
+        for id in 2..=6 {
+            table.push_str(&format!(
+                "{id} {parent} 8:{id} / /data rw - ext4 /dev/sd{id} rw\n"
+            ));
+            parent = id;
+        }
+        let entries = parse_mountinfo(&table);
+        let visible = visible_mounts(&entries).unwrap();
+        let ids: Vec<u32> = visible.iter().map(|e| e.mount_id).collect();
+        assert_eq!(ids, [1, 6]);
     }
 }

@@ -156,9 +156,14 @@ pub fn sizes_are_queried(fs_type: &str) -> bool {
 /// single reply (rebuilt on each call); controllers group aliases from one
 /// reply and use provisioned mount paths across requests. Raw mount sources
 /// and device numbers are never placed in the reply (design §4.5, §5.9, AC27).
-pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<FilesystemInfo> {
+pub fn fs_info(
+    mounts: &[MountEntry],
+    statfs: &dyn StatfsSource,
+) -> Result<Vec<FilesystemInfo>, Error> {
+    let visible = crate::freeze_plan::visible_mounts(mounts)
+        .map_err(|err| Error::Internal(format!("fsinfo: {err}")))?;
     let mut superblocks: HashMap<(u32, u32), usize> = HashMap::new();
-    crate::freeze_plan::visible_mounts(mounts)
+    Ok(visible
         .into_iter()
         .map(|m| {
             let next = superblocks.len() + 1;
@@ -175,7 +180,7 @@ pub fn fs_info(mounts: &[MountEntry], statfs: &dyn StatfsSource) -> Vec<Filesyst
                 disk: Vec::new(),
             }
         })
-        .collect()
+        .collect())
 }
 
 /// `guest-get-fsinfo` handler. `statfs` may block, so the whole walk runs
@@ -199,7 +204,7 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let walk = tokio::task::spawn_blocking(move || {
         let _walk = slot;
         let entries = mounts.mounts()?;
-        let info = fs_info(&entries, statfs.as_ref());
+        let info = fs_info(&entries, statfs.as_ref())?;
         crate::handlers::bounded_reply("fsinfo", &info, MAX_FSINFO_REPLY_BYTES)
     });
     let info = tokio::time::timeout(FSINFO_TIMEOUT, walk)
@@ -273,7 +278,7 @@ mod tests {
     #[test]
     fn fsinfo_reports_name_type_mountpoint_and_sizes() {
         let mounts = parse_mountinfo(fixture("simple.txt"));
-        let info = fs_info(&mounts, &fake());
+        let info = fs_info(&mounts, &fake()).unwrap();
         let root = info.iter().find(|f| f.mountpoint == "/").unwrap();
         assert_eq!(root.name, "fs-4");
         assert_eq!(root.fs_type, "ext4");
@@ -308,7 +313,7 @@ mod tests {
     #[test]
     fn fsinfo_includes_pseudo_filesystems_and_disk_is_empty_array() {
         let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
-        let info = fs_info(&mounts, &fake());
+        let info = fs_info(&mounts, &fake()).unwrap();
         assert_eq!(info.len(), mounts.len());
         let types: Vec<&str> = info.iter().map(|f| f.fs_type.as_str()).collect();
         assert!(types.contains(&"tmpfs"));
@@ -327,7 +332,7 @@ mod tests {
     #[test]
     fn fsinfo_statfs_failure_omits_size_fields_not_the_entry() {
         let mounts = parse_mountinfo(fixture("tmpfs_and_nfs.txt"));
-        let info = fs_info(&mounts, &fake());
+        let info = fs_info(&mounts, &fake()).unwrap();
         let nfs = info.iter().find(|f| f.fs_type == "nfs4").unwrap();
         assert_eq!(nfs.name, "fs-5");
         assert_eq!(nfs.used_bytes, None);
@@ -338,7 +343,7 @@ mod tests {
         assert!(!value.to_string().contains("null"));
         // Escaped mount points are reported unescaped.
         let mounts = parse_mountinfo(fixture("escaped_paths.txt"));
-        let info = fs_info(&mounts, &fake());
+        let info = fs_info(&mounts, &fake()).unwrap();
         assert_eq!(info[1].mountpoint, "/mnt/with space");
     }
 
@@ -358,7 +363,7 @@ mod tests {
                 .map(|m| (m.mount_point.to_string_lossy().into_owned(), sizes))
                 .collect(),
         );
-        let info = fs_info(&mounts, &all);
+        let info = fs_info(&mounts, &all).unwrap();
         for entry in &info {
             let queried = entry.total_bytes.is_some();
             assert_eq!(
@@ -397,7 +402,7 @@ mod tests {
         }
         let mounts = parse_mountinfo(fixture("escaped_paths.txt"));
         let recording = Recording(Mutex::new(Vec::new()));
-        let info = fs_info(&mounts, &recording);
+        let info = fs_info(&mounts, &recording).unwrap();
         assert_eq!(info.last().unwrap().mountpoint, "/mnt/caf\u{fffd}");
         let asked = recording.0.lock().unwrap();
         assert!(asked.contains(&b"/mnt/caf\xe9".to_vec()), "{asked:?}");
@@ -619,7 +624,7 @@ mod tests {
             "18 10 0:45 / /tmp rw - tmpfs tmpfs-custom-label-b rw\n",
         );
         let mounts = parse_mountinfo(table);
-        let info = fs_info(&mounts, &fake());
+        let info = fs_info(&mounts, &fake()).unwrap();
         assert_eq!(info.len(), 9);
         // Aliases of the same superblock share one opaque identifier.
         assert_eq!(info[0].name, info[1].name, "bind aliases of 8:1 share name");
@@ -694,7 +699,7 @@ mod tests {
                 },
             ),
         ]));
-        let info = fs_info(&mounts, &sizes);
+        let info = fs_info(&mounts, &sizes).unwrap();
         let paths: Vec<&str> = info.iter().map(|f| f.mountpoint.as_str()).collect();
         assert_eq!(paths, ["/", "/data-alias", "/data"]);
         let alias = info.iter().find(|f| f.mountpoint == "/data-alias").unwrap();
@@ -712,7 +717,7 @@ mod tests {
         );
 
         // moved_mount.txt: 8:5 moved over 8:2 at /data; 8:2 remains visible at /b-alias.
-        let moved = fs_info(&parse_mountinfo(fixture("moved_mount.txt")), &fake());
+        let moved = fs_info(&parse_mountinfo(fixture("moved_mount.txt")), &fake()).unwrap();
         let moved_paths: Vec<(&str, &str)> = moved
             .iter()
             .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
@@ -727,7 +732,8 @@ mod tests {
         let dir_over = fs_info(
             &parse_mountinfo(fixture("directory_overmount.txt")),
             &fake(),
-        );
+        )
+        .unwrap();
         let dir_paths: Vec<(&str, &str)> = dir_over
             .iter()
             .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
@@ -739,11 +745,34 @@ mod tests {
 
         // hidden_nested.txt: 8:2 at /data and its child 8:3 at /data/nested are
         // both hidden by 8:4 (xfs) mounted at /data.
-        let nested = fs_info(&parse_mountinfo(fixture("hidden_nested.txt")), &fake());
+        let nested = fs_info(&parse_mountinfo(fixture("hidden_nested.txt")), &fake()).unwrap();
         let nested_paths: Vec<(&str, &str)> = nested
             .iter()
             .map(|f| (f.mountpoint.as_str(), f.fs_type.as_str()))
             .collect();
         assert_eq!(nested_paths, [("/", "ext4"), ("/data", "xfs")]);
+    }
+
+    #[tokio::test]
+    async fn fsinfo_errors_on_nonempty_mount_table_without_root_and_allows_empty_table() {
+        let req = crate::proto::parse_request(br#"{"execute":"guest-get-fsinfo"}"#).unwrap();
+        // Empty mount table returns empty JSON array.
+        let empty_ctx = Context::for_tests()
+            .with_mounts(Arc::new(StaticMounts(String::new())))
+            .with_statfs(Arc::new(fake()));
+        assert_eq!(handle(&empty_ctx, &req).await.unwrap(), json!([]));
+
+        // Chroot-style table with one child mount and omitted `/` parent must
+        // fail with a fixed error rather than silently returning `[]`.
+        let rootless_ctx = Context::for_tests()
+            .with_mounts(Arc::new(StaticMounts(
+                "40 27 8:2 / /data rw,relatime - ext4 /dev/sdb1 rw\n".to_owned(),
+            )))
+            .with_statfs(Arc::new(fake()));
+        let err = handle(&rootless_ctx, &req).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "fsinfo: mount table has no recognizable root mount"
+        );
     }
 }

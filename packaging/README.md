@@ -101,18 +101,20 @@ mount names, alternate paths, device numbers or marker paths).
   visible in the mount tree with valid UTF-8 mount points (preferring
   visible UTF-8 bind aliases, omitting non-representable mounts so each
   advertised path round-trips byte-exact to its row without lossy
-  `U+FFFD` collisions while full-guest freeze stays byte-exact,
-  verifying descriptor device identity before `fstatfs(2)`, and
-  erroring on a non-empty mount table with no recognizable `/` root)
-  and emits an opaque per-superblock identifier (`fs-1`, `fs-2`, …) in
-  `name` shared by all visible valid-UTF-8 aliases of a superblock and
-  never publishes raw mount sources (such as FUSE or network URLs) or
-  device numbers. Each `fs-N` identifier is valid only within that
-  single reply (rebuilt in mount-table order on each call, so removing
-  an earlier mount can assign an old number to a different filesystem);
-  controllers should group aliases within one reply and use provisioned
-  mount paths across requests. Enabling `information` also enables
-  `guest-get-osinfo` and `guest-network-get-interfaces`.
+  `U+FFFD` collisions while full-guest freeze stays byte-exact for
+  still-reachable raw non-UTF-8 directory paths, opening targets with
+  metadata-only `O_PATH` and verifying both device and mount ID via
+  `statx(STATX_MNT_ID)` before `fstatfs(2)`, and erroring on a non-empty
+  mount table with no recognizable `/` root) and emits an opaque
+  per-superblock identifier (`fs-1`, `fs-2`, …) in `name` shared by all
+  visible valid-UTF-8 aliases of a superblock and never publishes raw
+  mount sources (such as FUSE or network URLs) or device numbers. Each
+  `fs-N` identifier is valid only within that single reply (rebuilt in
+  mount-table order on each call, so removing an earlier mount can
+  assign an old number to a different filesystem); controllers should
+  group aliases within one reply and use provisioned mount paths across
+  requests. Enabling `information` also enables `guest-get-osinfo` and
+  `guest-network-get-interfaces`.
 - **Mount-binding assumption (v1).** Whether required mount paths come
   from provisioning (`config-data-protection.toml`) or from
   `guest-get-fsinfo`, the guest must keep each required path bound to

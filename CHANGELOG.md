@@ -23,11 +23,15 @@ semantic versioning.
     root) and valid UTF-8 (preferring visible UTF-8 bind aliases and
     omitting non-representable mounts so every advertised `mountpoint`
     round-trips byte-exact without lossy `U+FFFD` collisions, while
-    full-guest freeze remains byte-exact), opens each target once and
-    verifies `fstat(2)` device identity before calling `fstatfs(2)`
-    (omitting sizes if the live mount changed), and emits an opaque
-    per-superblock `fs-N` identifier valid within that single reply instead
-    of raw mount sources or device numbers.
+    full-guest freeze stays byte-exact for still-reachable raw non-UTF-8
+    directory paths), opens each target once with a metadata-only
+    `O_PATH | O_NOFOLLOW | O_CLOEXEC` descriptor and verifies both
+    superblock device and mount ID (`statx(STATX_MNT_ID)`) before calling
+    `fstatfs(2)` (preserving sizes on regular-file bind mounts, avoiding
+    automount activation, and omitting sizes if either differs or cannot
+    be verified), and emits an opaque per-superblock `fs-N` identifier
+    valid within that single reply instead of raw mount sources or device
+    numbers.
   - All freeze/thaw lifecycle errors (`guest-fsfreeze-freeze`,
     `guest-fsfreeze-freeze-list`, `guest-fsfreeze-thaw`, including in-flight
     abort/join, rollback, marker failure, and recovery thaw) emit only

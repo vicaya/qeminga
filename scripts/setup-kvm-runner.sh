@@ -1018,22 +1018,39 @@ def open_chain_opath(abs_path):
         raise
 
 
-def open_dir_readonly_via_opath(abs_path):
+def open_child_dir_same_mount(parent_fd, name, child_abs, mountpoints):
+    if child_abs in mountpoints:
+        raise OSError(errno.EXDEV, f"refusing to cross mount point '{child_abs}'")
+    pst = os.fstat(parent_fd)
+    p_mnt = fd_mnt_id(parent_fd)
+    cfd = os.open(name, READ_DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        cst = os.fstat(cfd)
+        if cst.st_dev != pst.st_dev or fd_mnt_id(cfd) != p_mnt:
+            raise OSError(errno.EXDEV, f"'{child_abs}' crosses mount boundary")
+        return cfd
+    except Exception:
+        os.close(cfd)
+        raise
+
+
+def open_dir_readonly_same_mount(abs_path, mountpoints):
     norm = abs_path.rstrip("/")
     parent = os.path.dirname(norm) or "/"
     base = os.path.basename(norm)
     pfd = open_chain_opath(parent)
     try:
-        return os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
+        return open_child_dir_same_mount(pfd, base, norm, mountpoints)
     finally:
         os.close(pfd)
 
 
-def open_images_fd(state_dir):
+def open_images_fd(state_dir, mountpoints):
+    images_root = f"{state_dir.rstrip('/')}/images"
     state_fd = open_chain_opath(state_dir)
     try:
         try:
-            return os.open("images", READ_DIR_FLAGS, dir_fd=state_fd)
+            return open_child_dir_same_mount(state_fd, "images", images_root, mountpoints)
         except FileNotFoundError:
             return None
     finally:
@@ -1110,9 +1127,9 @@ if op == "scrub-work":
     work_dir = sys.argv[3].rstrip("/")
     try:
         mountpoints = parse_mountpoints()
-        assert_no_mount_at_or_under(work_dir, mountpoints, include_self=False)
+        assert_no_mount_at_or_under(work_dir, mountpoints, include_self=True)
         try:
-            wfd = open_dir_readonly_via_opath(work_dir)
+            wfd = open_dir_readonly_same_mount(work_dir, mountpoints)
         except FileNotFoundError:
             sys.exit(0)
         try:
@@ -1139,7 +1156,8 @@ if op == "scrub-work":
     sys.exit(0)
 
 try:
-    img_fd = open_images_fd(state_dir)
+    mountpoints = parse_mountpoints()
+    img_fd = open_images_fd(state_dir, mountpoints)
 except OSError as exc:
     sys.stderr.write(
         f"qeminga-runner-cleanup: refusing unsafe images directory under {state_dir}: {exc}\n"
@@ -2013,24 +2031,29 @@ generate_install_id() {
 }
 
 # Root-side filesystem operations using kernel O_PATH|O_DIRECTORY|O_NOFOLLOW
-# traversal, /proc/self/mountinfo volume/mount inspection, /proc/self/fdinfo
-# mnt_id verification (catching same-filesystem bind mounts), and pure
-# rename(2) without copy-and-delete fallback on EXDEV.
+# traversal, /proc/self/fdinfo mnt_id -> /proc/self/mountinfo resolution,
+# persistent filesystem UUID/f_fsid fingerprinting, mount-bounded recursive
+# chown/rmtree, and pure rename(2) without copy-and-delete fallback on EXDEV.
 fs_ops() {
     local op="$1"
     shift
     local py="/usr/bin/python3"
     [ -x "$py" ] || die "/usr/bin/python3 is required for safe filesystem operations"
-    env -i PATH=/usr/bin:/bin HOME=/nonexistent "QEMINGA_MOUNTINFO=${QEMINGA_MOUNTINFO:-}" \
+    env -i PATH=/usr/bin:/bin HOME=/nonexistent \
+        "QEMINGA_MOUNTINFO=${QEMINGA_MOUNTINFO:-}" \
+        "QEMINGA_FS_UUID_MAP=${QEMINGA_FS_UUID_MAP:-}" \
+        "QEMINGA_TEST_MNT_ID=${QEMINGA_TEST_MNT_ID:-}" \
         "$py" -I -S - "$op" "$@" <<'PY'
 import errno
 import os
 import re
 import stat
+import subprocess
 import sys
 
 PATH_DIR_FLAGS = os.O_PATH | os.O_DIRECTORY | os.O_NOFOLLOW
 READ_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+CUSTOM_MOUNTINFO = bool(os.environ.get("QEMINGA_MOUNTINFO"))
 
 
 def unescape_mountinfo(field):
@@ -2064,6 +2087,7 @@ def parse_mountinfo():
             entries.append(
                 {
                     "mount_id": int(lparts[0]),
+                    "parent_id": int(lparts[1]),
                     "dev": lparts[2],
                     "root": unescape_mountinfo(lparts[3]),
                     "mp": mp,
@@ -2102,35 +2126,161 @@ def norm_abs(p):
     return "/" if p == "/" else p.rstrip("/")
 
 
-def volume_id_of(abs_path, entries):
-    norm = norm_abs(abs_path)
-    if norm == "/":
-        os.lstat("/")
-    else:
-        parent = os.path.dirname(norm) or "/"
-        base = os.path.basename(norm)
-        pfd = open_chain_opath(parent)
-        try:
-            os.lstat(base, dir_fd=pfd)
-        finally:
-            os.close(pfd)
+def resolve_mount_in_tree(entries, norm_path):
+    by_id = {e["mount_id"]: e for e in entries}
+    children = {}
+    root_entry = None
+    for entry in entries:
+        children[(entry["parent_id"], entry["mp"])] = entry
+        if entry["mp"] == "/" and entry["parent_id"] not in by_id:
+            root_entry = entry
+    if root_entry is None:
+        for entry in entries:
+            if entry["mp"] == "/":
+                root_entry = entry
+    if root_entry is None:
+        raise OSError(errno.ENOENT, f"no root mount entry covers '{norm_path}'")
 
-    best = None
-    best_len = -1
+    cur = root_entry
+    seen = {cur["mount_id"]}
+    while (cur["mount_id"], "/") in children:
+        nxt = children[(cur["mount_id"], "/")]
+        if nxt["mount_id"] in seen:
+            break
+        seen.add(nxt["mount_id"])
+        cur = nxt
+
+    if norm_path == "/":
+        return cur
+
+    prefix = ""
+    for part in [p for p in norm_path.split("/") if p]:
+        prefix = f"{prefix}/{part}"
+        while (cur["mount_id"], prefix) in children:
+            nxt = children[(cur["mount_id"], prefix)]
+            if nxt["mount_id"] in seen:
+                break
+            seen.add(nxt["mount_id"])
+            cur = nxt
+    return cur
+
+
+def visible_mountpoints(entries):
+    mps = set()
     for entry in entries:
         mp = entry["mp"]
-        if mp == "/" or norm == mp or norm.startswith(mp + "/"):
-            if len(mp) >= best_len:
-                best_len = len(mp)
-                best = entry
-    if best is None:
-        raise OSError(errno.ENOENT, f"no mount entry covers '{norm}'")
-    return (
-        f"mp:{pct_encode(best['mp'])},"
-        f"root:{pct_encode(best['root'])},"
-        f"fs:{pct_encode(best['fstype'])},"
-        f"src:{pct_encode(best['source'])}"
-    )
+        try:
+            top = resolve_mount_in_tree(entries, mp)
+        except OSError:
+            continue
+        if top["mp"] == mp:
+            mps.add(mp)
+    return mps
+
+
+def resolve_mount_for_fd(fd, norm_path, entries):
+    by_id = {e["mount_id"]: e for e in entries}
+    if not CUSTOM_MOUNTINFO:
+        actual_mnt = fd_mnt_id(fd)
+        entry = by_id.get(actual_mnt)
+        if entry is None:
+            raise OSError(
+                errno.ENOENT,
+                f"mount_id {actual_mnt} for '{norm_path}' not found in /proc/self/mountinfo",
+            )
+        return entry
+    test_mnt = os.environ.get("QEMINGA_TEST_MNT_ID")
+    if test_mnt:
+        mid = int(test_mnt)
+        entry = by_id.get(mid)
+        if entry is None:
+            raise OSError(errno.ENOENT, f"test mount_id {mid} not found in mountinfo")
+        return entry
+    return resolve_mount_in_tree(entries, norm_path)
+
+
+def resolve_fs_uuid(entry):
+    if CUSTOM_MOUNTINFO:
+        raw_map = os.environ.get("QEMINGA_FS_UUID_MAP", "")
+        if raw_map:
+            mapping = {}
+            for item in re.split(r"[\n,]", raw_map):
+                item = item.strip()
+                if "=" in item:
+                    k, v = item.split("=", 1)
+                    mapping[k.strip()] = v.strip()
+            for key in (str(entry["mount_id"]), entry["source"], entry["mp"]):
+                if key in mapping and mapping[key]:
+                    return mapping[key]
+        return ""
+
+    src = entry["source"]
+    if not src.startswith("/dev/"):
+        return ""
+    try:
+        src_st = os.stat(src)
+    except OSError:
+        return ""
+    if not stat.S_ISBLK(src_st.st_mode):
+        return ""
+
+    by_uuid = "/dev/disk/by-uuid"
+    try:
+        for name in sorted(os.listdir(by_uuid)):
+            try:
+                lst = os.stat(os.path.join(by_uuid, name))
+            except OSError:
+                continue
+            if stat.S_ISBLK(lst.st_mode) and lst.st_rdev == src_st.st_rdev:
+                return name
+    except OSError:
+        pass
+
+    for blkid in ("/usr/sbin/blkid", "/sbin/blkid"):
+        if os.path.isfile(blkid) and os.access(blkid, os.X_OK):
+            try:
+                res = subprocess.run(
+                    [blkid, "-s", "UUID", "-o", "value", src],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                val = res.stdout.strip()
+                if res.returncode == 0 and re.fullmatch(r"[A-Za-z0-9._-]+", val):
+                    return val
+            except OSError:
+                pass
+    return ""
+
+
+def volume_id_of_fd(fd, norm_path, entries):
+    entry = resolve_mount_for_fd(fd, norm_path, entries)
+    fs_uuid = resolve_fs_uuid(entry)
+    try:
+        fsid_num = os.fstatvfs(fd).f_fsid
+    except OSError:
+        fsid_num = 0
+    fsid_hex = f"{fsid_num:x}" if fsid_num else ""
+
+    parts = [
+        f"mp:{pct_encode(entry['mp'])}",
+        f"root:{pct_encode(entry['root'])}",
+        f"fs:{pct_encode(entry['fstype'])}",
+    ]
+    if fs_uuid:
+        parts.append(f"uuid:{pct_encode(fs_uuid)}")
+        if fsid_hex:
+            parts.append(f"fsid:{fsid_hex}")
+    else:
+        if not fsid_hex and entry["source"].startswith("/dev/") and not CUSTOM_MOUNTINFO:
+            raise OSError(
+                errno.EINVAL,
+                f"cannot establish persistent filesystem identifier for block device '{entry['source']}' at '{norm_path}'",
+            )
+        parts.append(f"src:{pct_encode(entry['source'])}")
+        if fsid_hex:
+            parts.append(f"fsid:{fsid_hex}")
+    return ",".join(parts)
 
 
 def assert_no_mount_at_or_under(abs_path, mountpoints):
@@ -2235,11 +2385,57 @@ def rmtree_same_mount(parent_fd, name, root_dev, root_mnt_id, cur_path, mountpoi
     os.rmdir(name, dir_fd=parent_fd)
 
 
+def chown_tree_same_mount(parent_fd, name, uid, gid, root_dev, root_mnt_id, cur_path, mountpoints, apply_chown):
+    if cur_path in mountpoints:
+        raise OSError(errno.EXDEV, f"refusing to cross mount point '{cur_path}'")
+    st = os.lstat(name, dir_fd=parent_fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.ENOTDIR, f"'{cur_path}' is not a real directory")
+    if st.st_dev != root_dev:
+        raise OSError(errno.EXDEV, f"'{cur_path}' crosses filesystem boundary")
+    dir_fd = os.open(name, READ_DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        fst = os.fstat(dir_fd)
+        if fst.st_dev != root_dev or fd_mnt_id(dir_fd) != root_mnt_id:
+            raise OSError(errno.EXDEV, f"'{cur_path}' crosses mount boundary")
+        if apply_chown:
+            os.fchown(dir_fd, uid, gid)
+        for entry in os.listdir(dir_fd):
+            child_path = f"{cur_path}/{entry}"
+            est = assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path, mountpoints)
+            if stat.S_ISDIR(est.st_mode):
+                chown_tree_same_mount(
+                    dir_fd, entry, uid, gid, root_dev, root_mnt_id, child_path, mountpoints, apply_chown
+                )
+            elif apply_chown:
+                os.chown(entry, uid, gid, dir_fd=dir_fd, follow_symlinks=False)
+    finally:
+        os.close(dir_fd)
+
+
 op = sys.argv[1]
 try:
     if op == "volume-id":
+        target = norm_abs(sys.argv[2])
         entries = parse_mountinfo()
-        print(volume_id_of(sys.argv[2], entries))
+        if target == "/":
+            tfd = os.open("/", PATH_DIR_FLAGS)
+            try:
+                print(volume_id_of_fd(tfd, "/", entries))
+            finally:
+                os.close(tfd)
+        else:
+            parent = os.path.dirname(target) or "/"
+            base = os.path.basename(target)
+            pfd = open_chain_opath(parent)
+            try:
+                tfd = os.open(base, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
+                try:
+                    print(volume_id_of_fd(tfd, target, entries))
+                finally:
+                    os.close(tfd)
+            finally:
+                os.close(pfd)
     elif op == "verify-volume":
         target = norm_abs(sys.argv[2])
         expected = sys.argv[3]
@@ -2254,38 +2450,63 @@ try:
             )
             sys.exit(1)
         try:
+            tfd = None
             try:
-                os.lstat(base, dir_fd=pfd)
-                exists = True
+                tfd = os.open(base, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
             except FileNotFoundError:
-                exists = False
-        finally:
-            os.close(pfd)
-        if exists:
+                tfd = None
+            if tfd is not None:
+                try:
+                    if not expected:
+                        sys.exit(0)
+                    actual = volume_id_of_fd(tfd, target, entries)
+                    if actual != expected:
+                        sys.stderr.write(
+                            f"setup-kvm-runner: backing volume mismatch for '{target}': expected '{expected}', found '{actual}'\n"
+                        )
+                        sys.exit(1)
+                    sys.exit(0)
+                finally:
+                    os.close(tfd)
             if not expected:
-                sys.exit(0)
-            actual = volume_id_of(target, entries)
-            if actual != expected:
                 sys.stderr.write(
-                    f"setup-kvm-runner: backing volume mismatch for '{target}': expected '{expected}', found '{actual}'\n"
+                    f"setup-kvm-runner: refusing to treat absent path '{target}' as deleted without a recorded backing volume\n"
                 )
                 sys.exit(1)
-            sys.exit(0)
-        if not expected:
-            sys.stderr.write(
-                f"setup-kvm-runner: refusing to treat absent path '{target}' as deleted without a recorded backing volume\n"
-            )
-            sys.exit(1)
-        actual = volume_id_of(parent, entries)
-        if actual != expected:
-            sys.stderr.write(
-                f"setup-kvm-runner: recorded backing volume for absent path '{target}' is unavailable (expected '{expected}', parent '{parent}' is on '{actual}')\n"
-            )
-            sys.exit(1)
+            actual = volume_id_of_fd(pfd, parent, entries)
+            if actual != expected:
+                sys.stderr.write(
+                    f"setup-kvm-runner: recorded backing volume for absent path '{target}' is unavailable (expected '{expected}', parent '{parent}' is on '{actual}')\n"
+                )
+                sys.exit(1)
+        finally:
+            os.close(pfd)
     elif op == "check-no-mounts":
         entries = parse_mountinfo()
-        mountpoints = {e["mp"] for e in entries}
+        mountpoints = visible_mountpoints(entries)
         check_no_mounts(sys.argv[2], mountpoints)
+    elif op == "safe-chown-tree":
+        target = norm_abs(sys.argv[2])
+        uid = int(sys.argv[3])
+        gid = int(sys.argv[4])
+        entries = parse_mountinfo()
+        mountpoints = visible_mountpoints(entries)
+        check_no_mounts(target, mountpoints)
+        parent = os.path.dirname(target) or "/"
+        base = os.path.basename(target)
+        pfd = open_chain_opath(parent)
+        try:
+            pst = os.fstat(pfd)
+            p_mnt = fd_mnt_id(pfd)
+            st = assert_entry_same_mount(pfd, base, pst.st_dev, p_mnt, target, mountpoints)
+            if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+                raise OSError(errno.ENOTDIR, f"'{target}' is not a real directory")
+            apply_chown = os.geteuid() == 0
+            chown_tree_same_mount(
+                pfd, base, uid, gid, pst.st_dev, p_mnt, target, mountpoints, apply_chown
+            )
+        finally:
+            os.close(pfd)
     elif op == "rename-only":
         src = norm_abs(sys.argv[2])
         dst = norm_abs(sys.argv[3])
@@ -2319,7 +2540,7 @@ try:
             except FileNotFoundError:
                 sys.exit(0)
             entries = parse_mountinfo()
-            mountpoints = {e["mp"] for e in entries}
+            mountpoints = visible_mountpoints(entries)
             check_no_mounts(target, mountpoints)
             pst = os.fstat(pfd)
             p_mnt = fd_mnt_id(pfd)
@@ -2332,13 +2553,23 @@ try:
             os.close(pfd)
     elif op == "verify-images-fallback":
         state_dir = norm_abs(sys.argv[2])
+        entries = parse_mountinfo()
+        mountpoints = visible_mountpoints(entries)
+        images_root = f"{state_dir}/images"
+        if images_root in mountpoints:
+            raise OSError(errno.EXDEV, f"refusing mounted images directory '{images_root}'")
         sfd = open_chain_opath(state_dir)
         try:
+            s_st = os.fstat(sfd)
+            s_mnt = fd_mnt_id(sfd)
             try:
                 ifd = os.open("images", READ_DIR_FLAGS, dir_fd=sfd)
             except FileNotFoundError:
                 sys.exit(0)
             try:
+                i_st = os.fstat(ifd)
+                if i_st.st_dev != s_st.st_dev or fd_mnt_id(ifd) != s_mnt:
+                    raise OSError(errno.EXDEV, f"'{images_root}' crosses mount boundary")
                 for entry in sorted(os.listdir(ifd)):
                     if entry.startswith("qeminga-e2e-"):
                         sys.stderr.write(
@@ -2356,6 +2587,27 @@ except OSError as exc:
     sys.stderr.write(f"setup-kvm-runner: fs_ops {op} failed: {exc}\n")
     sys.exit(1)
 PY
+}
+
+# Recursively change ownership of a managed directory strictly within its own
+# mount boundary (pre-scanning and verifying every directory and entry via
+# O_PATH|O_NOFOLLOW + /proc/self/fdinfo mnt_id + mountinfo). Under real root
+# (euid == 0), fs_ops performs every os.chown/os.fchown directly over open FDs.
+safe_chown_runner_dir() {
+    local target_spec="$1" dir="$2"
+    local uid gid
+    if [ "$target_spec" = "root:root" ]; then
+        uid=0
+        gid=0
+    else
+        uid="${REC_USER_UID:-${MANAGED_USER_UID:-$(id -u "$OPT_USER")}}"
+        gid="${REC_USER_GID:-${MANAGED_USER_GID:-$(id -g "$OPT_USER")}}"
+    fi
+    fs_ops safe-chown-tree "$dir" "$uid" "$gid" \
+        || die "refusing recursive ownership change on '$dir' (mount boundary or unsafe entry)"
+    if [ "$(/usr/bin/id -u)" -ne 0 ]; then
+        chown -h "${target_spec}" "$dir"
+    fi
 }
 
 is_reserved_system_dir() {
@@ -2903,6 +3155,20 @@ EOF
     fi
 }
 
+# Verify the live account's GECOS carries qeminga-runner-<REC_INSTALL_ID>.
+# Leaves install.env intact on mismatch so an operator can inspect safely.
+verify_user_install_marker() {
+    local mode="$1" label="${2:-service user}"
+    local expected_marker passwd_line gecos
+    expected_marker="qeminga-runner-${REC_INSTALL_ID}"
+    passwd_line="$(getent passwd "$OPT_USER" 2>/dev/null || true)"
+    gecos="$(printf '%s\n' "$passwd_line" | awk -F: 'NR==1 { print $5 }')"
+    gecos="${gecos%%,*}"
+    if [ "$gecos" != "$expected_marker" ]; then
+        die "${mode}: ${label} '$OPT_USER' does not carry installation marker '${expected_marker}' (found '${gecos:-<empty>}'); refusing to adopt, modify, or delete an unverified account (leaving $OPT_CONFIG_DIR/install.env intact for manual inspection)"
+    fi
+}
+
 # Verify a user-pending bootstrap account (no recorded UID/GID yet) was actually
 # created by THIS installation (matching INSTALL_ID stamped into the account
 # GECOS during useradd), is strictly non-root, and is confined to primary group
@@ -2915,7 +3181,7 @@ verify_pending_user_safety() {
     if ! id "$OPT_USER" >/dev/null 2>&1; then
         return 0
     fi
-    local cur_uid cur_gid pgroup groups g passwd_line gecos expected_marker
+    local cur_uid cur_gid pgroup groups g
     cur_uid="$(id -u "$OPT_USER")"
     cur_gid="$(id -g "$OPT_USER")"
     pgroup="$(id -gn "$OPT_USER")"
@@ -2931,19 +3197,15 @@ verify_pending_user_safety() {
             die "${mode}: pending service user '$OPT_USER' belongs to unexpected group '$g' (only '$OPT_USER' and 'kvm' are permitted); refusing to proceed (leaving $OPT_CONFIG_DIR/install.env intact)"
         fi
     done
-    expected_marker="qeminga-runner-${REC_INSTALL_ID}"
-    passwd_line="$(getent passwd "$OPT_USER" 2>/dev/null || true)"
-    gecos="$(printf '%s\n' "$passwd_line" | awk -F: 'NR==1 { print $5 }')"
-    gecos="${gecos%%,*}"
-    if [ "$gecos" != "$expected_marker" ]; then
-        die "${mode}: pending service user '$OPT_USER' does not carry installation marker '${expected_marker}' (found '${gecos:-<empty>}'); refusing to adopt, modify, or delete an unverified account (leaving $OPT_CONFIG_DIR/install.env intact for manual inspection)"
-    fi
+    verify_user_install_marker "$mode" "pending service user"
 }
 
-# Verify the live numeric UID and GID of OPT_USER match the root-owned record
+# Verify the live numeric UID/GID (and, for records carrying INSTALL_ID, the
+# stamped GECOS installation marker) of OPT_USER match the root-owned record
 # BEFORE any runuser execution, chown, credential handling, service stop, or
 # file removal. Leaves install.env intact on mismatch so the operator can
-# inspect and recover safely.
+# inspect and recover safely. Legacy records without INSTALL_ID stay
+# distinguishable and verify numeric UID/GID during migration.
 verify_recorded_user_identity() {
     local mode="$1"
     if [ "$REC_STATE" = "user-pending" ]; then
@@ -2956,6 +3218,9 @@ verify_recorded_user_identity() {
         cur_gid="$(id -g "$OPT_USER")"
         if [ "$cur_uid" -eq 0 ] || [ "$cur_uid" != "$REC_USER_UID" ] || [ "$cur_gid" != "$REC_USER_GID" ]; then
             die "${mode}: service user '$OPT_USER' uid:gid (${cur_uid}:${cur_gid}) does not match recorded ${REC_USER_UID}:${REC_USER_GID}; refusing to proceed (leaving $OPT_CONFIG_DIR/install.env intact for recovery)"
+        fi
+        if [ -n "${REC_INSTALL_ID:-}" ] && [ "${REC_USER_CREATED:-1}" = "1" ]; then
+            verify_user_install_marker "$mode" "service user"
         fi
     elif [ "$mode" = "update" ]; then
         die "update: recorded service user '$OPT_USER' does not exist"
@@ -3100,16 +3365,14 @@ ensure_service_user() {
         fi
         if [ "$REC_STATE" = "user-pending" ]; then
             verify_pending_user_safety install
+        else
+            verify_recorded_user_identity install
         fi
         local uid gid pgroup groups g
         uid="$(id -u "$OPT_USER")"
         gid="$(id -g "$OPT_USER")"
         pgroup="$(id -gn "$OPT_USER")"
         [ "$uid" -ne 0 ] || die "existing user $OPT_USER has uid 0"
-        if [ "$REC_STATE" != "user-pending" ]; then
-            [ "$uid" = "$REC_USER_UID" ] || die "user '$OPT_USER' uid $uid does not match recorded uid $REC_USER_UID; refusing to reuse"
-            [ "$gid" = "$REC_USER_GID" ] || die "user '$OPT_USER' gid $gid does not match recorded gid $REC_USER_GID; refusing to reuse"
-        fi
         [ "$pgroup" = "$OPT_USER" ] || die "user '$OPT_USER' primary group '$pgroup' does not match '$OPT_USER'; refusing to reuse"
         groups="$(id -nG "$OPT_USER")"
         for g in $groups; do
@@ -3172,9 +3435,10 @@ reserve_fresh_dir() {
 #   initializing any child files/subdirectories, so an interruption leaves
 #   <dir> recorded as owned and recoverable by ordinary retry or uninstall.
 # - When <owned_var> is 1 (already owned per verified install.env or reserved
-#   earlier in this invocation), validates <dir> as a non-symlink directory
-#   under trusted root-owned ancestors (or recreates it exclusively if absent)
-#   and applies owner/group/mode.
+#   earlier in this invocation), verifies the backing volume (refusing an absent
+#   path without a recorded volume or on a mismatched/unmounted volume), validates
+#   <dir> as a non-symlink directory under trusted root-owned ancestors, and
+#   applies owner/group/mode.
 claim_managed_dir() {
     local label="$1" owned_var="$2" dir="$3" mode="$4" owner="$5" group="$6" runner_name="$7"
     local is_owned=0
@@ -3220,15 +3484,15 @@ claim_managed_dir() {
             _INSTALL_BOOTSTRAP_CFG=""
         fi
     else
-        local expected_vol=""
-        case "$owned_var" in
-            OWNED_STATE_DIR) expected_vol="$VOL_STATE_DIR" ;;
-            OWNED_INSTALL_DIR) expected_vol="$VOL_INSTALL_DIR" ;;
-            OWNED_HOOK_DIR) expected_vol="$VOL_HOOK_DIR" ;;
-        esac
-        if [ -n "$expected_vol" ]; then
+        if [ "$owned_var" != "OWNED_CONFIG_DIR" ]; then
+            local expected_vol=""
+            case "$owned_var" in
+                OWNED_STATE_DIR) expected_vol="$VOL_STATE_DIR" ;;
+                OWNED_INSTALL_DIR) expected_vol="$VOL_INSTALL_DIR" ;;
+                OWNED_HOOK_DIR) expected_vol="$VOL_HOOK_DIR" ;;
+            esac
             fs_ops verify-volume "$dir" "$expected_vol" \
-                || die "refusing to modify or recreate owned ${label} directory '$dir': recorded backing volume is unavailable or mismatched"
+                || die "refusing to modify or recreate owned ${label} directory '$dir': recorded backing volume is unavailable, mismatched, or unrecorded for an absent path"
         fi
         if [ -e "$dir" ]; then
             [ -d "$dir" ] || die "${label} path '$dir' exists and is not a directory"
@@ -3297,9 +3561,9 @@ lock_runner_permissions() {
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory does not exist: $OPT_INSTALL_DIR"
     if [ "$OPT_ALLOW_AUTO_UPDATE" -eq 1 ]; then
-        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        safe_chown_runner_dir "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
     else
-        chown -h -R -P root:root "$OPT_INSTALL_DIR"
+        safe_chown_runner_dir root:root "$OPT_INSTALL_DIR"
         chmod 0755 "$OPT_INSTALL_DIR"
 
         local diag_dir="$OPT_INSTALL_DIR/_diag"
@@ -3433,7 +3697,7 @@ check_existing_registration() {
 register_runner_with_rollback() {
     local was_active="$1" token="$2"
     shift 2
-    chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+    safe_chown_runner_dir "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
     local rc=0
     if run_runner_config_with_token "$token" "$@"; then
         return 0
@@ -3488,6 +3752,11 @@ cmd_install() {
     VOL_INSTALL_DIR=""
     VOL_HOOK_DIR=""
     VOL_STATE_DIR=""
+    local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    unit_dir="${unit_dir%/}"
+    check_abs_path "systemd unit dir" "$unit_dir"
+    local unit_path="${unit_dir}/${OPT_SERVICE}.service"
+
     local rec_path="$OPT_CONFIG_DIR/install.env"
     if [ -e "$rec_path" ] || [ -L "$rec_path" ]; then
         read_install_record "$rec_path"
@@ -3495,9 +3764,7 @@ cmd_install() {
         [ "$REC_CONFIG_DIR" = "$OPT_CONFIG_DIR" ] || die "existing record at $rec_path manages config dir '$REC_CONFIG_DIR', not '$OPT_CONFIG_DIR'"
         MANAGED_INSTALL_ID="${REC_INSTALL_ID:-}"
         if [ "$REC_STATE" = "user-only" ] || [ "$REC_STATE" = "user-pending" ]; then
-            if [ "$REC_STATE" = "user-pending" ]; then
-                verify_pending_user_safety install
-            fi
+            verify_recorded_user_identity install
             OWNED_CONFIG_DIR=1
             check_dedicated_managed_dirs 2
             check_unit_not_occupied
@@ -3517,16 +3784,32 @@ cmd_install() {
             VOL_INSTALL_DIR="${REC_VOL_INSTALL_DIR:-}"
             VOL_HOOK_DIR="${REC_VOL_HOOK_DIR:-}"
             VOL_STATE_DIR="${REC_VOL_STATE_DIR:-}"
+            verify_recorded_user_identity install
             check_dedicated_managed_dirs record
-            if [ "$OWNED_UNIT" -ne 1 ]; then
+            if [ "$OWNED_STATE_DIR" -eq 1 ]; then
+                fs_ops verify-volume "$OPT_STATE_DIR" "$VOL_STATE_DIR" \
+                    || die "refusing reinstall: owned state directory '$OPT_STATE_DIR' backing volume is unavailable, mismatched, or unrecorded for an absent path"
+            fi
+            if [ "$OWNED_INSTALL_DIR" -eq 1 ]; then
+                fs_ops verify-volume "$OPT_INSTALL_DIR" "$VOL_INSTALL_DIR" \
+                    || die "refusing reinstall: owned runner directory '$OPT_INSTALL_DIR' backing volume is unavailable, mismatched, or unrecorded for an absent path"
+            fi
+            if [ "$OWNED_HOOK_DIR" -eq 1 ]; then
+                fs_ops verify-volume "$OPT_HOOK_DIR" "$VOL_HOOK_DIR" \
+                    || die "refusing reinstall: owned hook directory '$OPT_HOOK_DIR' backing volume is unavailable, mismatched, or unrecorded for an absent path"
+            fi
+            if [ "$OWNED_UNIT" -eq 1 ]; then
+                fs_ops verify-volume "$unit_path" "$VOL_UNIT" \
+                    || die "refusing reinstall: owned systemd unit '$unit_path' backing volume is unavailable, mismatched, or unrecorded for an absent path"
+            else
                 check_unit_not_occupied
             fi
         fi
     else
         check_dedicated_managed_dirs 0
         check_unit_not_occupied
+        MANAGED_INSTALL_ID="$(generate_install_id)"
     fi
-    [ -n "$MANAGED_INSTALL_ID" ] || MANAGED_INSTALL_ID="$(generate_install_id)"
 
     local runner_name
     if [ -n "$OPT_NAME" ]; then
@@ -3715,10 +3998,6 @@ cmd_install() {
     # directory entry — including a systemd mask symlink to /dev/null or a
     # directory — without following symlinks, linking into a directory, or
     # altering target permissions. Record OWNED_UNIT=1 only after publication.
-    local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
-    unit_dir="${unit_dir%/}"
-    check_abs_path "systemd unit dir" "$unit_dir"
-    local unit_path="${unit_dir}/${OPT_SERVICE}.service"
     check_trusted_parent_dir "$unit_path"
     [ ! -L "$unit_path" ] || die "refusing symlinked systemd unit path: $unit_path"
     if [ "$OWNED_UNIT" -ne 1 ]; then
@@ -3749,6 +4028,10 @@ cmd_install() {
         write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
         _INSTALL_BOOTSTRAP_UNIT=""
     else
+        if ! fs_ops verify-volume "$unit_path" "$VOL_UNIT"; then
+            rm -f "$tmp_unit"
+            die "refusing to replace owned systemd unit '$unit_path': recorded backing volume is unavailable, mismatched, or unrecorded for an absent path"
+        fi
         if ! mv -T -f -- "$tmp_unit" "$unit_path"; then
             rm -f "$tmp_unit"
             die "failed to update owned systemd unit '$unit_path'"
@@ -3832,11 +4115,20 @@ cmd_update() {
     acquire_install_lock
 
     # Refuse to modify any service or directory without a valid root-owned
-    # installation record matching CLI options and live user UID/GID.
+    # installation record matching CLI options and live user UID/GID/marker.
     load_and_verify_install_record update
 
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR does not exist"
+    verify_resource_volume install "runner directory" "$OPT_INSTALL_DIR"
+    fs_ops check-no-mounts "$OPT_INSTALL_DIR" \
+        || die "refusing to update runner directory '$OPT_INSTALL_DIR' containing an active mount or bind mount"
+    if [ "$REC_OWNED_UNIT" = "1" ]; then
+        local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+        unit_dir="${unit_dir%/}"
+        check_abs_path "systemd unit dir" "$unit_dir"
+        verify_resource_volume unit "systemd unit" "${unit_dir}/${OPT_SERVICE}.service"
+    fi
     local arch
     arch="$(normalize_arch "$(uname -m)")"
 
@@ -4206,10 +4498,14 @@ cmd_uninstall() {
     # cleanup hooks, deregistering, or purging OPT_USER.
     reconcile_staged_removals "$unit_path"
 
-    # Only stop/disable the unit if this installation actually created/owns it.
-    if [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
-        systemctl stop "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
-        systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
+    # Only stop/disable the unit if this installation actually created/owns it
+    # and its recorded backing volume matches.
+    if [ "$REC_OWNED_UNIT" = "1" ]; then
+        verify_resource_volume unit "systemd unit" "$unit_path"
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl stop "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
+            systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
+        fi
     fi
 
     # Run THIS installer's own domain-only cleanup logic (with a minimal
@@ -4291,11 +4587,13 @@ EOF
         && [ ! -L "$OPT_INSTALL_DIR" ] && [ ! -L "$OPT_INSTALL_DIR/config.sh" ] \
         && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
         verify_resource_volume install "runner directory" "$OPT_INSTALL_DIR"
+        fs_ops check-no-mounts "$OPT_INSTALL_DIR" \
+            || die "refusing to deregister or modify runner directory '$OPT_INSTALL_DIR' containing an active mount or bind mount; preserving $OPT_CONFIG_DIR/install.env and service account '$OPT_USER' for retry"
         command -v runuser >/dev/null 2>&1 || die "runuser is required to deregister the runner as $OPT_USER"
         local rm_token
         rm_token="$(read_secret_file --token-file "$OPT_TOKEN_FILE")"
         say "deregistering runner from GitHub"
-        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        safe_chown_runner_dir "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
         run_runner_config_with_token "$rm_token" remove --unattended \
             || warn "deregistration failed (remove manually in GitHub Settings -> Actions -> Runners)"
         unset rm_token

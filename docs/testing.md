@@ -201,12 +201,15 @@ journalctl -u qeminga-kvm-runner.service -f
 For one-shot ephemeral runs, pass `--ephemeral` or (with a private `--repo`
 controller) `--jitconfig-file /path/to/jitconfig` (mode `0600`; organization
 JIT provisioning is refused because JIT blobs do not cryptographically bind
-the GitHub runner group; the single-use credential is validated for its
-GitHub endpoint / optional `gitHubUrl` and disjoint workspace path under
-`$INSTALL_DIR/<name>` or `$STATE_DIR/work`, delivered via systemd
-`LoadCredential=`, and removed automatically on service stop). You can
-inspect the generated unit and hooks before touching the host with
-`render-unit` and `render-hooks`.
+the GitHub runner group, and unbound JIT blobs omitting or emptying
+`gitHubUrl` are refused in favor of `--token-file` / interactive token
+registration because shared `actions.githubusercontent.com` endpoints do
+not identify the repository; the single-use credential is decoded after
+package installation supplies `jq`, validated for its exact matching
+`gitHubUrl` and direct-child workspace path `$INSTALL_DIR/<name>` or exact
+`$STATE_DIR/work`, delivered via systemd `LoadCredential=`, and removed
+automatically on service stop). You can inspect the generated unit and
+hooks before touching the host with `render-unit` and `render-hooks`.
 
 ### Security-by-default controls on donated runners
 
@@ -218,13 +221,17 @@ inspect the generated unit and hooks before touching the host with
    world-writable modes), refuses to adopt unrelated pre-existing accounts
    (or accounts in any group beyond `{qeminga-runner, kvm}`), unmanaged
    pre-existing directories, or existing systemd units (including vendor
-   units) without a matching installation record. It records the
-   provisioned UID/GID and dedicated, non-overlapping paths in root-owned
-   `/etc/qeminga-runner/install.env` (`0600`) immediately after creating
-   the service user (`RECORD_STATE=installing`, finalized to `installed`)
-   so an interrupted first install remains recoverable via retry or
-   uninstall, stops any existing managed runner service before mutating
-   state, and creates runtime state subdirectories (`work/`, `images/`,
+   units) without a matching unit ownership record. It records the
+   provisioned UID/GID, dedicated non-overlapping paths, and per-resource
+   acquisition markers (`OWNED_CONFIG_DIR`, `OWNED_STATE_DIR`,
+   `OWNED_INSTALL_DIR`, `OWNED_HOOK_DIR`, `OWNED_UNIT`) in root-owned
+   `/etc/qeminga-runner/install.env` (`0600`) incrementally as each
+   resource is actually created (`RECORD_STATE=installing`, finalized to
+   `installed` only after startup readiness succeeds unless `--no-start`
+   is set), so an interrupted first install stays recoverable without ever
+   claiming a unit name or directory created independently afterwards,
+   stops an existing runner service only when owned by this installation,
+   and creates runtime state subdirectories (`work/`, `images/`,
    `image-cache/`, etc.) as the unprivileged runner user rather than root.
 2. **Unprivileged `qemu:///session` isolation:** installs only minimal
    session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
@@ -252,17 +259,21 @@ inspect the generated unit and hooks before touching the host with
    `systemd-resolved` at `127.0.0.53`) and `::1/128`. Because systemd
    silently skips `IPAddressDeny=` on hosts or containers without cgroup
    BPF firewalling (and excludes `ExecStartPre=` from
-   `RestartPreventExitStatus=`), the root-owned main-process launcher
-   (`run-runner.sh` or `run-jit.sh`) invokes `check-egress-firewall.sh`
-   before `exec`'ing the runner listener. That script runs `/usr/bin/python3`
-   in isolated mode (`-I -S`) under `env -i` so runner-writable `HOME` /
-   user-site configuration cannot influence the verdict, proves this unit's
-   cgroup BPF policy rejects the loopback sentinel (`127.255.255.254`),
-   IMDS, and configured private LANs with `EPERM` (distinguishing unit
-   policy from host-wide IMDS blocks), and exits `78` directly in the main
-   process so `RestartPreventExitStatus=78` stops restarts on unsupported
-   hosts. Because QEMU runs in the same cgroup, disposable guest VMs
-   inherit the same block. Hosts with a private DNS resolver can pass
+   `RestartPreventExitStatus=`), the unit uses `Type=notify` with
+   `NotifyAccess=main` and `TimeoutStartSec=60s`: the root-owned
+   main-process launcher (`run-runner.sh` or `run-jit.sh`) invokes
+   `check-egress-firewall.sh` before signaling `READY=1` as MainPID and
+   `exec`'ing the runner listener (stripping `NOTIFY_SOCKET`). That check
+   runs `/usr/bin/python3` in isolated mode (`-I -S`) under `env -i` so
+   runner-writable `HOME` / user-site configuration cannot influence the
+   verdict, proves this unit's cgroup BPF policy rejects the loopback
+   sentinel (`127.255.255.254`), IMDS, and configured private LANs with
+   `EPERM` (distinguishing unit policy from host-wide IMDS blocks), and
+   exits `78` directly in the main process without sending `READY=1` so
+   `systemctl start` / `install` fails immediately and
+   `RestartPreventExitStatus=78` stops restarts on unsupported hosts.
+   Because QEMU runs in the same cgroup, disposable guest VMs inherit the
+   same block. Hosts with a private DNS resolver can pass
    `--allow-ip <ip>/32` (IMDS ranges, the loopback sentinel, and default
    routes are always refused).
 5. **Host-enforced pre- and post-job hooks (defense-in-depth):** root-owned
@@ -278,9 +289,11 @@ inspect the generated unit and hooks before touching the host with
    checks `/dev/kvm` and stale `qeminga-e2e-*` domains. After every job,
    `hook-job-completed.sh` destroys/undefines any stray `qeminga-e2e-*`
    session domains (leaving unrelated domains alone and keeping disks if
-   state is unknown) and verifies `WORK_DIR` is disjoint from `IMAGES_DIR`,
-   `IMAGE_CACHE_DIR`, and libvirt state before scrubbing it (including
-   `_work` for JIT runners) while keeping the SHA-256-verified image cache.
+   state is unknown), restricts `WORK_DIR` to exact `$STATE_DIR/work` or a
+   single non-reserved child under `$INSTALL_DIR`, verifies no symlink
+   appears in any path component and that neither the lexical nor canonical
+   path overlaps `IMAGES_DIR`, `IMAGE_CACHE_DIR`, or `.config`, and scrubs
+   `WORK_DIR` with `find -P` while keeping the SHA-256-verified image cache.
 6. **Pinned, read-only runner binaries & safe update/reinstall/uninstall:**
    downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
    pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
@@ -294,17 +307,19 @@ inspect the generated unit and hooks before touching the host with
    binaries stay kernel-read-only; GitHub requires runner updates within
    30 days of a new release — update cleanly with
    `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
-   root-owned `install.env` and refuses mismatched flags, matching
-   `uninstall`, or opt in to GitHub self-updates with
-   `--allow-auto-update`). Remove everything owned by the recorded
+   root-owned `install.env`, verifies live numeric UID/GID, and refuses
+   mismatched flags, or opt in to GitHub self-updates with
+   `--allow-auto-update`). Remove only resources owned by the recorded
    installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
-   (uninstall refuses to delete unrecorded paths, preserves
-   `$STATE_DIR/images` if session domain cleanup cannot confirm domains are
-   gone, and when run without `--purge-user` retains a minimal
-   `RECORD_STATE=user-only` UID/GID record in `/etc/qeminga-runner/install.env`
-   so a later default reinstall or `uninstall --purge-user` recognizes the
-   surviving managed account).
+   (uninstall shares the same record and live numeric UID/GID checks BEFORE
+   any `runuser`, `chown`, service stop, or token handoff — leaving
+   `install.env` intact on mismatch — refuses to touch unowned units or
+   paths, preserves `$STATE_DIR/images` if session domain cleanup cannot
+   confirm domains are gone, and when run without `--purge-user` retains a
+   minimal `RECORD_STATE=user-only` UID/GID record in
+   `/etc/qeminga-runner/install.env` so a later default reinstall or
+   `uninstall --purge-user` recognizes the surviving managed account).
 
 ### Running the KVM smoke script locally (unprivileged)
 

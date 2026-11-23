@@ -206,6 +206,9 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
     let unit = String::from_utf8(out.stdout).unwrap();
 
     for required in [
+        "Type=notify",
+        "NotifyAccess=main",
+        "TimeoutStartSec=60s",
         "User=qeminga-runner",
         "Group=qeminga-runner",
         "SupplementaryGroups=kvm",
@@ -265,9 +268,11 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
     }
 
     // Never root, never docker/libvirt/sudo groups, never MDWE=yes (breaks .NET/Node/QEMU JIT),
+    // never Type=simple (systemctl start must wait for the firewall gate via Type=notify),
     // never ExecStartPre= for the firewall gate (RestartPreventExitStatus=78 applies only to the
     // main service process), and never run.sh.
     for forbidden in [
+        "Type=simple",
         "User=root",
         "SupplementaryGroups=libvirt",
         "SupplementaryGroups=docker",
@@ -386,9 +391,11 @@ fn rendered_units_pass_systemd_analyze_verify() {
             .output()
             .unwrap();
         let combined = text(&verify);
+        let unprivileged_run_systemd_err = combined.contains("Failed to create /run/systemd")
+            || combined.contains("Failed to create directory '/run/systemd");
         if !verify.status.success()
             && std::env::var_os("CI").is_none()
-            && combined.contains("Failed to create /run/systemd")
+            && unprivileged_run_systemd_err
         {
             eprintln!("skipped systemd-analyze verify in unprivileged container: {combined}");
             return;
@@ -1374,10 +1381,15 @@ fn registration_and_uninstall_pass_tokens_only_via_inherited_env_never_argv() {
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
 
-    // Fake id reports root (uid 0) and existing service user; fake systemctl/chown are no-ops.
+    // Fake id reports root (uid 0) and existing service user (995:995); fake systemctl/chown are no-ops.
     write_exec(
         &bin.join("id"),
-        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+exit 0
+"#,
     );
     write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
@@ -1531,6 +1543,8 @@ exit 0
 
 #[test]
 fn jit_launcher_execs_runner_listener_directly_without_writing_install_dir() {
+    use std::os::unix::net::UnixDatagram;
+
     let dir = tempfile::tempdir().unwrap();
     let install_dir = dir.path().join("runner");
     let bin_dir = install_dir.join("bin");
@@ -1540,13 +1554,19 @@ fn jit_launcher_execs_runner_listener_directly_without_writing_install_dir() {
     std::fs::create_dir_all(&hook_dir).unwrap();
     std::fs::create_dir_all(&cred_dir).unwrap();
 
+    let notify_sock_path = dir.path().join("notify.sock");
+    let notify_sock = UnixDatagram::bind(&notify_sock_path).unwrap();
+    notify_sock.set_nonblocking(true).unwrap();
+
     let listener_args = dir.path().join("listener.args");
     let listener_jit = dir.path().join("listener.jit");
+    let listener_notify = dir.path().join("listener.notify");
     write_exec(
         &bin_dir.join("Runner.Listener"),
         r#"#!/bin/sh
 printf '%s' "$*" > "${FAKE_LISTENER_ARGS:?}"
 printf '%s' "${ACTIONS_RUNNER_INPUT_JITCONFIG:-}" > "${FAKE_LISTENER_JIT:?}"
+printf '%s' "${NOTIFY_SOCKET:-}" > "${FAKE_LISTENER_NOTIFY:?}"
 exit 0
 "#,
     );
@@ -1576,12 +1596,15 @@ exit 0
     assert!(generated.status.success(), "{}", text(&generated));
 
     // When the firewall check fails, the main process wrapper MUST exit 78
-    // directly (matching RestartPreventExitStatus=78) without starting Runner.Listener.
+    // directly (matching RestartPreventExitStatus=78) without sending READY=1
+    // or starting Runner.Listener.
     let blocked = Command::new(&launcher)
         .env("CREDENTIALS_DIRECTORY", &cred_dir)
+        .env("NOTIFY_SOCKET", &notify_sock_path)
         .env("FAKE_FW_RC", "78")
         .env("FAKE_LISTENER_ARGS", &listener_args)
         .env("FAKE_LISTENER_JIT", &listener_jit)
+        .env("FAKE_LISTENER_NOTIFY", &listener_notify)
         .output()
         .unwrap();
     assert_eq!(
@@ -1594,19 +1617,40 @@ exit 0
         !listener_args.exists(),
         "Runner.Listener must NOT be started when firewall check fails"
     );
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        notify_sock.recv(&mut buf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "run-jit.sh must NOT signal READY=1 when firewall check fails"
+    );
 
     // Make install_dir read-only to prove the launcher never writes run-helper.sh.
     std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let run = Command::new(&launcher)
         .env("CREDENTIALS_DIRECTORY", &cred_dir)
+        .env("NOTIFY_SOCKET", &notify_sock_path)
         .env("FAKE_FW_RC", "0")
         .env("FAKE_LISTENER_ARGS", &listener_args)
         .env("FAKE_LISTENER_JIT", &listener_jit)
+        .env("FAKE_LISTENER_NOTIFY", &listener_notify)
         .output()
         .unwrap();
     std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(run.status.success(), "run-jit.sh failed: {}", text(&run));
+    let n = notify_sock
+        .recv(&mut buf)
+        .expect("run-jit.sh must send READY=1 to NOTIFY_SOCKET after firewall gate passes");
+    assert_eq!(
+        std::str::from_utf8(&buf[..n]).unwrap().trim(),
+        "READY=1",
+        "unexpected sd_notify payload from run-jit.sh"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&listener_notify).unwrap(),
+        "",
+        "NOTIFY_SOCKET must be stripped before exec'ing Runner.Listener"
+    );
     assert_eq!(
         std::fs::read_to_string(&listener_args).unwrap(),
         "run --startuptype service"
@@ -2034,15 +2078,23 @@ socket.socket.sendto = _forge
     );
 
     // 2. Main-process run-runner.sh exits 78 directly (matching RestartPreventExitStatus=78)
-    //    without starting bin/runsvc.sh when the firewall check fails.
+    //    without sending READY=1 or starting bin/runsvc.sh when the firewall check fails,
+    //    and signals READY=1 (stripping NOTIFY_SOCKET) before exec'ing bin/runsvc.sh when it passes.
+    let notify_sock_path = dir.path().join("runner-notify.sock");
+    let notify_sock = std::os::unix::net::UnixDatagram::bind(&notify_sock_path).unwrap();
+    notify_sock.set_nonblocking(true).unwrap();
+
     let runsvc_marker = dir.path().join("runsvc.started");
+    let runsvc_notify = dir.path().join("runsvc.notify");
     write_exec(
         &fake_bin.join("runsvc.sh"),
-        "#!/bin/sh\necho started > \"${FAKE_RUNSVC_MARKER:?}\"\nexit 0\n",
+        "#!/bin/sh\necho started > \"${FAKE_RUNSVC_MARKER:?}\"\nprintf '%s' \"${NOTIFY_SOCKET:-}\" > \"${FAKE_RUNSVC_NOTIFY:?}\"\nexit 0\n",
     );
     let blocked_main = Command::new(&run_runner)
         .env("HOME", &poison_home)
+        .env("NOTIFY_SOCKET", &notify_sock_path)
         .env("FAKE_RUNSVC_MARKER", &runsvc_marker)
+        .env("FAKE_RUNSVC_NOTIFY", &runsvc_notify)
         .output()
         .unwrap();
     assert_eq!(
@@ -2055,15 +2107,37 @@ socket.socket.sendto = _forge
         !runsvc_marker.exists(),
         "bin/runsvc.sh must NOT start when firewall check fails"
     );
+    let mut nbuf = [0u8; 64];
+    assert_eq!(
+        notify_sock.recv(&mut nbuf).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "run-runner.sh must NOT send READY=1 when firewall check fails"
+    );
 
-    // Replace check-egress-firewall.sh with a passing stub to confirm run-runner.sh execs runsvc.sh.
+    // Replace check-egress-firewall.sh with a passing stub to confirm run-runner.sh
+    // sends READY=1, strips NOTIFY_SOCKET, and execs bin/runsvc.sh.
     let saved_check = std::fs::read_to_string(&check).unwrap();
     write_exec(&check, "#!/bin/sh\nexit 0\n");
     let ok_main = Command::new(&run_runner)
+        .env("NOTIFY_SOCKET", &notify_sock_path)
         .env("FAKE_RUNSVC_MARKER", &runsvc_marker)
+        .env("FAKE_RUNSVC_NOTIFY", &runsvc_notify)
         .output()
         .unwrap();
     assert!(ok_main.status.success(), "{}", text(&ok_main));
+    let n = notify_sock
+        .recv(&mut nbuf)
+        .expect("run-runner.sh must send READY=1 to NOTIFY_SOCKET after firewall gate passes");
+    assert_eq!(
+        std::str::from_utf8(&nbuf[..n]).unwrap().trim(),
+        "READY=1",
+        "unexpected sd_notify payload from run-runner.sh"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&runsvc_notify).unwrap(),
+        "",
+        "NOTIFY_SOCKET must be stripped before exec'ing bin/runsvc.sh"
+    );
     assert!(
         runsvc_marker.exists(),
         "run-runner.sh must exec bin/runsvc.sh when firewall check passes"
@@ -2200,7 +2274,12 @@ fn install_record_scopes_uninstall_refuses_unmanaged_dirs_and_preserves_images_o
     std::fs::create_dir_all(&bin).unwrap();
     write_exec(
         &bin.join("id"),
-        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+exit 0
+"#,
     );
     write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
@@ -2749,22 +2828,63 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         "image-cache must stay untouched"
     );
 
-    // 2. Real GitHub JIT configs with gitHubUrl omitted (using serverUrl/serverUrlV2,
-    //    matching actions/runner ConfigurationStore.cs L73-L105) MUST be accepted for
-    //    private --repo controllers, and absolute workFolder inside STATE_DIR/work is allowed.
-    let jit_no_url = dir.path().join("jit-no-url");
-    let work_sub = state_dir.join("work/job-sub");
+    // 2. Unbound JIT configs with gitHubUrl omitted or empty MUST fail closed even when
+    //    serverUrlV2 points to a shared hosted GitHub Actions endpoint (shared endpoints do
+    //    not identify which repository owns the enrollment); donors are directed to token
+    //    registration (--token-file). An explicit matching gitHubUrl with exact STATE_DIR/work
+    //    is accepted.
+    for (label, json) in [
+        (
+            "omitted-url",
+            format!(
+                "\u{feff}{{\"agentId\":7,\"agentName\":\"jit-nourl\",\"serverUrlV2\":\"https://broker.actions.githubusercontent.com/test\",\"workFolder\":\"{}\"}}",
+                state_dir.join("work").display()
+            ),
+        ),
+        (
+            "empty-url",
+            "\u{feff}{\"agentId\":8,\"agentName\":\"jit-emptyurl\",\"gitHubUrl\":\"\",\"serverUrl\":\"https://pipelines.actions.githubusercontent.com/test\",\"workFolder\":\"_work\"}".to_string(),
+        ),
+    ] {
+        let jit_unbound = dir.path().join(format!("jit-{label}"));
+        std::fs::write(&jit_unbound, make_jit_config_json(&json)).unwrap();
+        std::fs::set_permissions(&jit_unbound, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let out_dir = dir.path().join(format!("hooks-{label}"));
+        let rejected = run_setup(&[
+            "render-hooks",
+            "--repo",
+            REPO_URL,
+            "--install-dir",
+            install_dir.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--jitconfig-file",
+            jit_unbound.to_str().unwrap(),
+            "--out",
+            out_dir.to_str().unwrap(),
+        ]);
+        assert!(
+            !rejected.status.success(),
+            "unbound JIT blob ({label}) must be refused: {}",
+            text(&rejected)
+        );
+        let msg = text(&rejected);
+        assert!(
+            msg.contains("gitHubUrl") && msg.contains("--token-file"),
+            "refusal for unbound JIT blob ({label}) should explain missing gitHubUrl and direct donors to --token-file: {msg}"
+        );
+    }
+
+    let jit_exact_work = dir.path().join("jit-exact-work");
+    let exact_work = state_dir.join("work");
     std::fs::write(
-        &jit_no_url,
-        make_jit_config_json(&format!(
-            "\u{feff}{{\"agentId\":7,\"agentName\":\"jit-nourl\",\"serverUrlV2\":\"https://broker.actions.githubusercontent.com/test\",\"workFolder\":\"{}\"}}",
-            work_sub.display()
-        )),
+        &jit_exact_work,
+        make_jit_config(REPO_URL, exact_work.to_str().unwrap()),
     )
     .unwrap();
-    std::fs::set_permissions(&jit_no_url, std::fs::Permissions::from_mode(0o600)).unwrap();
-    let hooks_no_url = dir.path().join("hooks-no-url");
-    let ok_no_url = run_setup(&[
+    std::fs::set_permissions(&jit_exact_work, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let hooks_exact_work = dir.path().join("hooks-exact-work");
+    let ok_exact = run_setup(&[
         "render-hooks",
         "--repo",
         REPO_URL,
@@ -2773,19 +2893,19 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         "--state-dir",
         state_dir.to_str().unwrap(),
         "--jitconfig-file",
-        jit_no_url.to_str().unwrap(),
+        jit_exact_work.to_str().unwrap(),
         "--out",
-        hooks_no_url.to_str().unwrap(),
+        hooks_exact_work.to_str().unwrap(),
     ]);
     assert!(
-        ok_no_url.status.success(),
-        "supported JIT blob with gitHubUrl omitted must be accepted: {}",
-        text(&ok_no_url)
+        ok_exact.status.success(),
+        "bound JIT blob with exact STATE_DIR/work must succeed: {}",
+        text(&ok_exact)
     );
     assert!(
-        std::fs::read_to_string(hooks_no_url.join("policy.env"))
+        std::fs::read_to_string(hooks_exact_work.join("policy.env"))
             .unwrap()
-            .contains(&format!("WORK_DIR={}\n", work_sub.display()))
+            .contains(&format!("WORK_DIR={}\n", exact_work.display()))
     );
 
     // 3. Organization JIT provisioning (--org + --jitconfig-file) MUST be refused
@@ -2848,8 +2968,13 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         text(&grp_mismatch)
     );
 
-    // 4. Malicious/escaped JIT workFolder, overlapping VM/state subtrees (images,
-    //    image-cache, .config, work2), or mismatched gitHubUrl must fail closed.
+    // 4. Malicious/escaped JIT workFolder, nested work/sub (which would allow runner-writable
+    //    intermediate symlink swaps), overlapping VM/state subtrees (images, image-cache,
+    //    .config, work2), or mismatched gitHubUrl must fail closed.
+    let bad_work_sub = state_dir
+        .join("work/job-sub")
+        .to_string_lossy()
+        .into_owned();
     let bad_images = state_dir.join("images").to_string_lossy().into_owned();
     let bad_images_sub = state_dir.join("images/sub").to_string_lossy().into_owned();
     let bad_cache = state_dir.join("image-cache").to_string_lossy().into_owned();
@@ -2861,6 +2986,7 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         ("bin-dir", REPO_URL, "bin"),
         ("dot-dir", REPO_URL, "."),
         ("wrong-repo", "https://github.com/evil/repo", "_work"),
+        ("nested-work-sub", REPO_URL, bad_work_sub.as_str()),
         ("state-images", REPO_URL, bad_images.as_str()),
         ("state-images-sub", REPO_URL, bad_images_sub.as_str()),
         ("state-image-cache", REPO_URL, bad_cache.as_str()),
@@ -2892,10 +3018,14 @@ fn jit_workspace_validation_and_post_job_cleanup() {
     }
 
     // 5. Defense in depth: hook-job-completed.sh MUST refuse a policy whose WORK_DIR
-    //    overlaps IMAGES_DIR (or image-cache / .config) and preserve VM disks intact.
+    //    overlaps IMAGES_DIR, uses a nested path through an intermediate runner-writable
+    //    symlink into IMAGES_DIR, or points WORK_DIR itself via a symlink into IMAGES_DIR,
+    //    preserving VM disks intact even when libvirt cannot confirm domains absent.
     let kept_disk = state_dir.join("images/qeminga-e2e-88-1-x86_64/root.qcow2");
     std::fs::create_dir_all(kept_disk.parent().unwrap()).unwrap();
     std::fs::write(&kept_disk, b"keep-me").unwrap();
+
+    // 5a. Direct overlap WORK_DIR=$STATE_DIR/images.
     let bad_policy = dir.path().join("bad-overlap-policy.env");
     std::fs::write(
         &bad_policy,
@@ -2923,6 +3053,69 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         kept_disk.exists(),
         "VM disk under images/ must remain intact when WORK_DIR overlaps images/"
     );
+
+    // 5b. Intermediate symlink inside a nested WORK_DIR ($STATE_DIR/work/link/qeminga-e2e-88-1-x86_64
+    //     where $STATE_DIR/work/link -> $STATE_DIR/images): must be refused without deleting kept_disk!
+    let inter_link = state_dir.join("work/link");
+    std::os::unix::fs::symlink(state_dir.join("images"), &inter_link).unwrap();
+    let nested_symlink_policy = dir.path().join("nested-symlink-policy.env");
+    std::fs::write(
+        &nested_symlink_policy,
+        format!(
+            "INSTALL_DIR={}\nSTATE_DIR={}\nWORK_DIR={}/work/link/qeminga-e2e-88-1-x86_64\nIMAGES_DIR={}/images\nLIBVIRT_CONNECT=qemu:///session\n",
+            install_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+        ),
+    )
+    .unwrap();
+    let bad_nested = run_hook(
+        &hooks_out.join("hook-job-completed.sh"),
+        &nested_symlink_policy,
+        &bin,
+        &[("FAKE_LOG", log.to_str().unwrap()), ("FAKE_LIST_FAIL", "1")],
+    );
+    assert!(
+        !bad_nested.status.success(),
+        "hook-job-completed.sh must refuse nested WORK_DIR traversing intermediate symlink: {}",
+        text(&bad_nested)
+    );
+    assert!(
+        kept_disk.exists(),
+        "VM disk under images/ must survive intermediate symlink in nested WORK_DIR"
+    );
+
+    // 5c. Direct symlink replacing $STATE_DIR/work -> $STATE_DIR/images: must refuse to scrub!
+    std::fs::remove_dir_all(state_dir.join("work")).unwrap();
+    std::os::unix::fs::symlink(state_dir.join("images"), state_dir.join("work")).unwrap();
+    let direct_sym_policy = dir.path().join("direct-sym-policy.env");
+    std::fs::write(
+        &direct_sym_policy,
+        format!(
+            "INSTALL_DIR={}\nSTATE_DIR={}\nWORK_DIR={}/work\nIMAGES_DIR={}/images\nLIBVIRT_CONNECT=qemu:///session\n",
+            install_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+        ),
+    )
+    .unwrap();
+    let bad_direct = run_hook(
+        &hooks_out.join("hook-job-completed.sh"),
+        &direct_sym_policy,
+        &bin,
+        &[("FAKE_LOG", log.to_str().unwrap()), ("FAKE_LIST_FAIL", "1")],
+    );
+    assert!(
+        !bad_direct.status.success(),
+        "hook-job-completed.sh must refuse symlinked WORK_DIR -> images: {}",
+        text(&bad_direct)
+    );
+    assert!(
+        kept_disk.exists(),
+        "VM disk under images/ must survive symlinked WORK_DIR"
+    );
 }
 
 #[test]
@@ -2948,6 +3141,7 @@ fn uninstall_provides_private_runtime_dir_for_cleanup_after_stopping_service() {
         r#"#!/bin/sh
 if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
 if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
 exit 0
 "#,
     );
@@ -4123,5 +4317,856 @@ exit 0
     assert!(
         !user_flag.exists() && !cfg.exists(),
         "later --purge-user must delete surviving user and remove retained config dir"
+    );
+}
+
+#[test]
+fn uninstall_verifies_recorded_uid_and_gid_before_credentials_or_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let rt_root = dir.path().join("run");
+    let etc_units = dir.path().join("etc-systemd");
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    for d in [&bin, &rt_root, &etc_units, &inst, &state, &hooks, &cfg] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let runuser_log = dir.path().join("runuser.log");
+    let chown_log = dir.path().join("chown.log");
+    let systemctl_log = dir.path().join("systemctl.log");
+    let unit_file = etc_units.join("qeminga-uid-guard.service");
+    std::fs::write(&unit_file, "[Unit]\n").unwrap();
+    std::fs::write(inst.join(".credentials"), b"secret-runner-creds").unwrap();
+    write_exec(&inst.join("config.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&hooks.join("hook-job-completed.sh"), "#!/bin/sh\nexit 0\n");
+    std::fs::write(
+        cfg.join("policy.env"),
+        "ALLOWED_REPOSITORY=vicaya/qeminga-kvm-controller\n",
+    )
+    .unwrap();
+    std::fs::write(
+        cfg.join("install.env"),
+        format!(
+            "RECORD_SCHEMA=1\nRECORD_STATE=installed\nSERVICE=qeminga-uid-guard\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nINSTALL_DIR={}\nSTATE_DIR={}\nHOOK_DIR={}\nCONFIG_DIR={}\nTARGET_URL={REPO_URL}\nRUNNER_GROUP=\nRUNNER_NAME=test\nLABELS=qeminga-kvm\nEPHEMERAL=0\nALLOW_AUTO_UPDATE=0\nWORK_DIR={}/work\n",
+            inst.display(),
+            state.display(),
+            hooks.display(),
+            cfg.display(),
+            state.display(),
+        ),
+    )
+    .unwrap();
+    let tok = dir.path().join("rm-token");
+    std::fs::write(&tok, "REMOVE_TOKEN_SECRET\n").unwrap();
+    std::fs::set_permissions(&tok, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo "${FAKE_LIVE_UID:?}"; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo "${FAKE_LIVE_GID:?}"; exit 0; fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_RUNUSER_LOG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("chown"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_CHOWN_LOG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+
+    for (label, live_uid, live_gid) in [
+        ("uid-reassigned", "996", "995"),
+        ("gid-reassigned", "995", "996"),
+        ("uid-zero", "0", "995"),
+    ] {
+        let out = run_setup_env(
+            &[
+                "uninstall",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--token-file",
+                tok.to_str().unwrap(),
+            ],
+            &[
+                ("FAKE_LIVE_UID", live_uid),
+                ("FAKE_LIVE_GID", live_gid),
+                ("FAKE_RUNUSER_LOG", runuser_log.to_str().unwrap()),
+                ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+                ("FAKE_SC_LOG", systemctl_log.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", etc_units.to_str().unwrap()),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            !out.status.success(),
+            "uninstall with {label} ({live_uid}:{live_gid}) MUST fail closed: {}",
+            text(&out)
+        );
+        assert!(
+            !runuser_log.exists(),
+            "{label}: uninstall must NEVER invoke runuser before verifying UID/GID"
+        );
+        assert!(
+            !chown_log.exists(),
+            "{label}: uninstall must NEVER chown runner credentials before verifying UID/GID"
+        );
+        assert!(
+            !systemctl_log.exists(),
+            "{label}: uninstall must NEVER stop/disable service before verifying UID/GID"
+        );
+        assert!(
+            cfg.join("install.env").exists()
+                && inst.join(".credentials").exists()
+                && unit_file.exists(),
+            "{label}: mismatch must leave install.env, credentials, and unit intact for recovery"
+        );
+    }
+}
+
+#[test]
+fn install_fails_without_marking_installed_when_service_start_rejects_firewall() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let etc_units = dir.path().join("etc-systemd");
+    let fake_tar_src = dir.path().join("tar-src");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("bin")).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("externals")).unwrap();
+
+    write_exec(
+        &fake_tar_src.join("config.sh"),
+        r#"#!/bin/sh
+work="" url="" name=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --url) url="$2"; shift 2 ;;
+        --name) name="$2"; shift 2 ;;
+        --work) work="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '{"agentId":1,"agentName":"%s","gitHubUrl":"%s","workFolder":"%s","disableUpdate":true}\n' "$name" "$url" "$work" > "$(dirname "$0")/.runner"
+exit 0
+"#,
+    );
+    write_exec(&fake_tar_src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("run.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+    let good_tarball = dir.path().join("runner.tar.gz");
+    let tar_out = Command::new("tar")
+        .args([
+            "-czf",
+            good_tarball.to_str().unwrap(),
+            "-C",
+            fake_tar_src.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(tar_out.status.success(), "{}", text(&tar_out));
+    let good_sha = sha256_of(&std::fs::read(&good_tarball).unwrap());
+
+    let user_flag = dir.path().join("user_exists");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let tok_file = dir.path().join("token");
+    std::fs::write(&tok_file, "FAKE_REG_TOKEN\n").unwrap();
+    std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    // Simulate systemd Type=notify rejecting startup when run-runner.sh exits 78 without READY=1.
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "enable" ] || [ "$1" = "start" ]; then
+    echo "Job for qeminga-notify-svc.service failed because the control process exited with error code 78." >&2
+    exit 1
+fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("systemd-analyze"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+for a in "$@"; do
+    case "$a" in *api.github.com/repos/*) printf '404'; exit 0 ;; esac
+done
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+cp "${FAKE_GOOD_TARBALL:?}" "$out"
+exit 0
+"#,
+    );
+
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = etc_units.to_str().unwrap();
+    let failed_start = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "notify-box",
+            "--service",
+            "qeminga-notify-svc",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--skip-packages",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", good_tarball.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !failed_start.status.success(),
+        "install MUST fail when Type=notify service start fails firewall gate: {}",
+        text(&failed_start)
+    );
+    assert!(
+        !text(&failed_start).contains("qeminga KVM runner installed:"),
+        "failed startup must NOT report the runner installed/started: {}",
+        text(&failed_start)
+    );
+    let rec = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec.contains("RECORD_STATE=installing\n") && rec.contains("OWNED_UNIT=1\n"),
+        "failed start must keep RECORD_STATE=installing with OWNED_UNIT=1:\n{rec}"
+    );
+    let installed_unit =
+        std::fs::read_to_string(etc_units.join("qeminga-notify-svc.service")).unwrap();
+    assert!(
+        installed_unit.contains("Type=notify\n") && installed_unit.contains("NotifyAccess=main\n"),
+        "installed unit must use Type=notify so systemctl start waits for firewall gate:\n{installed_unit}"
+    );
+}
+
+#[test]
+fn interrupted_install_tracks_per_resource_ownership_against_later_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let rt_root = dir.path().join("run");
+    let etc_units = dir.path().join("etc-systemd");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&rt_root).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+
+    let user_flag = dir.path().join("user_exists");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let tok_file = dir.path().join("token");
+    std::fs::write(&tok_file, "FAKE_REG_TOKEN\n").unwrap();
+    std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+    let sc_log = dir.path().join("systemctl.log");
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("userdel"),
+        "#!/bin/sh\nrm -f \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+for a in "$@"; do
+    case "$a" in *api.github.com/repos/*) printf '404'; exit 0 ;; esac
+done
+exit 22
+"#,
+    );
+
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = etc_units.to_str().unwrap();
+    let common_env = [
+        ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+        ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+        ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+        ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+        ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+    ];
+
+    // 1. First install fails during runner download (after creating user + state dir,
+    //    BEFORE creating install_dir, hook_dir, or systemd unit).
+    let fail1 = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "collide-box",
+            "--service",
+            "qeminga-collide-svc",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(!fail1.status.success(), "{}", text(&fail1));
+    let rec = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    for expected in [
+        "RECORD_STATE=installing\n",
+        "OWNED_CONFIG_DIR=1\n",
+        "OWNED_STATE_DIR=1\n",
+        "OWNED_INSTALL_DIR=0\n",
+        "OWNED_HOOK_DIR=0\n",
+        "OWNED_UNIT=0\n",
+    ] {
+        assert!(
+            rec.contains(expected),
+            "interrupted install record missing {expected:?}:\n{rec}"
+        );
+    }
+
+    // 2. An independent service now claims the same service name and install_dir path!
+    let foreign_unit = etc_units.join("qeminga-collide-svc.service");
+    std::fs::write(
+        &foreign_unit,
+        "[Unit]\nDescription=unrelated donor service\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(&inst).unwrap();
+    std::fs::write(inst.join("foreign.txt"), b"do-not-touch").unwrap();
+
+    // 3. Retrying install MUST refuse because OWNED_UNIT=0 / OWNED_INSTALL_DIR=0!
+    let retry_collide = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "collide-box",
+            "--service",
+            "qeminga-collide-svc",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(
+        !retry_collide.status.success(),
+        "retry must refuse colliding unowned unit/dir after interrupted install: {}",
+        text(&retry_collide)
+    );
+    assert!(
+        foreign_unit.exists() && inst.join("foreign.txt").exists(),
+        "colliding foreign service and dir must stay untouched on failed retry"
+    );
+
+    // 4. Uninstall --purge-user MUST clean up ONLY our owned resources (state dir, user,
+    //    config dir) and MUST NOT stop, disable, or delete the foreign service or foreign dir!
+    let _ = std::fs::remove_file(&sc_log);
+    let uninst = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(
+        uninst.status.success(),
+        "uninstall of interrupted install should succeed without touching foreign resources: {}",
+        text(&uninst)
+    );
+    assert!(
+        foreign_unit.exists(),
+        "uninstall must NEVER delete a same-named service that had OWNED_UNIT=0"
+    );
+    assert!(
+        inst.join("foreign.txt").exists(),
+        "uninstall must NEVER delete a directory that had OWNED_INSTALL_DIR=0"
+    );
+    let sc_calls = std::fs::read_to_string(&sc_log).unwrap_or_default();
+    assert!(
+        !sc_calls.contains("stop qeminga-collide-svc.service")
+            && !sc_calls.contains("disable qeminga-collide-svc.service"),
+        "uninstall must NEVER stop/disable a service that had OWNED_UNIT=0: {sc_calls}"
+    );
+    assert!(
+        !state.exists() && !user_flag.exists() && !cfg.exists(),
+        "owned state dir, managed user, and config dir must be cleaned up"
+    );
+}
+
+#[test]
+fn jit_install_bootstraps_jq_via_install_packages_before_decoding_blob() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let etc_units = dir.path().join("etc-systemd");
+    let fake_tar_src = dir.path().join("tar-src");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("bin")).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("externals")).unwrap();
+
+    // Symlink essential POSIX utilities into isolated bin WITHOUT jq initially.
+    for util in [
+        "awk",
+        "base64",
+        "cat",
+        "chmod",
+        "cp",
+        "cut",
+        "dirname",
+        "env",
+        "find",
+        "grep",
+        "gzip",
+        "head",
+        "hostname",
+        "ln",
+        "mkdir",
+        "mktemp",
+        "mv",
+        "rm",
+        "sed",
+        "sha256sum",
+        "tar",
+        "tr",
+        "uname",
+    ] {
+        let out = Command::new("which").arg(util).output().unwrap();
+        assert!(out.status.success(), "host lacks {util}");
+        let real = String::from_utf8(out.stdout).unwrap();
+        std::os::unix::fs::symlink(real.trim(), bin.join(util)).unwrap();
+    }
+    let real_jq_out = Command::new("which").arg("jq").output().unwrap();
+    assert!(real_jq_out.status.success(), "host lacks jq");
+    let real_jq = String::from_utf8(real_jq_out.stdout).unwrap();
+    let real_jq = real_jq.trim();
+
+    write_exec(
+        &fake_tar_src.join("bin/Runner.Listener"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    write_exec(&fake_tar_src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("run.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("config.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+    let good_tarball = dir.path().join("runner-jit.tar.gz");
+    let tar_out = Command::new("tar")
+        .args([
+            "-czf",
+            good_tarball.to_str().unwrap(),
+            "-C",
+            fake_tar_src.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(tar_out.status.success(), "{}", text(&tar_out));
+    let good_sha = sha256_of(&std::fs::read(&good_tarball).unwrap());
+
+    let user_flag = dir.path().join("user_exists");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    // Fake apt-get installs jq into our isolated bin when install_packages runs!
+    write_exec(
+        &bin.join("apt-get"),
+        r#"#!/bin/sh
+if [ "$1" = "install" ]; then
+    ln -sf "${REAL_JQ_BIN:?}" "${ISOLATED_BIN:?}/jq"
+fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("systemd-analyze"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+for a in "$@"; do
+    case "$a" in *api.github.com/repos/*) printf '404'; exit 0 ;; esac
+done
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+cp "${FAKE_GOOD_TARBALL:?}" "$out"
+exit 0
+"#,
+    );
+
+    let jit_file = dir.path().join("jitconfig");
+    std::fs::write(&jit_file, make_jit_config(REPO_URL, "_work")).unwrap();
+    std::fs::set_permissions(&jit_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = etc_units.to_str().unwrap();
+
+    // 1. With --skip-packages and no jq on PATH, install MUST fail with clear missing-jq
+    //    error BEFORE creating any service user or managed directories.
+    let no_jq_skip = Command::new("/bin/bash")
+        .arg(script())
+        .args([
+            "install",
+            "--repo",
+            REPO_URL,
+            "--service",
+            "qeminga-jit-bootstrap",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--jitconfig-file",
+            jit_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--skip-packages",
+            "--no-start",
+        ])
+        .env("PATH", &bin)
+        .env("FAKE_USER_FLAG", &user_flag)
+        .env("FAKE_GOOD_TARBALL", &good_tarball)
+        .env("REAL_JQ_BIN", real_jq)
+        .env("ISOLATED_BIN", &bin)
+        .env("QEMINGA_KVM_DEVICE", "/dev/null")
+        .env("QEMINGA_CGROUP_CONTROLLERS", &cg_ctrls)
+        .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
+        .env("QEMINGA_AAVMF_CODE", &aavmf_code)
+        .env("QEMINGA_AAVMF_VARS", &aavmf_vars)
+        .output()
+        .unwrap();
+    assert!(
+        !no_jq_skip.status.success(),
+        "--skip-packages without jq must fail: {}",
+        text(&no_jq_skip)
+    );
+    assert!(
+        text(&no_jq_skip).contains("jq is required"),
+        "missing-jq error should be clear: {}",
+        text(&no_jq_skip)
+    );
+    assert!(
+        !user_flag.exists() && !cfg.exists() && !state.exists(),
+        "--skip-packages failure must occur before creating user or directories"
+    );
+
+    // 2. Normal one-command JIT install (no --skip-packages) on a fresh host without jq
+    //    installs jq via install_packages first, then decodes/validates the JIT blob and succeeds!
+    let bootstrap_ok = Command::new("/bin/bash")
+        .arg(script())
+        .args([
+            "install",
+            "--repo",
+            REPO_URL,
+            "--service",
+            "qeminga-jit-bootstrap",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--jitconfig-file",
+            jit_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--no-start",
+        ])
+        .env("PATH", &bin)
+        .env("FAKE_USER_FLAG", &user_flag)
+        .env("FAKE_GOOD_TARBALL", &good_tarball)
+        .env("REAL_JQ_BIN", real_jq)
+        .env("ISOLATED_BIN", &bin)
+        .env("QEMINGA_KVM_DEVICE", "/dev/null")
+        .env("QEMINGA_CGROUP_CONTROLLERS", &cg_ctrls)
+        .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
+        .env("QEMINGA_AAVMF_CODE", &aavmf_code)
+        .env("QEMINGA_AAVMF_VARS", &aavmf_vars)
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap_ok.status.success(),
+        "one-command JIT install must bootstrap jq via install_packages before decoding JIT blob: {}",
+        text(&bootstrap_ok)
+    );
+    assert!(
+        hooks.join("run-jit.sh").exists()
+            && cfg.join("jitconfig").exists()
+            && std::fs::read_to_string(cfg.join("install.env"))
+                .unwrap()
+                .contains("RECORD_STATE=installed\n"),
+        "JIT bootstrap install must complete cleanly"
     );
 }

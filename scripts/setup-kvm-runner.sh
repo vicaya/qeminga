@@ -6217,6 +6217,111 @@ require_recorded_volume() {
         || die "${mode}: installation record '$OPT_CONFIG_DIR/install.env' is missing ${key} for owned ${label}; verify the mounted storage and run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' before proceeding"
 }
 
+# Verify that systemd resolves `${OPT_SERVICE}.service` to THIS installation's
+# recorded unit fragment (`$unit_path`), not a same-name vendor or runtime unit
+# in another search-path directory (for example `/usr/lib/systemd/system/<unit>`).
+# Fails closed (returns 1) before querying, stopping, or disabling if:
+#   - `$unit_path` is a symlink or non-regular file;
+#   - `$unit_path` is absent while a same-name unit exists in another directory
+#     in the systemd unit search path;
+#   - `$unit_path` is absent while an enablement symlink points to a different
+#     unit path; or
+#   - `systemctl show` reports a conflicting `FragmentPath=` (or a loaded
+#     manager state with empty `FragmentPath=` while `$unit_path` is absent).
+verify_resolved_owned_unit_fragment() {
+    local mode="$1" unit_path="${2:-}"
+    if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
+        return 0
+    fi
+    local unit="${OPT_SERVICE}.service"
+    local primary_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    primary_dir="${primary_dir%/}"
+    local expected_path="${unit_path:-${primary_dir}/${unit}}"
+    local alt_root_path=""
+    if [ -n "${QEMINGA_SYSTEMD_ROOT:-}" ]; then
+        local norm_root="${QEMINGA_SYSTEMD_ROOT%/}"
+        if [[ "$expected_path" == "${norm_root}"/* ]]; then
+            alt_root_path="${expected_path#"$norm_root"}"
+        fi
+    elif [[ "$primary_dir" == */etc/systemd/system ]] && [ "$primary_dir" != "/etc/systemd/system" ]; then
+        alt_root_path="/etc/systemd/system/${unit}"
+    fi
+
+    if [ -L "$expected_path" ]; then
+        warn "${mode}: recorded unit path '${expected_path}' is a symlink rather than a managed unit file; refusing to stop or disable ${unit}"
+        return 1
+    fi
+    if [ -e "$expected_path" ] && [ ! -f "$expected_path" ]; then
+        warn "${mode}: recorded unit path '${expected_path}' is not a regular file; refusing to stop or disable ${unit}"
+        return 1
+    fi
+
+    local default_unit_dirs="/etc/systemd/system:/run/systemd/system:/usr/local/lib/systemd/system:/usr/lib/systemd/system:/lib/systemd/system"
+    if [ -n "${QEMINGA_SYSTEMD_ROOT:-}" ]; then
+        local norm_root="${QEMINGA_SYSTEMD_ROOT%/}"
+        default_unit_dirs="${norm_root}/etc/systemd/system:${norm_root}/run/systemd/system:${norm_root}/usr/local/lib/systemd/system:${norm_root}/usr/lib/systemd/system:${norm_root}/lib/systemd/system"
+    fi
+    local unit_dirs="${QEMINGA_SYSTEMD_UNIT_DIRS:-$default_unit_dirs}"
+    local dirs=() d
+    IFS=':' read -r -a dirs <<<"${unit_dirs}"
+    if [ ! -e "$expected_path" ]; then
+        for d in "${dirs[@]}"; do
+            [ -n "$d" ] || continue
+            d="${d%/}"
+            [ "$d" != "$primary_dir" ] || continue
+            if [ -e "${d}/${unit}" ] || [ -L "${d}/${unit}" ]; then
+                warn "${mode}: managed unit '${expected_path}' is missing and unrelated unit '${d}/${unit}' occupies '${unit}'; preserving unrelated unit and its enablement"
+                return 1
+            fi
+        done
+        local links link link_target resolved_target
+        links="$(find_unit_enablement_links)"
+        while IFS= read -r link; do
+            [ -n "$link" ] || continue
+            if [ -L "$link" ]; then
+                link_target="$(readlink "$link" 2>/dev/null || true)"
+                if [ -n "$link_target" ]; then
+                    resolved_target="$link_target"
+                    if [[ "$link_target" != /* ]] && command -v realpath >/dev/null 2>&1; then
+                        resolved_target="$(realpath -m -- "$(dirname "$link")/$link_target" 2>/dev/null || echo "$link_target")"
+                    fi
+                    if [ "$resolved_target" != "$expected_path" ] \
+                        && { [ -z "$alt_root_path" ] || [ "$resolved_target" != "$alt_root_path" ]; }; then
+                        warn "${mode}: enablement link '${link}' points to unrelated target '${link_target}' instead of '${expected_path}'; preserving unrelated unit enablement"
+                        return 1
+                    fi
+                fi
+            fi
+        done <<<"$links"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        local show_out="" line frag_path="" load_state=""
+        show_out="$(systemctl show -p LoadState -p FragmentPath "$unit" 2>/dev/null || true)"
+        while IFS= read -r line; do
+            case "$line" in
+                FragmentPath=*) frag_path="${line#FragmentPath=}" ;;
+                LoadState=*) load_state="${line#LoadState=}" ;;
+            esac
+        done <<<"$show_out"
+        if [ -n "$frag_path" ]; then
+            if [ "$frag_path" != "$expected_path" ] \
+                && { [ -z "$alt_root_path" ] || [ "$frag_path" != "$alt_root_path" ]; }; then
+                warn "${mode}: systemd resolved '${unit}' to '${frag_path}' instead of managed unit '${expected_path}'; preserving unrelated unit"
+                return 1
+            fi
+        elif [ ! -e "$expected_path" ]; then
+            case "$load_state" in
+                loaded | masked | bad-setting | error)
+                    warn "${mode}: managed unit '${expected_path}' is missing while systemd reports LoadState=${load_state} for '${unit}' with no matching FragmentPath; preserving unrelated unit"
+                    return 1
+                    ;;
+            esac
+        fi
+    fi
+    return 0
+}
+
 # Query an owned systemd unit's active state without `--quiet` so a missing
 # `systemctl` client, manager/D-Bus connection failures (empty stdout, non-zero
 # exit), and unrecognized states are treated as indeterminate (fail-closed)
@@ -6227,6 +6332,7 @@ query_owned_service_state() {
     if ! command -v systemctl >/dev/null 2>&1; then
         return 1
     fi
+    verify_resolved_owned_unit_fragment "service-check" || return 1
     local svc_state rc=0
     svc_state="$(systemctl is-active "${OPT_SERVICE}.service" 2>/dev/null)" || rc=$?
     svc_state="${svc_state%%$'\n'*}"
@@ -6256,12 +6362,13 @@ query_owned_service_state() {
 # mutating live runner binaries, managed config, or unit files (forward
 # update/reinstall, ordinary uninstall, and rollback/recovery). Sets
 # _SERVICE_WAS_ACTIVE=1 if the unit was active/reloading/refreshing/activating
-# prior to stopping. Fails closed (returns 1) when `systemctl` is unavailable
-# for an owned unit, on manager errors, unrecognized states, stop failure, or
-# if the unit does not reach a confirmed stopped state after stop.
+# prior to stopping. When `$2` (a recovery journal path) is provided and the
+# unit is newly observed running while `REC_UPDATE_WAS_ACTIVE=0`, durably
+# persists `UPDATE_WAS_ACTIVE=1` BEFORE issuing `systemctl stop` so a failure
+# or crash immediately after stopping never loses restart intent.
 _SERVICE_WAS_ACTIVE=0
 ensure_owned_service_stopped() {
-    local mode="$1"
+    local mode="$1" rec_path_to_upgrade="${2:-}"
     _SERVICE_WAS_ACTIVE=0
     if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
         return 0
@@ -6270,6 +6377,7 @@ ensure_owned_service_stopped() {
         warn "${mode}: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; refusing to modify live runner files"
         return 1
     fi
+    verify_resolved_owned_unit_fragment "$mode" || return 1
     local state
     if ! state="$(query_owned_service_state)"; then
         warn "${mode}: unable to confirm systemd state for ${OPT_SERVICE}.service (manager error or unrecognized state); refusing to modify live runner files"
@@ -6280,6 +6388,15 @@ ensure_owned_service_stopped() {
     fi
     if [ "$state" = "running" ]; then
         _SERVICE_WAS_ACTIVE=1
+        if [ -n "$rec_path_to_upgrade" ] && [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "0" ]; then
+            if ! ( write_update_record "$rec_path_to_upgrade" "updating" "$REC_UPDATE_PHASE" \
+                "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "1" ); then
+                warn "${mode}: failed to persist newly observed running state (UPDATE_WAS_ACTIVE=1) to '${rec_path_to_upgrade}' before stopping ${OPT_SERVICE}.service"
+                return 1
+            fi
+            REC_UPDATE_WAS_ACTIVE="1"
+        fi
     fi
     say "stopping ${OPT_SERVICE}.service (state: ${state})"
     if ! systemctl stop "${OPT_SERVICE}.service" 9>&-; then
@@ -6295,7 +6412,7 @@ ensure_owned_service_stopped() {
 }
 
 ensure_owned_service_stopped_for_restore() {
-    ensure_owned_service_stopped "$1"
+    ensure_owned_service_stopped "$@"
 }
 
 # Print any remaining systemd enablement symlinks (*.wants, *.requires,
@@ -6307,6 +6424,9 @@ find_unit_enablement_links() {
     local unit_dirs
     if [ -n "${QEMINGA_SYSTEMD_UNIT_DIRS:-}" ]; then
         unit_dirs="$QEMINGA_SYSTEMD_UNIT_DIRS"
+    elif [ -n "${QEMINGA_SYSTEMD_ROOT:-}" ]; then
+        local norm_root="${QEMINGA_SYSTEMD_ROOT%/}"
+        unit_dirs="${norm_root}/etc/systemd/system:${norm_root}/run/systemd/system"
     elif [ -n "${QEMINGA_SYSTEMD_UNIT_DIR:-}" ]; then
         unit_dirs="$primary_dir"
     else
@@ -6331,11 +6451,13 @@ find_unit_enablement_links() {
     if [ "$prev_nullglob" -eq 0 ]; then shopt -u nullglob; fi
 }
 
-# Disable an owned systemd unit and confirm no enablement state or link remains
-# BEFORE releasing ownership or removing the unit file. Fails closed (returns 1)
-# if `systemctl` is unavailable, if any `.wants`/`.requires`/`.upholds` link
-# remains, if `systemctl is-enabled` still reports enabled/unrecognized state,
-# or if `systemctl disable` fails while enablement cannot be confirmed absent.
+# Disable an owned systemd unit across both persistent and runtime scopes and
+# confirm no enablement state or link remains BEFORE releasing ownership or
+# removing the unit file. Fails closed (returns 1) if `systemctl` is
+# unavailable, if systemd resolves the name to an unrelated unit fragment, if
+# any `.wants`/`.requires`/`.upholds` link remains in either scope, if
+# `systemctl is-enabled` still reports enabled/runtime/unrecognized state, or
+# if disabling fails while enablement cannot be confirmed absent.
 ensure_owned_service_disabled() {
     local mode="$1" unit_path="$2"
     if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
@@ -6345,44 +6467,107 @@ ensure_owned_service_disabled() {
         warn "${mode}: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; refusing to release unit ownership"
         return 1
     fi
+    verify_resolved_owned_unit_fragment "$mode" "$unit_path" || return 1
+
     local unit="${OPT_SERVICE}.service"
-    local disable_rc=0
+    local disable_rc=0 runtime_disable_rc=0
     systemctl disable "$unit" 9>&- 2>/dev/null || disable_rc=$?
 
-    local remaining_link
-    remaining_link="$(find_unit_enablement_links)"
-    remaining_link="${remaining_link%%$'\n'*}"
+    local all_links enabled_state="" enabled_rc=0
+    all_links="$(find_unit_enablement_links)"
+    enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || enabled_rc=$?
+    enabled_state="${enabled_state%%$'\n'*}"
+
+    # Plain `systemctl disable` only clears persistent links. When runtime
+    # enablement (`enabled-runtime` / `linked-runtime` or a `/run/systemd/system`
+    # link) is present, clear it with `systemctl --runtime disable` and recheck
+    # both scopes.
+    if [ "$enabled_state" = "enabled-runtime" ] || [ "$enabled_state" = "linked-runtime" ] \
+        || [[ "$all_links" == *"/run/systemd/system/"* ]] \
+        || [[ "$all_links" == "run/systemd/system/"* ]]; then
+        systemctl --runtime disable "$unit" 9>&- 2>/dev/null || runtime_disable_rc=$?
+        all_links="$(find_unit_enablement_links)"
+        enabled_state=""
+        enabled_rc=0
+        enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || enabled_rc=$?
+        enabled_state="${enabled_state%%$'\n'*}"
+    fi
+
+    local remaining_link="${all_links%%$'\n'*}"
     if [ -n "$remaining_link" ]; then
-        warn "${mode}: enablement link '${remaining_link}' still exists for ${unit} after 'systemctl disable' (rc=${disable_rc}); preserving unit ownership for retry"
+        warn "${mode}: enablement link '${remaining_link}' still exists for ${unit} after 'systemctl disable' (rc=${disable_rc}, runtime rc=${runtime_disable_rc}); preserving unit ownership for retry"
         return 1
     fi
 
-    local enabled_state="" enabled_rc=0
-    enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || enabled_rc=$?
-    enabled_state="${enabled_state%%$'\n'*}"
     case "$enabled_state" in
         enabled | enabled-runtime | alias | linked | linked-runtime)
-            warn "${mode}: ${unit} is still enabled ('${enabled_state}') after 'systemctl disable' (rc=${disable_rc}); preserving unit ownership for retry"
+            warn "${mode}: ${unit} is still enabled ('${enabled_state}') after 'systemctl disable' (rc=${disable_rc}, runtime rc=${runtime_disable_rc}); preserving unit ownership for retry"
             return 1
             ;;
         disabled | static | indirect | generated | transient | masked | masked-runtime | not-found)
             return 0
             ;;
         "")
-            if [ "$disable_rc" -eq 0 ] && [ "$enabled_rc" -eq 0 ]; then
+            if [ "$disable_rc" -eq 0 ] && [ "$runtime_disable_rc" -eq 0 ] && [ "$enabled_rc" -eq 0 ]; then
                 return 0
             fi
             if [ ! -e "$unit_path" ] && [ ! -L "$unit_path" ]; then
                 return 0
             fi
-            warn "${mode}: 'systemctl disable ${unit}' failed (rc=${disable_rc}, is-enabled rc=${enabled_rc}) and enablement state could not be confirmed absent; preserving unit ownership for retry"
+            warn "${mode}: 'systemctl disable ${unit}' failed (rc=${disable_rc}, runtime rc=${runtime_disable_rc}, is-enabled rc=${enabled_rc}) and enablement state could not be confirmed absent; preserving unit ownership for retry"
             return 1
             ;;
         *)
-            warn "${mode}: 'systemctl is-enabled ${unit}' returned unrecognized state '${enabled_state}' (disable rc=${disable_rc}); preserving unit ownership for retry"
+            warn "${mode}: 'systemctl is-enabled ${unit}' returned unrecognized state '${enabled_state}' (disable rc=${disable_rc}, runtime rc=${runtime_disable_rc}); preserving unit ownership for retry"
             return 1
             ;;
     esac
+}
+
+# Shared recovery helper: validate recorded stage/backup paths (and volumes in
+# uninstall mode), durably persist `$pre_phase` while the containers still
+# exist on disk, prune verified stage and/or backup containers via
+# `safe-rmtree-id`, and then durably persist `$post_state` / `$post_phase` with
+# empty container fields. Any pre-prune journal write failure leaves the
+# containers and journal as a consistent recoverable pair.
+_sync_and_prune_update_containers() {
+    local mode="$1" rec_path="$2" pre_phase="$3" post_state="$4" post_phase="$5" was_active="$6"
+    if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
+        validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+        if [ "$mode" = "uninstall" ]; then
+            verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
+        fi
+    fi
+    if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+        validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+        if [ "$mode" = "uninstall" ]; then
+            verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
+        fi
+    fi
+    if [ -n "$REC_UPDATE_STAGE_DIR" ] || [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+        write_update_record "$rec_path" "updating" "$pre_phase" \
+            "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+            "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
+    fi
+    if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
+        fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+            || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
+        REC_UPDATE_STAGE_DIR=""
+        REC_UPDATE_STAGE_ID=""
+    fi
+    if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+        fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
+            || die "${mode}: failed to prune ${pre_phase} update backup '$REC_UPDATE_BACKUP_DIR'; preserving updating record for inspection"
+        REC_UPDATE_BACKUP_DIR=""
+        REC_UPDATE_BACKUP_ID=""
+    fi
+    REC_STATE="$post_state"
+    REC_UPDATE_PHASE="$post_phase"
+    if [ "$post_state" = "installed" ]; then
+        write_update_record "$rec_path" "installed"
+    else
+        write_update_record "$rec_path" "updating" "$post_phase" "" "" "" "" "$was_active"
+    fi
 }
 
 # Three-outcome journal check shared by `cleanup_install_exit` and
@@ -7190,26 +7375,8 @@ cmd_install() {
                 if [ "${REC_LEGACY_PHASED_IDS:-0}" -eq 1 ]; then
                     die "existing installation at $rec_path uses preceding phased update identity tokens (preparing); run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' before retrying"
                 fi
-                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                    validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
-                fi
-                validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-                write_update_record "$rec_path" "updating" "preparing" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
-                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                    say "pruning interrupted reinstall stage directory (${REC_UPDATE_STAGE_DIR})"
-                    fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                        || die "install: failed to prune interrupted preparing stage '$REC_UPDATE_STAGE_DIR'; preserving preparing record for inspection"
-                    REC_UPDATE_STAGE_DIR=""
-                    REC_UPDATE_STAGE_ID=""
-                fi
                 say "pruning incomplete reinstall snapshot (${REC_UPDATE_BACKUP_DIR})"
-                fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                    || die "install: failed to prune incomplete preparing snapshot '$REC_UPDATE_BACKUP_DIR'; preserving preparing record for inspection"
-                REC_UPDATE_BACKUP_DIR=""
-                REC_UPDATE_BACKUP_ID=""
-                REC_UPDATE_PHASE=""
-                REC_STATE="installed"
-                write_update_record "$rec_path" "installed"
+                _sync_and_prune_update_containers install "$rec_path" "preparing" "installed" "" "$REC_UPDATE_WAS_ACTIVE"
             fi
         fi
     else
@@ -7856,51 +8023,17 @@ cmd_update() {
     local was_active=0
     if [ "$REC_STATE" = "updating" ]; then
         if [ "$REC_UPDATE_PHASE" = "preparing" ]; then
-            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
-            fi
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-            write_update_record "$_UPDATE_RECORD_PATH" "updating" "preparing" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
-            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                    || die "update: failed to prune interrupted preparing stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
-                REC_UPDATE_STAGE_DIR=""
-                REC_UPDATE_STAGE_ID=""
-            fi
             say "pruning incomplete snapshot from interrupted preparation (${REC_UPDATE_BACKUP_DIR})"
-            fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                || die "update: failed to prune incomplete preparing backup '$REC_UPDATE_BACKUP_DIR'; preserving updating record for inspection"
-            REC_UPDATE_BACKUP_DIR=""
-            REC_UPDATE_BACKUP_ID=""
-            REC_UPDATE_PHASE=""
-            REC_STATE="installed"
-            write_update_record "$_UPDATE_RECORD_PATH" "installed"
+            _sync_and_prune_update_containers update "$_UPDATE_RECORD_PATH" "preparing" "installed" "" "$REC_UPDATE_WAS_ACTIVE"
         elif [ "$REC_UPDATE_PHASE" = "committed" ]; then
-            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
-            fi
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-            write_update_record "$_UPDATE_RECORD_PATH" "updating" "committed" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
-            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-                fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                    || die "update: failed to reclaim leftover stage '$REC_UPDATE_STAGE_DIR' after committed update; preserving updating record for inspection"
-                REC_UPDATE_STAGE_DIR=""
-                REC_UPDATE_STAGE_ID=""
-            fi
             say "finishing backup cleanup for committed update (${REC_UPDATE_BACKUP_DIR})"
-            fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                || die "update: failed to prune committed update backup '$REC_UPDATE_BACKUP_DIR'; preserving updating record for inspection"
-            REC_UPDATE_BACKUP_DIR=""
-            REC_UPDATE_BACKUP_ID=""
-            REC_UPDATE_PHASE=""
-            REC_STATE="installed"
-            write_update_record "$_UPDATE_RECORD_PATH" "installed"
+            _sync_and_prune_update_containers update "$_UPDATE_RECORD_PATH" "committed" "installed" "" "$REC_UPDATE_WAS_ACTIVE"
         elif [ "$REC_UPDATE_PHASE" = "publishing" ]; then
             was_active="$REC_UPDATE_WAS_ACTIVE"
             _UPDATE_WAS_ACTIVE="$was_active"
-            ensure_owned_service_stopped_for_restore update \
+            ensure_owned_service_stopped_for_restore update "$_UPDATE_RECORD_PATH" \
                 || die "update: refusing to restore interrupted update backup without confirming ${OPT_SERVICE}.service is stopped"
-            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
+            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ] || [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "1" ]; then
                 was_active=1
                 _UPDATE_WAS_ACTIVE=1
             fi
@@ -7917,13 +8050,7 @@ cmd_update() {
             fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$work_child" "0" \
                 "$OPT_CONFIG_DIR" "$OPT_HOOK_DIR" "${REC_VOL_HOOK_DIR:-}" "$unit_path" "${REC_VOL_UNIT:-}" \
                 || die "update: failed to restore previous runner from '$REC_UPDATE_BACKUP_DIR'; preserving updating record for retry"
-            REC_UPDATE_PHASE="restored"
-            write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
-            fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                || die "update: failed to prune restored update backup '$REC_UPDATE_BACKUP_DIR'; preserving restored record for inspection"
-            REC_UPDATE_BACKUP_DIR=""
-            REC_UPDATE_BACKUP_ID=""
-            write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
+            _sync_and_prune_update_containers update "$_UPDATE_RECORD_PATH" "restored" "updating" "restored" "$was_active"
             lock_runner_permissions
             if [ "$REC_OWNED_UNIT" = "1" ]; then
                 command -v systemctl >/dev/null 2>&1 \
@@ -7934,23 +8061,15 @@ cmd_update() {
         else
             was_active="$REC_UPDATE_WAS_ACTIVE"
             _UPDATE_WAS_ACTIVE="$was_active"
-            ensure_owned_service_stopped_for_restore update \
+            ensure_owned_service_stopped_for_restore update "$_UPDATE_RECORD_PATH" \
                 || die "update: refusing to finalize restored update without confirming ${OPT_SERVICE}.service is stopped"
-            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
+            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ] || [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "1" ]; then
                 was_active=1
                 _UPDATE_WAS_ACTIVE=1
             fi
-            if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-                validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-                write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
+            if [ -n "$REC_UPDATE_STAGE_DIR" ] || [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
                 say "pruning verified backup container from restored update (${REC_UPDATE_BACKUP_DIR})"
-                fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                    || die "update: failed to prune restored update backup '$REC_UPDATE_BACKUP_DIR'; preserving restored record for inspection"
-                REC_UPDATE_BACKUP_DIR=""
-                REC_UPDATE_BACKUP_ID=""
-                write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
-            elif [ "$was_active" != "$REC_UPDATE_WAS_ACTIVE" ]; then
-                write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
+                _sync_and_prune_update_containers update "$_UPDATE_RECORD_PATH" "restored" "updating" "restored" "$was_active"
             fi
             lock_runner_permissions
             if [ "$REC_OWNED_UNIT" = "1" ]; then
@@ -8733,39 +8852,28 @@ cmd_uninstall() {
         if [ "${REC_LEGACY_PHASED_IDS:-0}" -eq 1 ]; then
             die "uninstall: installation record '$OPT_CONFIG_DIR/install.env' uses preceding phased update identity tokens (${REC_UPDATE_PHASE}); after verifying mounted volumes and backup directory '${REC_UPDATE_BACKUP_DIR:-<none>}', run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' (or finish recovery with the matching preceding installer revision) before uninstalling"
         fi
-        if [ "$REC_UPDATE_PHASE" = "publishing" ] && [ "$REC_OWNED_UNIT" = "1" ]; then
-            verify_resource_volume unit "systemd unit" "$unit_path"
-            ensure_owned_service_stopped_for_restore uninstall \
-                || die "uninstall: refusing to restore interrupted update backup without confirming ${OPT_SERVICE}.service is stopped"
-        fi
-        if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-            validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
-            verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
-        fi
-        if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-            verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
-        fi
         if [ "$REC_UPDATE_PHASE" = "preparing" ] || [ "$REC_UPDATE_PHASE" = "committed" ] || [ "$REC_UPDATE_PHASE" = "restored" ]; then
-            if [ -n "$REC_UPDATE_STAGE_DIR" ] || [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "$REC_UPDATE_PHASE" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+            _sync_and_prune_update_containers uninstall "$OPT_CONFIG_DIR/install.env" "$REC_UPDATE_PHASE" "updating" "restored" "$REC_UPDATE_WAS_ACTIVE"
+        else
+            if [ "$REC_OWNED_UNIT" = "1" ]; then
+                verify_resource_volume unit "systemd unit" "$unit_path"
+                ensure_owned_service_stopped_for_restore uninstall \
+                    || die "uninstall: refusing to restore interrupted update backup without confirming ${OPT_SERVICE}.service is stopped"
             fi
-        fi
-        if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-            fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
-            REC_UPDATE_STAGE_DIR=""
-            REC_UPDATE_STAGE_ID=""
-        fi
-        if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-            if [ "$REC_UPDATE_PHASE" = "preparing" ] || [ "$REC_UPDATE_PHASE" = "committed" ] || [ "$REC_UPDATE_PHASE" = "restored" ]; then
-                fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                    || die "uninstall: failed to prune ${REC_UPDATE_PHASE} update backup '$REC_UPDATE_BACKUP_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
-                REC_UPDATE_BACKUP_DIR=""
-                REC_UPDATE_BACKUP_ID=""
-                REC_UPDATE_PHASE="restored"
-                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "restored" "" "" "" "" "$REC_UPDATE_WAS_ACTIVE"
-            elif [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ -d "$OPT_INSTALL_DIR" ]; then
+            if [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ -L "$OPT_INSTALL_DIR" ]; then
+                die "uninstall: refusing symlinked runner directory '$OPT_INSTALL_DIR' during publishing recovery"
+            fi
+            if [ -n "$REC_UPDATE_BACKUP_DIR" ] && [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ -d "$OPT_INSTALL_DIR" ]; then
+                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
+                    validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+                    verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
+                    fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                        || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
+                    REC_UPDATE_STAGE_DIR=""
+                    REC_UPDATE_STAGE_ID=""
+                fi
+                validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+                verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
                 local uninstall_work_child=""
                 if [ -n "${REC_WORK_DIR:-}" ]; then
                     uninstall_work_child="$(runner_workspace_child_name "$OPT_INSTALL_DIR" "$REC_WORK_DIR")"
@@ -8773,24 +8881,33 @@ cmd_uninstall() {
                 fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$uninstall_work_child" "0" \
                     "$OPT_CONFIG_DIR" "$OPT_HOOK_DIR" "${REC_VOL_HOOK_DIR:-}" "$unit_path" "${REC_VOL_UNIT:-}" \
                     || die "uninstall: failed to reconcile interrupted update backup '$REC_UPDATE_BACKUP_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
-                REC_UPDATE_PHASE="restored"
-                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "restored" "" "" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
-                fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                    || die "uninstall: failed to prune restored update backup '$REC_UPDATE_BACKUP_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
-                REC_UPDATE_BACKUP_DIR=""
-                REC_UPDATE_BACKUP_ID=""
-                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "restored" "" "" "" "" "$REC_UPDATE_WAS_ACTIVE"
+                _sync_and_prune_update_containers uninstall "$OPT_CONFIG_DIR/install.env" "restored" "updating" "restored" "$REC_UPDATE_WAS_ACTIVE"
             else
-                fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
-                    || die "uninstall: failed to remove interrupted update backup '$REC_UPDATE_BACKUP_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
-                REC_UPDATE_BACKUP_DIR=""
-                REC_UPDATE_BACKUP_ID=""
-                REC_UPDATE_PHASE="restored"
-                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "restored" "" "" "" "" "$REC_UPDATE_WAS_ACTIVE"
+                if [ "$REC_OWNED_INSTALL_DIR" = "1" ]; then
+                    verify_resource_volume install "runner directory" "$OPT_INSTALL_DIR"
+                fi
+                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
+                    validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+                    verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
+                fi
+                if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+                    validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+                    verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
+                fi
+                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
+                    write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" \
+                        "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                        "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+                    fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                        || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
+                    REC_UPDATE_STAGE_DIR=""
+                    REC_UPDATE_STAGE_ID=""
+                fi
+                if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+                    warn "uninstall: live runner directory '${OPT_INSTALL_DIR}' is absent on the recorded volume during publishing recovery; durably recording decision to discard update backup '${REC_UPDATE_BACKUP_DIR}' before pruning"
+                fi
+                _sync_and_prune_update_containers uninstall "$OPT_CONFIG_DIR/install.env" "restored" "updating" "restored" "$REC_UPDATE_WAS_ACTIVE"
             fi
-        else
-            REC_UPDATE_PHASE="restored"
-            write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "restored" "" "" "" "" "$REC_UPDATE_WAS_ACTIVE"
         fi
     fi
 

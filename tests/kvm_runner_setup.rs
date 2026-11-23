@@ -21425,3 +21425,847 @@ assert f";tx:{tok_f};" in new_id_f, new_id_f
         text(&py_check)
     );
 }
+
+#[test]
+fn uninstall_publishing_with_missing_live_dir_preserves_backup_on_journal_write_failure() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_sh = runner_registration_config_script("pubmiss-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+    let (v2_tb, v2_sha) =
+        build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active) echo "inactive"; exit 3 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "pubmiss-box",
+            "--service",
+            "qeminga-pubmiss-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // Crash an update mid-publish -> `UPDATE_PHASE=publishing` + verified backup container.
+    let crash = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_TEST_CRASH_PUBLISH_AFTER", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert_eq!(crash.status.code(), Some(99), "{}", text(&crash));
+    let rec_pub = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(rec_pub.contains("UPDATE_PHASE=publishing\n"), "{rec_pub}");
+    let bk_pub = PathBuf::from(
+        rec_pub
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+    assert!(bk_pub.is_dir() && bk_pub.join(".qeminga-tx-id").is_file());
+
+    // Move live runner directory aside so it is absent on the recorded volume.
+    let inst_aside = dir.path().join("opt-runner-aside");
+    std::fs::rename(&inst, &inst_aside).unwrap();
+    assert!(!inst.exists());
+
+    // 1. Fail the next journal write BEFORE rename (by making `cfg` read-only 0500):
+    //    `uninstall` MUST fail closed while leaving `install.env` at `UPDATE_PHASE=publishing`
+    //    AND keeping `bk_pub` completely intact on disk!
+    struct RestoreDirMode(PathBuf);
+    impl Drop for RestoreDirMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let cfg_guard = RestoreDirMode(cfg.clone());
+
+    let uninst_ro_fail = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !uninst_ro_fail.status.success(),
+        "uninstall must fail when journal write fails before rename: {}",
+        text(&uninst_ro_fail)
+    );
+    let rec_after_ro = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_after_ro.contains("UPDATE_PHASE=publishing\n"),
+        "journal should still show publishing after pre-rename write failure:\n{rec_after_ro}"
+    );
+    assert!(
+        bk_pub.is_dir() && bk_pub.join(".qeminga-tx-id").is_file(),
+        "uninstall MUST preserve publishing backup when journal write fails before rename: {}",
+        text(&uninst_ro_fail)
+    );
+
+    drop(cfg_guard);
+
+    // 2. Fail the pre-prune journal write AFTER rename on parent-dir fsync:
+    //    `uninstall` MUST ALSO preserve `bk_pub` on disk!
+    let uninst_sync_fail = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=restored",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !uninst_sync_fail.status.success() && bk_pub.is_dir(),
+        "uninstall MUST preserve backup while post-rename config-dir fsync fails: {}",
+        text(&uninst_sync_fail)
+    );
+
+    // 3. Normal retry with writable cfg and working fsync succeeds cleanly and prunes backup!
+    let uninst_ok = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        uninst_ok.status.success() && !bk_pub.exists(),
+        "normal uninstall retry must cleanly discard backup and finish uninstall: {}",
+        text(&uninst_ok)
+    );
+}
+
+#[test]
+fn recovery_persists_newly_observed_running_state_before_stopping_service() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_sh = runner_registration_config_script("intent-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+    let (v2_tb, v2_sha) =
+        build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
+
+    let state_file = dir.path().join("svc.state");
+    let post_stop_fail_flag = dir.path().join("fail-after-stop.flag");
+    let rec_seen_at_stop = dir.path().join("rec-seen-at-stop.txt");
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active)
+        if [ -f "${FAKE_POST_STOP_ARMED:-}" ]; then
+            rm -f "$FAKE_POST_STOP_ARMED"
+            echo "Failed to connect to bus: simulated post-stop status error" >&2
+            exit 1
+        fi
+        st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+        case "$st" in
+            active) echo active; exit 0 ;;
+            inactive) echo inactive; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        if [ -n "${FAKE_REC_PATH:-}" ] && [ -n "${FAKE_REC_AT_STOP_OUT:-}" ] && [ -f "$FAKE_REC_PATH" ]; then
+            grep -E '^UPDATE_WAS_ACTIVE=' "$FAKE_REC_PATH" > "$FAKE_REC_AT_STOP_OUT" || true
+        fi
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        if [ "${FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP:-0}" = "1" ] && [ -n "${FAKE_POST_STOP_ARMED:-}" ]; then
+            : > "$FAKE_POST_STOP_ARMED"
+        fi
+        exit 0
+        ;;
+    start | enable)
+        echo "active" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let rec_path = cfg.join("install.env");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "intent-box",
+            "--service",
+            "qeminga-intent-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // 1. `UPDATE_PHASE=restored` with `UPDATE_WAS_ACTIVE=0` while service IS `active`:
+    //    Fail ONLY the status query immediately after `systemctl stop`.
+    //    `UPDATE_WAS_ACTIVE=1` MUST already be persisted BEFORE `systemctl stop` runs, so the
+    //    retry (which sees `inactive`) remembers restart intent and leaves the runner `active`!
+    let base_rec = std::fs::read_to_string(&rec_path).unwrap();
+    std::fs::write(
+        &rec_path,
+        base_rec.replace(
+            "RECORD_STATE=installed\n",
+            "RECORD_STATE=updating\nUPDATE_PHASE=restored\nUPDATE_STAGE_DIR=\nUPDATE_STAGE_ID=\nUPDATE_BACKUP_DIR=\nUPDATE_BACKUP_ID=\nUPDATE_WAS_ACTIVE=0\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&state_file, "active\n").unwrap();
+    let _ = std::fs::remove_file(&rec_seen_at_stop);
+    let _ = std::fs::remove_file(&post_stop_fail_flag);
+
+    let rest_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_REC_PATH", rec_path.to_str().unwrap()),
+            ("FAKE_REC_AT_STOP_OUT", rec_seen_at_stop.to_str().unwrap()),
+            (
+                "FAKE_POST_STOP_ARMED",
+                post_stop_fail_flag.to_str().unwrap(),
+            ),
+            ("FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !rest_fail.status.success(),
+        "restored recovery must fail when post-stop status check fails: {}",
+        text(&rest_fail)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "inactive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rec_seen_at_stop)
+            .unwrap_or_default()
+            .trim(),
+        "UPDATE_WAS_ACTIVE=1",
+        "restored recovery MUST persist UPDATE_WAS_ACTIVE=1 BEFORE invoking systemctl stop"
+    );
+    assert!(
+        std::fs::read_to_string(&rec_path)
+            .unwrap()
+            .contains("UPDATE_WAS_ACTIVE=1\n"),
+        "install.env must retain UPDATE_WAS_ACTIVE=1 after post-stop failure"
+    );
+
+    let rest_retry = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        rest_retry.status.success(),
+        "restored retry must succeed: {}",
+        text(&rest_retry)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "active",
+        "restored retry must restart runner based on persisted UPDATE_WAS_ACTIVE=1"
+    );
+
+    // 2. `UPDATE_PHASE=publishing` with `UPDATE_WAS_ACTIVE=0` while service IS `active`:
+    //    Crash update while `inactive` (`UPDATE_WAS_ACTIVE=0`), then set service `active`,
+    //    fail post-stop status check -> `UPDATE_WAS_ACTIVE=1` MUST be persisted BEFORE `stop`
+    //    (keeping `UPDATE_PHASE=publishing` and backup intact), and retry MUST restart service!
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    let crash = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_TEST_CRASH_PUBLISH_AFTER", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert_eq!(crash.status.code(), Some(99), "{}", text(&crash));
+    let pub_rec_initial = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        pub_rec_initial.contains("UPDATE_PHASE=publishing\n")
+            && pub_rec_initial.contains("UPDATE_WAS_ACTIVE=0\n"),
+        "expected publishing journal with UPDATE_WAS_ACTIVE=0:\n{pub_rec_initial}"
+    );
+    let bk_pub = PathBuf::from(
+        pub_rec_initial
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+
+    std::fs::write(&state_file, "active\n").unwrap();
+    let _ = std::fs::remove_file(&rec_seen_at_stop);
+    let _ = std::fs::remove_file(&post_stop_fail_flag);
+
+    let pub_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_REC_PATH", rec_path.to_str().unwrap()),
+            ("FAKE_REC_AT_STOP_OUT", rec_seen_at_stop.to_str().unwrap()),
+            (
+                "FAKE_POST_STOP_ARMED",
+                post_stop_fail_flag.to_str().unwrap(),
+            ),
+            ("FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !pub_fail.status.success() && bk_pub.is_dir(),
+        "publishing recovery must fail and keep backup when post-stop check fails: {}",
+        text(&pub_fail)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "inactive"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rec_seen_at_stop)
+            .unwrap_or_default()
+            .trim(),
+        "UPDATE_WAS_ACTIVE=1",
+        "publishing recovery MUST persist UPDATE_WAS_ACTIVE=1 BEFORE invoking systemctl stop"
+    );
+    let pub_rec_after = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        pub_rec_after.contains("UPDATE_PHASE=publishing\n")
+            && pub_rec_after.contains("UPDATE_WAS_ACTIVE=1\n"),
+        "install.env must keep publishing phase and UPDATE_WAS_ACTIVE=1:\n{pub_rec_after}"
+    );
+
+    let pub_retry = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        pub_retry.status.success(),
+        "publishing retry must succeed: {}",
+        text(&pub_retry)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "active",
+        "publishing retry must restart runner based on persisted UPDATE_WAS_ACTIVE=1"
+    );
+}
+
+#[test]
+fn uninstall_verifies_resolved_unit_fragment_and_clears_runtime_enablement_with_real_systemctl_root()
+ {
+    let real_systemctl = Path::new("/usr/bin/systemctl");
+    if !real_systemctl.is_file() {
+        return;
+    }
+
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let iso_root = dir.path().join("iso-root");
+    let etc_units = iso_root.join("etc/systemd/system");
+    let run_units = iso_root.join("run/systemd/system");
+    let usr_units = iso_root.join("usr/lib/systemd/system");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    for d in [
+        &bin,
+        &etc_units,
+        &run_units,
+        &usr_units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_sh = runner_registration_config_script("realsc-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+
+    let state_file = dir.path().join("svc.state");
+    let sc_log = dir.path().join("sc.log");
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    // Wrapper delegating enable/disable/is-enabled directly to REAL `/usr/bin/systemctl --root`
+    // against `iso_root` (zero running systemd manager needed!), while simulating `is-active`,
+    // `stop`, and optional live-manager `show` output.
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
+case "$1" in
+    is-active)
+        st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+        case "$st" in
+            active) echo active; exit 0 ;;
+            inactive) echo inactive; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    daemon-reload | start)
+        exit 0
+        ;;
+    show)
+        if [ -n "${FAKE_SHOW_OUT:-}" ]; then
+            printf '%s\n' "$FAKE_SHOW_OUT"
+            exit 0
+        fi
+        exec /usr/bin/systemctl --root "${FAKE_SYSTEMD_ROOT:?}" "$@"
+        ;;
+    list-unit-files)
+        exec /usr/bin/systemctl --root "${FAKE_SYSTEMD_ROOT:?}" "$@"
+        ;;
+    enable | disable | is-enabled | --runtime)
+        exec /usr/bin/systemctl --root "${FAKE_SYSTEMD_ROOT:?}" "$@"
+        ;;
+    *)
+        exec /usr/bin/systemctl --root "${FAKE_SYSTEMD_ROOT:?}" "$@"
+        ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_name = "qeminga-realsc-box.service";
+    let unit_dirs = format!(
+        "{}:{}:{}",
+        etc_units.display(),
+        run_units.display(),
+        usr_units.display()
+    );
+
+    let do_install = || {
+        let out = run_setup_env(
+            &[
+                "install",
+                "--repo",
+                REPO_URL,
+                "--name",
+                "realsc-box",
+                "--service",
+                "qeminga-realsc-box",
+                "--install-dir",
+                inst.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--hook-dir",
+                hooks.to_str().unwrap(),
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--token-file",
+                reg_file.to_str().unwrap(),
+                "--runner-sha256",
+                &v1_sha,
+                "--skip-packages",
+                "--no-start",
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", etc_units.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ],
+            Some(&bin),
+        );
+        assert!(out.status.success(), "install failed: {}", text(&out));
+    };
+
+    // 1. Runtime + persistent enablement with REAL `systemctl --root`:
+    //    Enable unit BOTH persistently and with `--runtime`. Plain `systemctl disable` leaves
+    //    `enabled-runtime` + `/run` symlink behind; `uninstall` MUST clear BOTH scopes!
+    do_install();
+    let en_pers = Command::new(real_systemctl)
+        .args(["--root", iso_root.to_str().unwrap(), "enable", unit_name])
+        .output()
+        .unwrap();
+    assert!(en_pers.status.success(), "{}", text(&en_pers));
+    let en_rt = Command::new(real_systemctl)
+        .args([
+            "--root",
+            iso_root.to_str().unwrap(),
+            "enable",
+            "--runtime",
+            unit_name,
+        ])
+        .output()
+        .unwrap();
+    assert!(en_rt.status.success(), "{}", text(&en_rt));
+
+    let etc_wants = etc_units.join("multi-user.target.wants").join(unit_name);
+    let run_wants = run_units.join("multi-user.target.wants").join(unit_name);
+    assert!(etc_wants.symlink_metadata().is_ok() && run_wants.symlink_metadata().is_ok());
+
+    let uninst_rt = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", etc_units.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        uninst_rt.status.success(),
+        "uninstall MUST clear both persistent and --runtime enablement links: {}",
+        text(&uninst_rt)
+    );
+    assert!(
+        etc_wants.symlink_metadata().is_err()
+            && run_wants.symlink_metadata().is_err()
+            && !etc_units.join(unit_name).exists(),
+        "both /etc and /run enablement links and unit file must be removed"
+    );
+
+    // 2. Missing managed `/etc` unit shadowed by a same-name vendor unit in `/usr/lib/systemd/system`:
+    //    `uninstall` MUST verify resolved unit identity BEFORE stopping or disabling, preserving
+    //    the vendor unit, its active state, its enablement link, and `install.env` (`OWNED_UNIT=1`)!
+    do_install();
+    std::fs::remove_file(etc_units.join(unit_name)).unwrap();
+    let vendor_unit = usr_units.join(unit_name);
+    std::fs::write(
+        &vendor_unit,
+        "[Unit]\nDescription=Unrelated vendor unit\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+    )
+    .unwrap();
+    let en_vendor = Command::new(real_systemctl)
+        .args(["--root", iso_root.to_str().unwrap(), "enable", unit_name])
+        .output()
+        .unwrap();
+    assert!(en_vendor.status.success(), "{}", text(&en_vendor));
+    assert!(etc_wants.symlink_metadata().is_ok());
+
+    std::fs::write(&state_file, "active\n").unwrap();
+    let _ = std::fs::remove_file(&sc_log);
+    let uninst_vendor = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("FAKE_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", etc_units.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs),
+        ],
+        Some(&bin),
+    );
+    let vendor_sc = std::fs::read_to_string(&sc_log).unwrap_or_default();
+    assert!(
+        !uninst_vendor.status.success(),
+        "uninstall MUST refuse when managed /etc unit is missing and vendor unit occupies name: {}",
+        text(&uninst_vendor)
+    );
+    assert!(
+        vendor_unit.is_file()
+            && etc_wants.symlink_metadata().is_ok()
+            && std::fs::read_to_string(&state_file).unwrap().trim() == "active"
+            && !vendor_sc.contains("stop ")
+            && !vendor_sc.contains("disable ")
+            && std::fs::read_to_string(cfg.join("install.env"))
+                .unwrap()
+                .contains("OWNED_UNIT=1\n"),
+        "unrelated vendor unit, its active state, its enablement link, and OWNED_UNIT=1 MUST all be preserved (sc_log:\n{vendor_sc}): {}",
+        text(&uninst_vendor)
+    );
+
+    // 3. Live manager `FragmentPath` mismatch: even if `/etc` fragment exists on disk, if the
+    //    manager reports `FragmentPath=/usr/lib/systemd/system/<unit>`, `uninstall` MUST refuse
+    //    BEFORE calling `stop` or `disable`!
+    let dis_vendor = Command::new(real_systemctl)
+        .args(["--root", iso_root.to_str().unwrap(), "disable", unit_name])
+        .output()
+        .unwrap();
+    assert!(dis_vendor.status.success(), "{}", text(&dis_vendor));
+    std::fs::remove_file(&vendor_unit).unwrap();
+    std::fs::write(
+        etc_units.join(unit_name),
+        "[Unit]\nDescription=managed\n[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=multi-user.target\n",
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(&sc_log);
+    let show_mismatch =
+        format!("LoadState=loaded\nFragmentPath=/usr/lib/systemd/system/{unit_name}");
+    let uninst_frag_mismatch = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("FAKE_SHOW_OUT", &show_mismatch),
+            ("FAKE_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_ROOT", iso_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", etc_units.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs),
+        ],
+        Some(&bin),
+    );
+    let frag_sc = std::fs::read_to_string(&sc_log).unwrap_or_default();
+    assert!(
+        !uninst_frag_mismatch.status.success()
+            && !frag_sc.contains("stop ")
+            && !frag_sc.contains("disable ")
+            && std::fs::read_to_string(&state_file).unwrap().trim() == "active",
+        "uninstall MUST refuse before stop/disable when manager FragmentPath differs (sc_log:\n{frag_sc}): {}",
+        text(&uninst_frag_mismatch)
+    );
+}

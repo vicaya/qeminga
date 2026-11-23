@@ -465,21 +465,29 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `STATE_VOL`/`INSTALL_VOL` in `policy.env`). Remove only resources owned
    by the recorded installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
-   (which requires a working `systemctl` client and confirmed deactivation
-   and enablement removal — verifying `systemctl disable`, `is-enabled`, and
-   absence of `.wants`/`.requires`/`.upholds` links before releasing
-   `OWNED_UNIT=1` — of any owned unit before restoring a `publishing` backup
-   OR running ordinary guest cleanup/deregistration/removal — preserving
-   `install.env` for retry if stopping or disabling fails or service state
-   is indeterminate — durably re-saves recovered `preparing`/`committed`/
-   `restored` phases before pruning any backup, prunes
-   interrupted `preparing` stages/backups without touching originals,
-   reclaims any recorded `UPDATE_STAGE_DIR`, reconciles `UPDATE_BACKUP_DIR`
-   by `UPDATE_PHASE` and verified identity retaining the backup container
-   until `UPDATE_PHASE=restored` is saved before pruning, emits a manual
-   **Settings → Actions → Runners** diagnostic naming the recorded runner
-   and target before discarding local state whenever executable `config.sh`
-   is unavailable for deregistration, directs legacy
+   (which requires a working `systemctl` client, verifies that systemd
+   resolves the service name to the installation's recorded local unit
+   fragment rather than a same-name vendor unit in another search-path
+   directory, and confirms deactivation of any owned unit before restoring a
+   `publishing` backup — then reconciles any interrupted `updating` phase via
+   the shared durable journal-write-before-prune sequence, durably saving
+   recovered `preparing`/`committed`/`restored` phases (including the
+   decision to discard a `publishing` backup when the live runner directory
+   is absent on the recorded volume) before pruning verified stage/backup
+   containers — and **after** backup restoration and pruning confirms the
+   owned unit is both stopped and disabled across persistent and `--runtime`
+   scopes, checking `systemctl disable`, `systemctl --runtime disable` when
+   runtime enablement is present, `is-enabled`, and absence of
+   `.wants`/`.requires`/`.upholds` links before running guest domain cleanup,
+   deregistration, or resource removal: if stopping fails before a
+   `publishing` restore, the backup and `UPDATE_PHASE=publishing` journal
+   stay untouched; if disabling fails afterward, backup restoration/pruning
+   has already completed and `install.env` (with `OWNED_UNIT=1` and
+   `UPDATE_PHASE=restored` when recovering from `updating`), the unit file,
+   and all owned runner/state/hook/config directories remain on disk for
+   retry; emits a manual **Settings → Actions → Runners** diagnostic naming
+   the recorded runner and target before discarding local state whenever
+   executable `config.sh` is unavailable for deregistration, directs legacy
    pre-phase and preceding `376eed2` phased `updating` records to
    `migrate-record --confirm-volumes`, and shares the same user, volume,
    and mount checks BEFORE any `runuser`, `chown`, service stop, or token

@@ -27,6 +27,13 @@ UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+QEMU_LOG_LAUNCH_HEADER_RE = re.compile(
+    rb"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}\.\d+(?:[+-]\d{4}|Z):\s+starting up\b"
+)
+QEMU_LOG_UUID_RE = re.compile(
+    rb"(?:^|[\s,'\"=])(?:-uuid(?:=|\s+)|uuid=)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?=$|[\s,'\"\\])",
+    re.IGNORECASE,
+)
 ALLOWED_EVIDENCE_FILES = frozenset(
     {
         "domain.xml",
@@ -71,6 +78,16 @@ class EvidenceUnsafeError(OSError):
 class EvidenceInvalidError(OSError):
     """Evidence file was read cleanly, but its contents failed JSON/schema validation."""
 
+
+def _parse_dir_id(expected_dir_id):
+    if expected_dir_id is None:
+        return None
+    parts = expected_dir_id.split(":")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        raise OSError(
+            errno.EINVAL, f"invalid expected run directory identity '{expected_dir_id}'"
+        )
+    return (int(parts[0]), int(parts[1]), int(parts[2]))
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAMEAT2 = getattr(_LIBC, "renameat2", None)
@@ -787,6 +804,7 @@ def create_run_dir(
         )
         rst = os.fstat(rfd)
         rfd_id = (rst.st_dev, rst.st_ino)
+        dir_id = f"{rst.st_dev}:{rst.st_ino}:{fd_mnt_id(rfd)}"
         # Keep `img_fd` and `rfd` open through final traversal verification so
         # any transient failure reclaims this invocation's still-empty directory
         # via the same identity-checked rollback before closing descriptors.
@@ -797,6 +815,7 @@ def create_run_dir(
             qemu_groups,
         )
         verified = True
+        return dir_id
     finally:
         if rfd is not None and not verified and rfd_id is not None:
             _reclaim_empty_published_dir(img_fd, run_name, rfd_id)
@@ -1176,36 +1195,37 @@ def prepare_evidence_dir(
             out_mnt = fd_mnt_id(out_fd)
             fcntl.flock(out_fd, fcntl.LOCK_EX)
             try:
+                for name in ALLOWED_EVIDENCE_FILES:
+                    try:
+                        rst = os.lstat(name, dir_fd=out_fd)
+                        if not stat.S_ISDIR(rst.st_mode):
+                            os.unlink(name, dir_fd=out_fd)
+                    except FileNotFoundError:
+                        pass
+                tests_fd = _create_evidence_dir_in_fd(
+                    out_fd, out_path, "tests", dir_mode, owner_uids
+                )
                 try:
-                    rst = os.lstat("result.json", dir_fd=out_fd)
-                    if not stat.S_ISDIR(rst.st_mode):
-                        os.unlink("result.json", dir_fd=out_fd)
-                except FileNotFoundError:
-                    pass
+                    tst = os.fstat(tests_fd)
+                    if tst.st_dev != out_st.st_dev or fd_mnt_id(tests_fd) != out_mnt:
+                        raise EvidenceDirUnsafeError(
+                            errno.EXDEV,
+                            f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, 'tests')}'",
+                        )
+                    for name in ALLOWED_TEST_FILES:
+                        try:
+                            est = os.lstat(name, dir_fd=tests_fd)
+                            if not stat.S_ISDIR(est.st_mode):
+                                os.unlink(name, dir_fd=tests_fd)
+                        except FileNotFoundError:
+                            pass
+                finally:
+                    os.close(tests_fd)
             finally:
                 try:
                     fcntl.flock(out_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
-            tests_fd = _create_evidence_dir_in_fd(
-                out_fd, out_path, "tests", dir_mode, owner_uids
-            )
-            try:
-                tst = os.fstat(tests_fd)
-                if tst.st_dev != out_st.st_dev or fd_mnt_id(tests_fd) != out_mnt:
-                    raise EvidenceDirUnsafeError(
-                        errno.EXDEV,
-                        f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, 'tests')}'",
-                    )
-                for name in ALLOWED_TEST_FILES:
-                    try:
-                        est = os.lstat(name, dir_fd=tests_fd)
-                        if not stat.S_ISDIR(est.st_mode):
-                            os.unlink(name, dir_fd=tests_fd)
-                    except FileNotFoundError:
-                        pass
-            finally:
-                os.close(tests_fd)
     finally:
         os.close(out_fd)
 
@@ -1838,18 +1858,25 @@ def collect_serial_log(
     out_dir,
     dest_name="serial.log",
     *,
+    expected_dir_id=None,
     root_fd=None,
     root_path="/",
 ):
     """Copy ``serial.log`` from a verified run directory into a verified evidence directory."""
     if dest_name != "serial.log":
         raise OSError(errno.EINVAL, f"unexpected serial log filename '{dest_name}'")
-    status, img_fd, rfd, _, run_mnt, _, _ = _open_verified_run_dir_ro(
+    exp_triple = _parse_dir_id(expected_dir_id)
+    status, img_fd, rfd, rst, run_mnt, _, resolved_run = _open_verified_run_dir_ro(
         images_dir, run_name, root_fd=root_fd, root_path=root_path
     )
     if status != "present":
         return False
     try:
+        if exp_triple is not None and (rst.st_dev, rst.st_ino, run_mnt) != exp_triple:
+            raise OSError(
+                errno.EXDEV,
+                f"run directory '{resolved_run}' identity changed since verification; refusing serial.log collection",
+            )
         try:
             ffd = os.open(
                 "serial.log",
@@ -1959,48 +1986,157 @@ def snapshot_qemu_log_cursor(qlog_path, *, session=False, root_fd=None, root_pat
         os.close(pfd)
 
 
-def _seek_qemu_log_segment(ffd, fst, cursor):
-    """Position ``ffd`` at the start of the current run's newly written bytes.
+def _read_all_fd(ffd):
+    chunks = []
+    while True:
+        chunk = os.read(ffd, 65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
 
-    Returns ``True`` when at least one new byte is available after ``cursor``,
-    or ``False`` when no new output was produced since ``cursor`` was recorded.
+
+def _extract_uuid_launch_blocks(data, expected_uuid, *, require_uuid):
+    """Filter QEMU log bytes to launch blocks consistent with ``expected_uuid``.
+
+    When ``require_uuid`` is True (rotated inode), ONLY launch blocks that
+    explicitly declare ``expected_uuid`` (and no conflicting domain UUID) are
+    accepted; unverified or foreign logs return ``None``.
+    """
+    if not data:
+        return None
+    exp_bytes = None
+    if expected_uuid:
+        norm_uuid = expected_uuid.strip().lower()
+        if UUID_RE.fullmatch(norm_uuid):
+            exp_bytes = norm_uuid.encode("ascii")
+    if require_uuid and exp_bytes is None:
+        return None
+
+    blocks = []
+    current = []
+    for line in data.splitlines(keepends=True):
+        if QEMU_LOG_LAUNCH_HEADER_RE.match(line) and current:
+            blocks.append(b"".join(current))
+            current = [line]
+        else:
+            current.append(line)
+    if current:
+        blocks.append(b"".join(current))
+
+    kept = []
+    for block in blocks:
+        uuids = {m.group(1).lower() for m in QEMU_LOG_UUID_RE.finditer(block)}
+        if require_uuid:
+            if uuids == {exp_bytes}:
+                kept.append(block)
+        else:
+            if exp_bytes is not None and uuids and uuids != {exp_bytes}:
+                continue
+            kept.append(block)
+    out = b"".join(kept)
+    return out if out else None
+
+
+def _read_verified_qemu_log_segment(
+    qlog_path,
+    cursor,
+    *,
+    expected_uuid=None,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Read ONLY bytes belonging to this run's verified launch.
+
+    Returns ``(data, ("present", st_dev, st_ino, start_offset))`` or ``(None, None)``.
+    If ``cursor`` was ``present`` and the filename rotated to a different inode,
+    accepts the replacement ONLY if it carries a verified launch block for
+    ``expected_uuid``; otherwise omits the segment.
     """
     if cursor is None:
-        return False
+        return (None, None)
     c_status, c_dev, c_ino, c_offset = cursor
-    if c_status == "present" and (fst.st_dev, fst.st_ino) == (c_dev, c_ino):
-        if fst.st_size <= c_offset:
-            return False
-        os.lseek(ffd, c_offset, os.SEEK_SET)
-        return True
-    if c_status in ("absent", "present"):
-        if fst.st_size == 0:
-            return False
-        return True
-    raise OSError(errno.EINVAL, f"invalid QEMU log cursor status '{c_status}'")
-
-
-def read_qemu_log_segment(qlog_path, cursor, *, session=False, root_fd=None, root_path="/"):
-    """Return only the current run's newly appended QEMU log bytes, or None if none exist."""
+    if c_status not in ("absent", "present"):
+        raise OSError(errno.EINVAL, f"invalid QEMU log cursor status '{c_status}'")
     pfd, ffd, fst = _open_verified_qemu_log_ro(
         qlog_path, session=session, root_fd=root_fd, root_path=root_path
     )
     if ffd is None:
-        return None
+        return (None, None)
     try:
-        if not _seek_qemu_log_segment(ffd, fst, cursor):
-            return None
-        chunks = []
-        while True:
-            chunk = os.read(ffd, 65536)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        data = b"".join(chunks)
-        return data if data else None
+        if c_status == "present" and (fst.st_dev, fst.st_ino) == (c_dev, c_ino):
+            if fst.st_size <= c_offset:
+                return (None, None)
+            os.lseek(ffd, c_offset, os.SEEK_SET)
+            raw = _read_all_fd(ffd)
+            data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=False)
+            if not data:
+                return (None, None)
+            return (data, ("present", fst.st_dev, fst.st_ino, c_offset))
+        if c_status == "present":
+            # Rotated to a new inode: NEVER blindly accept from byte 0; require
+            # an explicit launch boundary bound to expected_uuid.
+            if fst.st_size == 0:
+                return (None, None)
+            raw = _read_all_fd(ffd)
+            data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=True)
+            if not data:
+                return (None, None)
+            return (data, ("present", fst.st_dev, fst.st_ino, 0))
+        # c_status == "absent": file created after pre-start snapshot.
+        if fst.st_size == 0:
+            return (None, None)
+        raw = _read_all_fd(ffd)
+        data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=False)
+        if not data:
+            return (None, None)
+        return (data, ("present", fst.st_dev, fst.st_ino, 0))
     finally:
         os.close(ffd)
         os.close(pfd)
+
+
+def pin_qemu_log_cursor(
+    qlog_path,
+    cursor,
+    *,
+    expected_uuid=None,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Pin an initially-absent or rotated cursor to the verified launch inode."""
+    _, pinned = _read_verified_qemu_log_segment(
+        qlog_path,
+        cursor,
+        expected_uuid=expected_uuid,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    return pinned
+
+
+def read_qemu_log_segment(
+    qlog_path,
+    cursor,
+    *,
+    expected_uuid=None,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Return only the current run's verified QEMU log bytes, or None if unavailable."""
+    data, _ = _read_verified_qemu_log_segment(
+        qlog_path,
+        cursor,
+        expected_uuid=expected_uuid,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    return data
 
 
 def collect_qemu_log(
@@ -2009,44 +2145,41 @@ def collect_qemu_log(
     dest_name="qemu.log",
     *,
     cursor=None,
+    expected_uuid=None,
     session=False,
     root_fd=None,
     root_path="/",
 ):
-    """Copy ONLY the current run's newly written QEMU log segment into an evidence directory."""
+    """Copy ONLY the current run's verified QEMU log segment into an evidence directory."""
     if dest_name != "qemu.log":
         raise OSError(errno.EINVAL, f"unexpected QEMU log filename '{dest_name}'")
-    if cursor is None:
-        return False
-    pfd, ffd, fst = _open_verified_qemu_log_ro(
-        qlog_path, session=session, root_fd=root_fd, root_path=root_path
+    data, _ = _read_verified_qemu_log_segment(
+        qlog_path,
+        cursor,
+        expected_uuid=expected_uuid,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
     )
-    if ffd is None:
+    if not data:
         return False
+    out_fd, _ = _open_verified_evidence_dir(
+        out_dir,
+        create_missing=True,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
     try:
-        if not _seek_qemu_log_segment(ffd, fst, cursor):
-            return False
-        file_mode = 0o600 if session else 0o644
-        out_fd, _ = _open_verified_evidence_dir(
-            out_dir,
-            create_missing=True,
-            session=session,
-            root_fd=root_fd,
-            root_path=root_path,
+        _publish_evidence_stream(
+            out_fd,
+            dest_name,
+            lambda dst: _write_all_fd(dst, data),
+            mode=0o600 if session else 0o644,
         )
-        try:
-            _publish_evidence_stream(
-                out_fd,
-                dest_name,
-                lambda dst: _copy_fd_to_fd(ffd, dst),
-                mode=file_mode,
-            )
-        finally:
-            os.close(out_fd)
-        return True
     finally:
-        os.close(ffd)
-        os.close(pfd)
+        os.close(out_fd)
+    return True
 
 
 def collect_serial_log_session(
@@ -2284,14 +2417,7 @@ def cleanup_run_dir(
     images_dir, run_name, *, expected_dir_id=None, root_fd=None, root_path="/"
 ):
     """Verify ancestor trust, run-dir identity, and same-mount tree before removing."""
-    exp_triple = None
-    if expected_dir_id is not None:
-        parts = expected_dir_id.split(":")
-        if len(parts) != 3 or not all(p.isdigit() for p in parts):
-            raise OSError(
-                errno.EINVAL, f"invalid expected run directory identity '{expected_dir_id}'"
-            )
-        exp_triple = (int(parts[0]), int(parts[1]), int(parts[2]))
+    exp_triple = _parse_dir_id(expected_dir_id)
     status, img_fd, rfd, rst, run_mnt, _, resolved_run = _open_verified_run_dir_ro(
         images_dir, run_name, root_fd=root_fd, root_path=root_path
     )
@@ -2396,9 +2522,22 @@ def main(argv):
             c_st, c_dev, c_ino, c_off = snapshot_qemu_log_cursor(argv[1], session=True)
             print(f"{c_st}\t{c_dev}\t{c_ino}\t{c_off}")
             return 0
+        if op == "pin-qemu-log-cursor-session":
+            cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
+            expected_uuid = argv[6] if len(argv) > 6 and argv[6] else None
+            pinned = pin_qemu_log_cursor(
+                argv[1], cursor, expected_uuid=expected_uuid, session=True
+            )
+            if pinned is None:
+                return 1
+            print(f"{pinned[0]}\t{pinned[1]}\t{pinned[2]}\t{pinned[3]}")
+            return 0
         if op == "read-qemu-log-segment-session":
             cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
-            data = read_qemu_log_segment(argv[1], cursor, session=True)
+            expected_uuid = argv[6] if len(argv) > 6 and argv[6] else None
+            data = read_qemu_log_segment(
+                argv[1], cursor, expected_uuid=expected_uuid, session=True
+            )
             if data is None:
                 return 1
             sys.stdout.buffer.write(data)
@@ -2420,7 +2559,7 @@ def main(argv):
                 root_path=root_path,
             )
         elif op == "create-run-dir":
-            create_run_dir(
+            dir_id = create_run_dir(
                 argv[1],
                 argv[2],
                 int(argv[3]),
@@ -2429,6 +2568,7 @@ def main(argv):
                 root_fd=root_fd,
                 root_path=root_path,
             )
+            print(dir_id)
         elif op == "handoff-file":
             delegated = handoff_file(
                 argv[1],
@@ -2527,11 +2667,13 @@ def main(argv):
                 sys.stdout.buffer.write(fallback_bytes)
                 sys.stdout.buffer.flush()
         elif op == "collect-serial-log":
+            expected_dir_id = argv[5] if len(argv) > 5 and argv[5] else None
             collect_serial_log(
                 argv[1],
                 argv[2],
                 argv[3],
                 argv[4] if len(argv) > 4 else "serial.log",
+                expected_dir_id=expected_dir_id,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -2549,22 +2691,44 @@ def main(argv):
                 argv[1], session=False, root_fd=root_fd, root_path=root_path
             )
             print(f"{c_st}\t{c_dev}\t{c_ino}\t{c_off}")
+        elif op == "pin-qemu-log-cursor":
+            cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
+            expected_uuid = argv[6] if len(argv) > 6 and argv[6] else None
+            pinned = pin_qemu_log_cursor(
+                argv[1],
+                cursor,
+                expected_uuid=expected_uuid,
+                session=False,
+                root_fd=root_fd,
+                root_path=root_path,
+            )
+            if pinned is None:
+                return 1
+            print(f"{pinned[0]}\t{pinned[1]}\t{pinned[2]}\t{pinned[3]}")
         elif op in ("collect-qemu-log", "collect-qemu-log-session"):
             is_session = op == "collect-qemu-log-session"
             cursor = (argv[4], int(argv[5]), int(argv[6]), int(argv[7]))
+            expected_uuid = argv[8] if len(argv) > 8 and argv[8] else None
             collect_qemu_log(
                 argv[1],
                 argv[2],
                 argv[3],
                 cursor=cursor,
+                expected_uuid=expected_uuid,
                 session=is_session,
                 root_fd=root_fd,
                 root_path=root_path,
             )
         elif op == "read-qemu-log-segment":
             cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
+            expected_uuid = argv[6] if len(argv) > 6 and argv[6] else None
             data = read_qemu_log_segment(
-                argv[1], cursor, session=False, root_fd=root_fd, root_path=root_path
+                argv[1],
+                cursor,
+                expected_uuid=expected_uuid,
+                session=False,
+                root_fd=root_fd,
+                root_path=root_path,
             )
             if data is None:
                 return 1

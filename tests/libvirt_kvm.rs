@@ -546,11 +546,17 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         lane.contains("target_rev:"),
         "libvirt-kvm-lane.yml must accept the resolved target_rev:\n{lane}"
     );
+    // Caller must NEVER control the hosted build runner or runner_arch labels.
+    assert!(
+        !lane.contains("build_runner:"),
+        "libvirt-kvm-lane.yml must derive build runner from arch, never accept build_runner input:\n{lane}"
+    );
+    assert!(
+        !lane.contains("runner_arch:"),
+        "libvirt-kvm-lane.yml must derive runner_arch from arch, never accept runner_arch input:\n{lane}"
+    );
 
-    for (arch, build_runner, runner_arch) in [
-        ("x86_64", "ubuntu-24.04", "X64"),
-        ("aarch64", "ubuntu-24.04-arm", "ARM64"),
-    ] {
+    for arch in ["x86_64", "aarch64"] {
         let j = job(&text, arch);
         assert!(j.contains("needs: resolve"), "{arch}");
         assert!(
@@ -559,16 +565,12 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         );
         assert!(j.contains(&format!("arch: {arch}\n")), "{arch}");
         assert!(
-            j.contains(&format!("build_runner: {build_runner}\n")),
-            "{arch}"
-        );
-        assert!(
-            j.contains(&format!("runner_arch: {runner_arch}\n")),
-            "{arch}"
-        );
-        assert!(
             j.contains("target_rev: ${{ needs.resolve.outputs.target_rev }}\n"),
             "{arch}"
+        );
+        assert!(
+            !j.contains("build_runner:") && !j.contains("runner_arch:"),
+            "{arch}: caller must not pass build_runner or runner_arch to reusable lane:\n{j}"
         );
     }
     assert!(
@@ -583,10 +585,51 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     assert!(text.contains("workflow_call:"));
     assert!(text.contains("permissions:\n  contents: read"));
 
+    // Fixed hosted verify gate enforces caller workflow, event, ref, arch, and
+    // commit reachability from vicaya/qeminga's protected main branch BEFORE
+    // scheduling candidate or self-hosted kvm jobs.
+    let verify = job(&text, "verify");
+    assert!(
+        verify.contains("runs-on: ubuntu-24.04\n"),
+        "verify gate must run on fixed GitHub-hosted ubuntu-24.04:\n{verify}"
+    );
+    assert!(
+        verify.contains("github.event_name == 'workflow_dispatch'"),
+        "verify gate must restrict event to workflow_dispatch:\n{verify}"
+    );
+    assert!(
+        verify.contains("github.ref == 'refs/heads/main'"),
+        "verify gate must restrict ref to refs/heads/main:\n{verify}"
+    );
+    assert!(
+        verify.contains(".github/workflows/libvirt-kvm.yml"),
+        "verify gate must restrict caller workflow to libvirt-kvm.yml:\n{verify}"
+    );
+    assert!(
+        verify.contains("merge-base --is-ancestor \"$TARGET_REV\" FETCH_HEAD"),
+        "verify gate must prove target_rev is reachable from vicaya/qeminga main:\n{verify}"
+    );
+    assert!(
+        verify.contains("https://github.com/vicaya/qeminga.git")
+            && verify.contains("refs/heads/main"),
+        "verify gate must check ancestry against vicaya/qeminga refs/heads/main:\n{verify}"
+    );
+
     let build = job(&text, "candidate");
-    assert!(build.contains("runs-on: ${{ inputs.build_runner }}"));
+    assert!(build.contains("needs: verify"), "{build}");
+    assert!(
+        build.contains(
+            "runs-on: ${{ inputs.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}"
+        ),
+        "candidate must derive hosted build runner from a fixed architecture mapping:\n{build}"
+    );
+    assert!(
+        build.contains("github.event_name == 'workflow_dispatch'")
+            && build.contains("github.ref == 'refs/heads/main'"),
+        "candidate must repeat caller/event/ref guard:\n{build}"
+    );
     assert!(build.contains("repository: vicaya/qeminga"));
-    assert!(build.contains("ref: ${{ inputs.target_rev }}"));
+    assert!(build.contains("ref: ${{ needs.verify.outputs.target_rev }}"));
     assert!(build.contains("cargo build --release --locked --features seccomp\n"));
     assert!(build.contains("sha256: ${{ steps.digest.outputs.sha256 }}"));
     assert!(build.contains("persist-credentials: false"));
@@ -603,17 +646,26 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     }
 
     let kvm = job(&text, "kvm");
-    assert!(kvm.contains("needs: candidate"));
+    assert!(kvm.contains("needs: [verify, candidate]"), "{kvm}");
     assert!(
-        kvm.contains(r#"runs-on: [self-hosted, linux, "${{ inputs.runner_arch }}", qeminga-kvm]"#)
+        kvm.contains(
+            r#"runs-on: [self-hosted, linux, "${{ inputs.arch == 'x86_64' && 'X64' || 'ARM64' }}", qeminga-kvm]"#
+        ),
+        "kvm must derive runner_arch from a fixed architecture mapping:\n{kvm}"
+    );
+    assert!(
+        kvm.contains("github.event_name == 'workflow_dispatch'")
+            && kvm.contains("github.ref == 'refs/heads/main'"),
+        "kvm must repeat caller/event/ref guard:\n{kvm}"
     );
     assert!(kvm.contains("repository: vicaya/qeminga"));
-    assert!(kvm.contains("ref: ${{ inputs.target_rev }}"));
+    assert!(kvm.contains("ref: ${{ needs.verify.outputs.target_rev }}"));
     assert!(kvm.contains("cancel-in-progress: false"));
     assert!(kvm.contains("timeout-minutes:"));
     assert!(kvm.contains("persist-credentials: false"));
-    assert!(kvm.contains(r#"test "$(uname -m)" = "${{ inputs.arch }}""#));
-    assert!(kvm.contains(r#"test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}""#));
+    assert!(kvm.contains(r#"test "$(uname -m)" = "$ARCH""#));
+    assert!(kvm.contains(r#"EXPECTED_RUNNER_ARCH: ${{ needs.verify.outputs.expected_arch }}"#));
+    assert!(kvm.contains(r#"test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH""#));
     assert!(
         kvm.contains(r#"test "$(git rev-parse HEAD)" = "$TARGET_REV""#),
         "kvm job must verify checked-out commit equals target_rev:\n{kvm}"

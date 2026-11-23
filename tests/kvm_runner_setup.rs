@@ -237,7 +237,9 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "KillMode=control-group",
         "MemoryMax=80%",
         "TasksMax=512",
-        "IPAddressAllow=localhost",
+        "IPAddressAllow=127.0.0.0/9",
+        "IPAddressAllow=::1/128",
+        "IPAddressDeny=127.255.255.254/32",
         "IPAddressDeny=link-local",
         "IPAddressDeny=multicast",
         "IPAddressDeny=10.0.0.0/8",
@@ -247,8 +249,7 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "IPAddressDeny=fc00::/7",
         "IPAddressDeny=fe80::/10",
         "IPAddressDeny=fd00:ec2::254/128",
-        "ExecStartPre=/usr/local/libexec/qeminga-runner/check-egress-firewall.sh",
-        "ExecStart=/opt/qeminga-runner/bin/runsvc.sh",
+        "ExecStart=/usr/local/libexec/qeminga-runner/run-runner.sh",
         "RestartPreventExitStatus=78",
         "Environment=XDG_RUNTIME_DIR=/run/qeminga-kvm-runner",
         "Environment=QEMINGA_E2E_CONNECT=qemu:///session",
@@ -264,7 +265,8 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
     }
 
     // Never root, never docker/libvirt/sudo groups, never MDWE=yes (breaks .NET/Node/QEMU JIT),
-    // and never run.sh (which tries to copy run-helper.sh into the read-only install dir).
+    // never ExecStartPre= for the firewall gate (RestartPreventExitStatus=78 applies only to the
+    // main service process), and never run.sh.
     for forbidden in [
         "User=root",
         "SupplementaryGroups=libvirt",
@@ -273,6 +275,7 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "MemoryDenyWriteExecute=yes",
         "ReadWritePaths=/opt/qeminga-runner\n",
         "ExecStart=/opt/qeminga-runner/run.sh",
+        "ExecStartPre=",
     ] {
         assert!(
             !unit.contains(forbidden),
@@ -315,6 +318,7 @@ fn rendered_units_pass_systemd_analyze_verify() {
     std::fs::write(fake_install.join(".env"), b"").unwrap();
     write_exec(&fake_bin.join("runsvc.sh"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_bin.join("Runner.Listener"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_hooks.join("run-runner.sh"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_hooks.join("run-jit.sh"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &fake_hooks.join("check-egress-firewall.sh"),
@@ -427,7 +431,7 @@ fn unit_options_preserve_security_invariants() {
     let unit = String::from_utf8(eph.stdout).unwrap();
     assert!(unit.contains("Restart=no"), "{unit}");
     assert!(
-        unit.contains("ExecStart=/opt/qeminga-runner/bin/runsvc.sh"),
+        unit.contains("ExecStart=/usr/local/libexec/qeminga-runner/run-runner.sh"),
         "{unit}"
     );
     assert!(
@@ -454,6 +458,7 @@ fn unit_options_preserve_security_invariants() {
     ]);
     assert!(no_lan.status.success(), "{}", text(&no_lan));
     let unit = String::from_utf8(no_lan.stdout).unwrap();
+    assert!(unit.contains("IPAddressDeny=127.255.255.254/32"), "{unit}");
     assert!(unit.contains("IPAddressDeny=link-local"), "{unit}");
     assert!(unit.contains("IPAddressDeny=fe80::/10"), "{unit}");
     assert!(unit.contains("IPAddressDeny=fd00:ec2::254/128"), "{unit}");
@@ -461,7 +466,7 @@ fn unit_options_preserve_security_invariants() {
     assert!(!unit.contains("IPAddressDeny=10.0.0.0/8"), "{unit}");
     assert!(!unit.contains("IPAddressDeny=fc00::/7"), "{unit}");
 
-    // --allow-ip allows a specific private resolver, never cloud IMDS, supernets, or 0.0.0.0/0.
+    // --allow-ip allows a specific private resolver, never cloud IMDS, the loopback sentinel, supernets, or 0.0.0.0/0.
     let ok_ip = run_setup(&[
         "render-unit",
         "--repo",
@@ -479,6 +484,9 @@ fn unit_options_preserve_security_invariants() {
     );
 
     for bad_ip in [
+        "127.255.255.254",
+        "127.255.255.254/32",
+        "127.0.0.0/8",
         "169.254.169.254",
         "169.254.169.254/32",
         "169.254.0.0/16",
@@ -1382,8 +1390,7 @@ if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then
     exit 0
 fi
 if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
-    mode="$(/usr/bin/stat -c '%a' "$3")"
-    echo "0:${mode}"
+    echo "0:755"
     exit 0
 fi
 exec /usr/bin/stat "$@"
@@ -1527,8 +1534,10 @@ fn jit_launcher_execs_runner_listener_directly_without_writing_install_dir() {
     let dir = tempfile::tempdir().unwrap();
     let install_dir = dir.path().join("runner");
     let bin_dir = install_dir.join("bin");
+    let hook_dir = dir.path().join("hooks");
     let cred_dir = dir.path().join("creds");
     std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&hook_dir).unwrap();
     std::fs::create_dir_all(&cred_dir).unwrap();
 
     let listener_args = dir.path().join("listener.args");
@@ -1545,26 +1554,52 @@ exit 0
         &install_dir.join("run.sh"),
         "#!/bin/sh\necho 'run.sh must not be invoked' >&2\nexit 99\n",
     );
+    write_exec(
+        &hook_dir.join("check-egress-firewall.sh"),
+        "#!/bin/sh\nexit \"${FAKE_FW_RC:-0}\"\n",
+    );
     std::fs::write(cred_dir.join("jitconfig"), "JIT_SECRET_VALUE\n").unwrap();
 
-    let launcher = dir.path().join("run-jit.sh");
+    let launcher = hook_dir.join("run-jit.sh");
     let generated = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_INSTALL_DIR="$2"; write_jit_launcher "$3""#,
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_HOOK_DIR="$3"; write_jit_launcher "$4""#,
             "_",
             script().to_str().unwrap(),
             install_dir.to_str().unwrap(),
+            hook_dir.to_str().unwrap(),
             launcher.to_str().unwrap(),
         ])
         .output()
         .unwrap();
     assert!(generated.status.success(), "{}", text(&generated));
 
+    // When the firewall check fails, the main process wrapper MUST exit 78
+    // directly (matching RestartPreventExitStatus=78) without starting Runner.Listener.
+    let blocked = Command::new(&launcher)
+        .env("CREDENTIALS_DIRECTORY", &cred_dir)
+        .env("FAKE_FW_RC", "78")
+        .env("FAKE_LISTENER_ARGS", &listener_args)
+        .env("FAKE_LISTENER_JIT", &listener_jit)
+        .output()
+        .unwrap();
+    assert_eq!(
+        blocked.status.code(),
+        Some(78),
+        "run-jit.sh must exit 78 from main process when firewall check fails: {}",
+        text(&blocked)
+    );
+    assert!(
+        !listener_args.exists(),
+        "Runner.Listener must NOT be started when firewall check fails"
+    );
+
     // Make install_dir read-only to prove the launcher never writes run-helper.sh.
     std::fs::set_permissions(&install_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
     let run = Command::new(&launcher)
         .env("CREDENTIALS_DIRECTORY", &cred_dir)
+        .env("FAKE_FW_RC", "0")
         .env("FAKE_LISTENER_ARGS", &listener_args)
         .env("FAKE_LISTENER_JIT", &listener_jit)
         .output()
@@ -1616,12 +1651,16 @@ fn b64(bytes: &[u8]) -> String {
     out
 }
 
+fn make_jit_config_json(runner_json: &str) -> String {
+    let outer = format!("{{\".runner\":\"{}\"}}", b64(runner_json.as_bytes()));
+    b64(outer.as_bytes())
+}
+
 fn make_jit_config(github_url: &str, work_folder: &str) -> String {
     let runner_json = format!(
         "\u{feff}{{\"agentId\":1,\"agentName\":\"jit-test\",\"gitHubUrl\":\"{github_url}\",\"workFolder\":\"{work_folder}\"}}"
     );
-    let outer = format!("{{\".runner\":\"{}\"}}", b64(runner_json.as_bytes()));
-    b64(outer.as_bytes())
+    make_jit_config_json(&runner_json)
 }
 
 #[test]
@@ -1899,92 +1938,258 @@ exec "$@"
 #[test]
 fn egress_firewall_check_gates_unit_startup_and_fails_closed_when_unfiltered() {
     let dir = tempfile::tempdir().unwrap();
+    let fake_install = dir.path().join("runner");
+    let fake_bin = fake_install.join("bin");
     let hooks_out = dir.path().join("hooks");
+    std::fs::create_dir_all(&fake_bin).unwrap();
+
     let rendered = run_setup(&[
         "render-hooks",
         "--repo",
         REPO_URL,
+        "--install-dir",
+        fake_install.to_str().unwrap(),
+        "--hook-dir",
+        hooks_out.to_str().unwrap(),
         "--out",
         hooks_out.to_str().unwrap(),
     ]);
     assert!(rendered.status.success(), "{}", text(&rendered));
 
     let check = hooks_out.join("check-egress-firewall.sh");
+    let run_runner = hooks_out.join("run-runner.sh");
     assert!(
         check.is_file(),
         "render-hooks must write check-egress-firewall.sh"
     );
+    assert!(
+        run_runner.is_file(),
+        "render-hooks must write root-owned main-process run-runner.sh"
+    );
 
-    // Controlled local check on an unfiltered cgroup (no IPAddressDeny BPF active):
-    // must fail closed with EX_CONFIG (78) before the listener ever starts.
-    let unfiltered = Command::new("bash")
+    // 1. Controlled local check on an unfiltered cgroup (no IPAddressDeny BPF active)
+    //    WITH runner-writable Python user-site configuration poisoned in HOME,
+    //    PYTHONPATH, PYTHONUSERBASE, and PYTHONSTARTUP trying to forge EPERM:
+    //    check-egress-firewall.sh MUST run system python3 in isolated mode (-I -S)
+    //    with a sanitized environment and STILL fail closed with EX_CONFIG (78).
+    let py_ver_out = Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')",
+        ])
+        .output()
+        .unwrap();
+    assert!(py_ver_out.status.success());
+    let py_ver = String::from_utf8(py_ver_out.stdout).unwrap();
+    let py_ver = py_ver.trim();
+
+    let poison_home = dir.path().join("poison-home");
+    let user_site = poison_home.join(format!(".local/lib/python{py_ver}/site-packages"));
+    std::fs::create_dir_all(&user_site).unwrap();
+    let forge_eperm_py = r#"import errno, socket
+def _forge(self, data, addr):
+    if addr[0] == "127.0.0.1":
+        return len(data)
+    raise OSError(errno.EPERM, "forged by runner-writable python config")
+socket.socket.sendto = _forge
+"#;
+    std::fs::write(user_site.join("usercustomize.py"), forge_eperm_py).unwrap();
+    std::fs::write(user_site.join("sitecustomize.py"), forge_eperm_py).unwrap();
+    std::fs::write(user_site.join("poison.pth"), "import sys; sys.exit(0)\n").unwrap();
+    std::fs::write(user_site.join("socket.py"), "import sys; sys.exit(0)\n").unwrap();
+    let startup_py = poison_home.join("startup.py");
+    std::fs::write(&startup_py, "import sys; sys.exit(0)\n").unwrap();
+
+    // Also plant a fake `python3` earlier in PATH to prove check-egress-firewall.sh
+    // invokes the trusted system /usr/bin/python3 rather than PATH lookup.
+    let fake_path_bin = dir.path().join("fake-path-bin");
+    std::fs::create_dir_all(&fake_path_bin).unwrap();
+    write_exec(&fake_path_bin.join("python3"), "#!/bin/sh\nexit 0\n");
+    let poisoned_path = format!(
+        "{}:{}",
+        fake_path_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let poisoned = Command::new("bash")
         .arg(&check)
+        .env("HOME", &poison_home)
+        .env("PATH", &poisoned_path)
+        .env("PYTHONPATH", &user_site)
+        .env("PYTHONUSERBASE", poison_home.join(".local"))
+        .env("PYTHONSTARTUP", &startup_py)
         .env("QEMINGA_RUNNER_POLICY", hooks_out.join("policy.env"))
         .output()
         .unwrap();
     assert_eq!(
-        unfiltered.status.code(),
+        poisoned.status.code(),
         Some(78),
-        "unfiltered cgroup must exit 78 (EX_CONFIG): {}",
-        text(&unfiltered)
+        "poisoned user Python config and PATH must NOT bypass firewall check (must exit 78): {}",
+        text(&poisoned)
+    );
+    let check_body = std::fs::read_to_string(&check).unwrap();
+    assert!(
+        check_body.contains("-I -S") && check_body.contains("env -i"),
+        "check-egress-firewall.sh must run isolated Python (-I -S) under env -i:\n{check_body}"
+    );
+
+    // 2. Main-process run-runner.sh exits 78 directly (matching RestartPreventExitStatus=78)
+    //    without starting bin/runsvc.sh when the firewall check fails.
+    let runsvc_marker = dir.path().join("runsvc.started");
+    write_exec(
+        &fake_bin.join("runsvc.sh"),
+        "#!/bin/sh\necho started > \"${FAKE_RUNSVC_MARKER:?}\"\nexit 0\n",
+    );
+    let blocked_main = Command::new(&run_runner)
+        .env("HOME", &poison_home)
+        .env("FAKE_RUNSVC_MARKER", &runsvc_marker)
+        .output()
+        .unwrap();
+    assert_eq!(
+        blocked_main.status.code(),
+        Some(78),
+        "main-process run-runner.sh must exit 78 when firewall check fails: {}",
+        text(&blocked_main)
     );
     assert!(
-        text(&unfiltered).contains("169.254.169.254") || text(&unfiltered).contains("BPF"),
-        "diagnostic should explain failed egress block: {}",
-        text(&unfiltered)
+        !runsvc_marker.exists(),
+        "bin/runsvc.sh must NOT start when firewall check fails"
     );
 
-    // Controlled simulated outcomes via sitecustomize hook on PYTHONPATH:
-    let site_dir = dir.path().join("site");
-    std::fs::create_dir_all(&site_dir).unwrap();
-    std::fs::write(
-        site_dir.join("sitecustomize.py"),
-        r#"import errno, os, socket
-mode = os.environ.get("FAKE_SOCKET_MODE")
-if mode:
-    _orig = socket.socket.sendto
-    def _patched(self, data, addr):
+    // Replace check-egress-firewall.sh with a passing stub to confirm run-runner.sh execs runsvc.sh.
+    let saved_check = std::fs::read_to_string(&check).unwrap();
+    write_exec(&check, "#!/bin/sh\nexit 0\n");
+    let ok_main = Command::new(&run_runner)
+        .env("FAKE_RUNSVC_MARKER", &runsvc_marker)
+        .output()
+        .unwrap();
+    assert!(ok_main.status.success(), "{}", text(&ok_main));
+    assert!(
+        runsvc_marker.exists(),
+        "run-runner.sh must exec bin/runsvc.sh when firewall check passes"
+    );
+
+    // 3. Exercise the embedded Python probe logic directly against controlled kernel
+    //    sendto() verdicts (host-wide IMDS-only block vs real unit cgroup BPF,
+    //    loopback allow sanity, private-LAN deny, --no-lan-deny, --allow-ip).
+    let extract_py = |script_text: &str| -> String {
+        let start = script_text
+            .find("<<'PY'\n")
+            .expect("missing PY heredoc start")
+            + "<<'PY'\n".len();
+        let end = script_text[start..]
+            .find("\nPY\n")
+            .expect("missing PY heredoc end");
+        script_text[start..start + end].to_string()
+    };
+    let default_py = extract_py(&saved_check);
+
+    let run_probe_sim = |py_code: &str, mode: &str| -> Output {
+        let harness = format!(
+            r#"import errno, socket
+_MODE = {mode:?}
+class _SimSocket:
+    def __init__(self, family, stype):
+        self.family = family
+    def sendto(self, data, addr):
         host = addr[0]
-        if mode == "v4_eperm_v6_unreach":
-            if host == "169.254.169.254":
-                raise OSError(errno.EPERM, "Operation not permitted")
-            raise OSError(errno.ENETUNREACH, "Network is unreachable")
-        if mode == "v4_unreach_v6_eperm":
-            if host == "fd00:ec2::254":
-                raise OSError(errno.EPERM, "Operation not permitted")
-            raise OSError(errno.ENETUNREACH, "Network is unreachable")
-        if mode == "all_unreach":
-            raise OSError(errno.ENETUNREACH, "Network is unreachable")
-        if mode == "v4_eperm_v6_sent":
-            if host == "169.254.169.254":
+        if _MODE == "host_imds_only":
+            # Host firewall blocks IMDS, but unit cgroup BPF is missing (sentinel & LAN succeed!)
+            if host in ("169.254.169.254", "fd00:ec2::254"):
                 raise OSError(errno.EPERM, "Operation not permitted")
             return len(data)
-        return _orig(self, data, addr)
-    socket.socket.sendto = _patched
-"#,
-    )
-    .unwrap();
+        if _MODE == "unit_bpf_full":
+            if host == "127.0.0.1":
+                return len(data)
+            if host == "fd00:ec2::254":
+                raise OSError(errno.ENETUNREACH, "Network is unreachable")
+            raise OSError(errno.EPERM, "Operation not permitted")
+        if _MODE == "unit_bpf_lan_leaked":
+            if host == "127.0.0.1":
+                return len(data)
+            if host == "10.255.255.254":
+                return len(data)
+            raise OSError(errno.EPERM, "Operation not permitted")
+        if _MODE == "loopback_blocked":
+            raise OSError(errno.EPERM, "Operation not permitted")
+        if _MODE == "no_lan_deny_ok":
+            if host in ("127.255.255.254", "169.254.169.254"):
+                raise OSError(errno.EPERM, "Operation not permitted")
+            if host == "fd00:ec2::254":
+                raise OSError(errno.ENETUNREACH, "Network is unreachable")
+            return len(data)
+        raise AssertionError(f"unknown mode {{_MODE}}")
+    def close(self):
+        pass
+socket.socket = _SimSocket
+{py_code}
+"#
+        );
+        Command::new("/usr/bin/python3")
+            .args(["-I", "-S", "-c", &harness])
+            .output()
+            .unwrap()
+    };
 
     for (mode, want_code) in [
-        ("v4_eperm_v6_unreach", 0),
-        ("v4_unreach_v6_eperm", 0),
-        ("all_unreach", 78),
-        ("v4_eperm_v6_sent", 78),
+        ("host_imds_only", 78),
+        ("unit_bpf_full", 0),
+        ("unit_bpf_lan_leaked", 78),
+        ("loopback_blocked", 78),
     ] {
-        let out = Command::new("bash")
-            .arg(&check)
-            .env("PYTHONPATH", &site_dir)
-            .env("FAKE_SOCKET_MODE", mode)
-            .env("QEMINGA_RUNNER_POLICY", hooks_out.join("policy.env"))
-            .output()
-            .unwrap();
+        let out = run_probe_sim(&default_py, mode);
         assert_eq!(
             out.status.code(),
             Some(want_code),
-            "mode={mode}: {}",
+            "default policy mode={mode}: {}",
             text(&out)
         );
     }
+
+    // With --no-lan-deny, LAN probes are skipped while unit sentinel + IMDS still require EPERM.
+    let hooks_nolan = dir.path().join("hooks-nolan");
+    let r_nolan = run_setup(&[
+        "render-hooks",
+        "--repo",
+        REPO_URL,
+        "--no-lan-deny",
+        "--out",
+        hooks_nolan.to_str().unwrap(),
+    ]);
+    assert!(r_nolan.status.success(), "{}", text(&r_nolan));
+    let nolan_py =
+        extract_py(&std::fs::read_to_string(hooks_nolan.join("check-egress-firewall.sh")).unwrap());
+    assert_eq!(
+        run_probe_sim(&nolan_py, "no_lan_deny_ok").status.code(),
+        Some(0)
+    );
+    assert_eq!(
+        run_probe_sim(&nolan_py, "host_imds_only").status.code(),
+        Some(78)
+    );
+
+    // With --allow-ip 10.0.0.0/8, 10.255.255.254 is exempted while other LAN ranges remain probed.
+    let hooks_allow10 = dir.path().join("hooks-allow10");
+    let r_allow10 = run_setup(&[
+        "render-hooks",
+        "--repo",
+        REPO_URL,
+        "--allow-ip",
+        "10.0.0.0/8",
+        "--out",
+        hooks_allow10.to_str().unwrap(),
+    ]);
+    assert!(r_allow10.status.success(), "{}", text(&r_allow10));
+    let allow10_py = extract_py(
+        &std::fs::read_to_string(hooks_allow10.join("check-egress-firewall.sh")).unwrap(),
+    );
+    assert_eq!(
+        run_probe_sim(&allow10_py, "unit_bpf_lan_leaked")
+            .status
+            .code(),
+        Some(0),
+        "10.255.255.254 should be skipped when --allow-ip 10.0.0.0/8 is configured"
+    );
 }
 
 #[test]
@@ -2544,13 +2749,123 @@ fn jit_workspace_validation_and_post_job_cleanup() {
         "image-cache must stay untouched"
     );
 
-    // 2. Malicious/escaped JIT workFolder or mismatched gitHubUrl must fail closed.
+    // 2. Real GitHub JIT configs with gitHubUrl omitted (using serverUrl/serverUrlV2,
+    //    matching actions/runner ConfigurationStore.cs L73-L105) MUST be accepted for
+    //    private --repo controllers, and absolute workFolder inside STATE_DIR/work is allowed.
+    let jit_no_url = dir.path().join("jit-no-url");
+    let work_sub = state_dir.join("work/job-sub");
+    std::fs::write(
+        &jit_no_url,
+        make_jit_config_json(&format!(
+            "\u{feff}{{\"agentId\":7,\"agentName\":\"jit-nourl\",\"serverUrlV2\":\"https://broker.actions.githubusercontent.com/test\",\"workFolder\":\"{}\"}}",
+            work_sub.display()
+        )),
+    )
+    .unwrap();
+    std::fs::set_permissions(&jit_no_url, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let hooks_no_url = dir.path().join("hooks-no-url");
+    let ok_no_url = run_setup(&[
+        "render-hooks",
+        "--repo",
+        REPO_URL,
+        "--install-dir",
+        install_dir.to_str().unwrap(),
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--jitconfig-file",
+        jit_no_url.to_str().unwrap(),
+        "--out",
+        hooks_no_url.to_str().unwrap(),
+    ]);
+    assert!(
+        ok_no_url.status.success(),
+        "supported JIT blob with gitHubUrl omitted must be accepted: {}",
+        text(&ok_no_url)
+    );
+    assert!(
+        std::fs::read_to_string(hooks_no_url.join("policy.env"))
+            .unwrap()
+            .contains(&format!("WORK_DIR={}\n", work_sub.display()))
+    );
+
+    // 3. Organization JIT provisioning (--org + --jitconfig-file) MUST be refused
+    //    because JIT blobs do not cryptographically bind the org runner group, and
+    //    direct resolve_jit_work_dir rejects poolName mismatch against OPT_RUNNER_GROUP.
+    let org_jit = dir.path().join("jit-org");
+    std::fs::write(
+        &org_jit,
+        make_jit_config_json(
+            "\u{feff}{\"agentId\":9,\"agentName\":\"org-jit\",\"gitHubUrl\":\"https://github.com/myorg\",\"poolName\":\"wrong-group\",\"workFolder\":\"_work\"}",
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&org_jit, std::fs::Permissions::from_mode(0o600)).unwrap();
+    for subcmd in ["render-unit", "render-hooks"] {
+        let mut args = vec![
+            subcmd,
+            "--org",
+            "https://github.com/myorg",
+            "--runner-group",
+            "qeminga-kvm-restricted",
+            "--allow-repo",
+            "vicaya/qeminga",
+            "--jitconfig-file",
+            org_jit.to_str().unwrap(),
+        ];
+        let tmp_out = dir.path().join(format!("org-jit-{subcmd}"));
+        if subcmd == "render-hooks" {
+            args.extend(["--out", tmp_out.to_str().unwrap()]);
+        } else {
+            args.extend(["--arch", "x86_64"]);
+        }
+        let res = run_setup(&args);
+        assert!(
+            !res.status.success(),
+            "--org with --jitconfig-file ({subcmd}) must be refused: {}",
+            text(&res)
+        );
+        let msg = text(&res);
+        assert!(
+            msg.contains("--jitconfig-file") && msg.contains("--org"),
+            "refusal should explain --org + --jitconfig-file restriction ({subcmd}): {msg}"
+        );
+    }
+    let grp_mismatch = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_RUNNER_GROUP="qeminga-kvm-restricted"; resolve_jit_work_dir "$(cat "$4")" "https://github.com/myorg""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            org_jit.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !grp_mismatch.status.success(),
+        "JIT poolName mismatch against OPT_RUNNER_GROUP must be refused: {}",
+        text(&grp_mismatch)
+    );
+
+    // 4. Malicious/escaped JIT workFolder, overlapping VM/state subtrees (images,
+    //    image-cache, .config, work2), or mismatched gitHubUrl must fail closed.
+    let bad_images = state_dir.join("images").to_string_lossy().into_owned();
+    let bad_images_sub = state_dir.join("images/sub").to_string_lossy().into_owned();
+    let bad_cache = state_dir.join("image-cache").to_string_lossy().into_owned();
+    let bad_cfg = state_dir.join(".config").to_string_lossy().into_owned();
+    let bad_work2 = state_dir.join("work2").to_string_lossy().into_owned();
     for (label, url, wf) in [
         ("traversal", REPO_URL, "../../etc"),
         ("outside-abs", REPO_URL, "/tmp/outside"),
         ("bin-dir", REPO_URL, "bin"),
         ("dot-dir", REPO_URL, "."),
         ("wrong-repo", "https://github.com/evil/repo", "_work"),
+        ("state-images", REPO_URL, bad_images.as_str()),
+        ("state-images-sub", REPO_URL, bad_images_sub.as_str()),
+        ("state-image-cache", REPO_URL, bad_cache.as_str()),
+        ("state-dot-config", REPO_URL, bad_cfg.as_str()),
+        ("state-work2", REPO_URL, bad_work2.as_str()),
     ] {
         let bad_jit = dir.path().join(format!("jit-{label}"));
         std::fs::write(&bad_jit, make_jit_config(url, wf)).unwrap();
@@ -2575,6 +2890,39 @@ fn jit_workspace_validation_and_post_job_cleanup() {
             text(&out)
         );
     }
+
+    // 5. Defense in depth: hook-job-completed.sh MUST refuse a policy whose WORK_DIR
+    //    overlaps IMAGES_DIR (or image-cache / .config) and preserve VM disks intact.
+    let kept_disk = state_dir.join("images/qeminga-e2e-88-1-x86_64/root.qcow2");
+    std::fs::create_dir_all(kept_disk.parent().unwrap()).unwrap();
+    std::fs::write(&kept_disk, b"keep-me").unwrap();
+    let bad_policy = dir.path().join("bad-overlap-policy.env");
+    std::fs::write(
+        &bad_policy,
+        format!(
+            "INSTALL_DIR={}\nSTATE_DIR={}\nWORK_DIR={}/images\nIMAGES_DIR={}/images\nLIBVIRT_CONNECT=qemu:///session\n",
+            install_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+            state_dir.display(),
+        ),
+    )
+    .unwrap();
+    let bad_hook = run_hook(
+        &hooks_out.join("hook-job-completed.sh"),
+        &bad_policy,
+        &bin,
+        &[("FAKE_LOG", log.to_str().unwrap())],
+    );
+    assert!(
+        !bad_hook.status.success(),
+        "hook-job-completed.sh must refuse WORK_DIR overlapping IMAGES_DIR: {}",
+        text(&bad_hook)
+    );
+    assert!(
+        kept_disk.exists(),
+        "VM disk under images/ must remain intact when WORK_DIR overlaps images/"
+    );
 }
 
 #[test]
@@ -3109,4 +3457,663 @@ fn preflight_and_install_packages_require_git_and_support_modular_virtqemud() {
             "install_packages ({pm}, {arch}) must install git package: {logged}"
         );
     }
+}
+
+#[test]
+fn ancestor_path_validation_rejects_unsafe_ancestor_under_safe_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+
+    // Fake stat returns 0:755 by default, unless FAKE_BAD_PATH matches $3.
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
+    if [ -n "${FAKE_BAD_PATH:-}" ] && [ "$3" = "$FAKE_BAD_PATH" ]; then
+        echo "${FAKE_BAD_STAT:?}"
+        exit 0
+    fi
+    echo "0:755"
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 1. Safe-looking immediate parent beneath a symlinked ancestor MUST fail.
+    let real_base = dir.path().join("real-base");
+    let safe_parent = real_base.join("safe-parent");
+    std::fs::create_dir_all(&safe_parent).unwrap();
+    let sym_anc = dir.path().join("sym-anc");
+    std::os::unix::fs::symlink(&real_base, &sym_anc).unwrap();
+    let sym_target = sym_anc.join("safe-parent/runner");
+
+    let out_sym = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; check_trusted_parent_dir "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            sym_target.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        !out_sym.status.success(),
+        "symlinked ancestor beneath safe-looking parent must be refused: {}",
+        text(&out_sym)
+    );
+
+    // 2. Safe-looking root-owned 0755 immediate parent beneath a world-writable
+    //    (0:777) or non-root (1000:755) ancestor MUST fail.
+    let unsafe_anc = dir.path().join("unsafe-anc");
+    let nested_safe = unsafe_anc.join("safe-parent");
+    std::fs::create_dir_all(&nested_safe).unwrap();
+    let nested_target = nested_safe.join("runner");
+    for (label, bad_stat) in [("world-writable", "0:777"), ("non-root-owner", "1000:755")] {
+        let out = Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; check_trusted_parent_dir "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                nested_target.to_str().unwrap(),
+            ])
+            .env("PATH", &path_env)
+            .env("FAKE_BAD_PATH", &unsafe_anc)
+            .env("FAKE_BAD_STAT", bad_stat)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "{label} ancestor under safe-looking immediate parent must be refused: {}",
+            text(&out)
+        );
+    }
+
+    // 3. When all ancestors from / down are root-owned 0755 non-symlinks, check passes.
+    let ok = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; check_trusted_parent_dir "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            nested_target.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "clean ancestor chain must pass: {}",
+        text(&ok)
+    );
+}
+
+#[test]
+fn update_requires_valid_install_record_and_rejects_mismatched_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+
+    let inst = dir.path().join("runner");
+    let other_inst = dir.path().join("other-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    for d in [
+        inst.join("bin"),
+        other_inst.join("bin"),
+        state.clone(),
+        hooks.clone(),
+        cfg.clone(),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(inst.join("bin/keep"), b"orig").unwrap();
+    std::fs::write(other_inst.join("bin/precious"), b"unrelated").unwrap();
+
+    // 1. update WITHOUT install.env must fail closed before modifying anything.
+    let no_rec = run_setup_env(
+        &[
+            "update",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+        ],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !no_rec.status.success(),
+        "update without install.env must fail closed: {}",
+        text(&no_rec)
+    );
+    assert!(inst.join("bin/keep").exists());
+
+    // 2. With a valid install.env, passing a mismatched --install-dir or --service MUST fail
+    //    and leave both directories untouched.
+    std::fs::write(
+        cfg.join("install.env"),
+        format!(
+            "RECORD_SCHEMA=1\nRECORD_STATE=installed\nSERVICE=qeminga-kvm-runner\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nINSTALL_DIR={}\nSTATE_DIR={}\nHOOK_DIR={}\nCONFIG_DIR={}\nTARGET_URL={REPO_URL}\nRUNNER_GROUP=\nRUNNER_NAME=test\nLABELS=qeminga-kvm\nEPHEMERAL=0\nALLOW_AUTO_UPDATE=0\nWORK_DIR={}/work\n",
+            inst.display(),
+            state.display(),
+            hooks.display(),
+            cfg.display(),
+            state.display(),
+        ),
+    )
+    .unwrap();
+
+    let bad_dir = run_setup_env(
+        &[
+            "update",
+            "--install-dir",
+            other_inst.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+        ],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !bad_dir.status.success(),
+        "update with mismatched --install-dir must be refused: {}",
+        text(&bad_dir)
+    );
+    assert!(other_inst.join("bin/precious").exists());
+
+    let bad_svc = run_setup_env(
+        &[
+            "update",
+            "--service",
+            "unrelated-donor-svc",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+        ],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !bad_svc.status.success(),
+        "update with mismatched --service must be refused: {}",
+        text(&bad_svc)
+    );
+
+    // 3. update on a user-only record (post-uninstall) must also be refused.
+    std::fs::write(
+        cfg.join("install.env"),
+        format!(
+            "RECORD_SCHEMA=1\nRECORD_STATE=user-only\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nCONFIG_DIR={}\n",
+            cfg.display(),
+        ),
+    )
+    .unwrap();
+    let on_user_only = run_setup_env(
+        &["update", "--config-dir", cfg.to_str().unwrap()],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !on_user_only.status.success(),
+        "update on user-only record must be refused: {}",
+        text(&on_user_only)
+    );
+}
+
+#[test]
+fn fresh_install_refuses_existing_systemd_unit_without_install_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let etc_units = dir.path().join("etc-systemd");
+    let vendor_units = dir.path().join("usr-lib-systemd");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(&vendor_units).unwrap();
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then
+    echo "${FAKE_LOAD_STATE:-not-found}"
+    exit 0
+fi
+if [ "$1" = "list-unit-files" ]; then
+    printf '%s\n' "${FAKE_UNIT_FILES:-}"
+    exit 0
+fi
+if [ "$1" = "is-active" ]; then
+    exit "${FAKE_IS_ACTIVE_RC:-3}"
+fi
+exit 0
+"#,
+    );
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let unit_dirs = format!("{}:{}", etc_units.display(), vendor_units.display());
+
+    // 1. Clean unit name passes check_unit_not_occupied.
+    let ok = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_SERVICE="qeminga-fresh-svc"; check_unit_not_occupied"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs)
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "unoccupied unit name should pass: {}",
+        text(&ok)
+    );
+
+    // 2. Vendor unit file under /usr/lib/systemd/system collides and MUST fail.
+    std::fs::write(vendor_units.join("donor-vendor.service"), "[Unit]\n").unwrap();
+    let vendor_hit = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_SERVICE="donor-vendor"; check_unit_not_occupied"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs)
+        .output()
+        .unwrap();
+    assert!(
+        !vendor_hit.status.success(),
+        "fresh install must refuse colliding vendor unit file: {}",
+        text(&vendor_hit)
+    );
+
+    // 3. Systemd-known unit via LoadState=loaded or list-unit-files MUST fail even when
+    //    not present in the scanned unit directories.
+    let loaded_hit = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_SERVICE="donor-loaded"; check_unit_not_occupied"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs)
+        .env("FAKE_LOAD_STATE", "loaded")
+        .output()
+        .unwrap();
+    assert!(
+        !loaded_hit.status.success(),
+        "fresh install must refuse systemd-loaded unit without install.env: {}",
+        text(&loaded_hit)
+    );
+
+    let listed_hit = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_SERVICE="donor-listed"; check_unit_not_occupied"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dirs)
+        .env("FAKE_UNIT_FILES", "donor-listed.service disabled")
+        .output()
+        .unwrap();
+    assert!(
+        !listed_hit.status.success(),
+        "fresh install must refuse unit reported by systemctl list-unit-files: {}",
+        text(&listed_hit)
+    );
+}
+
+#[test]
+fn ownership_record_survives_failed_download_and_normal_uninstall_for_reinstall() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let rt_root = dir.path().join("run");
+    let etc_units = dir.path().join("etc-systemd");
+    let fake_tar_src = dir.path().join("tar-src");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&rt_root).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("bin")).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("externals")).unwrap();
+
+    // Build a valid fake runner tarball and compute its SHA-256.
+    write_exec(
+        &fake_tar_src.join("config.sh"),
+        r#"#!/bin/sh
+# Write a realistic .runner file with disableUpdate:true.
+work=""
+url=""
+name=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --url) url="$2"; shift 2 ;;
+        --name) name="$2"; shift 2 ;;
+        --work) work="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '{"agentId":1,"agentName":"%s","gitHubUrl":"%s","workFolder":"%s","disableUpdate":true}\n' "$name" "$url" "$work" > "$(dirname "$0")/.runner"
+exit 0
+"#,
+    );
+    write_exec(&fake_tar_src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("run.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+    let good_tarball = dir.path().join("runner-good.tar.gz");
+    let tar_out = Command::new("tar")
+        .args([
+            "-czf",
+            good_tarball.to_str().unwrap(),
+            "-C",
+            fake_tar_src.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(tar_out.status.success(), "{}", text(&tar_out));
+    let good_sha = sha256_of(&std::fs::read(&good_tarball).unwrap());
+
+    // Stateful fake account database so useradd/id/userdel reflect real lifecycle transitions.
+    let user_flag = dir.path().join("user_exists");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let tok_file = dir.path().join("token");
+    std::fs::write(&tok_file, "FAKE_REG_TOKEN\n").unwrap();
+    std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("userdel"),
+        "#!/bin/sh\nrm -f \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+# Strip -o / -g ownership flags so unprivileged tests can create real files/dirs.
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("systemd-analyze"), "#!/bin/sh\nexit 0\n");
+    // Fake curl: verify_private_repo gets 404 (private!), while tarball download fails or copies.
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+# Check if this is verify_private_repo (-w %{http_code})
+for a in "$@"; do
+    case "$a" in
+        *api.github.com/repos/*)
+            printf '404'
+            exit 0
+            ;;
+    esac
+done
+if [ "${FAKE_DOWNLOAD_FAIL:-0}" = "1" ]; then
+    exit 22
+fi
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+cp "${FAKE_GOOD_TARBALL:?}" "$out"
+exit 0
+"#,
+    );
+    write_exec(&bin.join("virsh"), FAKE_VIRSH);
+
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = etc_units.to_str().unwrap();
+    let virsh_log = dir.path().join("virsh.log");
+    let common_env = [
+        ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+        ("FAKE_GOOD_TARBALL", good_tarball.to_str().unwrap()),
+        ("FAKE_LOG", virsh_log.to_str().unwrap()),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+        ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+        ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+        ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+    ];
+    let install_args = [
+        "install",
+        "--repo",
+        REPO_URL,
+        "--name",
+        "recovery-box",
+        "--service",
+        "qeminga-recovery-svc",
+        "--install-dir",
+        inst.to_str().unwrap(),
+        "--state-dir",
+        state.to_str().unwrap(),
+        "--hook-dir",
+        hooks.to_str().unwrap(),
+        "--config-dir",
+        cfg.to_str().unwrap(),
+        "--token-file",
+        tok_file.to_str().unwrap(),
+        "--runner-sha256",
+        good_sha.as_str(),
+        "--skip-packages",
+        "--no-start",
+    ];
+
+    // 1. First install fails mid-flight during runner download (after user & state creation).
+    let mut env_fail = common_env.to_vec();
+    env_fail.push(("FAKE_DOWNLOAD_FAIL", "1"));
+    let fail1 = run_setup_env(&install_args, &env_fail, Some(&bin));
+    assert!(
+        !fail1.status.success(),
+        "interrupted download must fail install: {}",
+        text(&fail1)
+    );
+    assert!(
+        user_flag.exists(),
+        "service user was created before download failed"
+    );
+    let rec_after_fail = std::fs::read_to_string(cfg.join("install.env")).unwrap_or_else(|e| {
+        panic!(
+            "ownership record install.env MUST be written before download so retry/uninstall works: {e}"
+        )
+    });
+    assert!(
+        rec_after_fail.contains("RECORD_STATE=installing\n"),
+        "interrupted install must leave RECORD_STATE=installing:\n{rec_after_fail}"
+    );
+
+    // 2. Retrying the exact same install command succeeds once the network recovers.
+    let mut env_ok = common_env.to_vec();
+    env_ok.push(("FAKE_DOWNLOAD_FAIL", "0"));
+    let retry_ok = run_setup_env(&install_args, &env_ok, Some(&bin));
+    assert!(
+        retry_ok.status.success(),
+        "retrying install after interrupted download must succeed: {}",
+        text(&retry_ok)
+    );
+    let rec_installed = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_installed.contains("RECORD_STATE=installed\n"),
+        "completed install must mark RECORD_STATE=installed:\n{rec_installed}"
+    );
+
+    // 3. Ordinary uninstall WITHOUT --purge-user removes runner/state/hooks/policy while
+    //    retaining the minimal user-only ownership record so the surviving account is tracked.
+    let uninst = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-recovery-svc",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+        ],
+        &env_ok,
+        Some(&bin),
+    );
+    assert!(
+        uninst.status.success(),
+        "ordinary uninstall without --purge-user must succeed: {}",
+        text(&uninst)
+    );
+    assert!(
+        !inst.exists() && !state.exists() && !hooks.exists() && !cfg.join("policy.env").exists(),
+        "ordinary uninstall must remove install, state, hooks, and policy"
+    );
+    assert!(
+        user_flag.exists(),
+        "ordinary uninstall without --purge-user keeps the service user"
+    );
+    let rec_user_only = std::fs::read_to_string(cfg.join("install.env")).unwrap_or_else(|e| {
+        panic!("ordinary uninstall without --purge-user must retain minimal UID/GID record: {e}")
+    });
+    assert!(
+        rec_user_only.contains("RECORD_STATE=user-only\n")
+            && rec_user_only.contains("USER=qeminga-runner\n")
+            && rec_user_only.contains("USER_UID=995\n"),
+        "retained record must be user-only with UID/GID metadata:\n{rec_user_only}"
+    );
+
+    // 4. A subsequent default install MUST recognize and reuse its own surviving account!
+    let reinstall = run_setup_env(&install_args, &env_ok, Some(&bin));
+    assert!(
+        reinstall.status.success(),
+        "reinstall after ordinary uninstall without --purge-user must succeed: {}",
+        text(&reinstall)
+    );
+    assert!(
+        std::fs::read_to_string(cfg.join("install.env"))
+            .unwrap()
+            .contains("RECORD_STATE=installed\n")
+    );
+
+    // 5. Uninstall without --purge-user followed by a later uninstall --purge-user cleans
+    //    up both the surviving account and the retained config directory completely.
+    let uninst2 = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &env_ok,
+        Some(&bin),
+    );
+    assert!(uninst2.status.success(), "{}", text(&uninst2));
+    let purge_later = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &env_ok,
+        Some(&bin),
+    );
+    assert!(
+        purge_later.status.success(),
+        "later uninstall --purge-user on user-only record must succeed: {}",
+        text(&purge_later)
+    );
+    assert!(
+        !user_flag.exists() && !cfg.exists(),
+        "later --purge-user must delete surviving user and remove retained config dir"
+    );
 }

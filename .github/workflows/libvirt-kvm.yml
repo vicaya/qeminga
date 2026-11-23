@@ -68,8 +68,6 @@ jobs:
     uses: ./.github/workflows/libvirt-kvm-lane.yml
     with:
       arch: x86_64
-      build_runner: ubuntu-24.04
-      runner_arch: X64
       target_rev: ${{ needs.resolve.outputs.target_rev }}
 
   aarch64:
@@ -79,6 +77,4 @@ jobs:
     uses: ./.github/workflows/libvirt-kvm-lane.yml
     with:
       arch: aarch64
-      build_runner: ubuntu-24.04-arm
-      runner_arch: ARM64
       target_rev: ${{ needs.resolve.outputs.target_rev }}

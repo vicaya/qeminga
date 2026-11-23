@@ -18,16 +18,8 @@ on:
         description: uname -m of the target architecture (x86_64 or aarch64)
         type: string
         required: true
-      build_runner:
-        description: GitHub-hosted runner label that builds the release candidate
-        type: string
-        required: true
-      runner_arch:
-        description: RUNNER_ARCH value (X64 or ARM64)
-        type: string
-        required: true
       target_rev:
-        description: Vetted 40-hex vicaya/qeminga commit resolved by caller
+        description: Vetted 40-hex vicaya/qeminga commit reachable from refs/heads/main
         type: string
         required: true
 
@@ -40,19 +32,78 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  verify:
+    name: verify caller & revision
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.workflow_ref == format('{0}/.github/workflows/libvirt-kvm.yml@{1}', github.repository, github.ref)
+      && (inputs.arch == 'x86_64' || inputs.arch == 'aarch64')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      target_rev: ${{ steps.check.outputs.target_rev }}
+      build_label: ${{ steps.check.outputs.build_label }}
+      expected_arch: ${{ steps.check.outputs.expected_arch }}
+    steps:
+      - name: Verify architecture and reachability from vicaya/qeminga main
+        id: check
+        env:
+          ARCH: ${{ inputs.arch }}
+          TARGET_REV: ${{ inputs.target_rev }}
+        run: |
+          case "$ARCH" in
+            x86_64)  build_label="ubuntu-24.04";     expected_arch="X64" ;;
+            aarch64) build_label="ubuntu-24.04-arm"; expected_arch="ARM64" ;;
+            *)
+              echo "::error::unsupported arch '$ARCH'"
+              exit 1
+              ;;
+          esac
+          if ! [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_rev is not a 40-hex commit SHA: '$TARGET_REV'"
+            exit 1
+          fi
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+          git -C "$tmpdir" init -q
+          git -C "$tmpdir" fetch --no-tags --filter=blob:none -q \
+            https://github.com/vicaya/qeminga.git refs/heads/main
+          if ! git -C "$tmpdir" cat-file -e "${TARGET_REV}^{commit}" 2>/dev/null; then
+            echo "::error::commit $TARGET_REV is not reachable from vicaya/qeminga refs/heads/main"
+            exit 1
+          fi
+          if ! git -C "$tmpdir" merge-base --is-ancestor "$TARGET_REV" FETCH_HEAD; then
+            echo "::error::commit $TARGET_REV is not an ancestor of vicaya/qeminga refs/heads/main"
+            exit 1
+          fi
+          {
+            echo "target_rev=$TARGET_REV"
+            echo "build_label=$build_label"
+            echo "expected_arch=$expected_arch"
+          } >> "$GITHUB_OUTPUT"
+
   candidate:
     name: candidate
-    runs-on: ${{ inputs.build_runner }}
+    needs: verify
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.workflow_ref == format('{0}/.github/workflows/libvirt-kvm.yml@{1}', github.repository, github.ref)
+      && (inputs.arch == 'x86_64' || inputs.arch == 'aarch64')
+    runs-on: ${{ inputs.arch == 'x86_64' && 'ubuntu-24.04' || 'ubuntu-24.04-arm' }}
     timeout-minutes: 30
     outputs:
       sha256: ${{ steps.digest.outputs.sha256 }}
     env:
-      TARGET_REV: ${{ inputs.target_rev }}
+      ARCH: ${{ inputs.arch }}
+      EXPECTED_RUNNER_ARCH: ${{ needs.verify.outputs.expected_arch }}
+      TARGET_REV: ${{ needs.verify.outputs.target_rev }}
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vicaya/qeminga
-          ref: ${{ inputs.target_rev }}
+          ref: ${{ needs.verify.outputs.target_rev }}
           persist-credentials: false
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
@@ -60,9 +111,9 @@ jobs:
         run: |
           [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$TARGET_REV"
-          test "$(uname -m)" = "${{ inputs.arch }}"
-          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
-          rustc -vV | grep -qx "host: ${{ inputs.arch }}-unknown-linux-gnu"
+          test "$(uname -m)" = "$ARCH"
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
+          rustc -vV | grep -qx "host: ${ARCH}-unknown-linux-gnu"
       - name: Release build
         run: cargo build --release --locked --features seccomp
       - name: Digest of the built binary
@@ -70,8 +121,7 @@ jobs:
         run: echo "sha256=$(sha256sum target/release/qeminga | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
       - name: Candidate and manifest
         env:
-          ARCH: ${{ inputs.arch }}
-          RUNNER_LABEL: ${{ inputs.build_runner }}
+          RUNNER_LABEL: ${{ needs.verify.outputs.build_label }}
         run: |
           version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
           scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
@@ -86,29 +136,35 @@ jobs:
 
   kvm:
     name: libvirt KVM smoke
-    runs-on: [self-hosted, linux, "${{ inputs.runner_arch }}", qeminga-kvm]
-    needs: candidate
+    needs: [verify, candidate]
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      && github.ref == 'refs/heads/main'
+      && github.workflow_ref == format('{0}/.github/workflows/libvirt-kvm.yml@{1}', github.repository, github.ref)
+      && (inputs.arch == 'x86_64' || inputs.arch == 'aarch64')
+    runs-on: [self-hosted, linux, "${{ inputs.arch == 'x86_64' && 'X64' || 'ARM64' }}", qeminga-kvm]
     concurrency:
       group: qeminga-kvm-${{ inputs.arch }}
       cancel-in-progress: false
     timeout-minutes: 30
     env:
       ARCH: ${{ inputs.arch }}
-      TARGET_REV: ${{ inputs.target_rev }}
+      EXPECTED_RUNNER_ARCH: ${{ needs.verify.outputs.expected_arch }}
+      TARGET_REV: ${{ needs.verify.outputs.target_rev }}
       OUT: ${{ github.workspace }}/libvirt-kvm-out
       QEMINGA_E2E_CONNECT: qemu:///session
     steps:
       - uses: actions/checkout@v4
         with:
           repository: vicaya/qeminga
-          ref: ${{ inputs.target_rev }}
+          ref: ${{ needs.verify.outputs.target_rev }}
           persist-credentials: false
       - name: The runner is a native ${{ inputs.arch }} machine at the vetted commit
         run: |
           [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]]
           test "$(git rev-parse HEAD)" = "$TARGET_REV"
-          test "$(uname -m)" = "${{ inputs.arch }}"
-          test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
+          test "$(uname -m)" = "$ARCH"
+          test "$RUNNER_ARCH" = "$EXPECTED_RUNNER_ARCH"
       - uses: actions/download-artifact@v4
         with:
           name: candidate-kvm-${{ inputs.arch }}

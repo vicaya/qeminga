@@ -24,15 +24,20 @@
 #     action setup before ACTIONS_RUNNER_HOOK_JOB_STARTED and still evaluates
 #     `if: always()` / `if: failure()` steps after a failed hook.
 #   - Host-enforced root-owned runner hooks (ACTIONS_RUNNER_HOOK_JOB_STARTED /
-#     COMPLETED) and ExecStartPre egress-firewall verification configured via
-#     systemd (never runner-writable): exact whole-string allowlists for
-#     repository, event, ref, workflow, and optional actor; startup gated on
-#     effective cgroup BPF blocking of cloud IMDS; stale-domain check before
-#     each job and automatic workspace + stray-domain scrub after every job.
+#     COMPLETED) and main-process launcher wrappers (run-runner.sh / run-jit.sh)
+#     configured via systemd (never runner-writable): exact whole-string
+#     allowlists for repository, event, ref, workflow, and optional actor;
+#     startup gated inside the main service process (exit 78 ->
+#     RestartPreventExitStatus=78) using isolated /usr/bin/python3 -I -S under
+#     env -i to verify this unit's cgroup BPF filter blocks the unit loopback
+#     sentinel, cloud IMDS, and private LANs; stale-domain check before each
+#     job and automatic workspace + stray-domain scrub after every job.
 #   - Pinned GitHub actions/runner archive verified by SHA-256 for both x64 and
 #     arm64 before extraction; runner binaries stay kernel-read-only by default
 #     (--disableupdate); registration tokens are never accepted on the CLI or
-#     passed in process argv; root-owned install record scopes uninstall.
+#     passed in process argv; root-owned install record scopes update & uninstall
+#     and tracks managed account ownership across interrupted installs and
+#     uninstalls without --purge-user.
 #
 # Usage:
 #   scripts/setup-kvm-runner.sh preflight [OPTIONS]
@@ -360,8 +365,9 @@ check_allow_ip() {
         if ! [[ "$prefix" =~ ^[1-9][0-9]?$ ]] || [ "$prefix" -lt 8 ] || [ "$prefix" -gt 32 ]; then
             die "invalid IPv4 prefix in --allow-ip '$cidr' (must be 8..32)"
         fi
-        # Block any IPv4 address or supernet overlapping 169.254.0.0/16 (link-local / cloud IMDS).
-        local ip_int imds_net min_p mask
+        # Block any IPv4 address or supernet overlapping 169.254.0.0/16 (link-local / cloud IMDS)
+        # or our unit-policy loopback sentinel 127.255.255.254/32.
+        local ip_int imds_net sentinel_net min_p mask
         ip_int=$(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
         imds_net=$(( (169 << 24) | (254 << 16) ))
         min_p="$prefix"
@@ -369,6 +375,11 @@ check_allow_ip() {
         mask=$(( (0xFFFFFFFF << (32 - min_p)) & 0xFFFFFFFF ))
         if [ "$((ip_int & mask))" -eq "$((imds_net & mask))" ]; then
             die "refusing --allow-ip '$cidr': overlaps link-local / cloud metadata range 169.254.0.0/16"
+        fi
+        sentinel_net=$(( (127 << 24) | (255 << 16) | (255 << 8) | 254 ))
+        mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+        if [ "$((ip_int & mask))" -eq "$((sentinel_net & mask))" ]; then
+            die "refusing --allow-ip '$cidr': overlaps cgroup egress-firewall sentinel 127.255.255.254/32"
         fi
     elif [[ "$cidr" == *:* ]]; then
         local prefix="128"
@@ -428,11 +439,11 @@ read_secret_file() {
     printf '%s' "$val"
 }
 
-# Decode a GitHub JIT config payload, verify its gitHubUrl matches the expected
-# registration target, and return the validated canonical workspace path
-# (matching actions/runner HostContext.cs: Path.Combine(Root, workFolder)).
+# Decode a GitHub JIT config payload, verify its GitHub endpoint / optional
+# gitHubUrl and runner group metadata, and return the validated canonical
+# workspace path (matching actions/runner HostContext.cs: Path.Combine(Root, workFolder)).
 resolve_jit_work_dir() {
-    local jit_b64="$1" expected_url="$2" outer runner_b64 runner_json gh_url wf
+    local jit_b64="$1" expected_url="$2" outer runner_b64 runner_json gh_url srv_url srv_url_v2 pool_name wf
     command -v jq >/dev/null 2>&1 || die "jq is required to validate --jitconfig-file"
     command -v base64 >/dev/null 2>&1 || die "base64 is required to validate --jitconfig-file"
     outer="$(printf '%s' "$jit_b64" | base64 -d 2>/dev/null)" \
@@ -442,26 +453,47 @@ resolve_jit_work_dir() {
     [ -n "$runner_b64" ] || die "--jitconfig-file .runner entry is empty"
     runner_json="$(printf '%s' "$runner_b64" | base64 -d 2>/dev/null | sed '1s/^\xef\xbb\xbf//')" \
         || die "invalid base64 in --jitconfig-file .runner entry"
-    gh_url="$(printf '%s' "$runner_json" | jq -er '.gitHubUrl // empty' 2>/dev/null)" \
-        || die "--jitconfig-file .runner lacks gitHubUrl"
+    printf '%s' "$runner_json" | jq -e 'type == "object"' >/dev/null 2>&1 \
+        || die "--jitconfig-file .runner entry is not a JSON object"
     wf="$(printf '%s' "$runner_json" | jq -er '.workFolder // empty' 2>/dev/null)" \
         || die "--jitconfig-file .runner lacks workFolder"
 
-    local norm_got="${gh_url%/}" norm_want="${expected_url%/}"
-    if [ "${norm_got,,}" != "${norm_want,,}" ]; then
-        die "--jitconfig-file gitHubUrl '${gh_url}' does not match registration target '${expected_url}'"
+    # actions/runner supports JIT .runner payloads with gitHubUrl omitted/empty
+    # (inferring hosted GitHub from serverUrl / serverUrlV2; ConfigurationStore.cs).
+    gh_url="$(printf '%s' "$runner_json" | jq -r '.gitHubUrl // empty' 2>/dev/null || true)"
+    if [ -n "$gh_url" ]; then
+        local norm_got="${gh_url%/}" norm_want="${expected_url%/}"
+        if [ "${norm_got,,}" != "${norm_want,,}" ]; then
+            die "--jitconfig-file gitHubUrl '${gh_url}' does not match registration target '${expected_url}'"
+        fi
+    else
+        srv_url="$(printf '%s' "$runner_json" | jq -r '.serverUrl // empty' 2>/dev/null || true)"
+        srv_url_v2="$(printf '%s' "$runner_json" | jq -r '.serverUrlV2 // empty' 2>/dev/null || true)"
+        local endpoint="${srv_url_v2:-$srv_url}"
+        if ! [[ "${endpoint,,}" =~ ^https://([a-z0-9-]+\.)+(actions\.githubusercontent\.com|githubapp\.com|ghe\.com)(/|$) ]]; then
+            die "--jitconfig-file .runner omits gitHubUrl and lacks a valid hosted GitHub serverUrl/serverUrlV2"
+        fi
+    fi
+
+    # If a runner group is set, verify .runner poolName matches and is never Default.
+    if [ -n "$OPT_RUNNER_GROUP" ]; then
+        pool_name="$(printf '%s' "$runner_json" | jq -r '.poolName // empty' 2>/dev/null || true)"
+        if [ -z "$pool_name" ] || [ "${pool_name,,}" = "default" ] || [ "$pool_name" != "$OPT_RUNNER_GROUP" ]; then
+            die "--jitconfig-file .runner poolName '${pool_name:-<missing>}' does not match required runner group '${OPT_RUNNER_GROUP}'"
+        fi
     fi
 
     if [[ "$wf" == /* ]]; then
         check_abs_path "JIT workFolder" "$wf"
         wf="${wf%/}"
-        if [ "${wf#"$OPT_STATE_DIR"/}" = "$wf" ]; then
-            die "refusing JIT workFolder '$wf' outside managed state directory '$OPT_STATE_DIR'"
+        local work_root="${OPT_STATE_DIR}/work"
+        if [ "$wf" != "$work_root" ] && [ "${wf#"${work_root}"/}" = "$wf" ]; then
+            die "refusing JIT workFolder '$wf' outside dedicated workspace subtree '$work_root'"
         fi
         echo "$wf"
     else
         [[ "$wf" =~ ^[A-Za-z0-9._-]+$ ]] \
-            || die "refusing unsafe relative JIT workFolder '$wf' (expected a single directory name like _work or a path under $OPT_STATE_DIR)"
+            || die "refusing unsafe relative JIT workFolder '$wf' (expected a single directory name like _work or a path under ${OPT_STATE_DIR}/work)"
         case "$wf" in
             . | .. | .* | bin | externals | _diag | run.sh | config.sh | env.sh)
                 die "refusing reserved JIT workFolder '$wf'"
@@ -508,12 +540,14 @@ OPT_ALLOW_WORKFLOWS=()
 OPT_ALLOW_ACTORS=()
 OPT_ALLOW_IPS=()
 
-# Track whether paths/identities were explicitly set on the CLI (for uninstall verification).
+# Track whether paths/identities/policies were explicitly set on the CLI (for update/uninstall verification).
 SET_USER=0
 SET_SERVICE=0
 SET_INSTALL_DIR=0
 SET_STATE_DIR=0
 SET_HOOK_DIR=0
+SET_EPHEMERAL=0
+SET_ALLOW_AUTO_UPDATE=0
 
 TARGET_URL=""
 ALLOWED_REPO_SLUG=""
@@ -539,7 +573,7 @@ parse_common_opts() {
             --hook-dir) [ $# -ge 2 ] || die "--hook-dir needs a value"; check_abs_path --hook-dir "$2"; OPT_HOOK_DIR="${2%/}"; SET_HOOK_DIR=1; shift 2 ;;
             --config-dir) [ $# -ge 2 ] || die "--config-dir needs a value"; check_abs_path --config-dir "$2"; OPT_CONFIG_DIR="${2%/}"; shift 2 ;;
             --token-file) [ $# -ge 2 ] || die "--token-file needs a value"; OPT_TOKEN_FILE="$2"; shift 2 ;;
-            --jitconfig-file) [ $# -ge 2 ] || die "--jitconfig-file needs a value"; OPT_JITCONFIG_FILE="$2"; OPT_EPHEMERAL=1; shift 2 ;;
+            --jitconfig-file) [ $# -ge 2 ] || die "--jitconfig-file needs a value"; OPT_JITCONFIG_FILE="$2"; OPT_EPHEMERAL=1; SET_EPHEMERAL=1; shift 2 ;;
             --runner-version | --version) [ $# -ge 2 ] || die "$1 needs a value"; check_version "$2"; OPT_RUNNER_VERSION="$2"; shift 2 ;;
             --runner-sha256 | --sha256) [ $# -ge 2 ] || die "$1 needs a value"; check_sha256 "$1" "$2"; OPT_RUNNER_SHA256="$2"; shift 2 ;;
             --allow-event) [ $# -ge 2 ] || die "--allow-event needs a value"; check_event "$2"; OPT_ALLOW_EVENTS+=("$2"); shift 2 ;;
@@ -553,8 +587,8 @@ parse_common_opts() {
             --out) [ $# -ge 2 ] || die "--out needs a value"; OPT_OUT="$2"; shift 2 ;;
             --dest) [ $# -ge 2 ] || die "--dest needs a value"; OPT_DEST="$2"; shift 2 ;;
             --url) [ $# -ge 2 ] || die "--url needs a value"; OPT_URL="$2"; shift 2 ;;
-            --allow-auto-update) OPT_ALLOW_AUTO_UPDATE=1; shift ;;
-            --ephemeral) OPT_EPHEMERAL=1; shift ;;
+            --allow-auto-update) OPT_ALLOW_AUTO_UPDATE=1; SET_ALLOW_AUTO_UPDATE=1; shift ;;
+            --ephemeral) OPT_EPHEMERAL=1; SET_EPHEMERAL=1; shift ;;
             --no-lan-deny) OPT_NO_LAN_DENY=1; shift ;;
             --skip-packages) OPT_SKIP_PACKAGES=1; shift ;;
             --no-start) OPT_NO_START=1; shift ;;
@@ -571,6 +605,9 @@ resolve_target_registration() {
         die "$subcmd: --repo and --org are mutually exclusive"
     fi
     if [ -n "$OPT_ORG" ]; then
+        if [ -n "$OPT_JITCONFIG_FILE" ]; then
+            die "$subcmd: --jitconfig-file is not supported with --org because a JIT config blob does not cryptographically bind the GitHub organization runner group; use a private --repo controller with --jitconfig-file, or use --org --runner-group with --token-file"
+        fi
         [ -n "$OPT_RUNNER_GROUP" ] || die "$subcmd: --org requires --runner-group GROUP (restricted by GitHub to the reviewed workflow and ref)"
         [ -n "$OPT_ALLOW_REPO" ] || die "$subcmd: --org requires --allow-repo OWNER/REPO for the job-admission hook policy"
         TARGET_URL="$OPT_ORG"
@@ -845,10 +882,14 @@ safe_subdir() {
 }
 
 safe_work_dir() {
-    local p="$1" rel
+    local p="$1" rel work_root
     safe_path_syntax "$p" || return 1
-    if safe_subdir "$p"; then
-        return 0
+    p="${p%/}"
+    if [ -n "$STATE_DIR" ] && safe_path_syntax "$STATE_DIR"; then
+        work_root="${STATE_DIR%/}/work"
+        if [ "$p" = "$work_root" ] || [ "${p#"${work_root}"/}" != "$p" ]; then
+            return 0
+        fi
     fi
     # Validated JIT workspaces (e.g. GitHub API default `_work`) live directly
     # under INSTALL_DIR as a single non-reserved component.
@@ -863,8 +904,19 @@ safe_work_dir() {
     return 1
 }
 
+paths_overlap() {
+    local a="${1%/}" b="${2%/}"
+    [ -n "$a" ] && [ -n "$b" ] || return 1
+    [ "$a" = "$b" ] || [ "${a#"$b"/}" != "$a" ] || [ "${b#"$a"/}" != "$b" ]
+}
+
 safe_work_dir "$WORK_DIR" || die "refusing unsafe WORK_DIR '$WORK_DIR'"
 safe_subdir "$IMAGES_DIR" || die "refusing unsafe IMAGES_DIR '$IMAGES_DIR'"
+for protected in "$IMAGES_DIR" "${STATE_DIR%/}/images" "${STATE_DIR%/}/image-cache" "${STATE_DIR%/}/.config" "${STATE_DIR%/}/.cache" "${STATE_DIR%/}/.local"; do
+    if paths_overlap "$WORK_DIR" "$protected"; then
+        die "refusing WORK_DIR '$WORK_DIR' overlapping protected state path '$protected'"
+    fi
+done
 [ "$LIBVIRT_CONNECT" = "qemu:///session" ] || die "refusing unexpected LIBVIRT_CONNECT '$LIBVIRT_CONNECT'"
 
 v() { timeout 30 virsh "--connect=$LIBVIRT_CONNECT" "$@"; }
@@ -970,34 +1022,44 @@ EOF
 
 write_egress_firewall_check() {
     local dest="$1"
+    local py_deny_lan="True"
+    [ "$OPT_NO_LAN_DENY" -eq 1 ] && py_deny_lan="False"
+    local py_allow_cidrs="" ip
+    for ip in "${OPT_ALLOW_IPS[@]}"; do
+        py_allow_cidrs="${py_allow_cidrs}${py_allow_cidrs:+, }\"${ip}\""
+    done
+
     cat >"$dest" <<'EOF'
 #!/usr/bin/env bash
-# Root-owned ExecStartPre gate: verifies that systemd's cgroup BPF
-# IPAddressDeny= firewall is actively enforced inside this unit's cgroup before
-# the runner listener starts. Exits 78 (EX_CONFIG, matched by
-# RestartPreventExitStatus=78) on hosts/containers where cgroup BPF filtering
-# is unsupported or silently skipped by systemd.
+# Root-owned egress firewall gate (invoked by run-runner.sh / run-jit.sh as
+# the main service process before exec'ing the runner listener): verifies that
+# THIS unit's systemd cgroup BPF IPAddressDeny= firewall is actively enforced.
+# Exits 78 (EX_CONFIG, matched by RestartPreventExitStatus=78) on hosts or
+# containers where cgroup BPF filtering is unsupported or silently skipped.
+#
+# Runs /usr/bin/python3 in isolated mode (-I -S) under a clean env -i so
+# runner-writable HOME / user-site / PYTHONPATH / PYTHONSTARTUP / PATH cannot
+# influence the check.
 set -euo pipefail
 export LC_ALL=C LANG=C
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "qeminga-egress-check: python3 is required to verify cgroup BPF egress filtering" >&2
+PY="/usr/bin/python3"
+if [ ! -x "$PY" ]; then
+    echo "qeminga-egress-check: /usr/bin/python3 is required to verify cgroup BPF egress filtering" >&2
     exit 78
 fi
 
-python3 - <<'PY'
+env -i PATH=/usr/bin:/bin HOME=/nonexistent "$PY" -I -S - <<'PY'
 import errno
+import ipaddress
 import socket
 import sys
 
-# Unconditional cloud IMDS endpoints denied by IPAddressDeny=link-local and
-# IPAddressDeny=fd00:ec2::254/128. With cgroup BPF active, sendto() is rejected
-# synchronously in ip_local_out()/ip6_local_out() with EPERM before any packet
-# leaves the host.
-PROBES = [
-    ("IPv4 IMDS", socket.AF_INET, ("169.254.169.254", 80)),
-    ("IPv6 IMDS", socket.AF_INET6, ("fd00:ec2::254", 80)),
-]
+EOF
+    printf 'DENY_LAN = %s\nALLOW_CIDRS = [%s]\n' "$py_deny_lan" "$py_allow_cidrs" >>"$dest"
+    cat >>"$dest" <<'EOF'
+ALLOW_NETS = [ipaddress.ip_network(c, strict=False) for c in ALLOW_CIDRS]
+
 UNROUTED = {
     errno.ENETUNREACH,
     errno.EHOSTUNREACH,
@@ -1005,13 +1067,18 @@ UNROUTED = {
     errno.EADDRNOTAVAIL,
 }
 
-proved_eperm = False
-for label, family, addr in PROBES:
+
+def is_allowed(ip_str):
+    ip_obj = ipaddress.ip_address(ip_str)
+    return any(ip_obj in net for net in ALLOW_NETS)
+
+
+def probe_must_deny(label, family, addr, allow_unrouted=True):
     try:
         sock = socket.socket(family, socket.SOCK_DGRAM)
     except OSError as exc:
-        if exc.errno in UNROUTED:
-            continue
+        if allow_unrouted and exc.errno in UNROUTED:
+            return False
         sys.stderr.write(
             f"qeminga-egress-check: unexpected socket error probing {label} ({addr[0]}): {exc}\n"
         )
@@ -1020,14 +1087,13 @@ for label, family, addr in PROBES:
         sock.sendto(b"x", addr)
     except OSError as exc:
         if exc.errno == errno.EPERM:
-            proved_eperm = True
-        elif exc.errno in UNROUTED:
-            continue
-        else:
-            sys.stderr.write(
-                f"qeminga-egress-check: {label} ({addr[0]}) returned unexpected errno {exc.errno} ({exc.strerror}); cgroup BPF IPAddressDeny= is not proven active\n"
-            )
-            sys.exit(78)
+            return True
+        if allow_unrouted and exc.errno in UNROUTED:
+            return False
+        sys.stderr.write(
+            f"qeminga-egress-check: {label} ({addr[0]}) returned unexpected errno {exc.errno} ({exc.strerror}); cgroup BPF IPAddressDeny= is not proven active\n"
+        )
+        sys.exit(78)
     else:
         sys.stderr.write(
             f"qeminga-egress-check: {label} ({addr[0]}) was NOT blocked by cgroup BPF IPAddressDeny= (sendto succeeded); refusing to start runner listener\n"
@@ -1036,14 +1102,82 @@ for label, family, addr in PROBES:
     finally:
         sock.close()
 
-if not proved_eperm:
+
+# 1. Sanity check: permitted loopback (127.0.0.1 in IPAddressAllow=127.0.0.0/9)
+#    must NOT be rejected with EPERM (guards against broken/deny-all filters).
+try:
+    lo_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+except OSError as exc:
+    sys.stderr.write(f"qeminga-egress-check: cannot open IPv4 loopback socket: {exc}\n")
+    sys.exit(78)
+try:
+    lo_sock.sendto(b"x", ("127.0.0.1", 9))
+except OSError as exc:
+    if exc.errno == errno.EPERM:
+        sys.stderr.write(
+            "qeminga-egress-check: permitted loopback 127.0.0.1 returned EPERM; refusing to start runner listener\n"
+        )
+        sys.exit(78)
+finally:
+    lo_sock.close()
+
+# 2. Controlled local unit-policy sentinel: 127.255.255.254/32 is always routed
+#    on loopback and never blocked by host-wide cloud IMDS rules, so EPERM here
+#    specifically proves THIS unit's cgroup BPF IPAddressDeny= is active.
+probe_must_deny(
+    "unit cgroup BPF loopback sentinel",
+    socket.AF_INET,
+    ("127.255.255.254", 9),
+    allow_unrouted=False,
+)
+
+# 3. Unconditional cloud IMDS endpoints (IPAddressDeny=link-local + fd00:ec2::254/128).
+IMDS_PROBES = [
+    ("IPv4 IMDS", socket.AF_INET, ("169.254.169.254", 80)),
+    ("IPv6 IMDS", socket.AF_INET6, ("fd00:ec2::254", 80)),
+]
+proved_imds = False
+for label, family, addr in IMDS_PROBES:
+    if probe_must_deny(label, family, addr, allow_unrouted=True):
+        proved_imds = True
+
+if not proved_imds:
     sys.stderr.write(
         "qeminga-egress-check: no IMDS probe returned EPERM (cgroup BPF IPAddressDeny= not proven active in this service cgroup); refusing to start runner listener\n"
     )
     sys.exit(78)
 
-print("qeminga-egress-check: PASS (cgroup BPF IPAddressDeny= actively blocks IMDS with EPERM)")
+# 4. Private LAN / CGNAT / ULA ranges (when default LAN deny is enabled).
+if DENY_LAN:
+    LAN_PROBES = [
+        ("RFC1918 10/8", socket.AF_INET, ("10.255.255.254", 9)),
+        ("RFC1918 172.16/12", socket.AF_INET, ("172.31.255.254", 9)),
+        ("RFC1918 192.168/16", socket.AF_INET, ("192.168.255.254", 9)),
+        ("CGNAT 100.64/10", socket.AF_INET, ("100.127.255.254", 9)),
+        ("IPv6 ULA fc00::/7", socket.AF_INET6, ("fdff::1", 9)),
+    ]
+    for label, family, addr in LAN_PROBES:
+        if is_allowed(addr[0]):
+            continue
+        probe_must_deny(label, family, addr, allow_unrouted=True)
+
+print("qeminga-egress-check: PASS (unit cgroup BPF IPAddressDeny= actively blocks sentinel, IMDS, and configured LAN ranges)")
 PY
+EOF
+    chmod 0755 "$dest"
+}
+
+write_runner_launcher() {
+    local dest="$1"
+    cat >"$dest" <<EOF
+#!/usr/bin/env bash
+# Root-owned main-process runner launcher: verifies this unit's cgroup BPF
+# egress firewall inside the main service process (so exit 78 triggers
+# RestartPreventExitStatus=78, which systemd excludes for ExecStartPre=)
+# before exec'ing upstream's bin/runsvc.sh.
+set -euo pipefail
+"${OPT_HOOK_DIR}/check-egress-firewall.sh" || exit 78
+exec "${OPT_INSTALL_DIR}/bin/runsvc.sh"
 EOF
     chmod 0755 "$dest"
 }
@@ -1052,11 +1186,14 @@ write_jit_launcher() {
     local dest="$1"
     cat >"$dest" <<EOF
 #!/usr/bin/env bash
-# Root-owned one-shot JIT runner launcher: reads the single-use JIT config
-# from systemd LoadCredential= into ACTIONS_RUNNER_INPUT_JITCONFIG and execs
+# Root-owned one-shot JIT runner launcher: verifies this unit's cgroup BPF
+# egress firewall inside the main service process (so exit 78 triggers
+# RestartPreventExitStatus=78), then reads the single-use JIT config from
+# systemd LoadCredential= into ACTIONS_RUNNER_INPUT_JITCONFIG and execs
 # Runner.Listener directly so no intermediate shell/Node wrapper retains the
 # secret in its environment and no run-helper.sh copy is written to the root.
 set -euo pipefail
+"${OPT_HOOK_DIR}/check-egress-firewall.sh" || exit 78
 cred="\${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/jitconfig"
 [ -r "\$cred" ] || { echo "missing jitconfig credential" >&2; exit 1; }
 ACTIONS_RUNNER_INPUT_JITCONFIG="\$(tr -d '\r\n' <"\$cred")"
@@ -1082,7 +1219,13 @@ cmd_render_hooks() {
     write_job_started_hook "$OPT_OUT/hook-job-started.sh"
     write_job_completed_hook "$OPT_OUT/hook-job-completed.sh"
     write_egress_firewall_check "$OPT_OUT/check-egress-firewall.sh"
-    echo "wrote $OPT_OUT/policy.env, $OPT_OUT/hook-job-started.sh, $OPT_OUT/hook-job-completed.sh, $OPT_OUT/check-egress-firewall.sh"
+    if [ -n "$OPT_JITCONFIG_FILE" ]; then
+        write_jit_launcher "$OPT_OUT/run-jit.sh"
+        echo "wrote $OPT_OUT/policy.env, $OPT_OUT/hook-job-started.sh, $OPT_OUT/hook-job-completed.sh, $OPT_OUT/check-egress-firewall.sh, $OPT_OUT/run-jit.sh"
+    else
+        write_runner_launcher "$OPT_OUT/run-runner.sh"
+        echo "wrote $OPT_OUT/policy.env, $OPT_OUT/hook-job-started.sh, $OPT_OUT/hook-job-completed.sh, $OPT_OUT/check-egress-firewall.sh, $OPT_OUT/run-runner.sh"
+    fi
 }
 
 # ---- render-unit ----------------------------------------------------------
@@ -1092,10 +1235,11 @@ render_unit_text() {
     local restart_policy="on-failure"
     [ "$OPT_EPHEMERAL" -eq 1 ] && restart_policy="no"
 
-    # Use upstream's service launcher (bin/runsvc.sh -> RunnerService.js ->
-    # Runner.Listener) rather than interactive run.sh, which tries to copy
-    # run-helper.sh.template into the read-only runner root on every launch.
-    local exec_start="${OPT_INSTALL_DIR}/bin/runsvc.sh"
+    # Run a root-owned main-process launcher wrapper so the egress-firewall check
+    # runs inside the main service process (where exit 78 matches
+    # RestartPreventExitStatus=78; systemd excludes ExecStartPre= from it) before
+    # exec'ing upstream bin/runsvc.sh (or bin/Runner.Listener in JIT mode).
+    local exec_start="${OPT_HOOK_DIR}/run-runner.sh"
     local kill_signal="SIGTERM"
     local cred_line=""
     local stop_post_line=""
@@ -1137,14 +1281,19 @@ ReadWritePaths=${OPT_INSTALL_DIR}/_diag"
     local cpu_line=""
     [ -n "$OPT_CPU_QUOTA" ] && cpu_line="CPUQuota=${OPT_CPU_QUOTA}"
 
-    local ip_allow_lines="IPAddressAllow=localhost"
+    # Permit lower-half loopback (127.0.0.1, 127.0.0.53 systemd-resolved, etc.)
+    # and ::1 while keeping 127.255.255.254/32 outside IPAddressAllow= so it
+    # serves as a controlled unit-specific cgroup BPF sentinel.
+    local ip_allow_lines="IPAddressAllow=127.0.0.0/9
+IPAddressAllow=::1/128"
     local ip
     for ip in "${OPT_ALLOW_IPS[@]}"; do
         ip_allow_lines="${ip_allow_lines}
 IPAddressAllow=${ip}"
     done
 
-    local ip_deny_lines="IPAddressDeny=link-local
+    local ip_deny_lines="IPAddressDeny=127.255.255.254/32
+IPAddressDeny=link-local
 IPAddressDeny=multicast
 IPAddressDeny=fe80::/10
 IPAddressDeny=fd00:ec2::254/128"
@@ -1167,8 +1316,11 @@ IPAddressDeny=fc00::/7"
 #   - Unprivileged qemu:///session libvirt inside this unit's cgroup, so every
 #     disposable KVM guest inherits DevicePolicy=closed (/dev/kvm only),
 #     ProtectSystem=strict, MemoryMax, TasksMax, and cgroup IPAddressDeny.
-#   - ExecStartPre verifies that cgroup BPF IPAddressDeny= actively rejects IMDS
-#     with EPERM in this unit's cgroup before starting the runner listener.
+#   - Root-owned ExecStart wrapper verifies (via isolated /usr/bin/python3 -I -S
+#     under env -i) that THIS unit's cgroup BPF IPAddressDeny= actively rejects
+#     the unit loopback sentinel (127.255.255.254), IMDS, and configured private
+#     LANs with EPERM before exec'ing the runner listener (exiting 78 to stop
+#     restarts via RestartPreventExitStatus=78).
 #   - MemoryDenyWriteExecute is intentionally omitted because .NET (actions/runner),
 #     Node.js (JS actions), and QEMU require executable JIT mappings.
 [Unit]
@@ -1183,7 +1335,6 @@ User=${OPT_USER}
 Group=${OPT_USER}
 SupplementaryGroups=kvm
 WorkingDirectory=${OPT_INSTALL_DIR}
-ExecStartPre=${OPT_HOOK_DIR}/check-egress-firewall.sh
 ExecStart=${exec_start}
 ${cred_line}
 ${stop_post_line}
@@ -1250,8 +1401,9 @@ MemoryMax=${OPT_MEMORY_MAX}
 TasksMax=${OPT_TASKS_MAX}
 ${cpu_line}
 
-# Cgroup BPF egress firewall: unconditionally block cloud IMDS (169.254.0.0/16,
-# fe80::/10, fd00:ec2::254/128) and multicast; block private LANs by default.
+# Cgroup BPF egress firewall: unconditionally block the unit loopback sentinel
+# (127.255.255.254/32), cloud IMDS (169.254.0.0/16, fe80::/10, fd00:ec2::254/128),
+# and multicast; block private LANs by default.
 ${ip_allow_lines}
 ${ip_deny_lines}
 
@@ -1313,7 +1465,7 @@ cmd_preflight() {
     fi
 
     # systemd IPAddressDeny= requires cgroup v2 unified hierarchy for BPF attachment;
-    # the service unit also runs ExecStartPre check-egress-firewall.sh inside the cgroup.
+    # the main-process launcher wrapper also runs check-egress-firewall.sh inside the cgroup.
     local cg_ctrls="${QEMINGA_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}"
     if [ -r "$cg_ctrls" ]; then
         echo "  ok: cgroup v2 unified hierarchy present ($cg_ctrls)"
@@ -1445,7 +1597,9 @@ install_packages() {
 # ---- installation record & dedicated directory guards ---------------------
 
 HAS_INSTALL_RECORD=0
+HAS_USER_RECORD=0
 REC_SCHEMA=""
+REC_STATE=""
 REC_SERVICE=""
 REC_USER=""
 REC_USER_UID=""
@@ -1476,25 +1630,44 @@ is_reserved_system_dir() {
     esac
 }
 
+# Walk EVERY ancestor component from / down to dirname "$target" and refuse any
+# symlink (including dangling symlinks), non-directory, non-root owner, or
+# group-/world-writable mode. Prevents a root-owned immediate parent under an
+# untrusted or symlinked ancestor from redirecting later privileged operations.
 check_trusted_parent_dir() {
-    local target="$1" cur
-    cur="$(dirname "$target")"
-    while [ ! -e "$cur" ] && [ "$cur" != "/" ]; do
-        [ ! -L "$cur" ] || die "refusing symlinked parent directory '$cur' for '$target'"
+    local target="$1" parent
+    check_abs_path "target path" "$target"
+    parent="$(dirname "$target")"
+
+    local parts=() cur="$parent"
+    while [ "$cur" != "/" ]; do
+        parts=("$cur" "${parts[@]}")
         cur="$(dirname "$cur")"
     done
-    [ ! -L "$cur" ] || die "refusing symlinked parent directory '$cur' for '$target'"
-    [ -d "$cur" ] || die "parent '$cur' of '$target' is not a directory"
-    local info owner mode
-    info="$(stat -c '%u:%a' "$cur")" || die "cannot stat parent directory '$cur'"
-    owner="${info%%:*}"
-    mode="${info#*:}"
-    [ "$owner" -eq 0 ] || die "parent directory '$cur' of '$target' is owned by uid $owner (must be root)"
-    if [ "$((8#$mode & 022))" -ne 0 ]; then
-        die "parent directory '$cur' of '$target' has mode $mode (must not be group- or world-writable)"
-    fi
+    parts=("/" "${parts[@]}")
+
+    local anc info owner mode
+    for anc in "${parts[@]}"; do
+        [ ! -L "$anc" ] || die "refusing symlinked ancestor directory '$anc' for '$target'"
+        if [ ! -e "$anc" ]; then
+            continue
+        fi
+        [ -d "$anc" ] || die "ancestor '$anc' of '$target' is not a directory"
+        info="$(stat -c '%u:%a' "$anc")" || die "cannot stat ancestor directory '$anc'"
+        owner="${info%%:*}"
+        mode="${info#*:}"
+        [ "$owner" -eq 0 ] || die "ancestor directory '$anc' of '$target' is owned by uid $owner (must be root)"
+        if [ "$((8#$mode & 022))" -ne 0 ]; then
+            die "ancestor directory '$anc' of '$target' has mode $mode (must not be group- or world-writable)"
+        fi
+    done
 }
 
+# allow_existing:
+#   0 = fresh install (none of the four managed dirs may exist)
+#   1 = active/interrupted install record (all four managed dirs may exist)
+#   2 = user-only record retained after uninstall (only CONFIG_DIR may exist,
+#       and it may contain only install.env)
 check_dedicated_managed_dirs() {
     local allow_existing="$1"
     local dirs=("$OPT_INSTALL_DIR" "$OPT_STATE_DIR" "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR")
@@ -1510,10 +1683,20 @@ check_dedicated_managed_dirs() {
         if [ "$allow_existing" -eq 0 ] && [ -e "$a" ]; then
             die "refusing to adopt existing unmanaged path '$a' (no installation record at $OPT_CONFIG_DIR/install.env); choose a dedicated path or remove it first"
         fi
+        if [ "$allow_existing" -eq 2 ] && [ "$i" -ne 3 ] && [ -e "$a" ]; then
+            die "refusing to adopt existing unmanaged path '$a' while $OPT_CONFIG_DIR/install.env records only a surviving service user; choose a dedicated path or remove it first"
+        fi
         if [ -e "$a" ] && [ ! -d "$a" ]; then
             die "managed path '$a' exists and is not a directory"
         fi
     done
+    if [ "$allow_existing" -eq 2 ] && [ -d "$OPT_CONFIG_DIR" ]; then
+        local extra
+        extra="$(find "$OPT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name 'install.env' -print -quit 2>/dev/null || true)"
+        if [ -n "$extra" ]; then
+            die "refusing unexpected entry '$extra' in '$OPT_CONFIG_DIR' alongside user-only install.env"
+        fi
+    fi
     for i in 0 1 2 3; do
         for j in 0 1 2 3; do
             [ "$i" -lt "$j" ] || continue
@@ -1526,15 +1709,54 @@ check_dedicated_managed_dirs() {
     done
 }
 
+# Refuse to stop or overwrite an existing systemd service (including vendor
+# units under /usr/lib/systemd/system or /lib/systemd/system, drop-ins, or
+# systemd-known loaded/masked/static units) when no matching installation
+# record exists.
+check_unit_not_occupied() {
+    local unit="${OPT_SERVICE}.service"
+    local primary_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    primary_dir="${primary_dir%/}"
+    local unit_dirs="${QEMINGA_SYSTEMD_UNIT_DIRS:-/etc/systemd/system:/run/systemd/system:/usr/local/lib/systemd/system:/usr/lib/systemd/system:/lib/systemd/system}"
+    local dirs=() d
+    IFS=':' read -r -a dirs <<<"${primary_dir}:${unit_dirs}"
+    for d in "${dirs[@]}"; do
+        [ -n "$d" ] || continue
+        d="${d%/}"
+        if [ -e "${d}/${unit}" ] || [ -L "${d}/${unit}" ] || [ -e "${d}/${unit}.d" ]; then
+            die "systemd unit '${unit}' already exists at '${d}/${unit}' without a matching installation record at $OPT_CONFIG_DIR/install.env; refusing to overwrite an unmanaged service (pass --service <new-name>)"
+        fi
+    done
+
+    if command -v systemctl >/dev/null 2>&1; then
+        local load_state
+        load_state="$(systemctl show -p LoadState --value "$unit" 2>/dev/null || true)"
+        if [ -n "$load_state" ] && [ "$load_state" != "not-found" ]; then
+            die "systemd already knows unit '${unit}' (LoadState=${load_state}) without a matching installation record at $OPT_CONFIG_DIR/install.env; refusing to replace an unmanaged service (pass --service <new-name>)"
+        fi
+        local listed
+        listed="$(systemctl list-unit-files --no-legend --no-pager "$unit" 2>/dev/null | awk 'NF { print $1 }' || true)"
+        if [ -n "$listed" ]; then
+            die "systemd unit '${unit}' is already registered (${listed}) without a matching installation record at $OPT_CONFIG_DIR/install.env; refusing to replace an unmanaged service (pass --service <new-name>)"
+        fi
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            die "systemd unit '${unit}' is currently active without a matching installation record at $OPT_CONFIG_DIR/install.env; refusing to stop or replace an unmanaged service (pass --service <new-name>)"
+        fi
+    fi
+}
+
 read_install_record() {
     local rec="$1"
+    check_trusted_parent_dir "$rec"
     [ ! -L "$rec" ] || die "refusing symlinked installation record '$rec'"
     [ -f "$rec" ] || die "missing installation record '$rec'"
     local owner
     owner="$(stat -c '%u' "$rec")" || die "cannot stat installation record '$rec'"
     [ "$owner" -eq 0 ] || die "refusing installation record '$rec' owned by uid $owner (must be root)"
 
-    REC_SCHEMA="" REC_SERVICE="" REC_USER="" REC_USER_UID="" REC_USER_GID=""
+    HAS_INSTALL_RECORD=0
+    HAS_USER_RECORD=0
+    REC_SCHEMA="" REC_STATE="" REC_SERVICE="" REC_USER="" REC_USER_UID="" REC_USER_GID=""
     REC_USER_CREATED="" REC_INSTALL_DIR="" REC_STATE_DIR="" REC_HOOK_DIR=""
     REC_CONFIG_DIR="" REC_TARGET_URL="" REC_RUNNER_GROUP="" REC_RUNNER_NAME=""
     REC_LABELS="" REC_EPHEMERAL="" REC_ALLOW_AUTO_UPDATE="" REC_WORK_DIR=""
@@ -1544,6 +1766,7 @@ read_install_record() {
         case "$key" in
             '' | '#'*) continue ;;
             RECORD_SCHEMA) REC_SCHEMA="$val" ;;
+            RECORD_STATE) REC_STATE="$val" ;;
             SERVICE) REC_SERVICE="$val" ;;
             USER) REC_USER="$val" ;;
             USER_UID) REC_USER_UID="$val" ;;
@@ -1565,16 +1788,31 @@ read_install_record() {
     done <"$rec"
 
     [ "$REC_SCHEMA" = "1" ] || die "unsupported installation record schema '${REC_SCHEMA:-<empty>}' in '$rec'"
-    [ -n "$REC_SERVICE" ] && [ -n "$REC_USER" ] && [ -n "$REC_INSTALL_DIR" ] \
-        && [ -n "$REC_STATE_DIR" ] && [ -n "$REC_HOOK_DIR" ] && [ -n "$REC_CONFIG_DIR" ] \
+    REC_STATE="${REC_STATE:-installed}"
+    case "$REC_STATE" in
+        installed | installing | user-only) ;;
+        *) die "unsupported installation record state '$REC_STATE' in '$rec'" ;;
+    esac
+    [ -n "$REC_USER" ] && [ -n "$REC_CONFIG_DIR" ] \
         || die "incomplete installation record '$rec'"
     [[ "$REC_USER_UID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_UID '$REC_USER_UID' in '$rec'"
     [[ "$REC_USER_GID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_GID '$REC_USER_GID' in '$rec'"
-    HAS_INSTALL_RECORD=1
+
+    if [ "$REC_STATE" = "user-only" ]; then
+        HAS_USER_RECORD=1
+        HAS_INSTALL_RECORD=0
+    else
+        [ -n "$REC_SERVICE" ] && [ -n "$REC_INSTALL_DIR" ] \
+            && [ -n "$REC_STATE_DIR" ] && [ -n "$REC_HOOK_DIR" ] \
+            || die "incomplete installation record '$rec'"
+        HAS_INSTALL_RECORD=1
+        HAS_USER_RECORD=1
+    fi
 }
 
 write_install_record() {
-    local dest="$1" runner_name="$2"
+    local dest="$1" runner_name="$2" state="${3:-installed}"
+    check_trusted_parent_dir "$dest"
     [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
     local tmp
     tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
@@ -1582,6 +1820,7 @@ write_install_record() {
 # Managed by scripts/setup-kvm-runner.sh — root-owned installation record.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
 RECORD_SCHEMA=1
+RECORD_STATE=${state}
 SERVICE=${OPT_SERVICE}
 USER=${OPT_USER}
 USER_UID=${MANAGED_USER_UID}
@@ -1604,12 +1843,100 @@ EOF
     mv -f "$tmp" "$dest"
 }
 
+write_user_only_record() {
+    local dest="$1" user="$2" uid="$3" gid="$4" created="$5" cfg_dir="$6"
+    check_trusted_parent_dir "$dest"
+    [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
+    local tmp
+    tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
+    cat >"$tmp" <<EOF
+# Managed by scripts/setup-kvm-runner.sh — retained minimal UID/GID ownership
+# record for a managed service user that survived uninstall without --purge-user.
+# Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
+RECORD_SCHEMA=1
+RECORD_STATE=user-only
+USER=${user}
+USER_UID=${uid}
+USER_GID=${gid}
+USER_CREATED=${created}
+CONFIG_DIR=${cfg_dir}
+EOF
+    chown -h root:root "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$dest"
+}
+
+# Shared fail-closed installation record verification for both `update` and
+# `uninstall`. Refuses to proceed without a valid root-owned record and rejects
+# any explicit CLI option that disagrees with the recorded identity or paths.
+load_and_verify_install_record() {
+    local mode="$1"
+    local rec_path="$OPT_CONFIG_DIR/install.env"
+    read_install_record "$rec_path"
+
+    if [ "$SET_USER" -eq 1 ] && [ "$OPT_USER" != "$REC_USER" ]; then
+        die "${mode}: --user '$OPT_USER' does not match installation record '$REC_USER'"
+    fi
+    [ "$OPT_CONFIG_DIR" = "$REC_CONFIG_DIR" ] \
+        || die "${mode}: --config-dir '$OPT_CONFIG_DIR' does not match installation record '$REC_CONFIG_DIR'"
+
+    if [ "$REC_STATE" = "user-only" ]; then
+        if [ "$mode" = "update" ]; then
+            die "update: $rec_path records only a surviving service user '$REC_USER' (no active runner installation)"
+        fi
+        OPT_USER="$REC_USER"
+        OPT_CONFIG_DIR="$REC_CONFIG_DIR"
+        check_abs_path "config directory" "$OPT_CONFIG_DIR"
+        if is_reserved_system_dir "$OPT_CONFIG_DIR"; then
+            die "refusing shared system directory '$OPT_CONFIG_DIR' as a managed runner directory"
+        fi
+        [ ! -L "$OPT_CONFIG_DIR" ] || die "refusing symlinked managed directory '$OPT_CONFIG_DIR'"
+        check_trusted_parent_dir "$OPT_CONFIG_DIR"
+        return 0
+    fi
+
+    if [ "$mode" = "update" ] && [ "$REC_STATE" != "installed" ]; then
+        die "update: $rec_path has state '$REC_STATE' (finish 'install' or run 'uninstall' first)"
+    fi
+
+    if [ "$SET_SERVICE" -eq 1 ] && [ "$OPT_SERVICE" != "$REC_SERVICE" ]; then
+        die "${mode}: --service '$OPT_SERVICE' does not match installation record '$REC_SERVICE'"
+    fi
+    if [ "$SET_INSTALL_DIR" -eq 1 ] && [ "$OPT_INSTALL_DIR" != "$REC_INSTALL_DIR" ]; then
+        die "${mode}: --install-dir '$OPT_INSTALL_DIR' does not match installation record '$REC_INSTALL_DIR'"
+    fi
+    if [ "$SET_STATE_DIR" -eq 1 ] && [ "$OPT_STATE_DIR" != "$REC_STATE_DIR" ]; then
+        die "${mode}: --state-dir '$OPT_STATE_DIR' does not match installation record '$REC_STATE_DIR'"
+    fi
+    if [ "$SET_HOOK_DIR" -eq 1 ] && [ "$OPT_HOOK_DIR" != "$REC_HOOK_DIR" ]; then
+        die "${mode}: --hook-dir '$OPT_HOOK_DIR' does not match installation record '$REC_HOOK_DIR'"
+    fi
+    if [ "$mode" = "update" ]; then
+        if [ "$SET_EPHEMERAL" -eq 1 ] && [ "$OPT_EPHEMERAL" != "${REC_EPHEMERAL:-0}" ]; then
+            die "update: --ephemeral setting disagrees with installation record (EPHEMERAL=${REC_EPHEMERAL:-0})"
+        fi
+        if [ "$SET_ALLOW_AUTO_UPDATE" -eq 1 ] && [ "$OPT_ALLOW_AUTO_UPDATE" != "${REC_ALLOW_AUTO_UPDATE:-0}" ]; then
+            die "update: --allow-auto-update setting disagrees with installation record (ALLOW_AUTO_UPDATE=${REC_ALLOW_AUTO_UPDATE:-0})"
+        fi
+        OPT_EPHEMERAL="${REC_EPHEMERAL:-0}"
+        OPT_ALLOW_AUTO_UPDATE="${REC_ALLOW_AUTO_UPDATE:-0}"
+    fi
+
+    OPT_SERVICE="$REC_SERVICE"
+    OPT_USER="$REC_USER"
+    OPT_INSTALL_DIR="$REC_INSTALL_DIR"
+    OPT_STATE_DIR="$REC_STATE_DIR"
+    OPT_HOOK_DIR="$REC_HOOK_DIR"
+    OPT_CONFIG_DIR="$REC_CONFIG_DIR"
+    check_dedicated_managed_dirs 1
+}
+
 ensure_service_user() {
     say "configuring dedicated locked service user ${OPT_USER}"
     getent group kvm >/dev/null 2>&1 || die "group 'kvm' does not exist (is KVM enabled on this host?)"
 
     if id "$OPT_USER" >/dev/null 2>&1; then
-        if [ "$HAS_INSTALL_RECORD" -ne 1 ]; then
+        if [ "$HAS_INSTALL_RECORD" -ne 1 ] && [ "$HAS_USER_RECORD" -ne 1 ]; then
             die "account '$OPT_USER' already exists with no installation record at $OPT_CONFIG_DIR/install.env; refusing to adopt or modify a pre-existing account (pass --user <new-name>)"
         fi
         local uid gid pgroup groups g
@@ -1842,20 +2169,27 @@ cmd_install() {
     local cg_ctrls="${QEMINGA_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}"
     [ -r "$cg_ctrls" ] || die "cgroup v2 unified hierarchy missing ($cg_ctrls); required for systemd IPAddressDeny= BPF firewall"
 
-    # Load and validate existing installation record (if reinstalling) BEFORE
-    # mutating any live state, directories, or service status.
+    # Load and validate existing installation record (if reinstalling, recovering
+    # from an interrupted install, or reusing a managed user retained after
+    # uninstall) BEFORE mutating any live state, directories, or service status.
     local rec_path="$OPT_CONFIG_DIR/install.env"
     if [ -e "$rec_path" ] || [ -L "$rec_path" ]; then
         read_install_record "$rec_path"
-        [ "$REC_SERVICE" = "$OPT_SERVICE" ] || die "existing record at $rec_path is for service '$REC_SERVICE', not '$OPT_SERVICE'"
         [ "$REC_USER" = "$OPT_USER" ] || die "existing record at $rec_path is for user '$REC_USER', not '$OPT_USER'"
-        [ "$REC_INSTALL_DIR" = "$OPT_INSTALL_DIR" ] || die "existing record at $rec_path manages install dir '$REC_INSTALL_DIR', not '$OPT_INSTALL_DIR'"
-        [ "$REC_STATE_DIR" = "$OPT_STATE_DIR" ] || die "existing record at $rec_path manages state dir '$REC_STATE_DIR', not '$OPT_STATE_DIR'"
-        [ "$REC_HOOK_DIR" = "$OPT_HOOK_DIR" ] || die "existing record at $rec_path manages hook dir '$REC_HOOK_DIR', not '$OPT_HOOK_DIR'"
         [ "$REC_CONFIG_DIR" = "$OPT_CONFIG_DIR" ] || die "existing record at $rec_path manages config dir '$REC_CONFIG_DIR', not '$OPT_CONFIG_DIR'"
-        check_dedicated_managed_dirs 1
+        if [ "$REC_STATE" = "user-only" ]; then
+            check_dedicated_managed_dirs 2
+            check_unit_not_occupied
+        else
+            [ "$REC_SERVICE" = "$OPT_SERVICE" ] || die "existing record at $rec_path is for service '$REC_SERVICE', not '$OPT_SERVICE'"
+            [ "$REC_INSTALL_DIR" = "$OPT_INSTALL_DIR" ] || die "existing record at $rec_path manages install dir '$REC_INSTALL_DIR', not '$OPT_INSTALL_DIR'"
+            [ "$REC_STATE_DIR" = "$OPT_STATE_DIR" ] || die "existing record at $rec_path manages state dir '$REC_STATE_DIR', not '$OPT_STATE_DIR'"
+            [ "$REC_HOOK_DIR" = "$OPT_HOOK_DIR" ] || die "existing record at $rec_path manages hook dir '$REC_HOOK_DIR', not '$OPT_HOOK_DIR'"
+            check_dedicated_managed_dirs 1
+        fi
     else
         check_dedicated_managed_dirs 0
+        check_unit_not_occupied
     fi
 
     local runner_name
@@ -1908,15 +2242,22 @@ cmd_install() {
         find_aavmf >/dev/null || die "missing AArch64 UEFI firmware (install qemu-efi-aarch64 or edk2-aarch64)"
     fi
 
-    # Stop existing service BEFORE mutating any directories, state, or files.
+    # Stop existing managed service BEFORE mutating any directories, state, or files.
     local was_active=0
-    if systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
+    if [ "$HAS_INSTALL_RECORD" -eq 1 ] && systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
         was_active=1
         say "stopping existing ${OPT_SERVICE}.service"
         systemctl stop "${OPT_SERVICE}.service"
     fi
 
     ensure_service_user
+
+    # Persist ownership metadata immediately once the managed service user is
+    # acquired, BEFORE creating state directories or downloading the runner, so
+    # an interrupted first install stays recoverable via retry or uninstall.
+    install -d -m 0750 -o root -g "$OPT_USER" "$OPT_CONFIG_DIR"
+    write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
+
     provision_state_dirs
 
     # Download, SHA-256 verify, and extract actions/runner.
@@ -1940,8 +2281,8 @@ cmd_install() {
         "$OPT_INSTALL_DIR/bin/installdependencies.sh" >/dev/null
     fi
 
-    # Install root-owned hooks, egress firewall gate, policy, and installation record.
-    say "installing root-owned job guard, egress check, and cleanup hooks"
+    # Install root-owned hooks, egress firewall gate, main-process launcher, and policy.
+    say "installing root-owned job guard, egress check, launcher, and cleanup hooks"
     install -d -m 0755 -o root -g root "$OPT_HOOK_DIR"
     install -d -m 0750 -o root -g "$OPT_USER" "$OPT_CONFIG_DIR"
     write_policy_file "$OPT_CONFIG_DIR/policy.env" "$ALLOWED_REPO_SLUG"
@@ -1954,10 +2295,12 @@ cmd_install() {
         "$OPT_HOOK_DIR/hook-job-started.sh" \
         "$OPT_HOOK_DIR/hook-job-completed.sh" \
         "$OPT_HOOK_DIR/check-egress-firewall.sh"
-    write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name"
 
+    local launcher_name="run-runner.sh"
     if [ -n "$jit_config" ]; then
+        launcher_name="run-jit.sh"
         say "installing one-shot JIT config credential (workspace: ${RESOLVED_WORK_DIR})"
+        rm -f "$OPT_HOOK_DIR/run-runner.sh"
         write_jit_launcher "$OPT_HOOK_DIR/run-jit.sh"
         chown -h root:root "$OPT_HOOK_DIR/run-jit.sh"
         umask 0177
@@ -1966,32 +2309,42 @@ cmd_install() {
         chown -h root:root "$OPT_CONFIG_DIR/jitconfig"
         chmod 0600 "$OPT_CONFIG_DIR/jitconfig"
         unset jit_config
-    elif [ "$reg_mode" = "configure" ]; then
-        command -v runuser >/dev/null 2>&1 || die "runuser (util-linux) is required to register the runner as $OPT_USER"
-        say "registering runner '${runner_name}' (${arch}, labels=${OPT_LABELS}) against ${TARGET_URL}"
-        local cfg_args=(
-            --unattended
-            --replace
-            --url "$TARGET_URL"
-            --name "$runner_name"
-            --labels "$OPT_LABELS"
-            --work "$RESOLVED_WORK_DIR"
-        )
-        [ -n "$OPT_RUNNER_GROUP" ] && cfg_args+=(--runnergroup "$OPT_RUNNER_GROUP")
-        [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && cfg_args+=(--disableupdate)
-        [ "$OPT_EPHEMERAL" -eq 1 ] && cfg_args+=(--ephemeral)
+    else
+        rm -f "$OPT_HOOK_DIR/run-jit.sh"
+        write_runner_launcher "$OPT_HOOK_DIR/run-runner.sh"
+        chown -h root:root "$OPT_HOOK_DIR/run-runner.sh"
+        if [ "$reg_mode" = "configure" ]; then
+            command -v runuser >/dev/null 2>&1 || die "runuser (util-linux) is required to register the runner as $OPT_USER"
+            say "registering runner '${runner_name}' (${arch}, labels=${OPT_LABELS}) against ${TARGET_URL}"
+            local cfg_args=(
+                --unattended
+                --replace
+                --url "$TARGET_URL"
+                --name "$runner_name"
+                --labels "$OPT_LABELS"
+                --work "$RESOLVED_WORK_DIR"
+            )
+            [ -n "$OPT_RUNNER_GROUP" ] && cfg_args+=(--runnergroup "$OPT_RUNNER_GROUP")
+            [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && cfg_args+=(--disableupdate)
+            [ "$OPT_EPHEMERAL" -eq 1 ] && cfg_args+=(--ephemeral)
 
-        if ! register_runner_with_rollback "$was_active" "$reg_token" "${cfg_args[@]}"; then
+            if ! register_runner_with_rollback "$was_active" "$reg_token" "${cfg_args[@]}"; then
+                unset reg_token
+                die "runner registration failed"
+            fi
             unset reg_token
-            die "runner registration failed"
         fi
-        unset reg_token
     fi
 
     lock_runner_permissions
 
     # Install and verify the hardened systemd unit.
-    local unit_path="/etc/systemd/system/${OPT_SERVICE}.service"
+    local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    unit_dir="${unit_dir%/}"
+    check_abs_path "systemd unit dir" "$unit_dir"
+    local unit_path="${unit_dir}/${OPT_SERVICE}.service"
+    check_trusted_parent_dir "$unit_path"
+    [ ! -L "$unit_path" ] || die "refusing symlinked systemd unit path: $unit_path"
     say "installing hardened systemd unit ${unit_path}"
     render_unit_text "$arch" | awk 'NF || prev_nf { print } { prev_nf = NF }' >"$unit_path"
     chmod 0644 "$unit_path"
@@ -2014,6 +2367,9 @@ cmd_install() {
         say "--no-start set; inspect ${unit_path}, then run: sudo systemctl enable --now ${OPT_SERVICE}.service"
     fi
 
+    # Finalize installation record state only after unit verification & startup succeed.
+    write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installed"
+
     echo
     echo "qeminga KVM runner installed:"
     echo "  service:     ${OPT_SERVICE}.service"
@@ -2024,7 +2380,7 @@ cmd_install() {
     echo "  workspace:   ${RESOLVED_WORK_DIR}"
     echo "  policy:      ${OPT_CONFIG_DIR}/policy.env"
     echo "  record:      ${OPT_CONFIG_DIR}/install.env"
-    echo "  hooks:       ${OPT_HOOK_DIR}/{hook-job-started,hook-job-completed,check-egress-firewall}.sh"
+    echo "  hooks:       ${OPT_HOOK_DIR}/{hook-job-started,hook-job-completed,check-egress-firewall,${launcher_name%.sh}}.sh"
     if [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ]; then
         echo "  updates:     manual (--disableupdate, read-only binaries); GitHub requires runner updates"
         echo "               within 30 days of a new release — run: sudo $0 update"
@@ -2048,7 +2404,8 @@ cmd_status() {
         echo "-- policy (${OPT_CONFIG_DIR}/policy.env):"
         cat "${OPT_CONFIG_DIR}/policy.env"
     fi
-    if command -v systemd-analyze >/dev/null 2>&1 && [ -f "/etc/systemd/system/${OPT_SERVICE}.service" ]; then
+    local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    if command -v systemd-analyze >/dev/null 2>&1 && [ -f "${unit_dir%/}/${OPT_SERVICE}.service" ]; then
         echo "-- systemd security exposure:"
         systemd-analyze security --no-pager "${OPT_SERVICE}.service" | tail -n 5 || true
     fi
@@ -2059,14 +2416,18 @@ cmd_status() {
 cmd_update() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "update must run as root"
-    if [ -e "$OPT_CONFIG_DIR/install.env" ] || [ -L "$OPT_CONFIG_DIR/install.env" ]; then
-        read_install_record "$OPT_CONFIG_DIR/install.env"
-        [ "$SET_INSTALL_DIR" -eq 0 ] && OPT_INSTALL_DIR="$REC_INSTALL_DIR"
-        [ "$SET_SERVICE" -eq 0 ] && OPT_SERVICE="$REC_SERVICE"
-        [ "$SET_USER" -eq 0 ] && OPT_USER="$REC_USER"
-        [ "$OPT_EPHEMERAL" -eq 0 ] && [ "$REC_EPHEMERAL" = "1" ] && OPT_EPHEMERAL=1
-        [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && [ "$REC_ALLOW_AUTO_UPDATE" = "1" ] && OPT_ALLOW_AUTO_UPDATE=1
-    fi
+
+    # Refuse to modify any service or directory without a valid root-owned
+    # installation record matching any explicitly supplied CLI options.
+    load_and_verify_install_record update
+
+    id "$OPT_USER" >/dev/null 2>&1 || die "recorded service user '$OPT_USER' does not exist"
+    local cur_uid cur_gid
+    cur_uid="$(id -u "$OPT_USER")"
+    cur_gid="$(id -g "$OPT_USER")"
+    [ "$cur_uid" -ne 0 ] && [ "$cur_uid" = "$REC_USER_UID" ] && [ "$cur_gid" = "$REC_USER_GID" ] \
+        || die "service user '$OPT_USER' uid:gid (${cur_uid}:${cur_gid}) does not match recorded ${REC_USER_UID}:${REC_USER_GID}; refusing to update"
+
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR does not exist"
     local arch
@@ -2170,36 +2531,38 @@ cmd_uninstall() {
     [ "$(id -u)" -eq 0 ] || die "uninstall must run as root"
 
     # Refuse to delete anything without a valid root-owned installation record.
-    local rec_path="$OPT_CONFIG_DIR/install.env"
-    read_install_record "$rec_path"
+    load_and_verify_install_record uninstall
 
-    # Verify any explicitly passed CLI options match the recorded installation.
-    if [ "$SET_SERVICE" -eq 1 ] && [ "$OPT_SERVICE" != "$REC_SERVICE" ]; then
-        die "--service '$OPT_SERVICE' does not match installation record '$REC_SERVICE'"
+    # Handle a retained user-only record from a prior uninstall without --purge-user.
+    if [ "$REC_STATE" = "user-only" ]; then
+        if [ "$OPT_PURGE_USER" -eq 1 ]; then
+            if [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then
+                local cur_uid
+                cur_uid="$(id -u "$OPT_USER")"
+                if [ "$cur_uid" = "$REC_USER_UID" ] && [ "$cur_uid" -ne 0 ]; then
+                    userdel "$OPT_USER" || die "could not delete user $OPT_USER; preserving ownership record at $OPT_CONFIG_DIR/install.env"
+                    if getent group "$OPT_USER" >/dev/null 2>&1; then
+                        groupdel "$OPT_USER" || true
+                    fi
+                else
+                    die "refusing --purge-user: current uid '$cur_uid' does not match recorded uid '$REC_USER_UID'"
+                fi
+            fi
+            rm -rf --one-file-system -- "$OPT_CONFIG_DIR"
+            echo "purged user ${OPT_USER} and removed ${OPT_CONFIG_DIR}"
+        elif ! id "$OPT_USER" >/dev/null 2>&1; then
+            rm -rf --one-file-system -- "$OPT_CONFIG_DIR"
+            echo "removed stale user-only record in ${OPT_CONFIG_DIR}"
+        else
+            echo "no runner installation remains in ${OPT_CONFIG_DIR}; managed user '${OPT_USER}' (uid=${REC_USER_UID}) is preserved (pass --purge-user to remove it)"
+        fi
+        return 0
     fi
-    if [ "$SET_USER" -eq 1 ] && [ "$OPT_USER" != "$REC_USER" ]; then
-        die "--user '$OPT_USER' does not match installation record '$REC_USER'"
-    fi
-    if [ "$SET_INSTALL_DIR" -eq 1 ] && [ "$OPT_INSTALL_DIR" != "$REC_INSTALL_DIR" ]; then
-        die "--install-dir '$OPT_INSTALL_DIR' does not match installation record '$REC_INSTALL_DIR'"
-    fi
-    if [ "$SET_STATE_DIR" -eq 1 ] && [ "$OPT_STATE_DIR" != "$REC_STATE_DIR" ]; then
-        die "--state-dir '$OPT_STATE_DIR' does not match installation record '$REC_STATE_DIR'"
-    fi
-    if [ "$SET_HOOK_DIR" -eq 1 ] && [ "$OPT_HOOK_DIR" != "$REC_HOOK_DIR" ]; then
-        die "--hook-dir '$OPT_HOOK_DIR' does not match installation record '$REC_HOOK_DIR'"
-    fi
-    [ "$OPT_CONFIG_DIR" = "$REC_CONFIG_DIR" ] || die "--config-dir '$OPT_CONFIG_DIR' does not match installation record '$REC_CONFIG_DIR'"
 
-    OPT_SERVICE="$REC_SERVICE"
-    OPT_USER="$REC_USER"
-    OPT_INSTALL_DIR="$REC_INSTALL_DIR"
-    OPT_STATE_DIR="$REC_STATE_DIR"
-    OPT_HOOK_DIR="$REC_HOOK_DIR"
-    OPT_CONFIG_DIR="$REC_CONFIG_DIR"
-    check_dedicated_managed_dirs 1
-
-    local unit_path="/etc/systemd/system/${OPT_SERVICE}.service"
+    local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    unit_dir="${unit_dir%/}"
+    check_abs_path "systemd unit dir" "$unit_dir"
+    local unit_path="${unit_dir}/${OPT_SERVICE}.service"
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl stop "${OPT_SERVICE}.service" 2>/dev/null || true
@@ -2275,24 +2638,45 @@ cmd_uninstall() {
         unset rm_token
     fi
 
-    rm -f "$unit_path"
+    if [ ! -L "$unit_path" ]; then
+        rm -f "$unit_path"
+    fi
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
     fi
 
     if [ "$cleanup_rc" -eq 0 ]; then
-        rm -rf --one-file-system -- "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR" "$OPT_INSTALL_DIR" "$OPT_STATE_DIR"
+        rm -rf --one-file-system -- "$OPT_HOOK_DIR" "$OPT_INSTALL_DIR" "$OPT_STATE_DIR"
+        local user_purged=0
         if [ "$OPT_PURGE_USER" -eq 1 ] && [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then
             local cur_uid
             cur_uid="$(id -u "$OPT_USER")"
             if [ "$cur_uid" = "$REC_USER_UID" ] && [ "$cur_uid" -ne 0 ]; then
-                userdel "$OPT_USER" || warn "could not delete user $OPT_USER"
-                if getent group "$OPT_USER" >/dev/null 2>&1; then
-                    groupdel "$OPT_USER" || true
+                if userdel "$OPT_USER"; then
+                    user_purged=1
+                    if getent group "$OPT_USER" >/dev/null 2>&1; then
+                        groupdel "$OPT_USER" || true
+                    fi
+                else
+                    warn "could not delete user $OPT_USER"
                 fi
             else
                 warn "refusing --purge-user: current uid '$cur_uid' does not match recorded uid '$REC_USER_UID'"
             fi
+        fi
+
+        if [ "$user_purged" -eq 1 ] || [ "$REC_USER_CREATED" != "1" ] || ! id "$OPT_USER" >/dev/null 2>&1; then
+            rm -rf --one-file-system -- "$OPT_CONFIG_DIR"
+        else
+            # Retain a minimal UID/GID ownership record while the managed
+            # account survives uninstall so a subsequent default install or a
+            # later `uninstall --purge-user` can verify and manage it safely.
+            find "$OPT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name 'install.env' \
+                -exec rm -rf --one-file-system -- {} +
+            write_user_only_record "$OPT_CONFIG_DIR/install.env" \
+                "$OPT_USER" "$REC_USER_UID" "$REC_USER_GID" "$REC_USER_CREATED" "$OPT_CONFIG_DIR"
+            chown -h root:root "$OPT_CONFIG_DIR"
+            chmod 0700 "$OPT_CONFIG_DIR"
         fi
         echo "uninstalled ${OPT_SERVICE}"
     else

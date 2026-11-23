@@ -123,15 +123,15 @@ hosted TCG lane:
 - **Trust boundary:** `libvirt-kvm.yml` is triggered **only** via
   `workflow_dispatch` (never `pull_request`, `pull_request_target`, or
   comments), with `permissions: contents: read` and zero secrets passed to
-  the self-hosted runner. A hosted `resolve` job pins one vetted 40-hex
-  `vicaya/qeminga` commit (`$GITHUB_SHA` when dispatched in
-  `vicaya/qeminga`, or `qeminga-target.rev` / `vicaya/qeminga`
-  `refs/heads/main` when dispatched from a private controller repository)
-  and passes it to both `x86_64` and `aarch64` lanes so the hosted
-  `candidate` checkout, the self-hosted `kvm` checkout, and the release
-  candidate manifest all verify the exact same `vicaya/qeminga` commit.
-  The `candidate` job builds `cargo build --release --locked --features seccomp`
-  on GitHub-hosted `ubuntu-24.04` / `ubuntu-24.04-arm`, and the `kvm` job
+  the self-hosted runner. Inside the reusable `libvirt-kvm-lane.yml` itself,
+  every job requires `workflow_dispatch`, `refs/heads/main`, and caller
+  `.github/workflows/libvirt-kvm.yml`; a fixed GitHub-hosted `verify` job
+  (`ubuntu-24.04`) proves `target_rev` is a 40-hex commit reachable from
+  `vicaya/qeminga` `refs/heads/main` before either `candidate` or `kvm`
+  schedules, and `candidate` derives its hosted runner label
+  (`ubuntu-24.04` / `ubuntu-24.04-arm`) from a fixed architecture mapping
+  (never a caller input). The `candidate` job builds
+  `cargo build --release --locked --features seccomp`, and the `kvm` job
   verifies the binary against
   `--expect-sha256 "${{ needs.candidate.outputs.sha256 }}"` with no Rust
   toolchain, no `apt-get`, and no `sudo` on the self-hosted runner.
@@ -198,25 +198,34 @@ scripts/setup-kvm-runner.sh status
 journalctl -u qeminga-kvm-runner.service -f
 ```
 
-For one-shot ephemeral runs, pass `--ephemeral` or
-`--jitconfig-file /path/to/jitconfig` (mode `0600`; the single-use
-credential is validated for its target URL and resolved workspace path,
-delivered via systemd `LoadCredential=`, and removed automatically on
-service stop). You can inspect the generated unit and hooks before touching
-the host with `render-unit` and `render-hooks`.
+For one-shot ephemeral runs, pass `--ephemeral` or (with a private `--repo`
+controller) `--jitconfig-file /path/to/jitconfig` (mode `0600`; organization
+JIT provisioning is refused because JIT blobs do not cryptographically bind
+the GitHub runner group; the single-use credential is validated for its
+GitHub endpoint / optional `gitHubUrl` and disjoint workspace path under
+`$INSTALL_DIR/<name>` or `$STATE_DIR/work`, delivered via systemd
+`LoadCredential=`, and removed automatically on service stop). You can
+inspect the generated unit and hooks before touching the host with
+`render-unit` and `render-hooks`.
 
 ### Security-by-default controls on donated runners
 
 1. **Dedicated locked account (`qeminga-runner`) and scoped ownership:**
    system user with `/usr/sbin/nologin`, no `sudo`, no `libvirt`, `docker`,
    or `adm` group; only supplementary group `kvm` (to open `/dev/kvm`).
-   `install` records the provisioned UID/GID and dedicated, non-overlapping
-   paths in root-owned `/etc/qeminga-runner/install.env` (`0600`), refuses
-   to adopt unrelated pre-existing accounts (or accounts in any group beyond
-   `{qeminga-runner, kvm}`) or unmanaged pre-existing directories, stops any
-   existing runner service before mutating state, and creates runtime state
-   subdirectories (`work/`, `images/`, `image-cache/`, etc.) as the
-   unprivileged runner user rather than root.
+   `install` validates every ancestor component from `/` down to each
+   managed directory (refusing symlinks, non-root owners, and group- or
+   world-writable modes), refuses to adopt unrelated pre-existing accounts
+   (or accounts in any group beyond `{qeminga-runner, kvm}`), unmanaged
+   pre-existing directories, or existing systemd units (including vendor
+   units) without a matching installation record. It records the
+   provisioned UID/GID and dedicated, non-overlapping paths in root-owned
+   `/etc/qeminga-runner/install.env` (`0600`) immediately after creating
+   the service user (`RECORD_STATE=installing`, finalized to `installed`)
+   so an interrupted first install remains recoverable via retry or
+   uninstall, stops any existing managed runner service before mutating
+   state, and creates runtime state subdirectories (`work/`, `images/`,
+   `image-cache/`, etc.) as the unprivileged runner user rather than root.
 2. **Unprivileged `qemu:///session` isolation:** installs only minimal
    session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
    `libvirt-clients`, `qemu-system-x86` or `qemu-system-arm` +
@@ -234,20 +243,28 @@ the host with `render-unit` and `render-hooks`.
    and host-protecting bounds (`MemoryMax=80%`, `TasksMax=512`, optional
    `--cpu-quota`). (`MemoryDenyWriteExecute` is omitted because `.NET`,
    Node.js, and QEMU need JIT mappings.)
-4. **Verified cgroup BPF egress firewall:** denies cloud instance metadata
+4. **Verified cgroup BPF egress firewall:** denies a unit-specific loopback
+   sentinel (`127.255.255.254/32`), cloud instance metadata
    (`169.254.0.0/16`, `fe80::/10`, and AWS IPv6 IMDS `fd00:ec2::254/128`
    unconditionally, even with `--no-lan-deny`), multicast, and private LANs
    (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`,
-   `fc00::/7`) by default while allowing `localhost`
-   (`systemd-resolved` at `127.0.0.53`). Because systemd silently skips
-   `IPAddressDeny=` on hosts or containers without cgroup BPF firewalling,
-   `ExecStartPre=/usr/local/libexec/qeminga-runner/check-egress-firewall.sh`
-   verifies inside the runner's own cgroup that outbound IMDS datagrams
-   return `EPERM` before `Runner.Listener` starts (failing closed with exit
-   `78` and `RestartPreventExitStatus=78` if filtering is inactive). Because
-   QEMU runs in the same cgroup, disposable guest VMs inherit the same
-   block. Hosts with a private DNS resolver can pass `--allow-ip <ip>/32`
-   (IMDS ranges and default routes are always refused).
+   `fc00::/7`) by default while allowing `127.0.0.0/9` (`127.0.0.1`,
+   `systemd-resolved` at `127.0.0.53`) and `::1/128`. Because systemd
+   silently skips `IPAddressDeny=` on hosts or containers without cgroup
+   BPF firewalling (and excludes `ExecStartPre=` from
+   `RestartPreventExitStatus=`), the root-owned main-process launcher
+   (`run-runner.sh` or `run-jit.sh`) invokes `check-egress-firewall.sh`
+   before `exec`'ing the runner listener. That script runs `/usr/bin/python3`
+   in isolated mode (`-I -S`) under `env -i` so runner-writable `HOME` /
+   user-site configuration cannot influence the verdict, proves this unit's
+   cgroup BPF policy rejects the loopback sentinel (`127.255.255.254`),
+   IMDS, and configured private LANs with `EPERM` (distinguishing unit
+   policy from host-wide IMDS blocks), and exits `78` directly in the main
+   process so `RestartPreventExitStatus=78` stops restarts on unsupported
+   hosts. Because QEMU runs in the same cgroup, disposable guest VMs
+   inherit the same block. Hosts with a private DNS resolver can pass
+   `--allow-ip <ip>/32` (IMDS ranges, the loopback sentinel, and default
+   routes are always refused).
 5. **Host-enforced pre- and post-job hooks (defense-in-depth):** root-owned
    `/usr/local/libexec/qeminga-runner/hook-job-{started,completed}.sh`
    wired via systemd `Environment=` and configured by root-owned
@@ -261,10 +278,10 @@ the host with `render-unit` and `render-hooks`.
    checks `/dev/kvm` and stale `qeminga-e2e-*` domains. After every job,
    `hook-job-completed.sh` destroys/undefines any stray `qeminga-e2e-*`
    session domains (leaving unrelated domains alone and keeping disks if
-   state is unknown) and scrubs the runner's actual validated work
-   directory (including `_work` for JIT runners) while keeping the
-   SHA-256-verified image cache.
-6. **Pinned, read-only runner binaries & safe reinstall/uninstall:**
+   state is unknown) and verifies `WORK_DIR` is disjoint from `IMAGES_DIR`,
+   `IMAGE_CACHE_DIR`, and libvirt state before scrubbing it (including
+   `_work` for JIT runners) while keeping the SHA-256-verified image cache.
+6. **Pinned, read-only runner binaries & safe update/reinstall/uninstall:**
    downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
    pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
    extraction. Registration tokens are refused on the command line
@@ -276,13 +293,18 @@ the host with `render-unit` and `render-hooks`.
    Auto-updates are disabled by default (`--disableupdate`) so runner
    binaries stay kernel-read-only; GitHub requires runner updates within
    30 days of a new release — update cleanly with
-   `sudo scripts/setup-kvm-runner.sh update` (or opt in to GitHub
-   self-updates with `--allow-auto-update`). Remove everything owned by the
-   recorded installation with
+   `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
+   root-owned `install.env` and refuses mismatched flags, matching
+   `uninstall`, or opt in to GitHub self-updates with
+   `--allow-auto-update`). Remove everything owned by the recorded
+   installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
-   (uninstall refuses to delete unrecorded paths and preserves
+   (uninstall refuses to delete unrecorded paths, preserves
    `$STATE_DIR/images` if session domain cleanup cannot confirm domains are
-   gone).
+   gone, and when run without `--purge-user` retains a minimal
+   `RECORD_STATE=user-only` UID/GID record in `/etc/qeminga-runner/install.env`
+   so a later default reinstall or `uninstall --purge-user` recognizes the
+   surviving managed account).
 
 ### Running the KVM smoke script locally (unprivileged)
 

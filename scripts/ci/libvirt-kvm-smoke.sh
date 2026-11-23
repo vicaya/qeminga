@@ -338,6 +338,233 @@ cmd_result() {
 
 mark() { mkdir -p "$OUT/tests"; echo "$2" >"$OUT/tests/$1"; echo "-- $1: $2"; }
 
+QEMU_USER="root"
+QEMU_UID=0
+QEMU_GID=0
+QEMU_GROUPS="0"
+
+# Resolve the user/group identity that system libvirt runs QEMU as (honoring
+# QEMINGA_E2E_QEMU_USER/GROUP overrides, active entries in qemu.conf, and
+# standard distro libvirt accounts).
+resolve_system_qemu_identity() {
+    local conf="${QEMINGA_LIBVIRT_QEMU_CONF:-/etc/libvirt/qemu.conf}"
+    local user="${QEMINGA_E2E_QEMU_USER:-}"
+    local group="${QEMINGA_E2E_QEMU_GROUP:-}"
+    if [ -z "$user" ] || [ -z "$group" ]; then
+        if [ -r "$conf" ]; then
+            local parsed conf_user conf_group
+            parsed="$(python3 -I - "$conf" <<'PY'
+import re, sys
+u = g = ""
+for raw in open(sys.argv[1], "r", encoding="utf-8", errors="replace"):
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    m = re.match(r'^(user|group)\s*=\s*(["\'])(.*?)\2\s*$', line)
+    if m:
+        if m.group(1) == "user":
+            u = m.group(3).strip()
+        else:
+            g = m.group(3).strip()
+print(f"{u}\t{g}")
+PY
+)"
+            conf_user="${parsed%%$'\t'*}"
+            conf_group="${parsed#*$'\t'}"
+            [ -z "$user" ] && user="$conf_user"
+            [ -z "$group" ] && group="$conf_group"
+        fi
+    fi
+    if [ -z "$user" ]; then
+        if id -u libvirt-qemu >/dev/null 2>&1; then
+            user="libvirt-qemu"
+        elif id -u qemu >/dev/null 2>&1; then
+            user="qemu"
+        else
+            user="root"
+        fi
+    fi
+
+    local uid="" gid="" groups="" resolved_name=""
+    if [[ "$user" =~ ^\+[0-9]+$ ]]; then
+        uid="${user#+}"
+        resolved_name="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 || true)"
+    else
+        uid="$(id -u "$user" 2>/dev/null)" || die "cannot resolve system libvirt QEMU user '$user'"
+        resolved_name="$user"
+    fi
+
+    if [ -n "$group" ]; then
+        if [[ "$group" =~ ^\+[0-9]+$ ]]; then
+            gid="${group#+}"
+        else
+            gid="$(getent group "$group" 2>/dev/null | cut -d: -f3 || true)"
+            [ -n "$gid" ] || die "cannot resolve system libvirt QEMU group '$group'"
+        fi
+    elif [ -n "$resolved_name" ]; then
+        gid="$(id -g "$resolved_name" 2>/dev/null)" || die "cannot resolve primary group for QEMU user '$resolved_name'"
+    else
+        gid="$uid"
+    fi
+
+    groups="$gid"
+    if [ -n "$resolved_name" ]; then
+        local sup
+        sup="$(id -G "$resolved_name" 2>/dev/null | tr ' ' ',' || true)"
+        if [ -n "$sup" ]; then
+            groups="${gid},${sup}"
+        fi
+    fi
+
+    QEMU_USER="$user"
+    QEMU_UID="$uid"
+    QEMU_GID="$gid"
+    QEMU_GROUPS="$groups"
+}
+
+# Verify that (QEMU_UID, QEMU_GROUPS) has effective search (+x) permission on
+# every existing directory component from `/` down to the deepest existing
+# prefix of `$1` (evaluating both standard POSIX modes and POSIX access ACLs).
+# Prints the first blocking directory path on failure and returns 1.
+check_qemu_traversal_chain() {
+    local target="$1"
+    python3 -I - "$target" "$QEMU_UID" "$QEMU_GROUPS" <<'PY'
+import os, stat, struct, sys
+
+target = os.path.normpath(sys.argv[1])
+uid = int(sys.argv[2])
+groups = {int(x) for x in sys.argv[3].split(",") if x}
+
+if uid == 0:
+    sys.exit(0)
+
+def can_traverse(path):
+    st = os.stat(path)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    try:
+        raw = os.getxattr(path, b"system.posix_acl_access")
+    except OSError:
+        raw = None
+    if raw and len(raw) >= 4:
+        (ver,) = struct.unpack_from("<I", raw, 0)
+        if ver == 2:
+            mask = 0o7
+            entries = []
+            for off in range(4, len(raw), 8):
+                if off + 8 <= len(raw):
+                    tag, perm, eid = struct.unpack_from("<HHI", raw, off)
+                    entries.append((tag, perm, eid))
+                    if tag == 0x10:
+                        mask = perm
+            if uid == st.st_uid:
+                for tag, perm, _ in entries:
+                    if tag == 0x01:
+                        return bool(perm & 1)
+            for tag, perm, eid in entries:
+                if tag == 0x02 and eid == uid:
+                    return bool((perm & mask) & 1)
+            matched_grp = False
+            for tag, perm, eid in entries:
+                if (tag == 0x04 and st.st_gid in groups) or (tag == 0x08 and eid in groups):
+                    matched_grp = True
+                    if (perm & mask) & 1:
+                        return True
+            if matched_grp:
+                return False
+            for tag, perm, _ in entries:
+                if tag == 0x20:
+                    return bool(perm & 1)
+            return False
+    if uid == st.st_uid:
+        return bool(st.st_mode & 0o100)
+    if st.st_gid in groups:
+        return bool(st.st_mode & 0o010)
+    return bool(st.st_mode & 0o001)
+
+parts = [p for p in target.split("/") if p]
+cur = "/"
+if not can_traverse(cur):
+    print(cur)
+    sys.exit(1)
+for part in parts:
+    nxt = os.path.join(cur, part)
+    if not os.path.exists(nxt):
+        break
+    if not can_traverse(nxt):
+        print(nxt)
+        sys.exit(1)
+    cur = nxt
+
+resolved = os.path.realpath(cur)
+if resolved != cur:
+    rcur = "/"
+    if not can_traverse(rcur):
+        print(rcur)
+        sys.exit(1)
+    for part in [p for p in resolved.split("/") if p]:
+        rnxt = os.path.join(rcur, part)
+        if not can_traverse(rnxt):
+            print(rnxt)
+            sys.exit(1)
+        rcur = rnxt
+PY
+}
+
+# Grant traversal (--x) on a newly created private directory to the configured
+# system-mode QEMU identity without opening directory listing or world access:
+# prefer a targeted POSIX ACL (`u:<uid>:x` on mode 0700), falling back to
+# `chgrp <gid> + chmod 0710` (or `0711` only when QEMU_GID == 0).
+grant_qemu_traversal() {
+    local target="$1"
+    [ "$QEMU_UID" -ne 0 ] || return 0
+    if command -v setfacl >/dev/null 2>&1; then
+        if setfacl -m "u:${QEMU_UID}:x" "$target" 2>/dev/null \
+            && check_qemu_traversal_chain "$target" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    if [ "$QEMU_GID" -ne 0 ]; then
+        chgrp "$QEMU_GID" "$target" \
+            || die "cannot set group ${QEMU_GID} on $target for QEMU traversal"
+        chmod 0710 "$target"
+    else
+        chmod 0711 "$target"
+    fi
+    local blocked=""
+    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
+        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) still cannot traverse ${blocked:-$target}"
+    fi
+}
+
+# Validate existing ancestors of `$1` without altering their permissions, then
+# create any missing directory components with traversal provisioned for the
+# system-mode QEMU identity even under a restrictive umask (for example 0077).
+prepare_system_images_root() {
+    local target="$1"
+    resolve_system_qemu_identity
+    local blocked=""
+    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
+        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) cannot traverse existing ancestor directory '${blocked}' of ${target}; adjust its permissions or ACLs or choose a traversable QEMINGA_E2E_IMAGES path"
+    fi
+    local cur="" part
+    local -a parts=()
+    IFS='/' read -r -a parts <<<"$target"
+    for part in "${parts[@]}"; do
+        [ -n "$part" ] || continue
+        cur="${cur}/${part}"
+        if [ -e "$cur" ]; then
+            [ -d "$cur" ] || die "image root component '$cur' is not a directory"
+            continue
+        fi
+        mkdir -m 0700 "$cur"
+        grant_qemu_traversal "$cur"
+    done
+    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
+        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) cannot traverse '${blocked}' under ${target}"
+    fi
+}
+
 preflight() {
     local arch="$1"
     say "preflight ($arch, KVM on $CONNECT_URI)"
@@ -355,6 +582,9 @@ preflight() {
     for tool in virsh qemu-img genisoimage jq curl sha256sum "qemu-system-$arch"; do
         command -v "$tool" >/dev/null || die "missing tool: $tool"
     done
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
     if [ "$arch" = aarch64 ]; then
         local fw fw_code fw_vars
         fw="$(resolve_aavmf)"
@@ -371,7 +601,11 @@ preflight() {
         fi
     fi
     cmd_stale_check
-    mkdir -p "$IMAGES"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        prepare_system_images_root "$IMAGES"
+    else
+        mkdir -p "$IMAGES"
+    fi
     local free_kib
     free_kib="$(df -Pk "$IMAGES" | awk 'NR == 2 { print $4 }')"
     [ "${free_kib:-0}" -ge $((10 * 1024 * 1024)) ] || die "less than 10 GiB free under $IMAGES"
@@ -469,16 +703,20 @@ cmd_run() {
 
     say "disposable KVM guest $name in $dir"
     [ ! -e "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
-    local dir_mode=0700
+    mkdir -m 0700 "$dir"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        # System libvirt runs QEMU under an unprivileged account (for example
-        # libvirt-qemu) that needs traversal permission on the run directory to
-        # open guest disks, serial logs, and NVRAM — matching libvirt-tcg-smoke.sh.
-        dir_mode=0755
+        grant_qemu_traversal "$dir"
     fi
-    mkdir -m "$dir_mode" "$dir"
-    fetch_image "$arch" "$dir/root.qcow2" "$cache"
+    (
+        umask 0077
+        fetch_image "$arch" "$dir/root.qcow2" "$cache"
+    )
+    chmod 0600 "$dir/root.qcow2"
     qemu-img resize -q "$dir/root.qcow2" 8G
+    chmod 0600 "$dir/root.qcow2"
+    if [ "$CONNECT_URI" = "qemu:///system" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
+        chown "${QEMU_UID}:${QEMU_GID}" "$dir/root.qcow2"
+    fi
 
     local seed="$dir/seed" payload="$dir/payload"
     mkdir -p "$seed" "$payload/packaging"
@@ -500,6 +738,10 @@ EOF
     install -m 0755 "$HERE/libvirt-tcg-guest.sh" "$payload/guest.sh"
     genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
     genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
+    chmod 0600 "$dir/seed.iso" "$dir/payload.iso"
+    if [ "$CONNECT_URI" = "qemu:///system" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
+        chown "${QEMU_UID}:${QEMU_GID}" "$dir/seed.iso" "$dir/payload.iso"
+    fi
 
     cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$(nproc)" >"$dir/domain.xml"
     v define "$dir/domain.xml"

@@ -421,6 +421,8 @@ fn kvm_run_directory_permissions_match_libvirt_connection_mode() {
     );
 
     let dir = tempfile::tempdir().unwrap();
+    // Ensure the outer tempdir root itself is traversable (0755) for simulated QEMU checks.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
 
@@ -450,7 +452,35 @@ fn kvm_run_directory_permissions_match_libvirt_connection_mode() {
     assert!(m.status.success(), "{}", text(&m));
     let digest = sha256_hex(&candidate.join("qeminga"));
 
-    // Fake preflight + curl (exits non-zero so `run` stops right after creating $dir).
+    // Resolve the pinned image SHA for this arch from the common helper so our
+    // mock curl / cache-hit fixtures exercise the real `fetch_image` path.
+    let img_key = lane(&["image-key", arch]);
+    assert!(img_key.status.success(), "{}", text(&img_key));
+    let pinned_image_sha = String::from_utf8(img_key.stdout)
+        .unwrap()
+        .trim()
+        .rsplit('-')
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(pinned_image_sha.len(), 64);
+
+    // Current primary group number so real `chgrp` succeeds unprivileged while
+    // `qemu_acct_num` is strictly distinct from the current caller account.
+    let caller_grp_num = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-g")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let qemu_acct_num = "64055";
+    let qemu_user_spec = format!("+{qemu_acct_num}");
+    let qemu_group_spec = format!("+{caller_grp_num}");
+
     write_exec(
         &bin.join("virsh"),
         r#"#!/bin/sh
@@ -460,37 +490,189 @@ case "$1" in
     domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
     net-info) echo "Active:         yes"; exit 0 ;;
     list) echo ""; exit 0 ;;
+    define) exit 0 ;;
+    start) exit 42 ;;
     *) exit 0 ;;
 esac
 "#,
     );
     write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("genisoimage"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("genisoimage"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -output) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0
+"#,
+    );
     write_exec(
         &bin.join(format!("qemu-system-{arch}")),
         "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
     );
-    write_exec(&bin.join("curl"), "#!/bin/sh\nexit 22\n");
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_CURL_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_CURL_LOG"; fi
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf 'fake qcow2 bytes\n' > "$out"
+if [ "${FAKE_CURL_OPEN_MODE:-0}" = "1" ]; then
+    chmod 0644 "$out"
+fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("sha256sum"),
+        r#"#!/bin/sh
+case "$1" in
+    *.qcow2.part | */img-cache/*) printf '%s  %s\n' "${FAKE_IMAGE_SHA:?}" "$1"; exit 0 ;;
+esac
+exec /usr/bin/sha256sum "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("chown"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_CHOWN_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_CHOWN_LOG"; fi
+exit 0
+"#,
+    );
     write_exec(
         &bin.join("df"),
         "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
     );
     write_exec(
         &bin.join("id"),
-        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo \"${FAKE_ID_U:?}\"; exit 0; fi\nexec /usr/bin/id \"$@\"\n",
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo "${FAKE_ID_U:?}"; exit 0; fi
+exec /usr/bin/id "$@"
+"#,
     );
     let aavmf_code = dir.path().join("AAVMF_CODE.fd");
     let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
     std::fs::write(&aavmf_code, b"code").unwrap();
     std::fs::write(&aavmf_vars, b"vars").unwrap();
 
-    for (connect_uri, fake_caller_num, run_id, expected_mode) in [
-        ("qemu:///session", "1000", "77", 0o700u32),
-        ("qemu:///system", "0", "78", 0o755u32),
-    ] {
-        let images = dir.path().join(format!("images-{run_id}"));
-        let out_dir = dir.path().join(format!("out-{run_id}"));
-        let run_out = lane_env(
+    // Helper: run `libvirt-kvm-smoke.sh` under an explicit umask (e.g., 0077 or 0022).
+    let run_with_umask = |mask: &str, args: &[&str], env: &[(&str, &str)]| -> Output {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", r#"umask "$1"; shift; exec bash "$@""#, "_"]);
+        cmd.arg(mask).arg(script()).args(args);
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    };
+
+    // Helper: evaluate effective Linux directory traversal (standard POSIX mode + POSIX ACL
+    // xattr `system.posix_acl_access`) for a given numeric account/group along every component
+    // from `stop_ancestor` down to `leaf_dir`.
+    let check_effective_traversal =
+        |stop_ancestor: &Path, leaf_dir: &Path, acct: &str, grp: &str| -> bool {
+            let out = Command::new("python3")
+                .args([
+                    "-I",
+                    "-c",
+                    r#"
+import errno, os, stat, struct, sys
+
+stop = os.path.normpath(sys.argv[1])
+leaf = os.path.normpath(sys.argv[2])
+target_u = int(sys.argv[3])
+target_g = int(sys.argv[4])
+
+def can_traverse(p):
+    st = os.stat(p)
+    if not stat.S_ISDIR(st.st_mode):
+        return False
+    if target_u == 0:
+        return True
+    try:
+        raw = os.getxattr(p, b"system.posix_acl_access")
+    except OSError:
+        raw = None
+    if raw and len(raw) >= 4:
+        ver, = struct.unpack_from("<I", raw, 0)
+        if ver == 2:
+            mask = 0o7
+            entries = []
+            for off in range(4, len(raw), 8):
+                if off + 8 <= len(raw):
+                    tag, perm, eid = struct.unpack_from("<HHI", raw, off)
+                    entries.append((tag, perm, eid))
+                    if tag == 0x10:
+                        mask = perm
+            if target_u == st.st_uid:
+                for tag, perm, _ in entries:
+                    if tag == 0x01:
+                        return bool(perm & 1)
+            for tag, perm, eid in entries:
+                if tag == 0x02 and eid == target_u:
+                    return bool((perm & mask) & 1)
+            matched_grp = False
+            for tag, perm, eid in entries:
+                if (tag == 0x04 and st.st_gid == target_g) or (tag == 0x08 and eid == target_g):
+                    matched_grp = True
+                    if (perm & mask) & 1:
+                        return True
+            if matched_grp:
+                return False
+            for tag, perm, _ in entries:
+                if tag == 0x20:
+                    return bool(perm & 1)
+            return False
+    if target_u == st.st_uid:
+        return bool(st.st_mode & 0o100)
+    if target_g == st.st_gid:
+        return bool(st.st_mode & 0o010)
+    return bool(st.st_mode & 0o001)
+
+cur = leaf
+chain = []
+while True:
+    chain.append(cur)
+    if cur == stop or cur == "/":
+        break
+    cur = os.path.dirname(cur)
+for p in reversed(chain):
+    if not can_traverse(p):
+        sys.stderr.write(f"blocked at {p} mode={oct(os.stat(p).st_mode & 0o777)}\n")
+        sys.exit(1)
+"#,
+                    stop_ancestor.to_str().unwrap(),
+                    leaf_dir.to_str().unwrap(),
+                    acct,
+                    grp,
+                ])
+                .output()
+                .unwrap();
+            out.status.success()
+        };
+
+    // 1. qemu:///session (under umask 0022): run dir stays 0700 and root.qcow2 is private 0600.
+    {
+        let images = dir.path().join("session-images");
+        let out_dir = dir.path().join("out-session");
+        let run_out = run_with_umask(
+            "0022",
             &[
                 "run",
                 "--arch",
@@ -500,7 +682,7 @@ esac
                 "--source-sha",
                 SHA,
                 "--run-id",
-                run_id,
+                "77",
                 "--run-attempt",
                 "1",
                 "--out",
@@ -509,30 +691,294 @@ esac
                 &digest,
             ],
             &[
-                ("QEMINGA_E2E_CONNECT", connect_uri),
+                ("QEMINGA_E2E_CONNECT", "qemu:///session"),
                 ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
                 ("QEMINGA_KVM_DEVICE", "/dev/null"),
                 ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
                 ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
-                ("FAKE_ID_U", fake_caller_num),
+                ("FAKE_ID_U", "1000"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CURL_OPEN_MODE", "1"),
             ],
-            Some(&bin),
         );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let run_dir = images.join(format!("qeminga-e2e-77-1-{arch}"));
+        let disk = run_dir.join("root.qcow2");
+        assert!(run_dir.is_dir() && disk.is_file(), "{}", text(&run_out));
+        assert_eq!(
+            std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "session mode run dir must remain 0700"
+        );
+        assert_eq!(
+            std::fs::metadata(&disk).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "session mode root.qcow2 must be private 0600"
+        );
+    }
+
+    // 2. qemu:///system download path under restrictive umask 0077 with a NEW nested
+    //    QEMINGA_E2E_IMAGES root:
+    //    - Both new image root components AND run dir must grant effective traversal to QEMU
+    //      without exposing world access (`mode & 0o007 == 0`).
+    //    - Even if curl produces a 0644 file, `root.qcow2` MUST be private 0600 and chowned
+    //      to the configured QEMU identity before boot.
+    {
+        let images = dir.path().join("sys-new-parent/nested-images");
+        let out_dir = dir.path().join("out-sys-dl");
+        let chown_log = dir.path().join("chown-dl.log");
+        let run_out = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "78",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CURL_OPEN_MODE", "1"),
+                ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ],
+        );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let run_dir = images.join(format!("qeminga-e2e-78-1-{arch}"));
+        let disk = run_dir.join("root.qcow2");
+        assert!(run_dir.is_dir() && disk.is_file(), "{}", text(&run_out));
+        assert!(
+            check_effective_traversal(dir.path(), &run_dir, qemu_acct_num, &caller_grp_num),
+            "QEMU identity must have effective traversal across newly created image root and run dir under umask 0077: {}",
+            text(&run_out)
+        );
+        let run_dir_mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            run_dir_mode & 0o007,
+            0,
+            "system mode run dir must not grant world access (got {run_dir_mode:#o})"
+        );
+        let disk_mode = std::fs::metadata(&disk).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            disk_mode, 0o600,
+            "system mode downloaded root.qcow2 must be private 0600, got {disk_mode:#o}"
+        );
+        let chowns = std::fs::read_to_string(&chown_log).unwrap_or_default();
+        assert!(
+            chowns.contains(&format!("{qemu_acct_num}:{caller_grp_num}"))
+                && chowns.contains(disk.to_str().unwrap()),
+            "system mode root.qcow2 must be chowned to configured QEMU identity before boot:\n{chowns}"
+        );
+    }
+
+    // 3. qemu:///system cache-hit path under umask 0022 with a world-readable `0644` cache file:
+    //    copied `root.qcow2` MUST STILL end up private `0600` owned by QEMU (never `0644`)!
+    {
+        let cache_dir = dir.path().join("img-cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cached = cache_dir.join(&pinned_image_sha);
+        std::fs::write(&cached, b"cached qcow2 image\n").unwrap();
+        std::fs::set_permissions(&cached, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let images = dir.path().join("sys-cache-images");
+        let out_dir = dir.path().join("out-sys-cache");
+        let chown_log = dir.path().join("chown-cache.log");
+        let run_out = run_with_umask(
+            "0022",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "79",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+                "--image-cache",
+                cache_dir.to_str().unwrap(),
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ],
+        );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let run_dir = images.join(format!("qeminga-e2e-79-1-{arch}"));
+        let disk = run_dir.join("root.qcow2");
+        assert!(run_dir.is_dir() && disk.is_file(), "{}", text(&run_out));
+        let disk_mode = std::fs::metadata(&disk).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            disk_mode, 0o600,
+            "system mode cache-hit root.qcow2 copied from 0644 cache must be private 0600, got {disk_mode:#o}"
+        );
+        let chowns = std::fs::read_to_string(&chown_log).unwrap_or_default();
+        assert!(
+            chowns.contains(&format!("{qemu_acct_num}:{caller_grp_num}"))
+                && chowns.contains(disk.to_str().unwrap()),
+            "system mode cache-hit root.qcow2 must be chowned to configured QEMU identity:\n{chowns}"
+        );
+    }
+
+    // 4. qemu:///system with an EXISTING untraversable ancestor (`0700`):
+    //    `preflight` MUST report the blocking ancestor path, fail BEFORE downloading the image,
+    //    and leave the ancestor's `0700` permissions untouched!
+    {
+        let blocked_ancestor = dir.path().join("blocked-0700-ancestor");
+        std::fs::create_dir(&blocked_ancestor).unwrap();
+        std::fs::set_permissions(&blocked_ancestor, std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let images = blocked_ancestor.join("images");
+        let out_dir = dir.path().join("out-sys-blocked");
+        let curl_log = dir.path().join("curl-blocked.log");
+        let run_out = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "80",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CURL_LOG", curl_log.to_str().unwrap()),
+            ],
+        );
+        let msg = text(&run_out);
         assert!(
             !run_out.status.success(),
-            "expected fake curl failure after run dir creation for {connect_uri}: {}",
-            text(&run_out)
+            "system mode run with untraversable ancestor must fail closed: {msg}"
         );
-        let run_dir = images.join(format!("qeminga-e2e-{run_id}-1-{arch}"));
         assert!(
-            run_dir.is_dir(),
-            "run dir should have been created before image fetch for {connect_uri}: {}",
-            text(&run_out)
+            msg.contains(blocked_ancestor.to_str().unwrap()),
+            "error must report the blocking ancestor path ({}):\n{msg}",
+            blocked_ancestor.display()
         );
-        let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        assert!(
+            !curl_log.exists() && !images.exists(),
+            "must fail in preflight before creating images dir or downloading image:\n{msg}"
+        );
         assert_eq!(
-            mode, expected_mode,
-            "run dir mode for {connect_uri} must be {expected_mode:#o}, got {mode:#o}"
+            std::fs::metadata(&blocked_ancestor)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "existing blocking ancestor permissions must remain untouched (0700)"
+        );
+    }
+
+    // 5. qemu:///system identity resolution from `/etc/libvirt/qemu.conf` (via
+    //    `QEMINGA_LIBVIRT_QEMU_CONF`, without `QEMINGA_E2E_QEMU_USER/GROUP` overrides):
+    //    must parse active `user = ...` / `group = ...` entries (ignoring comments) and
+    //    apply them to both traversal provisioning and private disk ownership.
+    {
+        let qemu_conf = dir.path().join("qemu.conf");
+        std::fs::write(
+            &qemu_conf,
+            format!(
+                "# user = \"nobody\"\nuser = \"{qemu_user_spec}\" # active user\ngroup = \"{qemu_group_spec}\"\n"
+            ),
+        )
+        .unwrap();
+        let images = dir.path().join("sys-conf-images");
+        let out_dir = dir.path().join("out-sys-conf");
+        let chown_log = dir.path().join("chown-conf.log");
+        let run_out = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "81",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_LIBVIRT_QEMU_CONF", qemu_conf.to_str().unwrap()),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ],
+        );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let run_dir = images.join(format!("qeminga-e2e-81-1-{arch}"));
+        let disk = run_dir.join("root.qcow2");
+        assert!(run_dir.is_dir() && disk.is_file(), "{}", text(&run_out));
+        assert!(
+            check_effective_traversal(dir.path(), &run_dir, qemu_acct_num, &caller_grp_num),
+            "qemu.conf identity must have effective traversal across image root and run dir"
+        );
+        let chowns = std::fs::read_to_string(&chown_log).unwrap_or_default();
+        assert!(
+            chowns.contains(&format!("{qemu_acct_num}:{caller_grp_num}"))
+                && chowns.contains(disk.to_str().unwrap()),
+            "qemu.conf identity must be applied to root.qcow2 ownership:\n{chowns}"
         );
     }
 }

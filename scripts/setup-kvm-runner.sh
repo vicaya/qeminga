@@ -4244,6 +4244,33 @@ def verify_dir_identity(
     return True
 
 
+def retire_verified_stage_dir(pfd, pst, p_sync, sfd_box, stage_base, stage_dir, stage_ident):
+    # Retire an emptied staging container in crash-safe order: remove
+    # `payload`, durably sync the emptied stage directory BEFORE unlinking
+    # `.qeminga-tx-id`, close the stage FD, re-verify the stage inode in its
+    # parent, remove the directory, and sync the parent.
+    sfd = sfd_box[0]
+    try:
+        os.rmdir("payload", dir_fd=sfd)
+        os.fsync(sfd)
+        try:
+            os.unlink(TX_MARKER_NAME, dir_fd=sfd)
+        except FileNotFoundError:
+            pass
+    finally:
+        os.close(sfd)
+        sfd_box[0] = None
+    lst = os.lstat(stage_base, dir_fd=pfd)
+    if lst.st_dev != pst.st_dev or lst.st_ino != stage_ident["t_ino"]:
+        raise OSError(
+            errno.EXDEV,
+            f"refusing to remove staging dir '{stage_dir}': inode changed before rmdir",
+        )
+    os.rmdir(stage_base, dir_fd=pfd)
+    if p_sync:
+        os.fsync(pfd)
+
+
 op = sys.argv[1]
 try:
     if op == "volume-id":
@@ -4466,6 +4493,7 @@ try:
                 sfd, sst, s_mnt = open_verified_private_sibling(
                     pfd, pst.st_dev, p_mnt, stage_dir, stage_base, "staging dir", must_be_empty=True
                 )
+                sfd_box = [sfd]
                 try:
                     verify_dir_identity(pfd, pst, p_mnt, parent, sfd, sst, s_mnt, stage_dir, stage_ident, entries, "staging dir")
                     p_sfd = extract_tarball_into_stage(tfd, sfd, sst, s_mnt, stage_dir, reserved_names)
@@ -4492,20 +4520,10 @@ try:
                             os.close(rfd_pub)
                     finally:
                         os.close(p_sfd)
-                    os.rmdir("payload", dir_fd=sfd)
-                    os.fsync(sfd)
-                    try:
-                        os.unlink(TX_MARKER_NAME, dir_fd=sfd)
-                    except FileNotFoundError:
-                        pass
+                    retire_verified_stage_dir(pfd, pst, p_sync, sfd_box, stage_base, stage_dir, stage_ident)
                 finally:
-                    os.close(sfd)
-                lst = os.lstat(stage_base, dir_fd=pfd)
-                if lst.st_dev != pst.st_dev or lst.st_ino != stage_ident["t_ino"]:
-                    raise OSError(errno.EXDEV, f"refusing to remove staging dir '{stage_dir}': inode changed before rmdir")
-                os.rmdir(stage_base, dir_fd=pfd)
-                if p_sync:
-                    os.fsync(pfd)
+                    if sfd_box[0] is not None:
+                        os.close(sfd_box[0])
             finally:
                 os.close(pfd)
         finally:
@@ -4670,6 +4688,7 @@ try:
                 sfd, sst, s_mnt = open_verified_private_sibling(
                     pfd, rst.st_dev, r_mnt, stage_dir, stage_base, "staging dir"
                 )
+                sfd_box = [sfd]
                 try:
                     verify_dir_identity(pfd, pst, p_mnt, parent, sfd, sst, s_mnt, stage_dir, stage_ident, entries, "staging dir")
                     if (set(os.listdir(sfd)) - {TX_MARKER_NAME}) != {"payload"}:
@@ -4698,20 +4717,10 @@ try:
                             )
                     finally:
                         os.close(p_sfd)
-                    os.rmdir("payload", dir_fd=sfd)
-                    os.fsync(sfd)
-                    try:
-                        os.unlink(TX_MARKER_NAME, dir_fd=sfd)
-                    except FileNotFoundError:
-                        pass
+                    retire_verified_stage_dir(pfd, pst, p_sync, sfd_box, stage_base, stage_dir, stage_ident)
                 finally:
-                    os.close(sfd)
-                lst = os.lstat(stage_base, dir_fd=pfd)
-                if lst.st_dev != pst.st_dev or lst.st_ino != stage_ident["t_ino"]:
-                    raise OSError(errno.EXDEV, f"refusing to remove staging dir '{stage_dir}': inode changed before rmdir")
-                os.rmdir(stage_base, dir_fd=pfd)
-                if p_sync:
-                    os.fsync(pfd)
+                    if sfd_box[0] is not None:
+                        os.close(sfd_box[0])
             finally:
                 os.close(rfd)
         finally:

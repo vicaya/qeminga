@@ -142,6 +142,17 @@ semantic versioning.
 
 ### Fixed
 
+- Virtio-serial startup and host-disconnect race under fast KVM guests
+  (`src/channel.rs`, design §5.7, §5.10): when Linux `virtio_console`
+  reports an open port whose host side is not yet connected or has
+  disconnected (`POLLIN | POLLHUP` without `POLLOUT`, `POLLERR`, `POLLNVAL`,
+  or `POLLRDHUP`), `qeminga` now keeps the channel descriptor open and polls
+  readiness with `ppoll(2)` under bounded backoff (`10 ms` doubling to
+  `500 ms`), discarding any partial frame before the next session, instead
+  of immediately closing the descriptor and triggering
+  `VSERPORT_CHANGE (open=false)` while `libvirtd` is still connecting.
+  Hot-unplugged ports (bare `POLLHUP`), closed PTY/socket peers, and other
+  I/O errors still close and reopen with the `1 s` to `30 s` reopen backoff.
 - The thaw of a freeze operation this process completed drains the
   descriptors the operation published (its frozen targets and the
   `EBUSY` ones it retained) and nothing else, reading no mount table: a

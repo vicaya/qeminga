@@ -15,17 +15,27 @@
 //! yet present) with a bounded exponential backoff: 1 s, 2 s, 4 s, ...
 //! capped at [`MAX_BACKOFF`], forever, until cancelled.
 //!
-//! The same backoff separates sessions: a virtio port whose host side is
-//! disconnected opens successfully and reports EOF at once, so reopening
-//! immediately would spin. After a session that received nothing the
-//! delay doubles up to [`MAX_BACKOFF`]; a session that carried data
+//! When a Linux `virtio_console` port is opened before the host connects
+//! (or after the host disconnects), the kernel reports `POLLIN | POLLHUP`
+//! without `POLLOUT`, `POLLERR`, or `POLLRDHUP`, and `read(2)` returns EOF
+//! immediately. Closing the descriptor would clear `guest_connected` and
+//! cause QEMU to emit `VSERPORT_CHANGE (open=false)`, racing libvirt's
+//! asynchronous host-side connection. [`serve`] therefore keeps such an
+//! open descriptor while polling readiness with bounded backoff
+//! ([`HOST_WAIT_INITIAL`] doubling to [`HOST_WAIT_MAX`]) and starts each
+//! new host session with a fresh [`FrameDecoder`].
+//!
+//! When the descriptor itself is closed, hot-unplugged, or errors (bare
+//! `POLLHUP`, a dead PTY/socket peer, or an I/O error), [`serve`] drops it
+//! and reopens with bounded backoff: after a session that received nothing
+//! the delay doubles up to [`MAX_BACKOFF`]; a session that carried data
 //! resets it to [`INITIAL_BACKOFF`].
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +44,7 @@ use std::time::Duration;
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
+use nix::poll::PollFlags;
 use nix::sys::stat::Mode;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
@@ -48,6 +59,14 @@ pub const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Upper bound of the reopen backoff.
 pub const MAX_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Initial poll interval while waiting for the host side of an open
+/// virtio-serial port to connect (§5.7).
+pub const HOST_WAIT_INITIAL: Duration = Duration::from_millis(10);
+
+/// Upper bound of the poll interval while waiting for the host side of an
+/// open virtio-serial port to connect (§5.7).
+pub const HOST_WAIT_MAX: Duration = Duration::from_millis(500);
 
 /// Read chunk size for the session loop.
 const READ_CHUNK: usize = 4096;
@@ -775,15 +794,176 @@ pub async fn serve_with_initial<H: Handle>(
     serve_inner(path, open, handler, cancel, initial, Backoff::default()).await
 }
 
+/// Default poll cadence while waiting for the host side of an open
+/// virtio-serial port to connect.
+const DEFAULT_HOST_WAIT: Backoff = Backoff {
+    initial: HOST_WAIT_INITIAL,
+    max: HOST_WAIT_MAX,
+};
+
+/// Peer state of an already-open channel descriptor, inferred from a
+/// non-blocking `ppoll(2)` probe (§5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostState {
+    /// Connected (or no disconnect indicated): start a session.
+    Ready,
+    /// Open Linux `virtio_console` port whose host side is disconnected:
+    /// keep the descriptor open while waiting for the host to connect.
+    VirtioHostDisconnected,
+    /// Closed peer, hot-unplugged port, or error: close and reopen with
+    /// backoff.
+    Closed,
+}
+
+/// Outcome of waiting for the host side of an open virtio-serial port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostWait {
+    Ready,
+    Closed,
+    Cancelled,
+}
+
+/// Linux `POLLRDHUP` (stream socket peer closed or shut down writing); `nix`
+/// 0.31 does not expose it as a named [`PollFlags`] constant, so we pass it via
+/// `from_bits_retain` and check it explicitly (and `PollFd::revents()` also
+/// fails closed to `None` when unknown bits are returned).
+const POLLRDHUP_FLAG: PollFlags = PollFlags::from_bits_retain(nix::libc::POLLRDHUP);
+
+#[derive(Debug, Clone, Copy)]
+struct ServeTimers {
+    reopen: Backoff,
+    host_wait: Backoff,
+}
+
+fn classify_channel_revents(revents: PollFlags) -> HostState {
+    if revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL | POLLRDHUP_FLAG) {
+        return HostState::Closed;
+    }
+    if revents.contains(PollFlags::POLLHUP) {
+        // Linux `virtio_console` with `guest_connected == true` and
+        // `host_connected == false` sets `POLLIN | POLLRDNORM | POLLHUP`
+        // while leaving `POLLOUT` clear (`will_write_block` is true when
+        // `!host_connected`) and setting neither `POLLERR` nor `POLLRDHUP`.
+        // Hot-unplugged virtio ports return bare `POLLHUP` (`POLLIN` clear);
+        // closed PTY slaves return `POLLERR`; closed Unix sockets return
+        // `POLLOUT | POLLRDHUP`.
+        if revents.contains(PollFlags::POLLIN) && !revents.contains(PollFlags::POLLOUT) {
+            return HostState::VirtioHostDisconnected;
+        }
+        return HostState::Closed;
+    }
+    HostState::Ready
+}
+
+fn poll_host_state(fd: BorrowedFd<'_>) -> HostState {
+    use nix::poll::{PollFd, ppoll};
+    use nix::sys::time::TimeSpec;
+
+    let timeout = TimeSpec::new(0, 0);
+    let events = PollFlags::POLLIN | PollFlags::POLLOUT | POLLRDHUP_FLAG;
+    loop {
+        let mut fds = [PollFd::new(fd, events)];
+        match ppoll(&mut fds, Some(timeout), None) {
+            Ok(0) => return HostState::Ready,
+            Ok(_) => {
+                // Unknown bits (including `POLLRDHUP` while `nix` omits it
+                // from `PollFlags::all()`) fail closed.
+                let revents = fds[0].revents().unwrap_or(PollFlags::POLLERR);
+                return classify_channel_revents(revents);
+            }
+            Err(Errno::EINTR) => continue,
+            Err(_) => return HostState::Closed,
+        }
+    }
+}
+
+fn is_host_disconnect_end(end: &SessionEnd) -> bool {
+    matches!(end, SessionEnd::Eof)
+        || matches!(end, SessionEnd::WriteError(err) if err.kind() == io::ErrorKind::BrokenPipe)
+}
+
+async fn wait_for_virtio_host<H, P>(
+    fd: BorrowedFd<'_>,
+    probe: &P,
+    handler: &H,
+    cancel: &mut Cancel,
+    cancel_live: &mut bool,
+    wait: Backoff,
+) -> HostWait
+where
+    H: Handle,
+    P: Fn(BorrowedFd<'_>) -> HostState + Send + Sync,
+{
+    let mut delay = wait.initial;
+    loop {
+        if stop_now(cancel, handler) {
+            return HostWait::Cancelled;
+        }
+        let slept = tokio::select! {
+            () = tokio::time::sleep(delay) => true,
+            changed = cancel.changed(), if *cancel_live => {
+                *cancel_live = changed.is_ok();
+                if stop_now(cancel, handler) {
+                    return HostWait::Cancelled;
+                }
+                false
+            }
+        };
+        if stop_now(cancel, handler) {
+            return HostWait::Cancelled;
+        }
+        match probe(fd) {
+            HostState::Ready => return HostWait::Ready,
+            HostState::Closed => return HostWait::Closed,
+            HostState::VirtioHostDisconnected => {
+                if slept {
+                    delay = (delay * 2).clamp(wait.initial, wait.max);
+                }
+            }
+        }
+    }
+}
+
 async fn serve_inner<H: Handle>(
+    path: &Path,
+    open: OpenFn,
+    handler: &H,
+    cancel: Cancel,
+    initial: Option<OwnedFd>,
+    backoff: Backoff,
+) -> Result<(), OpenError> {
+    serve_inner_with_probe(
+        path,
+        open,
+        handler,
+        cancel,
+        initial,
+        ServeTimers {
+            reopen: backoff,
+            host_wait: DEFAULT_HOST_WAIT,
+        },
+        poll_host_state,
+    )
+    .await
+}
+
+async fn serve_inner_with_probe<H, P>(
     path: &Path,
     open: OpenFn,
     handler: &H,
     mut cancel: Cancel,
     initial: Option<OwnedFd>,
-    backoff: Backoff,
-) -> Result<(), OpenError> {
+    timers: ServeTimers,
+    probe: P,
+) -> Result<(), OpenError>
+where
+    H: Handle,
+    P: Fn(BorrowedFd<'_>) -> HostState + Send + Sync,
+{
     let mut initial = initial;
+    // An already-open virtio-serial descriptor kept across a host disconnect
+    // so `guest_connected` stays true (`VSERPORT_CHANGE open=true`).
+    let mut pending_channel: Option<Channel> = None;
     // Zero before the first open; afterwards the pause before each reopen.
     let mut reopen_delay = Duration::ZERO;
     let mut cancel_live = true;
@@ -791,7 +971,7 @@ async fn serve_inner<H: Handle>(
         if stop_now(&mut cancel, handler) {
             return Ok(());
         }
-        if !reopen_delay.is_zero() {
+        if pending_channel.is_none() && !reopen_delay.is_zero() {
             tokio::select! {
                 () = tokio::time::sleep(reopen_delay) => {}
                 changed = cancel.changed(), if cancel_live => {
@@ -803,40 +983,104 @@ async fn serve_inner<H: Handle>(
                 }
             }
         }
-        let channel = match initial.take() {
-            Some(fd) => match Channel::from_fd(fd) {
-                Ok(channel) => channel,
-                Err(err) => {
-                    tracing::warn!(event = "channel_register_failed", error = %err, "cannot register the initial channel; reopening");
-                    continue;
+        let channel = match pending_channel.take() {
+            Some(channel) => channel,
+            None => match initial.take() {
+                Some(fd) => match Channel::from_fd(fd) {
+                    Ok(channel) => channel,
+                    Err(err) => {
+                        tracing::warn!(event = "channel_register_failed", error = %err, "cannot register the initial channel; reopening");
+                        continue;
+                    }
+                },
+                None => {
+                    let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
+                        if handler.may_stop() {
+                            return Ok(());
+                        }
+                        // Stop requested but not allowed yet (C-21): keep
+                        // trying to reopen at a bounded cadence.
+                        tokio::time::sleep(timers.reopen.initial).await;
+                        continue;
+                    };
+                    channel
                 }
             },
-            None => {
-                let Some(channel) = open_with_retry(path, &open, &mut cancel).await? else {
-                    if handler.may_stop() {
-                        return Ok(());
-                    }
-                    // Stop requested but not allowed yet (C-21): keep
-                    // trying to reopen at a bounded cadence.
-                    tokio::time::sleep(backoff.initial).await;
-                    continue;
-                };
-                channel
-            }
         };
+        if probe(channel.fd.as_fd()) == HostState::VirtioHostDisconnected {
+            tracing::info!(
+                event = "channel_waiting_for_host",
+                path = %path.display(),
+                "channel open; waiting for host"
+            );
+            match wait_for_virtio_host(
+                channel.fd.as_fd(),
+                &probe,
+                handler,
+                &mut cancel,
+                &mut cancel_live,
+                timers.host_wait,
+            )
+            .await
+            {
+                HostWait::Ready => {}
+                HostWait::Cancelled => return Ok(()),
+                HostWait::Closed => {
+                    reopen_delay =
+                        (reopen_delay * 2).clamp(timers.reopen.initial, timers.reopen.max);
+                    tracing::warn!(
+                        event = "channel_closed",
+                        reason = "eof",
+                        received = 0u64,
+                        reopen_in_ms = reopen_delay.as_millis() as u64,
+                        "channel closed while waiting for host; reopening"
+                    );
+                    continue;
+                }
+            }
+        }
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
-        let (reader, writer) = tokio::io::split(channel);
+        let (mut reader, mut writer) = tokio::io::split(channel);
         let mut decoder = FrameDecoder::new();
-        let report = run_session_until(reader, writer, handler, &mut decoder, &mut cancel).await;
+        let report =
+            run_session_until(&mut reader, &mut writer, handler, &mut decoder, &mut cancel).await;
         if matches!(report.end, SessionEnd::Cancelled) {
             return Ok(());
         }
-        // A session that carried data resets the backoff; a host-disconnected
-        // port reports EOF immediately and must not be reopened in a loop.
+        let channel = reader.unsplit(writer);
+        if is_host_disconnect_end(&report.end) {
+            match probe(channel.fd.as_fd()) {
+                HostState::VirtioHostDisconnected => {
+                    tracing::warn!(
+                        event = "channel_closed",
+                        reason = %report.end,
+                        received = report.received,
+                        "host disconnected; keeping channel open while waiting for host"
+                    );
+                    pending_channel = Some(channel);
+                    reopen_delay = Duration::ZERO;
+                    continue;
+                }
+                HostState::Ready if report.received > 0 => {
+                    tracing::warn!(
+                        event = "channel_closed",
+                        reason = %report.end,
+                        received = report.received,
+                        "channel session ended; host already connected on open channel"
+                    );
+                    pending_channel = Some(channel);
+                    reopen_delay = Duration::ZERO;
+                    continue;
+                }
+                HostState::Closed | HostState::Ready => {}
+            }
+        }
+        // A session that carried data resets the backoff; a closed/errored
+        // descriptor is dropped and reopened with growing backoff.
         reopen_delay = if report.received > 0 {
-            backoff.initial
+            timers.reopen.initial
         } else {
-            (reopen_delay * 2).clamp(backoff.initial, backoff.max)
+            (reopen_delay * 2).clamp(timers.reopen.initial, timers.reopen.max)
         };
         tracing::warn!(
             event = "channel_closed",
@@ -2166,5 +2410,485 @@ mod tests {
         let err = Channel::open(Path::new("/dev/virtio-ports/does-not-exist")).unwrap_err();
         assert!(matches!(err, OpenError::NotFound { .. }));
         assert!(!err.is_terminal());
+    }
+
+    #[test]
+    fn classify_channel_revents_distinguishes_virtio_host_disconnect_from_closed_peers() {
+        // Ready states (connected peer, including full TX queue with empty revents).
+        assert_eq!(
+            classify_channel_revents(PollFlags::empty()),
+            HostState::Ready
+        );
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLOUT),
+            HostState::Ready
+        );
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN | PollFlags::POLLOUT),
+            HostState::Ready
+        );
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN),
+            HostState::Ready
+        );
+
+        // Linux virtio_console with guest_connected=true, host_connected=false:
+        // POLLIN | [POLLRDNORM |] POLLHUP, no POLLOUT / POLLERR / POLLRDHUP.
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN | PollFlags::POLLHUP),
+            HostState::VirtioHostDisconnected
+        );
+        assert_eq!(
+            classify_channel_revents(
+                PollFlags::POLLIN | PollFlags::POLLRDNORM | PollFlags::POLLHUP
+            ),
+            HostState::VirtioHostDisconnected
+        );
+
+        // Hot-unplugged virtio port or drained closed pipe: bare POLLHUP.
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLHUP),
+            HostState::Closed
+        );
+        // Dead Unix socketpair.
+        assert_eq!(
+            classify_channel_revents(
+                PollFlags::POLLIN | PollFlags::POLLOUT | PollFlags::POLLHUP | POLLRDHUP_FLAG
+            ),
+            HostState::Closed
+        );
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN | PollFlags::POLLOUT | PollFlags::POLLHUP),
+            HostState::Closed
+        );
+        // Half-closed Unix socketpair (peer shutdown(SHUT_WR)).
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN | PollFlags::POLLOUT | POLLRDHUP_FLAG),
+            HostState::Closed
+        );
+        // Dead PTY slave (master closed).
+        assert_eq!(
+            classify_channel_revents(
+                PollFlags::POLLIN | PollFlags::POLLOUT | PollFlags::POLLERR | PollFlags::POLLHUP
+            ),
+            HostState::Closed
+        );
+        // Error / invalid descriptor flags fail closed.
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLIN | PollFlags::POLLERR | PollFlags::POLLHUP),
+            HostState::Closed
+        );
+        assert_eq!(
+            classify_channel_revents(PollFlags::POLLNVAL),
+            HostState::Closed
+        );
+    }
+
+    #[test]
+    fn poll_host_state_classifies_real_socketpair_and_pty_descriptors() {
+        // Connected, half-closed, and dead Unix socketpairs.
+        let (ours, peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        assert_eq!(poll_host_state(ours.as_fd()), HostState::Ready);
+        nix::sys::socket::shutdown(peer.as_raw_fd(), nix::sys::socket::Shutdown::Write).unwrap();
+        assert_eq!(poll_host_state(ours.as_fd()), HostState::Closed);
+        drop(peer);
+        assert_eq!(poll_host_state(ours.as_fd()), HostState::Closed);
+
+        // Connected and closed PTY slave.
+        let master = nix::pty::posix_openpt(OFlag::O_RDWR | OFlag::O_NOCTTY).unwrap();
+        nix::pty::grantpt(&master).unwrap();
+        nix::pty::unlockpt(&master).unwrap();
+        let slave_path = nix::pty::ptsname_r(&master).unwrap();
+        let slave = open_device(Path::new(&slave_path)).unwrap();
+        assert_eq!(poll_host_state(slave.as_fd()), HostState::Ready);
+        drop(master);
+        assert_eq!(poll_host_state(slave.as_fd()), HostState::Closed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_virtio_host_waits_for_ready_handles_hot_unplug_and_honours_deferred_stop() {
+        let (ours, _peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let wait = Backoff {
+            initial: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        };
+
+        // Case A: VirtioHostDisconnected × 3 -> Ready, with exponential backoff clamped to max.
+        let polls = AtomicUsize::new(0);
+        let (_tx, mut cancel) = cancel_pair();
+        let mut cancel_live = true;
+        let handler = FakeDispatcher::default();
+        let start = tokio::time::Instant::now();
+        let outcome = wait_for_virtio_host(
+            ours.as_fd(),
+            &|_| {
+                if polls.fetch_add(1, Ordering::SeqCst) < 3 {
+                    HostState::VirtioHostDisconnected
+                } else {
+                    HostState::Ready
+                }
+            },
+            &handler,
+            &mut cancel,
+            &mut cancel_live,
+            wait,
+        )
+        .await;
+        assert_eq!(outcome, HostWait::Ready);
+        assert_eq!(polls.load(Ordering::SeqCst), 4);
+        // 4 sleeps before 4 probes: 10 ms + 20 ms + 40 ms + 50 ms (clamped) = 120 ms.
+        assert_eq!(start.elapsed(), Duration::from_millis(120));
+
+        // Case B: hot-unplug while waiting returns Closed.
+        let polls = AtomicUsize::new(0);
+        let (_tx, mut cancel) = cancel_pair();
+        let mut cancel_live = true;
+        let outcome = wait_for_virtio_host(
+            ours.as_fd(),
+            &|_| {
+                if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    HostState::VirtioHostDisconnected
+                } else {
+                    HostState::Closed
+                }
+            },
+            &handler,
+            &mut cancel,
+            &mut cancel_live,
+            wait,
+        )
+        .await;
+        assert_eq!(outcome, HostWait::Closed);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+
+        // Case C: cancel when may_stop() == true returns Cancelled immediately without waiting.
+        let (tx, mut cancel) = cancel_pair();
+        let mut cancel_live = true;
+        let long_wait = Backoff {
+            initial: Duration::from_secs(10),
+            max: Duration::from_secs(10),
+        };
+        let start = tokio::time::Instant::now();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send(true).unwrap();
+        });
+        let outcome = wait_for_virtio_host(
+            ours.as_fd(),
+            &|_| HostState::VirtioHostDisconnected,
+            &handler,
+            &mut cancel,
+            &mut cancel_live,
+            long_wait,
+        )
+        .await;
+        stopper.await.unwrap();
+        assert_eq!(outcome, HostWait::Cancelled);
+        assert_eq!(start.elapsed(), Duration::from_millis(5));
+
+        // Case D: cancel while may_stop() == false (Frozen, C-21) is deferred until thaw.
+        let slow = Arc::new(SlowHandler {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            allow_stop: std::sync::atomic::AtomicBool::new(false),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (tx, mut cancel) = cancel_pair();
+        let mut cancel_live = true;
+        let slow_flip = slow.clone();
+        let start = tokio::time::Instant::now();
+        let driver = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tx.send(true).unwrap(); // Arrives while frozen: must not stop yet.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            slow_flip.allow_stop.store(true, Ordering::SeqCst);
+            tx.send(true).unwrap(); // Thawed: now stop may take effect.
+        });
+        let outcome = wait_for_virtio_host(
+            ours.as_fd(),
+            &|_| HostState::VirtioHostDisconnected,
+            slow.as_ref(),
+            &mut cancel,
+            &mut cancel_live,
+            wait,
+        )
+        .await;
+        driver.await.unwrap();
+        assert_eq!(outcome, HostWait::Cancelled);
+        assert_eq!(start.elapsed(), Duration::from_millis(35));
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_virtio_fd_open_while_waiting_for_host_to_connect() {
+        bounded(async {
+            let (ours, peer) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::SeqPacket,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            // Pass the pre-opened fd via `initial` (the `main` pre-drop path):
+            // 3 VirtioHostDisconnected probes, then Ready.
+            let probes = Arc::new(AtomicUsize::new(0));
+            let p = probes.clone();
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                    Some(ours),
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| {
+                        if p.fetch_add(1, Ordering::SeqCst) < 3 {
+                            HostState::VirtioHostDisconnected
+                        } else {
+                            HostState::Ready
+                        }
+                    },
+                )
+                .await
+            });
+            let mut peer = Channel::from_fd(peer).unwrap();
+            peer.write_all(b"ping\n").await.unwrap();
+            let mut out = [0u8; 16];
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"PING\n");
+            assert!(
+                probes.load(Ordering::SeqCst) >= 4,
+                "waited through host-disconnected polls before serving"
+            );
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                0,
+                "initial descriptor was kept open without reopening"
+            );
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_keeps_virtio_fd_open_across_host_disconnect_and_discards_partial_frame() {
+        bounded(async {
+            let (ours, peer) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::SeqPacket,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let first = Arc::new(Mutex::new(Some(ours)));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                first
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            // 0 = Ready, 1 = VirtioHostDisconnected
+            let mode = Arc::new(AtomicUsize::new(0));
+            let wait_probes = Arc::new(AtomicUsize::new(0));
+            let m = mode.clone();
+            let wp = wait_probes.clone();
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                    None,
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| {
+                        if m.load(Ordering::SeqCst) == 0 {
+                            HostState::Ready
+                        } else {
+                            wp.fetch_add(1, Ordering::SeqCst);
+                            HostState::VirtioHostDisconnected
+                        }
+                    },
+                )
+                .await
+            });
+            let mut peer = Channel::from_fd(peer).unwrap();
+
+            // Session 1: send one complete frame plus a trailing partial frame.
+            peer.write_all(b"one\npartial-without-newline")
+                .await
+                .unwrap();
+            let mut out = [0u8; 32];
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"ONE\n");
+
+            // Host disconnects: flip probe and deliver a 0-byte packet (EOF) on the open socket.
+            mode.store(1, Ordering::SeqCst);
+            nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty())
+                .unwrap();
+            while wait_probes.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                1,
+                "descriptor must remain open across host disconnect"
+            );
+
+            // Host reconnects: fresh decoder discards the partial frame from session 1.
+            mode.store(0, Ordering::SeqCst);
+            peer.write_all(b"two\n").await.unwrap();
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"TWO\n");
+            assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+            // Fast reconnect: host disconnects and reconnects before probe runs (Ready + received > 0).
+            peer.write_all(b"three\npartial-two").await.unwrap();
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"THREE\n");
+            nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty())
+                .unwrap();
+            peer.write_all(b"four\n").await.unwrap();
+            let n = peer.read(&mut out).await.unwrap();
+            assert_eq!(&out[..n], b"FOUR\n");
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                1,
+                "fast reconnect keeps the open descriptor without reopening"
+            );
+
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_closes_and_reopens_when_virtio_port_hot_unplugs_while_waiting() {
+        bounded(async {
+            let (ours1, peer1) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let (ours2, peer2) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let fds = Arc::new(Mutex::new(VecDeque::from([ours1, ours2])));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                fds.lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            // Probe 0: VirtioHostDisconnected (enters wait), Probe 1: Closed (hot-unplug!),
+            // Probe 2+: Ready (second opened fd).
+            let probes = Arc::new(AtomicUsize::new(0));
+            let p = probes.clone();
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                    None,
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| match p.fetch_add(1, Ordering::SeqCst) {
+                        0 => HostState::VirtioHostDisconnected,
+                        1 => HostState::Closed,
+                        _ => HostState::Ready,
+                    },
+                )
+                .await
+            });
+
+            // First fd must be dropped when hot-unplugged while waiting.
+            let mut peer1 = Channel::from_fd(peer1).unwrap();
+            let mut buf = [0u8; 16];
+            assert_eq!(peer1.read(&mut buf).await.unwrap(), 0, "first fd closed");
+
+            // Second fd opens after backoff and serves commands normally.
+            let mut peer2 = Channel::from_fd(peer2).unwrap();
+            peer2.write_all(b"after\n").await.unwrap();
+            let n = peer2.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"AFTER\n");
+            assert_eq!(opened.load(Ordering::SeqCst), 2);
+
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    #[test]
+    fn is_host_disconnect_end_matches_eof_and_broken_pipe_only() {
+        assert!(is_host_disconnect_end(&SessionEnd::Eof));
+        assert!(is_host_disconnect_end(&SessionEnd::WriteError(
+            io::Error::from(io::ErrorKind::BrokenPipe)
+        )));
+        assert!(!is_host_disconnect_end(&SessionEnd::WriteError(
+            io::Error::from(io::ErrorKind::Other)
+        )));
+        assert!(!is_host_disconnect_end(&SessionEnd::ReadError(
+            io::Error::from(io::ErrorKind::BrokenPipe)
+        )));
+        assert!(!is_host_disconnect_end(&SessionEnd::Cancelled));
     }
 }

@@ -38,6 +38,8 @@
 # Environment overrides:
 #   QEMINGA_E2E_CONNECT               qemu:///session (default) or qemu:///system
 #   QEMINGA_E2E_IMAGES                run image root (default per connect URI)
+#   QEMINGA_E2E_QEMU_USER             override system-mode QEMU user (or +UID)
+#   QEMINGA_E2E_QEMU_GROUP            override system-mode QEMU group (or +GID)
 #   QEMINGA_E2E_BOOT_TIMEOUT_SECS     default 300 (5 min under KVM)
 #   QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS default 120 (2 min under KVM)
 #
@@ -242,12 +244,20 @@ domain_state() {
 }
 
 collect_diagnostics() {
-    local name="$1" dir="$2" out="$3" qlog
+    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" qlog
     mkdir -p "$out"
     v dumpxml "$name" >"$out/domain.xml" 2>/dev/null || true
     qlog="$(qemu_log_of "$name")"
-    if [ -f "$qlog" ]; then cp "$qlog" "$out/qemu.log" || true; fi
-    if [ -f "$dir/serial.log" ]; then cp "$dir/serial.log" "$out/serial.log" || true; fi
+    if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
+    if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
+        if [ "$CONNECT_URI" = "qemu:///system" ]; then
+            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out/serial.log" 2>/dev/null || true
+        elif command -v python3 >/dev/null 2>&1; then
+            sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out/serial.log" 2>/dev/null || true
+        elif [ ! -L "$dir/serial.log" ] && [ -f "$dir/serial.log" ]; then
+            cp -- "$dir/serial.log" "$out/serial.log" || true
+        fi
+    fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         chmod -R a+rX "$out" 2>/dev/null || true
     fi
@@ -264,6 +274,10 @@ cmd_cleanup() {
     name="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$name"
     check_path QEMINGA_E2E_IMAGES "$IMAGES"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        [ "$(id -u)" -eq 0 ] || die "qemu:///system cleanup requires root"
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
     dir="$IMAGES/$name"
     if ! command -v virsh >/dev/null 2>&1; then
         [ ! -e "$dir" ] || die "virsh is not installed, so the state of $name cannot be established; keeping $dir"
@@ -274,7 +288,7 @@ cmd_cleanup() {
         fi
         return 0
     fi
-    [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out"
+    [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
 
     state="$(domain_state "$name")" \
         || die "the state of $name cannot be established; keeping $dir"
@@ -288,7 +302,13 @@ cmd_cleanup() {
         state="$(domain_state "$name")" || die "cannot confirm $name is gone; keeping $dir"
         [ "$state" = absent ] || die "$name is still defined; keeping $dir"
     fi
-    if [ -d "$dir" ]; then
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        local cleanup_status=""
+        cleanup_status="$(sys_fs_ops cleanup-run-dir "$IMAGES" "$name")" || exit 1
+        if [ "$cleanup_status" = "removed" ]; then
+            echo "removed $dir"
+        fi
+    elif [ -d "$dir" ]; then
         rm -rf --one-file-system -- "$dir"
         echo "removed $dir"
     fi
@@ -441,6 +461,191 @@ cmd_verify_pass() {
 
 mark() { mkdir -p "$OUT/tests"; echo "$2" >"$OUT/tests/$1"; echo "-- $1: $2"; }
 
+QEMU_UID=0
+QEMU_GID=0
+QEMU_GROUPS="0"
+
+# Resolve the user/group DAC identity that the connected system libvirt daemon
+# uses for KVM guests:
+#   1. Explicit overrides (`QEMINGA_E2E_QEMU_USER` / `QEMINGA_E2E_QEMU_GROUP`)
+#   2. Connected daemon's `dac` KVM `<baselabel>` from `virsh capabilities`
+#      (falling back to `qemu` or untyped `dac` baselabel)
+#   3. Active `user`/`group` entries in `QEMINGA_LIBVIRT_QEMU_CONF`
+#      (`/etc/libvirt/qemu.conf`)
+#   4. Standard distro accounts (`libvirt-qemu`, `qemu`, `root`)
+# Follows libvirt's numeric-ID rules: `+NNN` is always numeric; an unprefixed
+# decimal integer falls back to a numeric UID/GID when NSS name lookup fails.
+resolve_system_qemu_identity() {
+    local conf="${QEMINGA_LIBVIRT_QEMU_CONF:-/etc/libvirt/qemu.conf}"
+    local override_user="${QEMINGA_E2E_QEMU_USER:-}"
+    local override_group="${QEMINGA_E2E_QEMU_GROUP:-}"
+    local caps_xml=""
+    if [ -z "$override_user" ] || [ -z "$override_group" ]; then
+        caps_xml="$(v capabilities 2>/dev/null || true)"
+    fi
+    local resolved=""
+    if ! resolved="$(python3 -I - "$conf" "$override_user" "$override_group" 3<<<"$caps_xml" <<'PY'
+import grp, os, pwd, re, sys, xml.etree.ElementTree as ET
+
+conf_path, user, group = sys.argv[1], sys.argv[2], sys.argv[3]
+with os.fdopen(3, "r", encoding="utf-8", errors="replace") as caps_fh:
+    caps_xml = caps_fh.read()
+
+def parse_dac_baselabel(xml_text):
+    if not xml_text or "<" not in xml_text:
+        return "", ""
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return "", ""
+    for secmodel in root.findall(".//secmodel"):
+        model_el = secmodel.find("model")
+        if model_el is None or (model_el.text or "").strip() != "dac":
+            continue
+        labels = {}
+        for bl in secmodel.findall("baselabel"):
+            txt = (bl.text or "").strip()
+            if ":" not in txt:
+                continue
+            btype = bl.attrib.get("type", "")
+            labels[btype] = txt
+        chosen = labels.get("kvm") or labels.get("qemu") or labels.get("") or ""
+        if ":" in chosen:
+            u, g = chosen.split(":", 1)
+            return u.strip(), g.strip()
+    return "", ""
+
+if not user or not group:
+    cap_u, cap_g = parse_dac_baselabel(caps_xml)
+    if not user and cap_u:
+        user = cap_u
+    if not group and cap_g:
+        group = cap_g
+
+if (not user or not group) and conf_path and os.path.isfile(conf_path) and os.access(conf_path, os.R_OK):
+    conf_u = conf_g = ""
+    with open(conf_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            m = re.match(r'^(user|group)\s*=\s*(["\'])(.*?)\2\s*$', line)
+            if m:
+                if m.group(1) == "user":
+                    conf_u = m.group(3).strip()
+                else:
+                    conf_g = m.group(3).strip()
+    if not user and conf_u:
+        user = conf_u
+    if not group and conf_g:
+        group = conf_g
+
+if not user:
+    for candidate in ("libvirt-qemu", "qemu"):
+        try:
+            pwd.getpwnam(candidate)
+            user = candidate
+            break
+        except KeyError:
+            pass
+    if not user:
+        user = "root"
+
+pw = None
+if re.fullmatch(r"\+[0-9]+", user):
+    uid = int(user[1:])
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        pw = None
+else:
+    try:
+        pw = pwd.getpwnam(user)
+        uid = pw.pw_uid
+    except KeyError:
+        if re.fullmatch(r"[0-9]+", user):
+            uid = int(user)
+            try:
+                pw = pwd.getpwuid(uid)
+            except KeyError:
+                pw = None
+        else:
+            sys.stderr.write(f"libvirt-kvm-smoke: cannot resolve system libvirt QEMU user '{user}'\n")
+            sys.exit(1)
+
+if group:
+    if re.fullmatch(r"\+[0-9]+", group):
+        gid = int(group[1:])
+    else:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            if re.fullmatch(r"[0-9]+", group):
+                gid = int(group)
+            else:
+                sys.stderr.write(f"libvirt-kvm-smoke: cannot resolve system libvirt QEMU group '{group}'\n")
+                sys.exit(1)
+elif pw is not None:
+    gid = pw.pw_gid
+else:
+    gid = uid
+
+groups = {gid}
+if pw is not None:
+    groups.add(pw.pw_gid)
+    try:
+        groups.update(os.getgrouplist(pw.pw_name, gid))
+    except OSError:
+        pass
+
+print(f"{uid}\t{gid}\t{','.join(str(g) for g in sorted(groups))}")
+PY
+    )"; then
+        exit 1
+    fi
+    IFS=$'\t' read -r QEMU_UID QEMU_GID QEMU_GROUPS <<<"$resolved"
+}
+
+# FD-anchored filesystem operations for the `qemu:///system` lane live in
+# `scripts/ci/libvirt_kvm_sysfs.py` so both this script (under `python3 -I`)
+# and unprivileged unit tests share the exact same implementation.
+sys_fs_ops() {
+    python3 -I "$HERE/libvirt_kvm_sysfs.py" "$@"
+}
+
+prepare_system_images_root() {
+    local target="$1"
+    resolve_system_qemu_identity
+    sys_fs_ops prepare-images-root "$target" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" \
+        || exit 1
+}
+
+create_system_run_dir() {
+    local images_dir="$1" run_name="$2"
+    sys_fs_ops create-run-dir "$images_dir" "$run_name" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" \
+        || exit 1
+}
+
+handoff_system_guest_file() {
+    local images_dir="$1" run_name="$2" filename="$3" do_chown="$4"
+    local action=""
+    if ! action="$(sys_fs_ops handoff-file "$images_dir" "$run_name" "$filename" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" "$do_chown")"; then
+        exit 1
+    fi
+    if [ "$action" = "DELEGATE_CHOWN" ] && [ "$do_chown" = "1" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
+        chown -h "${QEMU_UID}:${QEMU_GID}" "${images_dir}/${run_name}/${filename}"
+    fi
+}
+
+create_session_run_dir() {
+    local dir="$1"
+    [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
+    mkdir -m 0700 "$dir"
+    if command -v python3 >/dev/null 2>&1; then
+        sys_fs_ops strip-session-dir-acl "$dir" || exit 1
+    fi
+}
+
 preflight() {
     local arch="$1"
     say "preflight ($arch, KVM on $CONNECT_URI)"
@@ -458,6 +663,9 @@ preflight() {
     for tool in virsh qemu-img genisoimage jq curl sha256sum "qemu-system-$arch"; do
         command -v "$tool" >/dev/null || die "missing tool: $tool"
     done
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
     if [ "$arch" = aarch64 ]; then
         local fw fw_code fw_vars
         fw="$(resolve_aavmf)"
@@ -474,7 +682,11 @@ preflight() {
         fi
     fi
     cmd_stale_check
-    mkdir -p "$IMAGES"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        prepare_system_images_root "$IMAGES"
+    else
+        mkdir -p "$IMAGES"
+    fi
     local free_kib
     free_kib="$(df -Pk "$IMAGES" | awk 'NR == 2 { print $4 }')"
     [ "${free_kib:-0}" -ge $((10 * 1024 * 1024)) ] || die "less than 10 GiB free under $IMAGES"
@@ -548,10 +760,11 @@ cmd_run() {
     RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$RUN_NAME"
     RUN_DIR="$IMAGES/$RUN_NAME"
+    RUN_DIR_VERIFIED=0
     local name="$RUN_NAME" dir="$RUN_DIR" digest
 
     # shellcheck disable=SC2154 # rc is assigned inside the trap
-    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
+    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
 
     preflight "$arch"
     {
@@ -571,10 +784,25 @@ cmd_run() {
     version="$(jq -er .version "$candidate/manifest.json")"
 
     say "disposable KVM guest $name in $dir"
-    [ ! -e "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
-    mkdir -m 0700 "$dir"
-    fetch_image "$arch" "$dir/root.qcow2" "$cache"
-    qemu-img resize -q "$dir/root.qcow2" 8G
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        create_system_run_dir "$IMAGES" "$name"
+    else
+        create_session_run_dir "$dir"
+    fi
+    RUN_DIR_VERIFIED=1
+    (
+        umask 0077
+        fetch_image "$arch" "$dir/root.qcow2" "$cache"
+    )
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        handoff_system_guest_file "$IMAGES" "$name" "root.qcow2" 0
+        qemu-img resize -q "$dir/root.qcow2" 8G
+        handoff_system_guest_file "$IMAGES" "$name" "root.qcow2" 1
+    else
+        chmod 0600 "$dir/root.qcow2"
+        qemu-img resize -q "$dir/root.qcow2" 8G
+        chmod 0600 "$dir/root.qcow2"
+    fi
 
     local seed="$dir/seed" payload="$dir/payload"
     mkdir -p "$seed" "$payload/packaging"
@@ -594,8 +822,17 @@ EOF
     cp -r "$candidate/packaging/." "$payload/packaging/"
     echo "$digest" >"$payload/qeminga.sha256"
     install -m 0755 "$HERE/libvirt-tcg-guest.sh" "$payload/guest.sh"
-    genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
-    genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
+    (
+        umask 0077
+        genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
+        genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
+    )
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        handoff_system_guest_file "$IMAGES" "$name" "seed.iso" 1
+        handoff_system_guest_file "$IMAGES" "$name" "payload.iso" 1
+    else
+        chmod 0600 "$dir/seed.iso" "$dir/payload.iso"
+    fi
 
     cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$(nproc)" >"$dir/domain.xml"
     v define "$dir/domain.xml"

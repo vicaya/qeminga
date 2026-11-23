@@ -2271,18 +2271,19 @@ fn existing_registration_check_and_rollback_on_failed_reconfig() {
     std::fs::create_dir_all(&install_dir).unwrap();
     std::fs::create_dir_all(&state_dir).unwrap();
 
-    // Write a UTF-8-BOM .runner file like actions/runner produces.
-    let runner_json = format!(
-        "\u{feff}{{\"agentId\":1,\"agentName\":\"qeminga-kvm-x86_64-box\",\"gitHubUrl\":\"{REPO_URL}\",\"workFolder\":\"{}/work\"}}",
+    // Write a UTF-8-BOM .runner file like actions/runner produces for the default
+    // (--disableupdate) configuration.
+    let runner_json_disabled_update = format!(
+        "\u{feff}{{\"agentId\":1,\"agentName\":\"qeminga-kvm-x86_64-box\",\"gitHubUrl\":\"{REPO_URL}\",\"workFolder\":\"{}/work\",\"disableUpdate\":true}}",
         state_dir.display()
     );
-    std::fs::write(install_dir.join(".runner"), &runner_json).unwrap();
+    std::fs::write(install_dir.join(".runner"), &runner_json_disabled_update).unwrap();
 
     // 1. Matching existing registration returns "reuse".
     let reuse = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=0; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
             "_",
             script().to_str().unwrap(),
             install_dir.to_str().unwrap(),
@@ -2294,11 +2295,11 @@ fn existing_registration_check_and_rollback_on_failed_reconfig() {
     assert!(reuse.status.success(), "{}", text(&reuse));
     assert_eq!(String::from_utf8_lossy(&reuse.stdout).trim(), "reuse");
 
-    // 2. Incompatible target URL or runner name must fail immediately before mutating anything.
+    // 2. Incompatible target URL must fail immediately before mutating anything.
     let mismatch = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; check_existing_registration "https://github.com/other/controller" "qeminga-kvm-x86_64-box""#,
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=0; check_existing_registration "https://github.com/other/controller" "qeminga-kvm-x86_64-box""#,
             "_",
             script().to_str().unwrap(),
             install_dir.to_str().unwrap(),
@@ -2312,6 +2313,111 @@ fn existing_registration_check_and_rollback_on_failed_reconfig() {
         "incompatible existing registration must be refused: {}",
         text(&mismatch)
     );
+
+    // 2a. Switching from default (--disableupdate) to --allow-auto-update must NOT
+    //     silently reuse the existing disabled-update registration.
+    let enable_auto = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=1; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=0; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !enable_auto.status.success(),
+        "switching default registration to --allow-auto-update must be refused: {}",
+        text(&enable_auto)
+    );
+
+    // 2b. Even if install.env says ALLOW_AUTO_UPDATE=1, a .runner still carrying
+    //     "disableUpdate":true must be refused.
+    let runner_drift = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=1; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=1; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !runner_drift.status.success(),
+        ".runner disableUpdate=true must be refused when --allow-auto-update is requested: {}",
+        text(&runner_drift)
+    );
+
+    // 2c. An auto-update registration (disableUpdate omitted/false) matches
+    //     --allow-auto-update=1 and refuses switching back to default (0).
+    let runner_json_auto_update = format!(
+        "\u{feff}{{\"agentId\":1,\"agentName\":\"qeminga-kvm-x86_64-box\",\"gitHubUrl\":\"{REPO_URL}\",\"workFolder\":\"{}/work\"}}",
+        state_dir.display()
+    );
+    std::fs::write(install_dir.join(".runner"), &runner_json_auto_update).unwrap();
+    let reuse_auto = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=1; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=1; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(reuse_auto.status.success(), "{}", text(&reuse_auto));
+    assert_eq!(String::from_utf8_lossy(&reuse_auto.stdout).trim(), "reuse");
+
+    let disable_auto = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=1; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !disable_auto.status.success(),
+        "switching --allow-auto-update registration back to default must be refused: {}",
+        text(&disable_auto)
+    );
+
+    // 2d. Ephemeral flag mismatch in .runner must also be refused.
+    let runner_json_ephemeral = format!(
+        "\u{feff}{{\"agentId\":1,\"agentName\":\"qeminga-kvm-x86_64-box\",\"gitHubUrl\":\"{REPO_URL}\",\"workFolder\":\"{}/work\",\"disableUpdate\":true,\"ephemeral\":true}}",
+        state_dir.display()
+    );
+    std::fs::write(install_dir.join(".runner"), &runner_json_ephemeral).unwrap();
+    let eph_mismatch = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_ALLOW_AUTO_UPDATE=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; REC_ALLOW_AUTO_UPDATE=0; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !eph_mismatch.status.success(),
+        ".runner ephemeral=true must be refused when persistent mode is requested: {}",
+        text(&eph_mismatch)
+    );
+    std::fs::write(install_dir.join(".runner"), &runner_json_disabled_update).unwrap();
 
     // 3. Failed config.sh restores locked permissions and restarts previously-active service.
     let bin = dir.path().join("bin");

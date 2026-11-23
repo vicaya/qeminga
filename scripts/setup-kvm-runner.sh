@@ -1740,7 +1740,7 @@ check_existing_registration() {
         die "existing persistent registration found at $runner_file; run 'sudo $0 uninstall --token-file ...' before provisioning a JIT runner"
     fi
     command -v jq >/dev/null 2>&1 || die "jq is required to inspect existing runner registration"
-    local json got_url got_name got_work
+    local json got_url got_name got_work got_disable_update got_ephemeral
     json="$(sed '1s/^\xef\xbb\xbf//' "$runner_file")"
     got_url="$(printf '%s' "$json" | jq -er '.gitHubUrl // empty' 2>/dev/null)" \
         || die "existing $runner_file is malformed (missing gitHubUrl); uninstall before reinstalling"
@@ -1748,9 +1748,15 @@ check_existing_registration() {
         || die "existing $runner_file is malformed (missing agentName); uninstall before reinstalling"
     got_work="$(printf '%s' "$json" | jq -er '.workFolder // empty' 2>/dev/null)" \
         || die "existing $runner_file is malformed (missing workFolder); uninstall before reinstalling"
+    got_disable_update="$(printf '%s' "$json" | jq -er 'if has("disableUpdate") then (if (.disableUpdate | type) == "boolean" then (if .disableUpdate then "1" else "0" end) else error("bad type") end) else "0" end' 2>/dev/null)" \
+        || die "existing $runner_file is malformed (invalid disableUpdate); uninstall before reinstalling"
+    got_ephemeral="$(printf '%s' "$json" | jq -er 'if has("ephemeral") then (if (.ephemeral | type) == "boolean" then (if .ephemeral then "1" else "0" end) else error("bad type") end) else "0" end' 2>/dev/null)" \
+        || die "existing $runner_file is malformed (invalid ephemeral); uninstall before reinstalling"
 
     local norm_got="${got_url%/}" norm_want="${want_url%/}"
     local want_work="${OPT_STATE_DIR}/work"
+    local want_disable_update=1
+    [ "$OPT_ALLOW_AUTO_UPDATE" -eq 1 ] && want_disable_update=0
     if [ "${norm_got,,}" != "${norm_want,,}" ]; then
         die "existing registration in $runner_file targets '$got_url', not '$want_url'; run 'sudo $0 uninstall --token-file ...' first"
     fi
@@ -1759,6 +1765,12 @@ check_existing_registration() {
     fi
     if [ "$got_work" != "$want_work" ]; then
         die "existing registration in $runner_file uses work folder '$got_work', not '$want_work'; run 'sudo $0 uninstall --token-file ...' first"
+    fi
+    if [ "$got_disable_update" != "$want_disable_update" ]; then
+        die "existing registration in $runner_file has disableUpdate=$got_disable_update (incompatible with --allow-auto-update=$OPT_ALLOW_AUTO_UPDATE); run 'sudo $0 uninstall --token-file ...' first"
+    fi
+    if [ "$got_ephemeral" != "$OPT_EPHEMERAL" ]; then
+        die "existing registration in $runner_file has ephemeral=$got_ephemeral (incompatible with --ephemeral=$OPT_EPHEMERAL); run 'sudo $0 uninstall --token-file ...' first"
     fi
     if [ "$HAS_INSTALL_RECORD" -eq 1 ]; then
         local norm_rec="${REC_TARGET_URL%/}"
@@ -1771,8 +1783,11 @@ check_existing_registration() {
         if [ -n "$REC_WORK_DIR" ] && [ "$REC_WORK_DIR" != "$want_work" ]; then
             die "existing installation record uses work dir '$REC_WORK_DIR', not '$want_work'; run 'sudo $0 uninstall --token-file ...' first"
         fi
-        if [ "$REC_LABELS" != "$OPT_LABELS" ] || [ "$REC_RUNNER_GROUP" != "$OPT_RUNNER_GROUP" ] || [ "$REC_EPHEMERAL" != "$OPT_EPHEMERAL" ]; then
-            die "existing registration in $OPT_INSTALL_DIR differs in labels/runner-group/ephemeral mode; run 'sudo $0 uninstall --token-file ...' first"
+        if [ "$REC_LABELS" != "$OPT_LABELS" ] \
+            || [ "$REC_RUNNER_GROUP" != "$OPT_RUNNER_GROUP" ] \
+            || [ "$REC_EPHEMERAL" != "$OPT_EPHEMERAL" ] \
+            || [ "$REC_ALLOW_AUTO_UPDATE" != "$OPT_ALLOW_AUTO_UPDATE" ]; then
+            die "existing registration in $OPT_INSTALL_DIR differs in labels/runner-group/ephemeral/auto-update policy; run 'sudo $0 uninstall --token-file ...' first"
         fi
     fi
     echo "reuse"

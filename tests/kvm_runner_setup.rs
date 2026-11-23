@@ -219,7 +219,7 @@ if [ -n "${FAKE_SC_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$FAKE_SC_LOG"
 fi
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit "${FAKE_IS_ACTIVE_RC:-3}"; fi
+if [ "$1" = "is-active" ]; then rc="${FAKE_IS_ACTIVE_RC:-3}"; if [ "$rc" -eq 0 ]; then echo active; else echo inactive; fi; exit "$rc"; fi
 exit 0
 "#,
     );
@@ -2245,10 +2245,12 @@ init_state_subdirs"#,
         "init_state_subdirs must refuse symlinked state dir"
     );
 
-    // In cmd_install, systemctl stop must happen before claiming or initializing state dirs.
+    // In cmd_install, stopping any owned service must happen before claiming or initializing state dirs.
     let body = std::fs::read_to_string(script()).unwrap();
     let install_fn = &body[body.find("cmd_install()").unwrap()..];
-    let stop_pos = install_fn.find("systemctl stop").unwrap();
+    let stop_pos = install_fn
+        .find("ensure_owned_service_stopped install")
+        .unwrap();
     let claim_pos = install_fn.find("claim_managed_dir state").unwrap();
     let prov_pos = install_fn.find("init_state_subdirs").unwrap();
     assert!(
@@ -4613,7 +4615,9 @@ if [ "$1" = "list-unit-files" ]; then
     exit 0
 fi
 if [ "$1" = "is-active" ]; then
-    exit "${FAKE_IS_ACTIVE_RC:-3}"
+    rc="${FAKE_IS_ACTIVE_RC:-3}"
+    if [ "$rc" -eq 0 ]; then echo active; else echo inactive; fi
+    exit "$rc"
 fi
 exit 0
 "#,
@@ -4825,7 +4829,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -5271,7 +5275,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 if [ "$1" = "enable" ] || [ "$1" = "start" ]; then
     echo "Job for qeminga-notify-svc.service failed because the control process exited with error code 78." >&2
     exit 1
@@ -5445,7 +5449,7 @@ exec "$@"
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -5752,7 +5756,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -5990,7 +5994,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -6280,7 +6284,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -6908,7 +6912,7 @@ if [ "$1" = "list-unit-files" ]; then
     fi
     exit 0
 fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -7541,7 +7545,16 @@ fn concurrent_install_invocations_serialize_and_retain_all_ownership_flags() {
     );
     write_exec(&fake_tar_src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_tar_src.join("run.sh"), "#!/bin/sh\nexit 0\n");
-    write_exec(&fake_tar_src.join("config.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &fake_tar_src.join("config.sh"),
+        &format!(
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{{"gitHubUrl":"{REPO_URL}","agentName":"lock-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}}\n' "${{HOME}}/work" > "$dir/.runner"
+exit 0
+"#
+        ),
+    );
     write_exec(&fake_tar_src.join("env.sh"), "#!/bin/sh\nexit 0\n");
     let good_tarball = dir.path().join("runner-concurrent.tar.gz");
     let tar_out = Command::new("tar")
@@ -7632,7 +7645,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -8602,7 +8615,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -9833,7 +9846,7 @@ exec "$@"
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit "${FAKE_IS_ACTIVE_RC:-3}"; fi
+if [ "$1" = "is-active" ]; then rc="${FAKE_IS_ACTIVE_RC:-3}"; if [ "$rc" -eq 0 ]; then echo active; else echo inactive; fi; exit "$rc"; fi
 exit 0
 "#,
     );
@@ -10639,7 +10652,7 @@ exec "$@"
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
-if [ "$1" = "is-active" ]; then exit 3; fi
+if [ "$1" = "is-active" ]; then echo inactive; exit 3; fi
 exit 0
 "#,
     );
@@ -10877,7 +10890,7 @@ exec /usr/bin/stat "$@"
     );
     write_exec(
         &bin.join("systemctl"),
-        "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then exit 3; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
     write_exec(
         &bin.join("curl"),
@@ -10952,7 +10965,7 @@ exit 22
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
-if [ "$1" = "is-active" ]; then exit 0; fi
+if [ "$1" = "is-active" ]; then echo active; exit 0; fi
 exit 0
 "#,
     );
@@ -13379,7 +13392,7 @@ fn install_and_update_reject_empty_or_incomplete_runner_tarball_before_mutating(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
-if [ "$1" = "is-active" ]; then [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3; fi
+if [ "$1" = "is-active" ]; then if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi; fi
 exit 0
 "#,
     );
@@ -13621,7 +13634,7 @@ fn update_keeps_previous_runner_recoverable_across_mid_publish_failure_and_crash
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
 case "$1" in
     is-active)
-        [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3
+        if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi
         ;;
     stop)
         rm -f "${FAKE_ACTIVE_FLAG:?}"
@@ -14010,7 +14023,7 @@ fn update_protects_custom_jit_workspace_and_allows_hardlinked_job_files() {
     let sc_log = dir.path().join("systemctl.log");
     write_exec(
         &bin.join("systemctl"),
-        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nif [ \"$1\" = \"is-active\" ]; then exit 3; fi\nexit 0\n",
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
 
     let make_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
@@ -14361,7 +14374,7 @@ fn error_cleanup_verifies_stage_identity_and_preserves_replacement_mount() {
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) exit 0 ;;
+    is-active) if [ -f "${FAKE_SWAPPED_REC:?}" ]; then echo inactive; exit 3; else echo active; exit 0; fi ;;
     stop)
         for cand in "${FAKE_PARENT_DIR:?}"/.qeminga-extract.*; do
             [ -d "$cand" ] || continue
@@ -14988,7 +15001,7 @@ exit 0
         r#"#!/bin/sh
 case "$1" in
     is-active)
-        [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3
+        if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi
         ;;
     stop)
         rm -f "${FAKE_ACTIVE_FLAG:?}"
@@ -15253,7 +15266,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     *) exit 0 ;;
@@ -15552,7 +15565,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop)
         rm -f "${FAKE_ACTIVE_FLAG:?}"
         for cand in "${FAKE_PARENT_DIR:?}"/.qeminga-extract.*; do
@@ -15620,7 +15633,7 @@ esac
     // Part B: Missing recorded backup during `UPDATE_PHASE=publishing` MUST fail closed!
     write_exec(
         &bin.join("systemctl"),
-        "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then exit 3; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
     let missing_backup = dir.path().join(".qeminga-update-backup.missing1");
     std::fs::create_dir_all(&missing_backup).unwrap();
@@ -15783,7 +15796,7 @@ exit 0
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start | enable)
         if [ -f "${FAKE_REJECT_V2:?}" ] && [ -f "${FAKE_INST_DIR:?}/bin/v2-marker" ]; then
@@ -16189,7 +16202,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     *) exit 0 ;;
@@ -16482,7 +16495,7 @@ exit 0
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop)
         if [ -f "${FAKE_FAIL_STOP:?}" ]; then
             exit 1
@@ -16800,7 +16813,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     *) exit 0 ;;
@@ -17247,7 +17260,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     *) exit 0 ;;
@@ -17694,7 +17707,7 @@ exit 0
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
-    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    is-active) if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo active; exit 0; else echo inactive; exit 3; fi ;;
     stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
     *) exit 0 ;;
@@ -18362,5 +18375,1748 @@ exit 0
     assert!(
         !bk_uninst.exists(),
         "uninstall must remove empty post-marker-unlink backup container"
+    );
+
+    // Part 3: Stage retirement after publication (`publish-runner-stage` interrupted right after
+    // unlinking `.qeminga-tx-id` inside `sfd` and before `os.rmdir(stage_base)`): the now-empty
+    // 0700 stage container with matching recorded identity MUST also be reclaimed cleanly by
+    // `safe-rmtree-id` during recovery.
+    let stg_empty = dir.path().join(".qeminga-extract.posttx3");
+    std::fs::create_dir(&stg_empty).unwrap();
+    std::fs::set_permissions(&stg_empty, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let stg_id_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops path-identity "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            stg_empty.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(stg_id_out.status.success(), "{}", text(&stg_id_out));
+    let stg_id = String::from_utf8(stg_id_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::remove_file(stg_empty.join(".qeminga-tx-id")).unwrap();
+    let stg_prune = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops safe-rmtree-id "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stg_empty.to_str().unwrap(),
+            &stg_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        stg_prune.status.success() && !stg_empty.exists(),
+        "empty post-marker-unlink stage dir left by interrupted stage retirement must be reclaimed: {}",
+        text(&stg_prune)
+    );
+}
+
+#[test]
+fn reinstall_refuses_in_place_re_enrollment_when_runner_registration_missing() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_invoked = dir.path().join("config_sh.invoked");
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            &format!(
+                r#"#!/bin/sh
+dir="$(dirname "$0")"
+if [ -n "${{FAKE_CFG_LOG:-}}" ]; then printf '{tag}\n' >> "$FAKE_CFG_LOG"; fi
+printf '{{"gitHubUrl":"{REPO_URL}","agentName":"reg-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}}\n' "${{HOME}}/work" > "$dir/.runner"
+printf 'creds-{tag}\n' > "$dir/.credentials"
+exit 0
+"#
+            ),
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    let active_flag = dir.path().join("svc.active");
+    let sc_log = dir.path().join("sc.log");
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active)
+        if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo "active"; exit 0; else echo "inactive"; exit 3; fi
+        ;;
+    stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "reg-box",
+            "--service",
+            "qeminga-reg-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("FAKE_CFG_LOG", cfg_invoked.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+    std::fs::write(&active_flag, b"").unwrap();
+    let _ = std::fs::remove_file(&cfg_invoked);
+    let _ = std::fs::remove_file(&sc_log);
+
+    // Simulate missing `.runner` (while leaving `.credentials` behind first, then removing both).
+    std::fs::remove_file(inst.join(".runner")).unwrap();
+
+    // 1. Switching to --jitconfig-file while stray `.credentials` remains MUST be refused.
+    let jit_file = dir.path().join("jit-in");
+    std::fs::write(&jit_file, make_jit_config(REPO_URL, "_work")).unwrap();
+    std::fs::set_permissions(&jit_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let jit_stray_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "reg-box",
+            "--service",
+            "qeminga-reg-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--jitconfig-file",
+            jit_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !jit_stray_out.status.success(),
+        "provisioning JIT runner while persistent .credentials remains must be refused: {}",
+        text(&jit_stray_out)
+    );
+
+    // 2. Remove `.credentials` too -> no pre-existing registration files. Attempting in-place
+    //    reinstall with `--token-file` MUST fail closed before invoking config.sh --replace or
+    //    stopping the service, directing the operator to uninstall before re-enrolling.
+    std::fs::remove_file(inst.join(".credentials")).unwrap();
+    let reinst_no_reg = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "reg-box",
+            "--service",
+            "qeminga-reg-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+            "--skip-packages",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("FAKE_CFG_LOG", cfg_invoked.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    let out_msg = text(&reinst_no_reg);
+    assert!(
+        !reinst_no_reg.status.success(),
+        "in-place reinstall without matching .runner must refuse remote re-registration: {out_msg}"
+    );
+    assert!(
+        out_msg.contains("uninstall") && out_msg.contains(".runner"),
+        "refusal must explain why in-place re-registration is refused and direct to uninstall: {out_msg}"
+    );
+    assert!(
+        !cfg_invoked.exists()
+            && !inst.join(".runner").exists()
+            && !inst.join(".credentials").exists(),
+        "refused reinstall must NEVER invoke config.sh or create new registration files"
+    );
+    assert!(
+        inst.join("bin/v1-marker").exists()
+            && !inst.join("bin/v2-marker").exists()
+            && active_flag.exists()
+            && !std::fs::read_to_string(&sc_log)
+                .unwrap_or_default()
+                .contains("stop "),
+        "refused reinstall must leave v1 binaries and running service completely untouched"
+    );
+}
+
+#[test]
+fn update_and_reinstall_preserve_backup_when_publishing_record_dir_fsync_fails_after_rename() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    // 1. Direct `fs_ops replace-file` check: post-rename parent dir fsync failure MUST return
+    //    distinct exit code 86 while leaving destination published with the new bytes.
+    let rf_dir = dir.path().join("rf");
+    std::fs::create_dir_all(&rf_dir).unwrap();
+    let rf_src = rf_dir.join(".install.env.tmp");
+    let rf_dst = rf_dir.join("install.env");
+    std::fs::write(&rf_dst, b"OLD\n").unwrap();
+    std::fs::write(&rf_src, b"NEW\n").unwrap();
+    let rf_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops replace-file "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            rf_src.to_str().unwrap(),
+            rf_dst.to_str().unwrap(),
+        ])
+        .env("QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC", "install.env")
+        .output()
+        .unwrap();
+    assert_eq!(
+        rf_out.status.code(),
+        Some(86),
+        "replace-file post-rename parent dir fsync failure must exit 86: {}",
+        text(&rf_out)
+    );
+    assert_eq!(std::fs::read(&rf_dst).unwrap(), b"NEW\n");
+    assert!(!rf_src.exists());
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"fsync-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
+exit 0
+"#,
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    let active_flag = dir.path().join("svc.active");
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active)
+        if [ -f "${FAKE_ACTIVE_FLAG:?}" ]; then echo "active"; exit 0; else echo "inactive"; exit 3; fi
+        ;;
+    stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "fsync-box",
+            "--service",
+            "qeminga-fsync-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+    std::fs::write(&active_flag, b"").unwrap();
+
+    // 2. Lifecycle `update`: inject parent-dir fsync EIO AFTER rename on the first `publishing`
+    //    record write -> exit trap MUST retain the recorded backup so normal retry succeeds!
+    let upd_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC", "install.env"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !upd_fail.status.success(),
+        "update must fail when parent dir fsync fails: {}",
+        text(&upd_fail)
+    );
+    let rec_after_upd_fail = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_after_upd_fail.contains("RECORD_STATE=updating\n")
+            && rec_after_upd_fail.contains("UPDATE_PHASE=publishing\n"),
+        "published record should remain visible:\n{rec_after_upd_fail}"
+    );
+    let bk_upd = PathBuf::from(
+        rec_after_upd_fail
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+    assert!(
+        bk_upd.is_dir() && bk_upd.join(".qeminga-tx-id").is_file(),
+        "exit trap MUST preserve recorded backup container when publishing record rename already succeeded: {}",
+        bk_upd.display()
+    );
+
+    // Normal retry without fault injection MUST recover cleanly and publish v2!
+    let upd_retry = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        upd_retry.status.success(),
+        "normal retry after post-rename fsync failure must succeed: {}",
+        text(&upd_retry)
+    );
+    assert!(inst.join("bin/v2-marker").exists() && !bk_upd.exists());
+
+    // 3. Lifecycle `install` (reinstall): inject parent-dir fsync EIO AFTER rename on the first
+    //    `updating` record write -> exit trap MUST preserve the recorded backup so retry succeeds!
+    let reinst_fail = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "fsync-box",
+            "--service",
+            "qeminga-fsync-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC", "install.env"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(!reinst_fail.status.success());
+    let rec_after_reinst_fail = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_after_reinst_fail.contains("RECORD_STATE=updating\n"),
+        "reinstall record should be visible:\n{rec_after_reinst_fail}"
+    );
+    let bk_reinst = PathBuf::from(
+        rec_after_reinst_fail
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+    assert!(
+        bk_reinst.is_dir() && bk_reinst.join(".qeminga-tx-id").is_file(),
+        "reinstall exit trap MUST preserve recorded backup when record rename already succeeded"
+    );
+
+    let reinst_retry = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "fsync-box",
+            "--service",
+            "qeminga-fsync-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        reinst_retry.status.success(),
+        "retrying reinstall after post-rename fsync failure must recover cleanly: {}",
+        text(&reinst_retry)
+    );
+    assert!(inst.join("bin/v1-marker").exists() && !bk_reinst.exists());
+}
+
+#[test]
+fn restore_managed_config_retains_blobs_and_manifest_until_recorded_pruning_phase() {
+    let dir = private_tempdir();
+    let runner_dir = dir.path().join("runner");
+    let cfg_dir = dir.path().join("cfg");
+    let hook_dir = dir.path().join("hooks");
+    let unit_dir = dir.path().join("units");
+    let bk_dir = dir.path().join(".qeminga-update-backup.cfgretain");
+    for d in [&runner_dir, &cfg_dir, &hook_dir, &unit_dir, &bk_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::set_permissions(&bk_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let policy_path = cfg_dir.join("policy.env");
+    let hook_path = hook_dir.join("hook-job-started.sh");
+    let unit_path = unit_dir.join("qeminga-cfg-retain.service");
+    std::fs::write(&policy_path, b"ORIGINAL_POLICY=1\n").unwrap();
+    std::fs::write(&hook_path, b"#!/bin/sh\necho orig-hook\n").unwrap();
+    std::fs::write(&unit_path, b"[Unit]\nDescription=orig\n").unwrap();
+
+    let vol_inst = live_volume_id(&runner_dir);
+    let vol_hook = live_volume_id(&hook_dir);
+    let vol_unit = live_volume_id(&unit_path);
+
+    let id_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops path-identity "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            bk_dir.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(id_out.status.success(), "{}", text(&id_out));
+    let bk_id = String::from_utf8(id_out.stdout).unwrap().trim().to_string();
+
+    let snap_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops snapshot-managed-config "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}""#,
+            "_",
+            script().to_str().unwrap(),
+            runner_dir.to_str().unwrap(),
+            &vol_inst,
+            bk_dir.to_str().unwrap(),
+            &bk_id,
+            cfg_dir.to_str().unwrap(),
+            hook_dir.to_str().unwrap(),
+            &vol_hook,
+            unit_path.to_str().unwrap(),
+            &vol_unit,
+        ])
+        .output()
+        .unwrap();
+    assert!(snap_out.status.success(), "{}", text(&snap_out));
+
+    // Mutate live managed files as a reinstall would.
+    std::fs::write(&policy_path, b"MUTATED_POLICY=2\n").unwrap();
+    std::fs::write(&hook_path, b"#!/bin/sh\necho mutated-hook\n").unwrap();
+    std::fs::write(&unit_path, b"[Unit]\nDescription=mutated\n").unwrap();
+
+    // First restore MUST restore original files AND retain BOTH cfg_old/ and config-manifest.json.
+    let run_restore = || {
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops restore-runner-backup "$2" "$3" "$4" "$5" "" "0" "$6" "$7" "$8" "$9" "${10}""#,
+                "_",
+                script().to_str().unwrap(),
+                runner_dir.to_str().unwrap(),
+                &vol_inst,
+                bk_dir.to_str().unwrap(),
+                &bk_id,
+                cfg_dir.to_str().unwrap(),
+                hook_dir.to_str().unwrap(),
+                &vol_hook,
+                unit_path.to_str().unwrap(),
+                &vol_unit,
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let r1 = run_restore();
+    assert!(r1.status.success(), "first restore failed: {}", text(&r1));
+    assert_eq!(std::fs::read(&policy_path).unwrap(), b"ORIGINAL_POLICY=1\n");
+    assert_eq!(
+        std::fs::read(&hook_path).unwrap(),
+        b"#!/bin/sh\necho orig-hook\n"
+    );
+    assert_eq!(
+        std::fs::read(&unit_path).unwrap(),
+        b"[Unit]\nDescription=orig\n"
+    );
+    assert!(
+        bk_dir.join("cfg_old").is_dir()
+            && bk_dir.join("cfg_old/cfg__policy.env").is_file()
+            && bk_dir.join("config-manifest.json").is_file(),
+        "restore-runner-backup MUST retain cfg_old blobs and config-manifest.json until recorded pruning phase"
+    );
+
+    // Mutate again and invoke restore a SECOND time (simulating crash before UPDATE_PHASE=restored
+    // was saved) -> MUST remain completely idempotent!
+    std::fs::write(&policy_path, b"PARTIAL_RETRY=3\n").unwrap();
+    let r2 = run_restore();
+    assert!(
+        r2.status.success(),
+        "second idempotent restore must succeed with blobs+manifest retained: {}",
+        text(&r2)
+    );
+    assert_eq!(std::fs::read(&policy_path).unwrap(), b"ORIGINAL_POLICY=1\n");
+
+    // Recorded pruning phase (`safe-rmtree-id`) reclaims everything cleanly.
+    let prune = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops safe-rmtree-id "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            bk_dir.to_str().unwrap(),
+            &bk_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        prune.status.success() && !bk_dir.exists(),
+        "{}",
+        text(&prune)
+    );
+}
+
+#[test]
+fn service_state_checks_fail_closed_on_manager_error_unknown_state_and_stop_activating_units() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"svcstate-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
+exit 0
+"#,
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    let state_file = dir.path().join("svc.state");
+    let sc_log = dir.path().join("sc.log");
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
+st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active)
+        case "$st" in
+            bus-error)
+                echo "Failed to connect to bus: No such file or directory" >&2
+                exit 1
+                ;;
+            active | reloading)
+                echo "$st"
+                exit 0
+                ;;
+            activating | deactivating | inactive | failed | maintenance)
+                echo "$st"
+                exit 3
+                ;;
+            *)
+                echo "$st"
+                exit 3
+                ;;
+        esac
+        ;;
+    stop)
+        if [ -f "${FAKE_STOP_STUCK:-}" ]; then exit 0; fi
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    start | enable)
+        echo "active" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "svcstate-box",
+            "--service",
+            "qeminga-svcstate-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // 1. Forward `update` under systemd manager error (empty stdout, exit 1) MUST fail closed
+    //    without mutating live files or install.env.
+    std::fs::write(&state_file, "bus-error\n").unwrap();
+    let upd_bus = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !upd_bus.status.success()
+            && inst.join("bin/v1-marker").exists()
+            && !inst.join("bin/v2-marker").exists(),
+        "forward update MUST fail closed on systemd connection failure: {}",
+        text(&upd_bus)
+    );
+
+    // 2. Forward `update` under unrecognized state (`maintenance`) MUST also fail closed!
+    std::fs::write(&state_file, "maintenance\n").unwrap();
+    let upd_unk = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !upd_unk.status.success() && inst.join("bin/v1-marker").exists(),
+        "forward update MUST fail closed on unrecognized systemd state: {}",
+        text(&upd_unk)
+    );
+
+    // 3. Forward `update` while Type=notify unit is `activating` MUST stop it first, confirm
+    //    stopped, publish v2, and restart it (`active`)!
+    std::fs::write(&state_file, "activating\n").unwrap();
+    let _ = std::fs::remove_file(&sc_log);
+    let upd_act = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        upd_act.status.success(),
+        "forward update must stop an activating Type=notify unit and restart after publish: {}",
+        text(&upd_act)
+    );
+    let sc_act = std::fs::read_to_string(&sc_log).unwrap_or_default();
+    assert!(
+        sc_act.contains("stop qeminga-svcstate-box.service")
+            && sc_act.contains("start qeminga-svcstate-box.service")
+            && std::fs::read_to_string(&state_file).unwrap().trim() == "active",
+        "update must stop activating unit and restart it afterwards:\n{sc_act}"
+    );
+
+    // 4. Forward `reinstall` while unit is `activating` MUST also stop it before publishing,
+    //    and MUST fail closed under systemd connection failure (`bus-error`)!
+    std::fs::write(&state_file, "bus-error\n").unwrap();
+    let reinst_bus = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "svcstate-box",
+            "--service",
+            "qeminga-svcstate-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !reinst_bus.status.success() && inst.join("bin/v2-marker").exists(),
+        "forward reinstall MUST fail closed on systemd connection failure: {}",
+        text(&reinst_bus)
+    );
+
+    // 5. Recovery (`UPDATE_PHASE=publishing`) under systemd connection failure (`bus-error`):
+    //    Crash an update mid-publish while inactive, then set `bus-error` and verify BOTH
+    //    `update` recovery AND `uninstall` recovery refuse to restore underneath an indeterminate
+    //    service state and preserve the journal + backup intact!
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    let crash = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_TEST_CRASH_PUBLISH_AFTER", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert_eq!(crash.status.code(), Some(99), "{}", text(&crash));
+    let rec_pub = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let bk_pub = PathBuf::from(
+        rec_pub
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+
+    std::fs::write(&state_file, "bus-error\n").unwrap();
+    let recov_upd_bus = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !recov_upd_bus.status.success() && bk_pub.is_dir(),
+        "update recovery MUST fail closed and retain backup/journal when systemd connection fails: {}",
+        text(&recov_upd_bus)
+    );
+    assert!(
+        std::fs::read_to_string(cfg.join("install.env"))
+            .unwrap()
+            .contains("UPDATE_PHASE=publishing\n"),
+        "journal must remain in UPDATE_PHASE=publishing on indeterminate service state"
+    );
+
+    let recov_uninst_bus = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !recov_uninst_bus.status.success() && bk_pub.is_dir(),
+        "uninstall recovery MUST fail closed and retain backup/journal when systemd connection fails: {}",
+        text(&recov_uninst_bus)
+    );
+}
+
+#[test]
+fn reinstall_records_preparing_phase_before_copying_jit_credential_and_recovers_on_interruption() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("config.sh"), "#!/bin/sh\nexit 0\n");
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active) echo "inactive"; exit 3 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let jit1 = dir.path().join("jit1");
+    let jit2 = dir.path().join("jit2");
+    let jit1_blob = make_jit_config(REPO_URL, "_work");
+    let jit2_blob = make_jit_config(REPO_URL, "_work");
+    std::fs::write(&jit1, format!("{jit1_blob}\n")).unwrap();
+    std::fs::write(&jit2, format!("{jit2_blob}\n")).unwrap();
+    std::fs::set_permissions(&jit1, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&jit2, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    // Install v1 JIT runner with sensitive `cfg/jitconfig`.
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "jitprep-box",
+            "--service",
+            "qeminga-jitprep-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--jitconfig-file",
+            jit1.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+    let orig_policy = std::fs::read(cfg.join("policy.env")).unwrap();
+    let orig_jit = std::fs::read(cfg.join("jitconfig")).unwrap();
+
+    let crash_reinstall_mid_snapshot = || -> PathBuf {
+        let out = run_setup_env(
+            &[
+                "install",
+                "--repo",
+                REPO_URL,
+                "--name",
+                "jitprep-box",
+                "--service",
+                "qeminga-jitprep-box",
+                "--install-dir",
+                inst.to_str().unwrap(),
+                "--state-dir",
+                state.to_str().unwrap(),
+                "--hook-dir",
+                hooks.to_str().unwrap(),
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--jitconfig-file",
+                jit2.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+                "--skip-packages",
+                "--no-start",
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("QEMINGA_TEST_CRASH_SNAPSHOT_AFTER", "2"),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ],
+            Some(&bin),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(98),
+            "expected simulated mid-snapshot crash exit 98: {}",
+            text(&out)
+        );
+        let rec = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+        assert!(
+            rec.contains("RECORD_STATE=updating\n") && rec.contains("UPDATE_PHASE=preparing\n"),
+            "backup identity MUST already be recorded under UPDATE_PHASE=preparing before copying jitconfig:\n{rec}"
+        );
+        let bk = PathBuf::from(
+            rec.lines()
+                .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+                .unwrap(),
+        );
+        assert!(
+            bk.join("cfg_old/cfg__jitconfig").is_file()
+                && !bk.join("config-manifest.json").exists(),
+            "crash should happen AFTER copying cfg_old/cfg__jitconfig and BEFORE config-manifest.json"
+        );
+        assert_eq!(std::fs::read(cfg.join("policy.env")).unwrap(), orig_policy);
+        assert_eq!(std::fs::read(cfg.join("jitconfig")).unwrap(), orig_jit);
+        bk
+    };
+
+    // Case 1: Crash after copying jitconfig -> retry `install` locates and prunes the incomplete
+    // snapshot (eliminating stray cfg__jitconfig) and completes cleanly.
+    let bk1 = crash_reinstall_mid_snapshot();
+    let retry_inst = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "jitprep-box",
+            "--service",
+            "qeminga-jitprep-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--jitconfig-file",
+            jit2.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        retry_inst.status.success(),
+        "retrying install after mid-snapshot crash must prune incomplete snapshot and succeed: {}",
+        text(&retry_inst)
+    );
+    assert!(
+        !bk1.exists(),
+        "retry install must delete incomplete snapshot with copied jitconfig"
+    );
+
+    // Case 2: Crash again mid-snapshot -> `update` prunes incomplete snapshot without modifying
+    // original config/jitconfig files!
+    let bk2 = crash_reinstall_mid_snapshot();
+    let recov_upd = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        recov_upd.status.success(),
+        "update after mid-snapshot preparing crash must prune stray jitconfig snapshot: {}",
+        text(&recov_upd)
+    );
+    assert!(!bk2.exists() && std::fs::read(cfg.join("jitconfig")).unwrap() == orig_jit);
+
+    // Case 3: Crash again mid-snapshot -> `uninstall` locates and prunes the incomplete snapshot
+    // containing the copied jitconfig!
+    let bk3 = crash_reinstall_mid_snapshot();
+    let recov_uninst = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        recov_uninst.status.success(),
+        "uninstall after mid-snapshot preparing crash must prune stray jitconfig snapshot: {}",
+        text(&recov_uninst)
+    );
+    assert!(
+        !bk3.exists(),
+        "uninstall must remove incomplete snapshot containing copied jitconfig"
+    );
+}
+
+#[test]
+fn migrate_record_recognizes_and_validates_preceding_376eed2_phased_journals() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"prev-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
+exit 0
+"#,
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active) echo "inactive"; exit 3 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "prev-box",
+            "--service",
+            "qeminga-prev-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // Helper generating the EXACT `376eed2` identity token format:
+    // `p_dev:<dev>;p_ino:<ino>;p_mnt:<mnt>;t_dev:<dev>;t_ino:<ino>;t_mnt:<mnt>;vol:<vol>`
+    let make_376eed2_id = |target: &Path| -> String {
+        let vol = live_volume_id(target);
+        let py = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, sys
+target = os.path.normpath(sys.argv[1])
+vol = sys.argv[2]
+parent = os.path.dirname(target) or "/"
+def mnt(fd):
+    for line in open(f"/proc/self/fdinfo/{fd}"):
+        if line.startswith("mnt_id:"):
+            return line.split(":", 1)[1].strip()
+    raise RuntimeError("no mnt_id")
+pfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+tfd = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    pst = os.fstat(pfd)
+    tst = os.fstat(tfd)
+    print(f"p_dev:{pst.st_dev};p_ino:{pst.st_ino};p_mnt:{mnt(pfd)};t_dev:{tst.st_dev};t_ino:{tst.st_ino};t_mnt:{mnt(tfd)};vol:{vol}")
+finally:
+    os.close(tfd)
+    os.close(pfd)
+"#,
+                target.to_str().unwrap(),
+                &vol,
+            ])
+            .output()
+            .unwrap();
+        assert!(py.status.success(), "{}", text(&py));
+        String::from_utf8(py.stdout).unwrap().trim().to_string()
+    };
+
+    // Fixture A: `376eed2` `UPDATE_PHASE=publishing` record with stage + backup (no `.qeminga-tx-id`).
+    let prev_stage = dir.path().join(".qeminga-extract.prev376");
+    let prev_bk = dir.path().join(".qeminga-update-backup.prev376");
+    std::fs::create_dir(&prev_stage).unwrap();
+    std::fs::create_dir(&prev_bk).unwrap();
+    std::fs::set_permissions(&prev_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&prev_bk, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let prev_stage_id = make_376eed2_id(&prev_stage);
+    let prev_bk_id = make_376eed2_id(&prev_bk);
+
+    let rec_base = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let rec_376_pub = rec_base.replace(
+        "RECORD_STATE=installed\n",
+        &format!(
+            "RECORD_STATE=updating\nUPDATE_PHASE=publishing\nUPDATE_STAGE_DIR={}\nUPDATE_STAGE_ID={}\nUPDATE_BACKUP_DIR={}\nUPDATE_BACKUP_ID={}\nUPDATE_WAS_ACTIVE=0\n",
+            prev_stage.display(),
+            prev_stage_id,
+            prev_bk.display(),
+            prev_bk_id
+        ),
+    );
+    std::fs::write(cfg.join("install.env"), &rec_376_pub).unwrap();
+
+    // 1. `update` and `uninstall` MUST recognize the 376eed2 phased record (NOT crash with
+    //    cryptic `invalid UPDATE_BACKUP_ID`) and direct operator to `migrate-record --confirm-volumes`.
+    let upd_376 = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    let upd_376_msg = text(&upd_376);
+    assert!(
+        !upd_376.status.success()
+            && upd_376_msg.contains("migrate-record")
+            && !upd_376_msg.contains("invalid UPDATE_BACKUP_ID"),
+        "update must recognize preceding 376eed2 phased record and direct to migrate-record: {upd_376_msg}"
+    );
+
+    // 2. Substituted backup directory (different inode, still 0700) MUST be rejected by migrate-record!
+    let prev_bk_held = dir.path().join(".qeminga-hold-prev-bk");
+    std::fs::rename(&prev_bk, &prev_bk_held).unwrap();
+    std::fs::create_dir(&prev_bk).unwrap();
+    std::fs::set_permissions(&prev_bk, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mig_bad_ino = run_setup_env(
+        &[
+            "migrate-record",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--confirm-volumes",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !mig_bad_ino.status.success(),
+        "migrate-record MUST reject 376eed2 backup whose inode changed: {}",
+        text(&mig_bad_ino)
+    );
+    std::fs::remove_dir(&prev_bk).unwrap();
+    std::fs::rename(&prev_bk_held, &prev_bk).unwrap();
+
+    // 3. Genuine 376eed2 `publishing` record migrates cleanly, preserves UPDATE_PHASE=publishing,
+    //    stamps .qeminga-tx-id in both stage & backup, upgrades tokens, and allows `update` to recover!
+    let mig_pub = run_setup_env(
+        &[
+            "migrate-record",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--confirm-volumes",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        mig_pub.status.success(),
+        "migrate-record must upgrade verified 376eed2 publishing journal: {}",
+        text(&mig_pub)
+    );
+    let rec_pub_after = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_pub_after.contains("UPDATE_PHASE=publishing\n")
+            && rec_pub_after.contains("tx:")
+            && !rec_pub_after.contains("p_dev:")
+            && prev_bk.join(".qeminga-tx-id").is_file()
+            && prev_stage.join(".qeminga-tx-id").is_file(),
+        "migrated 376eed2 publishing record must preserve phase and carry tx tokens:\n{rec_pub_after}"
+    );
+    let upd_after_mig = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        upd_after_mig.status.success()
+            && !prev_bk.exists()
+            && !prev_stage.exists()
+            && inst.join("bin/v2-marker").exists(),
+        "update after migrating 376eed2 publishing record must recover cleanly: {}",
+        text(&upd_after_mig)
+    );
+
+    // Fixture B: `376eed2` `UPDATE_PHASE=committed` record with backup dir only -> migrates preserving
+    // `UPDATE_PHASE=committed` (never downgrading to `publishing`!) and `update` prunes backup cleanly!
+    let prev_bk_comm = dir.path().join(".qeminga-update-backup.prev376comm");
+    std::fs::create_dir(&prev_bk_comm).unwrap();
+    std::fs::set_permissions(&prev_bk_comm, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let prev_bk_comm_id = make_376eed2_id(&prev_bk_comm);
+    let rec_now = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let rec_376_comm = rec_now.replace(
+        "RECORD_STATE=installed\n",
+        &format!(
+            "RECORD_STATE=updating\nUPDATE_PHASE=committed\nUPDATE_STAGE_DIR=\nUPDATE_STAGE_ID=\nUPDATE_BACKUP_DIR={}\nUPDATE_BACKUP_ID={}\nUPDATE_WAS_ACTIVE=0\n",
+            prev_bk_comm.display(),
+            prev_bk_comm_id
+        ),
+    );
+    std::fs::write(cfg.join("install.env"), &rec_376_comm).unwrap();
+
+    let mig_comm = run_setup_env(
+        &[
+            "migrate-record",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--confirm-volumes",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        mig_comm.status.success(),
+        "migrate-record must upgrade verified 376eed2 committed journal: {}",
+        text(&mig_comm)
+    );
+    let rec_comm_after = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_comm_after.contains("UPDATE_PHASE=committed\n")
+            && rec_comm_after.contains("tx:")
+            && !rec_comm_after.contains("p_dev:"),
+        "migrated 376eed2 committed record must preserve UPDATE_PHASE=committed:\n{rec_comm_after}"
     );
 }

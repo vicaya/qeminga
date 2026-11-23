@@ -79,6 +79,27 @@ fn private_tempdir() -> tempfile::TempDir {
         .unwrap()
 }
 
+/// Write a mock `systemctl` stub that answers live
+/// `systemctl show -p LoadState -p FragmentPath <unit>` (and
+/// `systemctl show -p LoadState --value <unit>`) queries consistently with
+/// `QEMINGA_SYSTEMD_UNIT_DIR`, then runs `body` for all other verbs.
+fn write_mock_systemctl(path: &Path, body: &str) {
+    let rest = body.strip_prefix("#!/bin/sh\n").unwrap_or(body);
+    let full = format!(
+        "#!/bin/sh\n\
+if [ \"$1\" = \"show\" ]; then\n\
+    val_only=0; unit=\"\"\n\
+    for a in \"$@\"; do [ \"$a\" = \"--value\" ] && val_only=1; unit=\"$a\"; done\n\
+    if [ \"$val_only\" -eq 1 ]; then echo \"not-found\"; exit 0; fi\n\
+    udir=\"${{QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}}\"\n\
+    if [ -f \"${{udir%/}}/${{unit}}\" ]; then echo \"LoadState=loaded\"; echo \"FragmentPath=${{udir%/}}/${{unit}}\"; else echo \"LoadState=not-found\"; echo \"FragmentPath=\"; fi\n\
+    exit 0\n\
+fi\n\
+{rest}"
+    );
+    write_exec(path, &full);
+}
+
 fn live_volume_id(path: &Path) -> String {
     let out = Command::new("bash")
         .args([
@@ -218,7 +239,27 @@ exec "$@"
 if [ -n "${FAKE_SC_LOG:-}" ]; then
     printf '%s\n' "$*" >> "$FAKE_SC_LOG"
 fi
-if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "show" ]; then
+    val_only=0
+    unit=""
+    for a in "$@"; do
+        if [ "$a" = "--value" ]; then val_only=1; fi
+        unit="$a"
+    done
+    if [ "$val_only" -eq 1 ]; then
+        echo "not-found"
+        exit 0
+    fi
+    udir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    if [ -f "${udir%/}/${unit}" ]; then
+        echo "LoadState=loaded"
+        echo "FragmentPath=${udir%/}/${unit}"
+    else
+        echo "LoadState=not-found"
+        echo "FragmentPath="
+    fi
+    exit 0
+fi
 if [ "$1" = "is-active" ]; then rc="${FAKE_IS_ACTIVE_RC:-3}"; if [ "$rc" -eq 0 ]; then echo active; else echo inactive; fi; exit "$rc"; fi
 exit 0
 "#,
@@ -1639,7 +1680,7 @@ if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
 exit 0
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -2604,7 +2645,7 @@ if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
 exit 0
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -2810,7 +2851,7 @@ exit 0
     );
     write_exec(&bin3.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin3.join("getent"), "#!/bin/sh\nexit 0\n");
-    write_exec(
+    write_mock_systemctl(
         &bin3.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -3431,7 +3472,7 @@ fn existing_registration_check_and_rollback_on_failed_reconfig() {
     let sc_log = dir.path().join("systemctl.log");
     let chown_log = dir.path().join("chown.log");
     let install_log = dir.path().join("install.log");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nexit 0\n",
     );
@@ -3878,7 +3919,7 @@ exit 0
 "#,
     );
     // Simulate systemd removing RuntimeDirectory= when the service stops.
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "is-active" ]; then
@@ -4528,7 +4569,7 @@ if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
 exit 0
 "#,
     );
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
@@ -4881,7 +4922,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -5149,7 +5190,7 @@ exit 0
         &bin.join("chown"),
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_CHOWN_LOG:?}\"\nexit 0\n",
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nexit 0\n",
     );
@@ -5327,7 +5368,7 @@ exec "$@"
 "#,
     );
     // Simulate systemd Type=notify rejecting startup when run-runner.sh exits 78 without READY=1.
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -5500,7 +5541,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -5808,7 +5849,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -6046,7 +6087,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -6336,7 +6377,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -6637,7 +6678,7 @@ exec /usr/bin/stat "$@"
 "#,
     );
     // Fake systemctl captures a snapshot of install.env at the exact moment daemon-reload runs.
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         &format!(
             r#"#!/bin/sh
@@ -6956,7 +6997,7 @@ exec "$@"
     // When check_unit_not_occupied runs right before publishing the unit (detected by
     // $RACE_MASK_TRIGGER existing on disk), fake systemctl plants either a systemd mask
     // symlink ($RACE_MASK_UNIT -> /dev/null) or a directory ($RACE_DIR_UNIT)!
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -7418,7 +7459,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -7701,7 +7742,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -8055,7 +8096,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -8275,7 +8316,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -8404,7 +8445,7 @@ exit 0
     );
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -8671,7 +8712,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -9002,7 +9043,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -9187,7 +9228,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -9467,7 +9508,7 @@ exit 0
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -9638,7 +9679,7 @@ exit 0
     write_exec(&bin.join("userdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -9901,7 +9942,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -10708,7 +10749,7 @@ done
 exec "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
@@ -10948,7 +10989,7 @@ if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
 exec /usr/bin/stat "$@"
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -11021,7 +11062,7 @@ exit 22
     std::fs::write(inst.join("donor-sentinel"), b"UNCONFIRMED-VOLUME\n").unwrap();
     let sc_log = dir.path().join("sc.log");
     let curl_log = dir.path().join("curl.log");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -11232,7 +11273,7 @@ exit 0
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_RUNUSER_LOG:?}\"\nexit 0\n",
     );
     write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
-    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_mock_systemctl(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
@@ -13448,7 +13489,7 @@ fn install_and_update_reject_empty_or_incomplete_runner_tarball_before_mutating(
     write_exec(&bin.join("dpkg"), "#!/bin/sh\nexit 0\n");
     let sc_log = dir.path().join("systemctl.log");
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -13688,7 +13729,7 @@ fn update_keeps_previous_runner_recoverable_across_mid_publish_failure_and_crash
     // Stateful fake systemctl: tracks active/stopped in FAKE_ACTIVE_FLAG and logs every call.
     let sc_log = dir.path().join("systemctl.log");
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -14059,7 +14100,7 @@ fn update_protects_custom_jit_workspace_and_allows_hardlinked_job_files() {
     }
     install_standard_mock_bin(&bin);
     let sc_log = dir.path().join("systemctl.log");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -14408,7 +14449,7 @@ fn error_cleanup_verifies_stage_identity_and_preserves_replacement_mount() {
     // for a brand-new directory with the same name containing precious data.
     let swapped_record = dir.path().join("swapped-stage-path");
     let saved_orig = dir.path().join("saved-orig-stage");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -15012,7 +15053,7 @@ fn update_keeps_previous_runner_until_replacement_starts_and_commits_before_prun
     let state = dir.path().join("state");
     let hooks = dir.path().join("hooks");
     let cfg = dir.path().join("cfg");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -15256,7 +15297,7 @@ fn update_recovery_handles_interrupted_manifest_preparation_and_rejects_corrupt_
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -15555,7 +15596,7 @@ exit 0
     std::fs::write(&active_flag, b"1").unwrap();
     let swapped_stage_rec = dir.path().join("swapped-stage-rec");
     let saved_orig = dir.path().join("saved-orig-stage");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -15625,7 +15666,7 @@ esac
     let _ = std::fs::remove_dir_all(&saved_orig);
 
     // Part B: Missing recorded backup during `UPDATE_PHASE=publishing` MUST fail closed!
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         "#!/bin/sh\nif [ \"$1\" = \"is-active\" ]; then echo inactive; exit 3; fi\nexit 0\n",
     );
@@ -15763,7 +15804,7 @@ fn reinstall_existing_runner_validates_bundle_before_mutating_and_rolls_back_on_
     let state = dir.path().join("state");
     let hooks = dir.path().join("hooks");
     let cfg = dir.path().join("cfg");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -16146,7 +16187,7 @@ fn restore_runner_backup_is_idempotent_and_retains_verified_container_until_rest
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -16414,7 +16455,7 @@ fn publishing_recovery_and_uninstall_stop_active_replacement_service_before_rest
     let state = dir.path().join("state");
     let hooks = dir.path().join("hooks");
     let cfg = dir.path().join("cfg");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
@@ -16709,7 +16750,7 @@ fn interrupted_update_recovers_across_remount_with_tx_marker_and_volume() {
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -17119,7 +17160,7 @@ fn privileged_interrupted_update_recovers_across_remount_in_fresh_mount_namespac
         build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -17586,7 +17627,7 @@ fn legacy_updating_record_without_phase_provides_actionable_diagnostic_and_guard
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -18477,7 +18518,7 @@ exit 0
 
     let active_flag = dir.path().join("svc.active");
     let sc_log = dir.path().join("sc.log");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
@@ -18843,7 +18884,7 @@ fn update_and_reinstall_preserve_backup_when_publishing_record_dir_fsync_fails_a
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
     let active_flag = dir.path().join("svc.active");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -19674,7 +19715,7 @@ fn service_state_checks_fail_closed_on_manager_error_unknown_state_and_stop_acti
     let state_file = dir.path().join("svc.state");
     let sc_log = dir.path().join("sc.log");
     std::fs::write(&state_file, "inactive\n").unwrap();
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
@@ -20191,7 +20232,7 @@ esac
     //        service BEFORE `lock_runner_permissions` changes `inst` from 0700 to 0755, complete
     //        the update, and restart the service (`active`) retaining restart intent!
     let stop_seen_mode = dir.path().join("stop-seen-inst-mode");
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
@@ -20282,7 +20323,7 @@ case "$1" in
 esac
 "#,
     );
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -20489,7 +20530,7 @@ fn reinstall_records_preparing_phase_before_copying_jit_credential_and_recovers_
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -20758,7 +20799,7 @@ fn migrate_record_recognizes_and_validates_preceding_376eed2_phased_journals() {
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
 
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -21453,7 +21494,7 @@ fn uninstall_publishing_with_missing_live_dir_preserves_backup_on_journal_write_
     let (v2_tb, v2_sha) =
         build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
 
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -21668,7 +21709,7 @@ fn recovery_persists_newly_observed_running_state_before_stopping_service() {
     let rec_seen_at_stop = dir.path().join("rec-seen-at-stop.txt");
     std::fs::write(&state_file, "inactive\n").unwrap();
 
-    write_exec(
+    write_mock_systemctl(
         &bin.join("systemctl"),
         r#"#!/bin/sh
 case "$1" in
@@ -22267,5 +22308,466 @@ esac
             && std::fs::read_to_string(&state_file).unwrap().trim() == "active",
         "uninstall MUST refuse before stop/disable when manager FragmentPath differs (sc_log:\n{frag_sc}): {}",
         text(&uninst_frag_mismatch)
+    );
+}
+
+#[test]
+fn verify_resolved_unit_fragment_fails_closed_on_show_error_and_empty_output() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_sh = runner_registration_config_script("showerr-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+
+    let state_file = dir.path().join("svc.state");
+    let sc_log = dir.path().join("sc.log");
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
+case "$1" in
+    show)
+        # Support check_unit_not_occupied (`show -p LoadState --value`) during install
+        for a in "$@"; do
+            if [ "$a" = "--value" ]; then echo "not-found"; exit 0; fi
+        done
+        if [ "${FAKE_SHOW_MODE:-ok}" = "error" ]; then
+            echo "Failed to connect to bus" >&2
+            exit 1
+        elif [ "${FAKE_SHOW_MODE:-ok}" = "empty" ]; then
+            exit 0
+        elif [ "${FAKE_SHOW_MODE:-ok}" = "no_frag" ]; then
+            echo "LoadState=loaded"
+            echo "FragmentPath="
+            exit 0
+        else
+            echo "LoadState=loaded"
+            echo "FragmentPath=${FAKE_EXPECTED_FRAG:?}"
+            exit 0
+        fi
+        ;;
+    is-active)
+        st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+        case "$st" in
+            active) echo active; exit 0 ;;
+            inactive) echo inactive; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    is-enabled)
+        echo "disabled"; exit 1
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+    let unit_file = units.join("qeminga-showerr-box.service");
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "showerr-box",
+            "--service",
+            "qeminga-showerr-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+    assert!(unit_file.is_file());
+
+    // Even with a regular local unit file present, `systemctl show` failing, returning empty
+    // output, or returning `LoadState=loaded` with empty `FragmentPath=` MUST fail closed
+    // BEFORE `stop` or `disable`!
+    for bad_mode in ["error", "empty", "no_frag"] {
+        std::fs::write(&state_file, "active\n").unwrap();
+        let _ = std::fs::remove_file(&sc_log);
+        let uninst = run_setup_env(
+            &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+                ("FAKE_SHOW_MODE", bad_mode),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        let logged = std::fs::read_to_string(&sc_log).unwrap_or_default();
+        assert!(
+            !uninst.status.success()
+                && !logged.contains("stop ")
+                && !logged.contains("disable ")
+                && std::fs::read_to_string(&state_file).unwrap().trim() == "active"
+                && cfg.join("install.env").is_file(),
+            "mode={bad_mode}: uninstall MUST fail closed before stop/disable when live fragment cannot be verified (sc_log:\n{logged}): {}",
+            text(&uninst)
+        );
+    }
+
+    // With a matching live `LoadState=loaded` + `FragmentPath=<unit_file>`, uninstall succeeds!
+    std::fs::write(&state_file, "active\n").unwrap();
+    let uninst_ok = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SHOW_MODE", "ok"),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        uninst_ok.status.success() && !unit_file.exists(),
+        "uninstall with confirmed live FragmentPath should succeed: {}",
+        text(&uninst_ok)
+    );
+}
+
+#[test]
+fn retry_reconfirms_durable_restart_intent_before_stop_even_when_visible_flag_is_one() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let cfg_sh = runner_registration_config_script("reconfirm-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+    let (v2_tb, v2_sha) =
+        build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
+
+    let state_file = dir.path().join("svc.state");
+    let sc_count = dir.path().join("is_active.count");
+    let post_stop_armed = dir.path().join("post_stop.armed");
+    let rec_at_stop = dir.path().join("rec_at_stop.txt");
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show)
+        for a in "$@"; do
+            if [ "$a" = "--value" ]; then echo "not-found"; exit 0; fi
+        done
+        echo "LoadState=loaded"
+        echo "FragmentPath=${FAKE_EXPECTED_FRAG:?}"
+        exit 0
+        ;;
+    is-active)
+        if [ -n "${FAKE_POST_STOP_ARMED:-}" ] && [ -f "${FAKE_POST_STOP_ARMED}" ]; then
+            rm -f "${FAKE_POST_STOP_ARMED}"
+            echo "Failed to connect to bus" >&2
+            exit 1
+        fi
+        if [ -n "${FAKE_FLIP_ACTIVE_ON_CALL:-}" ] && [ -n "${FAKE_SC_COUNT:-}" ]; then
+            c="$(cat "${FAKE_SC_COUNT}" 2>/dev/null || echo 0)"
+            c=$((c + 1))
+            echo "$c" > "${FAKE_SC_COUNT}"
+            if [ "$c" -eq "${FAKE_FLIP_ACTIVE_ON_CALL}" ]; then
+                echo "active" > "${FAKE_STATE_FILE:?}"
+            fi
+        fi
+        st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+        case "$st" in
+            active) echo active; exit 0 ;;
+            inactive) echo inactive; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        if [ -n "${FAKE_REC_PATH:-}" ] && [ -n "${FAKE_REC_AT_STOP_OUT:-}" ]; then
+            grep '^UPDATE_WAS_ACTIVE=' "$FAKE_REC_PATH" > "$FAKE_REC_AT_STOP_OUT" 2>/dev/null || true
+        fi
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        if [ "${FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP:-0}" = "1" ] && [ -n "${FAKE_POST_STOP_ARMED:-}" ]; then
+            : > "${FAKE_POST_STOP_ARMED}"
+        fi
+        exit 0
+        ;;
+    start)
+        echo "active" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let rec_path = cfg.join("install.env");
+    let unit_dir = units.to_str().unwrap();
+    let unit_file = units.join("qeminga-reconfirm-box.service");
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "reconfirm-box",
+            "--service",
+            "qeminga-reconfirm-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // 1. Restored journal with UPDATE_WAS_ACTIVE=0 while service IS active:
+    //    Fail post-rename dir fsync on `install.env:UPDATE_WAS_ACTIVE=1` TWICE in a row!
+    //    After attempt 1, `UPDATE_WAS_ACTIVE=1` is visible on disk (unsynced) and service is active.
+    //    Attempt 2 MUST STILL re-sync `UPDATE_WAS_ACTIVE=1` BEFORE stopping — so while the sync
+    //    error persists, attempt 2 MUST ALSO fail BEFORE calling `systemctl stop`!
+    let base_rec = std::fs::read_to_string(&rec_path).unwrap();
+    std::fs::write(
+        &rec_path,
+        base_rec.replace(
+            "RECORD_STATE=installed\n",
+            "RECORD_STATE=updating\nUPDATE_PHASE=restored\nUPDATE_STAGE_DIR=\nUPDATE_STAGE_ID=\nUPDATE_BACKUP_DIR=\nUPDATE_BACKUP_ID=\nUPDATE_WAS_ACTIVE=0\n",
+        ),
+    )
+    .unwrap();
+    std::fs::write(&state_file, "active\n").unwrap();
+
+    for attempt in [1, 2] {
+        let fail_out = run_setup_env(
+            &[
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                (
+                    "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                    "install.env:UPDATE_WAS_ACTIVE=1",
+                ),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            !fail_out.status.success(),
+            "attempt {attempt}: update must fail while UPDATE_WAS_ACTIVE=1 dir fsync fails: {}",
+            text(&fail_out)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap().trim(),
+            "active",
+            "attempt {attempt}: MUST NOT stop service while durable restart intent sync fails (even when visible flag is already 1)"
+        );
+        assert!(
+            std::fs::read_to_string(&rec_path)
+                .unwrap()
+                .contains("UPDATE_WAS_ACTIVE=1\n")
+        );
+    }
+
+    // Attempt 3 without sync error succeeds and restarts the runner (`active`).
+    let ok_rest = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(ok_rest.status.success(), "{}", text(&ok_rest));
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "active"
+    );
+
+    // 2. Forward `cmd_update`: unit is `inactive` during pre-download (call 1) and post-download
+    //    (call 2), so `publishing` is written with `UPDATE_WAS_ACTIVE=0`. Right before
+    //    `ensure_owned_service_stopped` (call 3), the unit becomes `active`, and ONLY the
+    //    post-stop `is-active` query fails! Forward update MUST persist `UPDATE_WAS_ACTIVE=1`
+    //    BEFORE calling `systemctl stop`!
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    let _ = std::fs::remove_file(&sc_count);
+    let _ = std::fs::remove_file(&post_stop_armed);
+    let _ = std::fs::remove_file(&rec_at_stop);
+    let fwd_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("FAKE_SC_COUNT", sc_count.to_str().unwrap()),
+            ("FAKE_FLIP_ACTIVE_ON_CALL", "3"),
+            ("FAKE_REC_PATH", rec_path.to_str().unwrap()),
+            ("FAKE_REC_AT_STOP_OUT", rec_at_stop.to_str().unwrap()),
+            ("FAKE_POST_STOP_ARMED", post_stop_armed.to_str().unwrap()),
+            ("FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !fwd_fail.status.success(),
+        "forward update must fail when post-stop check fails: {}",
+        text(&fwd_fail)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rec_at_stop)
+            .unwrap_or_default()
+            .trim(),
+        "UPDATE_WAS_ACTIVE=1",
+        "forward update MUST durably persist UPDATE_WAS_ACTIVE=1 BEFORE invoking systemctl stop"
     );
 }

@@ -6295,31 +6295,57 @@ verify_resolved_owned_unit_fragment() {
         done <<<"$links"
     fi
 
-    if command -v systemctl >/dev/null 2>&1; then
-        local show_out="" line frag_path="" load_state=""
-        show_out="$(systemctl show -p LoadState -p FragmentPath "$unit" 2>/dev/null || true)"
-        while IFS= read -r line; do
-            case "$line" in
-                FragmentPath=*) frag_path="${line#FragmentPath=}" ;;
-                LoadState=*) load_state="${line#LoadState=}" ;;
-            esac
-        done <<<"$show_out"
-        if [ -n "$frag_path" ]; then
-            if [ "$frag_path" != "$expected_path" ] \
-                && { [ -z "$alt_root_path" ] || [ "$frag_path" != "$alt_root_path" ]; }; then
-                warn "${mode}: systemd resolved '${unit}' to '${frag_path}' instead of managed unit '${expected_path}'; preserving unrelated unit"
-                return 1
-            fi
-        elif [ ! -e "$expected_path" ]; then
-            case "$load_state" in
-                loaded | masked | bad-setting | error)
-                    warn "${mode}: managed unit '${expected_path}' is missing while systemd reports LoadState=${load_state} for '${unit}' with no matching FragmentPath; preserving unrelated unit"
-                    return 1
-                    ;;
-            esac
-        fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "${mode}: systemctl is unavailable; refusing to stop or disable ${unit} with indeterminate unit identity"
+        return 1
     fi
-    return 0
+
+    local show_out="" show_rc=0 line frag_path="" load_state=""
+    show_out="$(systemctl show -p LoadState -p FragmentPath "$unit" 2>&1)" || show_rc=$?
+    if [ "$show_rc" -ne 0 ]; then
+        if [ -n "${QEMINGA_SYSTEMD_ROOT:-}" ] && [[ "$show_out" == *"cannot be used with --root="* ]]; then
+            # Supported offline `--root=` operation: `systemctl show` rejects
+            # `--root=`, so unit resolution relies on the on-disk unit search
+            # path and enablement-link target checks verified above.
+            return 0
+        fi
+        warn "${mode}: 'systemctl show -p LoadState -p FragmentPath ${unit}' failed (rc=${show_rc}); refusing to stop or disable ${unit} with indeterminate unit identity"
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            FragmentPath=*) frag_path="${line#FragmentPath=}" ;;
+            LoadState=*) load_state="${line#LoadState=}" ;;
+        esac
+    done <<<"$show_out"
+
+    if [ -z "$load_state" ]; then
+        warn "${mode}: 'systemctl show ${unit}' returned no recognizable LoadState=; refusing to stop or disable ${unit} with indeterminate unit identity"
+        return 1
+    fi
+
+    if [ -n "$frag_path" ]; then
+        if [ "$frag_path" != "$expected_path" ] \
+            && { [ -z "$alt_root_path" ] || [ "$frag_path" != "$alt_root_path" ]; }; then
+            warn "${mode}: systemd resolved '${unit}' to '${frag_path}' instead of managed unit '${expected_path}'; preserving unrelated unit"
+            return 1
+        fi
+        return 0
+    fi
+
+    case "$load_state" in
+        not-found)
+            # Manager confirms no unit is currently loaded under this name;
+            # on-disk search-path and enablement-link checks above already
+            # verified no unrelated vendor unit or link occupies the name.
+            return 0
+            ;;
+        *)
+            warn "${mode}: systemd reports LoadState=${load_state} for '${unit}' without a matching FragmentPath for '${expected_path}'; preserving unrelated unit"
+            return 1
+            ;;
+    esac
 }
 
 # Query an owned systemd unit's active state without `--quiet` so a missing
@@ -6362,13 +6388,19 @@ query_owned_service_state() {
 # mutating live runner binaries, managed config, or unit files (forward
 # update/reinstall, ordinary uninstall, and rollback/recovery). Sets
 # _SERVICE_WAS_ACTIVE=1 if the unit was active/reloading/refreshing/activating
-# prior to stopping. When `$2` (a recovery journal path) is provided and the
-# unit is newly observed running while `REC_UPDATE_WAS_ACTIVE=0`, durably
-# persists `UPDATE_WAS_ACTIVE=1` BEFORE issuing `systemctl stop` so a failure
-# or crash immediately after stopping never loses restart intent.
+# prior to stopping. When `$2` (a journal path) is provided and the unit is
+# observed running, ALWAYS durably persists/re-syncs `UPDATE_WAS_ACTIVE=1`
+# BEFORE issuing `systemctl stop` — even if the visible value in `install.env`
+# is already `1` after an earlier failed parent-directory sync — so a failure
+# or crash immediately after stopping never loses durable restart intent.
 _SERVICE_WAS_ACTIVE=0
 ensure_owned_service_stopped() {
-    local mode="$1" rec_path_to_upgrade="${2:-}"
+    local mode="$1" rec_path_to_sync="${2:-}"
+    local sync_phase="${3:-${REC_UPDATE_PHASE:-}}"
+    local sync_stage_dir="${4:-${REC_UPDATE_STAGE_DIR:-}}"
+    local sync_stage_id="${5:-${REC_UPDATE_STAGE_ID:-}}"
+    local sync_backup_dir="${6:-${REC_UPDATE_BACKUP_DIR:-}}"
+    local sync_backup_id="${7:-${REC_UPDATE_BACKUP_ID:-}}"
     _SERVICE_WAS_ACTIVE=0
     if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
         return 0
@@ -6388,11 +6420,11 @@ ensure_owned_service_stopped() {
     fi
     if [ "$state" = "running" ]; then
         _SERVICE_WAS_ACTIVE=1
-        if [ -n "$rec_path_to_upgrade" ] && [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "0" ]; then
-            if ! ( write_update_record "$rec_path_to_upgrade" "updating" "$REC_UPDATE_PHASE" \
-                "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "1" ); then
-                warn "${mode}: failed to persist newly observed running state (UPDATE_WAS_ACTIVE=1) to '${rec_path_to_upgrade}' before stopping ${OPT_SERVICE}.service"
+        if [ -n "$rec_path_to_sync" ]; then
+            if ! ( write_update_record "$rec_path_to_sync" "updating" "$sync_phase" \
+                "$sync_stage_dir" "$sync_stage_id" \
+                "$sync_backup_dir" "$sync_backup_id" "1" ); then
+                warn "${mode}: failed to durably persist running state (UPDATE_WAS_ACTIVE=1) to '${rec_path_to_sync}' before stopping ${OPT_SERVICE}.service"
                 return 1
             fi
             REC_UPDATE_WAS_ACTIVE="1"
@@ -7595,11 +7627,11 @@ cmd_install() {
         _INSTALL_REINSTALL_ROLLBACK=1
 
         ensure_owned_service_stopped install \
+            "$_INSTALL_REINSTALL_RECORD_PATH" "publishing" "$stage_dir" "$stage_id" "$backup_dir" "$backup_id" \
             || die "install: refusing to replace live runner files without confirming ${OPT_SERVICE}.service is stopped"
         if [ "$_SERVICE_WAS_ACTIVE" -eq 1 ] && [ "$was_active" -eq 0 ]; then
             was_active=1
             _INSTALL_REINSTALL_WAS_ACTIVE=1
-            write_update_record "$_INSTALL_REINSTALL_RECORD_PATH" "updating" "publishing" "$stage_dir" "$stage_id" "$backup_dir" "$backup_id" "$was_active"
         fi
 
         ensure_service_user
@@ -8157,11 +8189,11 @@ cmd_update() {
     _UPDATE_ROLLBACK_ACTIVE=1
 
     ensure_owned_service_stopped update \
+        "$_UPDATE_RECORD_PATH" "publishing" "$stage_dir" "$stage_id" "$backup_dir" "$backup_id" \
         || die "update: refusing to replace live runner files without confirming ${OPT_SERVICE}.service is stopped"
     if [ "$_SERVICE_WAS_ACTIVE" -eq 1 ] && [ "$was_active" -eq 0 ]; then
         was_active=1
         _UPDATE_WAS_ACTIVE=1
-        write_update_record "$_UPDATE_RECORD_PATH" "updating" "publishing" "$stage_dir" "$stage_id" "$backup_dir" "$backup_id" "$was_active"
     fi
 
     local pub_rc=0

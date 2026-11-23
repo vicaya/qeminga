@@ -2,7 +2,7 @@
 """FD-anchored filesystem operations for the qemu:///system KVM smoke lane.
 
 Extracted from scripts/ci/libvirt-kvm-smoke.sh so both the shell entrypoint
-(via ``python3 -I``) and unprivileged unit tests can invoke the exact same
+(via ``python3 -IB``) and unprivileged unit tests can invoke the exact same
 verified operations without duplicating parsing or mocking host ``/``.
 """
 
@@ -14,11 +14,32 @@ import re
 import stat
 import struct
 import sys
+import xml.etree.ElementTree as ET
 
 READ_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+PATH_NOFOLLOW_FLAGS = os.O_PATH | os.O_NOFOLLOW
 RENAME_NOREPLACE = 1
 SYMLOOP_MAX = 40
 RUN_NAME_RE = re.compile(r"^qeminga-e2e-[0-9]+-[0-9]+-(x86_64|aarch64)$")
+ALLOWED_EVIDENCE_FILES = frozenset(
+    {
+        "domain.xml",
+        "qemu.log",
+        "serial.log",
+        "result.json",
+        "versions.txt",
+        "e2e-libvirt.log",
+        "cleanup.txt",
+    }
+)
+ALLOWED_TEST_FILES = frozenset(
+    {
+        "production_install",
+        "accelerator_kvm",
+        "libvirt_interop",
+        "agent_shutdown",
+    }
+)
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
 _RENAMEAT2 = getattr(_LIBC, "renameat2", None)
@@ -31,6 +52,15 @@ if _RENAMEAT2 is not None:
         ctypes.c_uint,
     ]
     _RENAMEAT2.restype = ctypes.c_int
+
+
+def fd_mnt_id(fd):
+    """Read the kernel mount ID for an open descriptor from /proc/self/fdinfo."""
+    with open(f"/proc/self/fdinfo/{fd}", "r", encoding="ascii", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("mnt_id:"):
+                return int(line.split(":", 1)[1].strip())
+    raise OSError(errno.EINVAL, f"missing mnt_id in /proc/self/fdinfo/{fd}")
 
 
 def renameat2_noreplace(src_dir_fd, src_name, dst_dir_fd, dst_name):
@@ -240,21 +270,21 @@ def verify_dir_fd(
     st = os.fstat(dfd)
     if not stat.S_ISDIR(st.st_mode):
         raise OSError(
-            errno.ENOTDIR, f"image root component '{path_label}' is not a directory"
+            errno.ENOTDIR, f"path component '{path_label}' is not a directory"
         )
     trusted_owner, is_writable, reason = dir_trust_info(dfd, st, trusted_uids)
     if not trusted_owner:
         raise OSError(
             errno.EACCES,
             f"refusing untrusted ancestor directory '{path_label}' ({reason}); "
-            "choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+            "choose a root-owned non-shared path",
         )
     if is_writable:
         if not (allow_sticky_writable and bool(st.st_mode & stat.S_ISVTX)):
             raise OSError(
                 errno.EACCES,
                 f"refusing shared writable ancestor directory '{path_label}' ({reason}); "
-                "choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+                "choose a root-owned non-shared path",
             )
     if check_traversal and not can_traverse_fd(dfd, st, qemu_uid, qemu_groups):
         raise OSError(
@@ -448,7 +478,7 @@ def walk_existing_prefix(
             if not stat.S_ISDIR(lst.st_mode):
                 raise OSError(
                     errno.ENOTDIR,
-                    f"image root component '{next_path}' is not a directory",
+                    f"path component '{next_path}' is not a directory",
                 )
             next_fd = os.open(comp, READ_DIR_FLAGS, dir_fd=cur_fd)
             try:
@@ -481,14 +511,14 @@ def walk_existing_prefix(
             if orig_prefix is not None:
                 deepest_lexical = orig_prefix
 
-        # The deepest existing directory will host newly created components or
-        # the per-run directory, so it MUST NOT be writable by other accounts
-        # even when the sticky bit is set.
+        # The deepest existing directory will host newly created components,
+        # run files, or evidence files, so it MUST NOT be writable by other
+        # accounts even when the sticky bit is set.
         if cur_writable:
             raise OSError(
                 errno.EACCES,
                 f"refusing shared writable directory '{cur_path}' ({cur_reason}); "
-                "choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+                "choose a root-owned non-shared path",
             )
         return cur_fd, cur_path, deepest_lexical, remaining
     except Exception:
@@ -511,10 +541,6 @@ def provision_private_dir_fd(tfd, qemu_uid, qemu_gid, qemu_groups):
     disable_acl = os.environ.get("QEMINGA_TEST_DISABLE_ACL") == "1"
     acl_applied = False
     if not disable_acl:
-        # Complete replacement access ACL:
-        #   user::rwx, user:<qemu_uid>:--x, group::---, mask::--x, other::---
-        # Replacing the full ACL drops any inherited named user/group entries
-        # and pins the mask strictly to search (--x).
         acl_bytes = encode_acl(
             [
                 (0x01, 0o7, 0xFFFFFFFF),
@@ -565,6 +591,16 @@ def provision_private_dir_fd(tfd, qemu_uid, qemu_gid, qemu_groups):
         )
 
 
+def _reclaim_empty_published_dir(parent_fd, comp, expected_id):
+    """Remove ``comp`` under ``parent_fd`` only if still empty and matching ``expected_id``."""
+    try:
+        cur_lst = os.lstat(comp, dir_fd=parent_fd)
+        if (cur_lst.st_dev, cur_lst.st_ino) == expected_id:
+            os.rmdir(comp, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
 def create_component_in_fd(
     parent_fd,
     parent_path,
@@ -611,12 +647,7 @@ def create_component_in_fd(
         # still open (pinning its (st_dev, st_ino) against inode reuse) so an
         # ordinary retry does not stall on EEXIST.
         if published and not synced and tfd_id is not None:
-            try:
-                cur_lst = os.lstat(comp, dir_fd=parent_fd)
-                if (cur_lst.st_dev, cur_lst.st_ino) == tfd_id:
-                    os.rmdir(comp, dir_fd=parent_fd)
-            except OSError:
-                pass
+            _reclaim_empty_published_dir(parent_fd, comp, tfd_id)
         if tfd is not None:
             os.close(tfd)
         if not published:
@@ -640,8 +671,7 @@ def prepare_images_root(
         root_path=root_path,
     )
     try:
-        if root_fd is None:
-            kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
+        kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
         for comp in remaining:
             next_fd = create_component_in_fd(
                 cur_fd,
@@ -670,10 +700,11 @@ def prepare_images_root(
                     raise
             os.close(cur_fd)
             cur_fd, cur_path = next_fd, next_path
+        kernel_verdict_traversal(
+            os.path.normpath(target), qemu_uid, qemu_gid, qemu_groups
+        )
     finally:
         os.close(cur_fd)
-    if root_fd is None:
-        kernel_verdict_traversal(os.path.normpath(target), qemu_uid, qemu_gid, qemu_groups)
 
 
 def create_run_dir(
@@ -691,11 +722,13 @@ def create_run_dir(
         root_fd=root_fd,
         root_path=root_path,
     )
+    rfd = None
+    rfd_id = None
+    verified = False
     try:
         if remaining:
             raise OSError(errno.ENOENT, f"images root '{images_dir}' does not exist")
-        if root_fd is None:
-            kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
+        kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
         rfd = create_component_in_fd(
             img_fd,
             img_path,
@@ -705,16 +738,87 @@ def create_run_dir(
             qemu_groups,
             fail_if_exists=True,
         )
-        os.close(rfd)
-    finally:
-        os.close(img_fd)
-    if root_fd is None:
+        rst = os.fstat(rfd)
+        rfd_id = (rst.st_dev, rst.st_ino)
+        # Keep `img_fd` and `rfd` open through final traversal verification so
+        # any transient failure reclaims this invocation's still-empty directory
+        # via the same identity-checked rollback before closing descriptors.
         kernel_verdict_traversal(
             os.path.join(os.path.normpath(images_dir), run_name),
             qemu_uid,
             qemu_gid,
             qemu_groups,
         )
+        verified = True
+    finally:
+        if rfd is not None and not verified and rfd_id is not None:
+            _reclaim_empty_published_dir(img_fd, run_name, rfd_id)
+        if rfd is not None:
+            os.close(rfd)
+        os.close(img_fd)
+
+
+def _assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, label):
+    est = os.lstat(entry, dir_fd=dir_fd)
+    if stat.S_ISLNK(est.st_mode):
+        return est
+    # On Linux overlayfs, directories report the overlay virtual st_dev while
+    # regular files report their underlying upper/lower layer st_dev — yet both
+    # share the exact same kernel mnt_id. Checking st_dev on directories catches
+    # btrfs subvolumes too, while fd_mnt_id catches every mountpoint (including
+    # cross-fs mounts, same-st_dev directory bind mounts, and single-file bind
+    # mounts) on all filesystems.
+    if stat.S_ISDIR(est.st_mode) and est.st_dev != root_dev:
+        raise OSError(errno.EXDEV, f"'{label}' crosses filesystem boundary")
+    efd = os.open(entry, PATH_NOFOLLOW_FLAGS, dir_fd=dir_fd)
+    try:
+        fst = os.fstat(efd)
+        if (stat.S_ISDIR(fst.st_mode) and fst.st_dev != root_dev) or fd_mnt_id(
+            efd
+        ) != root_mnt_id:
+            raise OSError(errno.EXDEV, f"'{label}' crosses mount boundary")
+    finally:
+        os.close(efd)
+    return est
+
+
+def scan_open_dir_same_mount(dir_fd, root_dev, root_mnt_id, cur_path):
+    """Verify every descendant stays on the same (st_dev, mnt_id) before any deletion."""
+    for entry in os.listdir(dir_fd):
+        child_path = f"{cur_path}/{entry}"
+        est = _assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path)
+        if stat.S_ISDIR(est.st_mode):
+            cfd = os.open(entry, READ_DIR_FLAGS, dir_fd=dir_fd)
+            try:
+                cst = os.fstat(cfd)
+                if cst.st_dev != root_dev or fd_mnt_id(cfd) != root_mnt_id:
+                    raise OSError(
+                        errno.EXDEV, f"'{child_path}' crosses mount boundary"
+                    )
+                scan_open_dir_same_mount(cfd, root_dev, root_mnt_id, child_path)
+            finally:
+                os.close(cfd)
+
+
+def rmtree_same_mount(dir_fd, root_dev, root_mnt_id, cur_path):
+    """Recursively remove contents of verified open ``dir_fd``, rechecking mount IDs."""
+    for entry in os.listdir(dir_fd):
+        child_path = f"{cur_path}/{entry}"
+        est = _assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path)
+        if stat.S_ISDIR(est.st_mode):
+            cfd = os.open(entry, READ_DIR_FLAGS, dir_fd=dir_fd)
+            try:
+                cst = os.fstat(cfd)
+                if cst.st_dev != root_dev or fd_mnt_id(cfd) != root_mnt_id:
+                    raise OSError(
+                        errno.EXDEV, f"'{child_path}' crosses mount boundary"
+                    )
+                rmtree_same_mount(cfd, root_dev, root_mnt_id, child_path)
+            finally:
+                os.close(cfd)
+            os.rmdir(entry, dir_fd=dir_fd)
+        else:
+            os.unlink(entry, dir_fd=dir_fd)
 
 
 def handoff_file(
@@ -752,8 +856,17 @@ def handoff_file(
     try:
         if remaining:
             raise OSError(errno.ENOENT, f"images root '{images_dir}' does not exist")
+        img_st = os.fstat(img_fd)
+        img_mnt = fd_mnt_id(img_fd)
         rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
         try:
+            rst = os.fstat(rfd)
+            run_mnt = fd_mnt_id(rfd)
+            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
+                raise OSError(
+                    errno.EXDEV,
+                    f"refusing cross-mount run directory '{os.path.join(img_path, run_name)}'",
+                )
             verify_dir_fd(
                 rfd,
                 os.path.join(img_path, run_name),
@@ -768,6 +881,11 @@ def handoff_file(
             )
             try:
                 fst = os.fstat(ffd)
+                if fd_mnt_id(ffd) != run_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"refusing cross-mount guest file '{filename}'",
+                    )
                 if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
                     raise OSError(
                         errno.EINVAL,
@@ -795,44 +913,239 @@ def handoff_file(
     return delegated
 
 
-def _copy_regular_file_from_dir_fd(rfd, filename, dest_path):
+def _create_public_dir_in_fd(parent_fd, parent_path, comp, trusted_uids):
+    tmp_name = f".qeminga-e2e-evinit.{os.urandom(8).hex()}"
+    os.mkdir(tmp_name, 0o700, dir_fd=parent_fd)
+    published = False
+    tfd = None
     try:
-        ffd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=rfd)
-    except FileNotFoundError:
-        return False
-    try:
-        fst = os.fstat(ffd)
-        if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
-            raise OSError(
-                errno.EINVAL,
-                f"refusing unsafe diagnostic file '{filename}' "
-                "(must be regular file with nlink == 1)",
-            )
-        out_fd = os.open(
-            dest_path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-            0o644,
-        )
+        tfd = os.open(tmp_name, READ_DIR_FLAGS, dir_fd=parent_fd)
+        if os.geteuid() == 0:
+            os.fchown(tfd, 0, 0)
+        remove_xattr_if_present(tfd, b"system.posix_acl_default")
+        remove_xattr_if_present(tfd, b"system.posix_acl_access")
+        os.fchmod(tfd, 0o755)
+        os.fsync(tfd)
         try:
-            while True:
-                chunk = os.read(ffd, 65536)
-                if not chunk:
-                    break
-                view = memoryview(chunk)
-                while view:
-                    written = os.write(out_fd, view)
-                    view = view[written:]
-        finally:
-            os.close(out_fd)
+            renameat2_noreplace(parent_fd, tmp_name, parent_fd, comp)
+        except FileExistsError:
+            os.close(tfd)
+            tfd = None
+            os.rmdir(tmp_name, dir_fd=parent_fd)
+            existing = os.open(comp, READ_DIR_FLAGS, dir_fd=parent_fd)
+            try:
+                verify_dir_fd(
+                    existing,
+                    os.path.join(parent_path, comp),
+                    0,
+                    {0},
+                    trusted_uids,
+                    allow_sticky_writable=False,
+                    check_traversal=False,
+                )
+            except Exception:
+                os.close(existing)
+                raise
+            return existing
+        published = True
+        os.fsync(parent_fd)
+        ret_fd = tfd
+        tfd = None
+        return ret_fd
     finally:
-        os.close(ffd)
-    return True
+        if tfd is not None:
+            os.close(tfd)
+        if not published:
+            try:
+                os.rmdir(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
 
 
-def collect_serial_log(images_dir, run_name, dest_path, *, root_fd=None, root_path="/"):
-    """Copy ``serial.log`` only from a trust-verified run directory using O_NOFOLLOW."""
+def _open_verified_evidence_dir(
+    out_dir, *, create_missing=True, root_fd=None, root_path="/"
+):
+    abs_out = os.path.abspath(out_dir)
+    trusted_uids = trusted_owner_uids()
+    cur_fd, cur_path, _, remaining = walk_existing_prefix(
+        abs_out,
+        0,
+        {0},
+        trusted_uids,
+        check_traversal=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    try:
+        if remaining and not create_missing:
+            raise OSError(errno.ENOENT, f"evidence directory '{abs_out}' does not exist")
+        for comp in remaining:
+            next_fd = _create_public_dir_in_fd(cur_fd, cur_path, comp, trusted_uids)
+            next_path = os.path.join(cur_path, comp)
+            os.close(cur_fd)
+            cur_fd, cur_path = next_fd, next_path
+        verify_dir_fd(
+            cur_fd,
+            cur_path,
+            0,
+            {0},
+            trusted_uids,
+            allow_sticky_writable=False,
+            check_traversal=False,
+        )
+        return cur_fd, cur_path
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+
+def _publish_evidence_stream(out_fd, dest_name, write_fn, mode=0o644):
+    if "/" in dest_name or dest_name in ("", ".", ".."):
+        raise OSError(errno.EINVAL, f"invalid evidence filename '{dest_name}'")
+    try:
+        dst_lst = os.lstat(dest_name, dir_fd=out_fd)
+        if stat.S_ISDIR(dst_lst.st_mode):
+            raise OSError(errno.EISDIR, f"evidence target '{dest_name}' is a directory")
+    except FileNotFoundError:
+        pass
+    tmp_name = f".qeminga-evidence.{os.urandom(8).hex()}"
+    tfd = os.open(
+        tmp_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=out_fd,
+    )
+    published = False
+    try:
+        write_fn(tfd)
+        remove_xattr_if_present(tfd, b"system.posix_acl_access")
+        os.fchmod(tfd, mode)
+        os.fsync(tfd)
+        os.close(tfd)
+        tfd = None
+        # Atomic replacement unlinks any pre-existing directory entry (including
+        # a symlink or hard-linked file) without opening or truncating its inode,
+        # and sets permissions exclusively on the newly created file.
+        os.replace(tmp_name, dest_name, src_dir_fd=out_fd, dst_dir_fd=out_fd)
+        published = True
+        os.fsync(out_fd)
+    finally:
+        if tfd is not None:
+            os.close(tfd)
+        if not published:
+            try:
+                os.unlink(tmp_name, dir_fd=out_fd)
+            except OSError:
+                pass
+
+
+def _write_all_fd(dst_fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(dst_fd, view)
+        view = view[written:]
+
+
+def _copy_fd_to_fd(src_fd, dst_fd):
+    while True:
+        chunk = os.read(src_fd, 65536)
+        if not chunk:
+            break
+        _write_all_fd(dst_fd, chunk)
+
+
+def prepare_evidence_dir(out_dir, *, init_run=False, root_fd=None, root_path="/"):
+    """Validate/create a trusted evidence directory; optionally reset known run outputs."""
+    trusted_uids = trusted_owner_uids()
+    out_fd, out_path = _open_verified_evidence_dir(
+        out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
+    )
+    try:
+        if init_run:
+            out_st = os.fstat(out_fd)
+            out_mnt = fd_mnt_id(out_fd)
+            try:
+                rst = os.lstat("result.json", dir_fd=out_fd)
+                if not stat.S_ISDIR(rst.st_mode):
+                    os.unlink("result.json", dir_fd=out_fd)
+            except FileNotFoundError:
+                pass
+            tests_fd = _create_public_dir_in_fd(out_fd, out_path, "tests", trusted_uids)
+            try:
+                tst = os.fstat(tests_fd)
+                if tst.st_dev != out_st.st_dev or fd_mnt_id(tests_fd) != out_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, 'tests')}'",
+                    )
+                for name in ALLOWED_TEST_FILES:
+                    try:
+                        est = os.lstat(name, dir_fd=tests_fd)
+                        if not stat.S_ISDIR(est.st_mode):
+                            os.unlink(name, dir_fd=tests_fd)
+                    except FileNotFoundError:
+                        pass
+            finally:
+                os.close(tests_fd)
+    finally:
+        os.close(out_fd)
+
+
+def publish_evidence_bytes(
+    out_dir, dest_name, data, *, subdir=None, root_fd=None, root_path="/"
+):
+    trusted_uids = trusted_owner_uids()
+    if subdir == "tests":
+        if dest_name not in ALLOWED_TEST_FILES:
+            raise OSError(errno.EINVAL, f"unexpected test result filename '{dest_name}'")
+    elif subdir is None:
+        if dest_name not in ALLOWED_EVIDENCE_FILES:
+            raise OSError(errno.EINVAL, f"unexpected evidence filename '{dest_name}'")
+    else:
+        raise OSError(errno.EINVAL, f"unexpected evidence subdirectory '{subdir}'")
+
+    out_fd, out_path = _open_verified_evidence_dir(
+        out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
+    )
+    try:
+        if subdir is not None:
+            out_st = os.fstat(out_fd)
+            out_mnt = fd_mnt_id(out_fd)
+            sub_fd = _create_public_dir_in_fd(out_fd, out_path, subdir, trusted_uids)
+            try:
+                sst = os.fstat(sub_fd)
+                if sst.st_dev != out_st.st_dev or fd_mnt_id(sub_fd) != out_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, subdir)}'",
+                    )
+                _publish_evidence_stream(
+                    sub_fd, dest_name, lambda fd: _write_all_fd(fd, data), mode=0o644
+                )
+            finally:
+                os.close(sub_fd)
+        else:
+            _publish_evidence_stream(
+                out_fd, dest_name, lambda fd: _write_all_fd(fd, data), mode=0o644
+            )
+    finally:
+        os.close(out_fd)
+
+
+def collect_serial_log(
+    images_dir,
+    run_name,
+    out_dir,
+    dest_name="serial.log",
+    *,
+    root_fd=None,
+    root_path="/",
+):
+    """Copy ``serial.log`` from a verified run directory into a verified evidence directory."""
     if not RUN_NAME_RE.fullmatch(run_name):
         raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
+    if dest_name != "serial.log":
+        raise OSError(errno.EINVAL, f"unexpected serial log filename '{dest_name}'")
     trusted_uids = trusted_owner_uids()
     img_fd, img_path, _, remaining = walk_existing_prefix(
         images_dir,
@@ -847,6 +1160,7 @@ def collect_serial_log(images_dir, run_name, dest_path, *, root_fd=None, root_pa
         if remaining:
             return False
         img_st = os.fstat(img_fd)
+        img_mnt = fd_mnt_id(img_fd)
         try:
             lst = os.lstat(run_name, dir_fd=img_fd)
         except FileNotFoundError:
@@ -859,15 +1173,16 @@ def collect_serial_log(images_dir, run_name, dest_path, *, root_fd=None, root_pa
         rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
         try:
             rst = os.fstat(rfd)
+            run_mnt = fd_mnt_id(rfd)
             if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
                 raise OSError(
                     errno.EXDEV,
                     f"run directory '{os.path.join(img_path, run_name)}' changed during verification",
                 )
-            if rst.st_dev != img_st.st_dev:
+            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
                 raise OSError(
                     errno.EXDEV,
-                    f"refusing cross-filesystem run directory '{os.path.join(img_path, run_name)}'",
+                    f"refusing cross-mount run directory '{os.path.join(img_path, run_name)}'",
                 )
             verify_dir_fd(
                 rfd,
@@ -878,17 +1193,118 @@ def collect_serial_log(images_dir, run_name, dest_path, *, root_fd=None, root_pa
                 allow_sticky_writable=False,
                 check_traversal=False,
             )
-            return _copy_regular_file_from_dir_fd(rfd, "serial.log", dest_path)
+            try:
+                ffd = os.open(
+                    "serial.log",
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=rfd,
+                )
+            except FileNotFoundError:
+                return False
+            try:
+                fst = os.fstat(ffd)
+                if fd_mnt_id(ffd) != run_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        "refusing cross-mount or bind-mounted 'serial.log'",
+                    )
+                if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                    raise OSError(
+                        errno.EINVAL,
+                        "refusing unsafe diagnostic file 'serial.log' "
+                        "(must be regular file with nlink == 1)",
+                    )
+                out_fd, _ = _open_verified_evidence_dir(
+                    out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
+                )
+                try:
+                    _publish_evidence_stream(
+                        out_fd,
+                        dest_name,
+                        lambda dst: _copy_fd_to_fd(ffd, dst),
+                        mode=0o644,
+                    )
+                finally:
+                    os.close(out_fd)
+            finally:
+                os.close(ffd)
+            return True
         finally:
             os.close(rfd)
     finally:
         os.close(img_fd)
 
 
-def collect_serial_log_session(images_dir, run_name, dest_path):
-    """Copy ``serial.log`` in unprivileged session mode via O_NOFOLLOW regular-file checks."""
+def collect_qemu_log(
+    qlog_path,
+    out_dir,
+    dest_name="qemu.log",
+    *,
+    root_fd=None,
+    root_path="/",
+):
+    """Copy a verified regular QEMU log file into a verified evidence directory."""
+    if dest_name != "qemu.log":
+        raise OSError(errno.EINVAL, f"unexpected QEMU log filename '{dest_name}'")
+    abs_qlog = os.path.abspath(qlog_path)
+    parent = os.path.dirname(abs_qlog)
+    base = os.path.basename(abs_qlog)
+    if not base or base in (".", ".."):
+        return False
+    trusted_uids = trusted_owner_uids()
+    pfd, _, _, remaining = walk_existing_prefix(
+        parent,
+        0,
+        {0},
+        trusted_uids,
+        check_traversal=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    try:
+        if remaining:
+            return False
+        p_mnt = fd_mnt_id(pfd)
+        try:
+            ffd = os.open(
+                base, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            fst = os.fstat(ffd)
+            if fd_mnt_id(ffd) != p_mnt:
+                raise OSError(errno.EXDEV, f"refusing cross-mount QEMU log '{base}'")
+            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                raise OSError(
+                    errno.EINVAL,
+                    f"refusing unsafe QEMU log '{base}' (must be regular file with nlink == 1)",
+                )
+            out_fd, _ = _open_verified_evidence_dir(
+                out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
+            )
+            try:
+                _publish_evidence_stream(
+                    out_fd,
+                    dest_name,
+                    lambda dst: _copy_fd_to_fd(ffd, dst),
+                    mode=0o644,
+                )
+            finally:
+                os.close(out_fd)
+            return True
+        finally:
+            os.close(ffd)
+    finally:
+        os.close(pfd)
+
+
+def collect_serial_log_session(images_dir, run_name, out_dir, dest_name="serial.log"):
+    """Copy ``serial.log`` in unprivileged session mode via O_NOFOLLOW + exclusive publish."""
     if not RUN_NAME_RE.fullmatch(run_name):
         raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
+    if dest_name != "serial.log":
+        raise OSError(errno.EINVAL, f"unexpected serial log filename '{dest_name}'")
     try:
         img_fd = os.open(images_dir, READ_DIR_FLAGS)
     except FileNotFoundError:
@@ -899,35 +1315,188 @@ def collect_serial_log_session(images_dir, run_name, dest_path):
         except FileNotFoundError:
             return False
         try:
-            return _copy_regular_file_from_dir_fd(rfd, "serial.log", dest_path)
+            try:
+                ffd = os.open(
+                    "serial.log",
+                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=rfd,
+                )
+            except FileNotFoundError:
+                return False
+            try:
+                fst = os.fstat(ffd)
+                if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                    raise OSError(
+                        errno.EINVAL,
+                        "refusing unsafe diagnostic file 'serial.log' "
+                        "(must be regular file with nlink == 1)",
+                    )
+                os.makedirs(out_dir, exist_ok=True)
+                out_fd = os.open(out_dir, READ_DIR_FLAGS)
+                try:
+                    _publish_evidence_stream(
+                        out_fd,
+                        dest_name,
+                        lambda dst: _copy_fd_to_fd(ffd, dst),
+                        mode=0o644,
+                    )
+                finally:
+                    os.close(out_fd)
+            finally:
+                os.close(ffd)
+            return True
         finally:
             os.close(rfd)
     finally:
         os.close(img_fd)
 
 
-def _rmtree_verified_fd(dfd, root_dev):
-    for entry in os.listdir(dfd):
-        est = os.lstat(entry, dir_fd=dfd)
-        if stat.S_ISDIR(est.st_mode):
-            cfd = os.open(entry, READ_DIR_FLAGS, dir_fd=dfd)
-            try:
-                cst = os.fstat(cfd)
-                if cst.st_dev != root_dev:
-                    raise OSError(
-                        errno.EXDEV,
-                        f"refusing mountpoint '{entry}' inside run directory",
-                    )
-                _rmtree_verified_fd(cfd, root_dev)
-            finally:
-                os.close(cfd)
-            os.rmdir(entry, dir_fd=dfd)
-        else:
-            os.unlink(entry, dir_fd=dfd)
+def verify_cleanup_target(images_dir, run_name, *, root_fd=None, root_path="/"):
+    """Read-only verification of image root and run directory before destructive virsh calls."""
+    if not RUN_NAME_RE.fullmatch(run_name):
+        raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
+    trusted_uids = trusted_owner_uids()
+    img_fd, img_path, _, remaining = walk_existing_prefix(
+        images_dir,
+        0,
+        {0},
+        trusted_uids,
+        check_traversal=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    lexical_run = os.path.join(os.path.normpath(images_dir), run_name)
+    resolved_run = os.path.join(img_path, run_name)
+    try:
+        if remaining:
+            return lexical_run, resolved_run
+        img_st = os.fstat(img_fd)
+        img_mnt = fd_mnt_id(img_fd)
+        try:
+            lst = os.lstat(run_name, dir_fd=img_fd)
+        except FileNotFoundError:
+            return lexical_run, resolved_run
+        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
+            raise OSError(
+                errno.ENOTDIR,
+                f"refusing non-directory run path '{resolved_run}'",
+            )
+        rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
+        try:
+            rst = os.fstat(rfd)
+            run_mnt = fd_mnt_id(rfd)
+            if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
+                raise OSError(
+                    errno.EXDEV,
+                    f"run directory '{resolved_run}' changed during verification",
+                )
+            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
+                raise OSError(
+                    errno.EXDEV,
+                    f"refusing cross-mount run directory '{resolved_run}'",
+                )
+            verify_dir_fd(
+                rfd,
+                resolved_run,
+                0,
+                {0},
+                trusted_uids,
+                allow_sticky_writable=False,
+                check_traversal=False,
+            )
+            scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
+        finally:
+            os.close(rfd)
+        return lexical_run, resolved_run
+    finally:
+        os.close(img_fd)
+
+
+def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir):
+    """Confirm a libvirt domain's XML belongs strictly to this run directory before destroy."""
+    if not RUN_NAME_RE.fullmatch(expected_name):
+        raise OSError(errno.EINVAL, f"invalid domain name '{expected_name}'")
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise OSError(errno.EINVAL, f"cannot parse domain XML for '{expected_name}': {exc}")
+    name_el = root.find("name")
+    dom_name = (name_el.text or "").strip() if name_el is not None else ""
+    if dom_name != expected_name:
+        raise OSError(
+            errno.EACCES,
+            f"domain XML <name> '{dom_name}' does not match expected '{expected_name}'",
+        )
+    allowed_dirs = {
+        os.path.normpath(p).rstrip("/") + "/"
+        for p in (lexical_run_dir, resolved_run_dir)
+        if p
+    }
+    if not allowed_dirs:
+        raise OSError(errno.EINVAL, "missing expected run directory for domain XML check")
+
+    def path_in_run_dir(raw_path):
+        if not raw_path or not raw_path.startswith("/"):
+            return False
+        if ".." in raw_path.split("/"):
+            return False
+        norm = os.path.normpath(raw_path)
+        return any(norm.startswith(prefix) for prefix in allowed_dirs)
+
+    found_root_disk = False
+    for disk in root.findall("./devices/disk"):
+        disk_type = (disk.attrib.get("type") or "").strip()
+        if disk_type != "file":
+            raise OSError(
+                errno.EACCES,
+                f"domain '{expected_name}' has unexpected non-file disk type '{disk_type}'",
+            )
+        src = disk.find("source")
+        file_path = (src.attrib.get("file") or "").strip() if src is not None else ""
+        if not file_path or not path_in_run_dir(file_path):
+            raise OSError(
+                errno.EACCES,
+                f"domain '{expected_name}' references disk '{file_path}' outside expected run directory",
+            )
+        if os.path.basename(os.path.normpath(file_path)) == "root.qcow2":
+            found_root_disk = True
+
+    for tag in ("./devices/serial/source", "./devices/console/source"):
+        for src in root.findall(tag):
+            path_val = (src.attrib.get("path") or "").strip()
+            if path_val and not path_in_run_dir(path_val):
+                raise OSError(
+                    errno.EACCES,
+                    f"domain '{expected_name}' references console path '{path_val}' outside expected run directory",
+                )
+
+    nvram = root.find("./os/nvram")
+    if nvram is not None:
+        nvram_paths = []
+        nvram_text = (nvram.text or "").strip()
+        if nvram_text:
+            nvram_paths.append(nvram_text)
+        nvram_src = nvram.find("source")
+        if nvram_src is not None:
+            nvram_file = (nvram_src.attrib.get("file") or "").strip()
+            if nvram_file:
+                nvram_paths.append(nvram_file)
+        for nvram_path in nvram_paths:
+            if not path_in_run_dir(nvram_path):
+                raise OSError(
+                    errno.EACCES,
+                    f"domain '{expected_name}' references nvram '{nvram_path}' outside expected run directory",
+                )
+
+    if not found_root_disk:
+        raise OSError(
+            errno.EACCES,
+            f"domain '{expected_name}' XML does not reference expected run root.qcow2; refusing destructive cleanup",
+        )
 
 
 def cleanup_run_dir(images_dir, run_name, *, root_fd=None, root_path="/"):
-    """Verify ancestor trust and run-directory ownership/identity before removing."""
+    """Verify ancestor trust, run-dir identity, and same-mount tree before removing."""
     if not RUN_NAME_RE.fullmatch(run_name):
         raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
     trusted_uids = trusted_owner_uids()
@@ -944,44 +1513,50 @@ def cleanup_run_dir(images_dir, run_name, *, root_fd=None, root_path="/"):
         if remaining:
             return "absent"
         img_st = os.fstat(img_fd)
+        img_mnt = fd_mnt_id(img_fd)
         try:
             lst = os.lstat(run_name, dir_fd=img_fd)
         except FileNotFoundError:
             return "absent"
+        run_path = os.path.join(img_path, run_name)
         if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
             raise OSError(
                 errno.ENOTDIR,
-                f"refusing non-directory run path '{os.path.join(img_path, run_name)}'",
+                f"refusing non-directory run path '{run_path}'",
             )
         rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
         try:
             rst = os.fstat(rfd)
+            run_mnt = fd_mnt_id(rfd)
             if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
                 raise OSError(
                     errno.EXDEV,
-                    f"run directory '{os.path.join(img_path, run_name)}' changed during verification",
+                    f"run directory '{run_path}' changed during verification",
                 )
-            if rst.st_dev != img_st.st_dev:
+            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
                 raise OSError(
                     errno.EXDEV,
-                    f"refusing cross-filesystem run directory '{os.path.join(img_path, run_name)}'",
+                    f"refusing cross-mount run directory '{run_path}'",
                 )
             verify_dir_fd(
                 rfd,
-                os.path.join(img_path, run_name),
+                run_path,
                 0,
                 {0},
                 trusted_uids,
                 allow_sticky_writable=False,
                 check_traversal=False,
             )
-            _rmtree_verified_fd(rfd, rst.st_dev)
+            # Pass 1: verify EVERY entry stays on (rst.st_dev, run_mnt) BEFORE the first unlink.
+            scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, run_path)
+            # Pass 2: remove entries while rechecking every opened descriptor's mount ID.
+            rmtree_same_mount(rfd, rst.st_dev, run_mnt, run_path)
             # Re-verify identity while `rfd` is still open before unlinking the directory.
             cur_lst = os.lstat(run_name, dir_fd=img_fd)
             if cur_lst.st_dev != rst.st_dev or cur_lst.st_ino != rst.st_ino:
                 raise OSError(
                     errno.EXDEV,
-                    f"run directory '{os.path.join(img_path, run_name)}' changed before removal",
+                    f"run directory '{run_path}' changed before removal",
                 )
             os.rmdir(run_name, dir_fd=img_fd)
         finally:
@@ -1047,7 +1622,13 @@ def main(argv):
             strip_session_dir_acl(argv[1])
             return 0
         if op == "collect-serial-log-session":
-            collect_serial_log_session(argv[1], argv[2], argv[3])
+            collect_serial_log_session(
+                argv[1], argv[2], argv[3], argv[4] if len(argv) > 4 else "serial.log"
+            )
+            return 0
+        if op == "verify-domain-xml":
+            xml_text = sys.stdin.read()
+            verify_domain_xml(xml_text, argv[1], argv[2], argv[3])
             return 0
 
         root_fd, root_path = resolve_cli_root()
@@ -1084,14 +1665,44 @@ def main(argv):
             )
             if delegated:
                 print("DELEGATE_CHOWN")
+        elif op == "prepare-evidence-dir":
+            init_run = len(argv) > 2 and argv[2] == "init-run"
+            prepare_evidence_dir(
+                argv[1], init_run=init_run, root_fd=root_fd, root_path=root_path
+            )
+        elif op == "publish-evidence-stdin":
+            subdir = argv[3] if len(argv) > 3 and argv[3] else None
+            data = sys.stdin.buffer.read()
+            publish_evidence_bytes(
+                argv[1],
+                argv[2],
+                data,
+                subdir=subdir,
+                root_fd=root_fd,
+                root_path=root_path,
+            )
         elif op == "collect-serial-log":
             collect_serial_log(
                 argv[1],
                 argv[2],
                 argv[3],
+                argv[4] if len(argv) > 4 else "serial.log",
                 root_fd=root_fd,
                 root_path=root_path,
             )
+        elif op == "collect-qemu-log":
+            collect_qemu_log(
+                argv[1],
+                argv[2],
+                argv[3] if len(argv) > 3 else "qemu.log",
+                root_fd=root_fd,
+                root_path=root_path,
+            )
+        elif op == "verify-cleanup-target":
+            lexical_run, resolved_run = verify_cleanup_target(
+                argv[1], argv[2], root_fd=root_fd, root_path=root_path
+            )
+            print(f"{lexical_run}\t{resolved_run}")
         elif op == "cleanup-run-dir":
             status = cleanup_run_dir(
                 argv[1],

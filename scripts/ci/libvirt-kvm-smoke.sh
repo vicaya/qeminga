@@ -79,7 +79,9 @@ fi
 
 qemu_log_of() {
     local name="$1"
-    if [ "$CONNECT_URI" = "qemu:///session" ]; then
+    if [ -n "${QEMINGA_E2E_QEMU_LOG_DIR:-}" ]; then
+        echo "${QEMINGA_E2E_QEMU_LOG_DIR%/}/${name}.log"
+    elif [ "$CONNECT_URI" = "qemu:///session" ]; then
         echo "${XDG_CACHE_HOME:-${HOME:?HOME must be set}/.cache}/libvirt/qemu/log/${name}.log"
     else
         echo "/var/log/libvirt/qemu/${name}.log"
@@ -245,21 +247,29 @@ domain_state() {
 
 collect_diagnostics() {
     local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" qlog
+    qlog="$(qemu_log_of "$name")"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        sys_fs_ops prepare-evidence-dir "$out" 2>/dev/null || return 0
+        local dom_xml=""
+        dom_xml="$(v dumpxml "$name" 2>/dev/null || true)"
+        if [ -n "$dom_xml" ]; then
+            printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+        fi
+        sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" 2>/dev/null || true
+        if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
+            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
+        fi
+        return 0
+    fi
     mkdir -p "$out"
     v dumpxml "$name" >"$out/domain.xml" 2>/dev/null || true
-    qlog="$(qemu_log_of "$name")"
     if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-        if [ "$CONNECT_URI" = "qemu:///system" ]; then
-            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out/serial.log" 2>/dev/null || true
-        elif command -v python3 >/dev/null 2>&1; then
-            sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out/serial.log" 2>/dev/null || true
+        if command -v python3 >/dev/null 2>&1; then
+            sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
         elif [ ! -L "$dir/serial.log" ] && [ -f "$dir/serial.log" ]; then
             cp -- "$dir/serial.log" "$out/serial.log" || true
         fi
-    fi
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        chmod -R a+rX "$out" 2>/dev/null || true
     fi
 }
 
@@ -277,6 +287,9 @@ cmd_cleanup() {
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         [ "$(id -u)" -eq 0 ] || die "qemu:///system cleanup requires root"
         command -v python3 >/dev/null || die "missing tool: python3"
+        if [ -n "$out" ]; then
+            sys_fs_ops prepare-evidence-dir "$out" || exit 1
+        fi
     fi
     dir="$IMAGES/$name"
     if ! command -v virsh >/dev/null 2>&1; then
@@ -284,14 +297,40 @@ cmd_cleanup() {
         local note="nothing to clean up: libvirt is not installed and $dir does not exist"
         echo "$note"
         if [ -n "$out" ]; then
-            mkdir -p "$out" && echo "$note" >"$out/cleanup.txt"
+            if [ "$CONNECT_URI" = "qemu:///system" ]; then
+                printf '%s\n' "$note" | sys_fs_ops publish-evidence-stdin "$out" "cleanup.txt"
+            else
+                mkdir -p "$out" && echo "$note" >"$out/cleanup.txt"
+            fi
         fi
         return 0
     fi
-    [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
 
-    state="$(domain_state "$name")" \
-        || die "the state of $name cannot be established; keeping $dir"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        # Verify the image root, run directory, and same-mount tree BEFORE
+        # touching libvirt or collecting diagnostics, then verify any existing
+        # domain's XML belongs to this run directory BEFORE destroy/undefine.
+        local verified_paths="" expected_lexical_dir="" expected_resolved_dir=""
+        verified_paths="$(sys_fs_ops verify-cleanup-target "$IMAGES" "$name")" || exit 1
+        IFS=$'\t' read -r expected_lexical_dir expected_resolved_dir <<<"$verified_paths"
+
+        state="$(domain_state "$name")" \
+            || die "the state of $name cannot be established; keeping $dir"
+        if [ "$state" != absent ]; then
+            local dom_xml=""
+            dom_xml="$(v dumpxml "$name" 2>/dev/null)" \
+                || die "cannot inspect XML for $name before cleanup; keeping $dir"
+            printf '%s\n' "$dom_xml" \
+                | sys_fs_ops verify-domain-xml "$name" "$expected_lexical_dir" "$expected_resolved_dir" \
+                || exit 1
+        fi
+        [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
+    else
+        [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
+        state="$(domain_state "$name")" \
+            || die "the state of $name cannot be established; keeping $dir"
+    fi
+
     if [ "$state" != absent ]; then
         if [ "$state" != "shut off" ]; then
             v destroy "$name" || true
@@ -319,14 +358,14 @@ cmd_cleanup() {
 
 write_result() {
     local out="$1" arch="$2" sha="$3" digest="$4" accel="$5" all_not_run="${6:-0}"
-    local tests='{}' overall=pass t status machine image image_sha
+    local tests='{}' overall=pass t status machine image image_sha result_json
     machine="$(machine_of "$arch")" || return 1
     image="$(image_file_of "$arch")" || return 1
     image_sha="$(image_sha_of "$arch")" || return 1
     for t in $MANDATORY_TESTS; do
         if [ "$all_not_run" = 1 ]; then
             status=not_run
-        elif [ -f "$out/tests/$t" ]; then
+        elif [ ! -L "$out/tests/$t" ] && [ -f "$out/tests/$t" ]; then
             case "$(tr -d '[:space:]' <"$out/tests/$t")" in
                 pass) status=pass ;;
                 *) status=fail ;;
@@ -338,9 +377,7 @@ write_result() {
         tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")" || return 1
     done
     [ "$accel" = kvm ] || overall=fail
-    local tmp="$out/.result.json.tmp.$$"
-    rm -f "$tmp" || return 1
-    if ! jq -n \
+    result_json="$(jq -n \
         --arg suite "$SUITE" --arg repo "$SOURCE_REPOSITORY" --arg sha "$sha" \
         --arg arch "$arch" --arg digest "$digest" --arg accel "$accel" \
         --arg machine "$machine" \
@@ -351,15 +388,23 @@ write_result() {
           architecture: $arch, candidate_binary_sha256: $digest,
           virtualization: {hypervisor: "qemu", accelerator: $accel, machine: $machine},
           guest: {image: $image, image_release: $image_release, image_sha256: $image_sha},
-          tests: $tests, result: $result}' >"$tmp"; then
-        rm -f "$tmp"
-        return 1
+          tests: $tests, result: $result}')" || return 1
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json" || return 1
+        printf '%s\n' "$result_json" || return 1
+    else
+        local tmp="$out/.result.json.tmp.$$"
+        rm -f "$tmp" || return 1
+        if ! printf '%s\n' "$result_json" >"$tmp"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        if ! mv -f -T "$tmp" "$out/result.json"; then
+            rm -f "$tmp"
+            return 1
+        fi
+        cat "$out/result.json" || return 1
     fi
-    if ! mv -f -T "$tmp" "$out/result.json"; then
-        rm -f "$tmp"
-        return 1
-    fi
-    cat "$out/result.json" || return 1
     [ "$overall" = pass ]
 }
 
@@ -459,7 +504,15 @@ cmd_verify_pass() {
 
 # ---- the lane -------------------------------------------------------------
 
-mark() { mkdir -p "$OUT/tests"; echo "$2" >"$OUT/tests/$1"; echo "-- $1: $2"; }
+mark() {
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        printf '%s\n' "$2" | sys_fs_ops publish-evidence-stdin "$OUT" "$1" "tests"
+    else
+        mkdir -p "$OUT/tests"
+        echo "$2" >"$OUT/tests/$1"
+    fi
+    echo "-- $1: $2"
+}
 
 QEMU_UID=0
 QEMU_GID=0
@@ -484,7 +537,7 @@ resolve_system_qemu_identity() {
         caps_xml="$(v capabilities 2>/dev/null || true)"
     fi
     local resolved=""
-    if ! resolved="$(python3 -I - "$conf" "$override_user" "$override_group" 3<<<"$caps_xml" <<'PY'
+    if ! resolved="$(python3 -IB - "$conf" "$override_user" "$override_group" 3<<<"$caps_xml" <<'PY'
 import grp, os, pwd, re, sys, xml.etree.ElementTree as ET
 
 conf_path, user, group = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -607,10 +660,11 @@ PY
 }
 
 # FD-anchored filesystem operations for the `qemu:///system` lane live in
-# `scripts/ci/libvirt_kvm_sysfs.py` so both this script (under `python3 -I`)
-# and unprivileged unit tests share the exact same implementation.
+# `scripts/ci/libvirt_kvm_sysfs.py` so both this script (under `python3 -IB`)
+# and unprivileged unit tests share the exact same implementation without
+# writing `__pycache__` bytecode into the checkout.
 sys_fs_ops() {
-    python3 -I "$HERE/libvirt_kvm_sysfs.py" "$@"
+    python3 -IB "$HERE/libvirt_kvm_sysfs.py" "$@"
 }
 
 prepare_system_images_root() {
@@ -754,8 +808,14 @@ cmd_run() {
     check_number QEMINGA_E2E_BOOT_TIMEOUT_SECS "$boot_timeout"
     check_number QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS "$shutdown_timeout"
 
-    mkdir -p "$OUT/tests"
-    rm -f "$OUT"/tests/* "$OUT/result.json"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        [ "$(id -u)" -eq 0 ] || die "qemu:///system requires root"
+        command -v python3 >/dev/null || die "missing tool: python3"
+        sys_fs_ops prepare-evidence-dir "$OUT" init-run || exit 1
+    else
+        mkdir -p "$OUT/tests"
+        rm -f "$OUT"/tests/* "$OUT/result.json"
+    fi
     RUN_ARCH="$arch" RUN_SHA="$sha" RUN_DIGEST="$NO_DIGEST" RUN_ACCEL=unknown
     RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$RUN_NAME"
@@ -767,12 +827,18 @@ cmd_run() {
     trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
 
     preflight "$arch"
-    {
+    local versions_txt=""
+    versions_txt="$({
         echo "runner kernel: $(uname -srm)"
         v version
         "qemu-system-$arch" --version | head -n 1
-    } >"$OUT/versions.txt" 2>&1
-    cat "$OUT/versions.txt"
+    } 2>&1)"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        printf '%s\n' "$versions_txt" | sys_fs_ops publish-evidence-stdin "$OUT" "versions.txt"
+    else
+        printf '%s\n' "$versions_txt" >"$OUT/versions.txt"
+    fi
+    printf '%s\n' "$versions_txt"
 
     say "candidate"
     digest="$(cmd_verify_candidate "$candidate" "$arch" "$sha")"
@@ -861,7 +927,22 @@ EOF
     [ "$install" = pass ] || exit 1
 
     say "AC16: scripts/e2e-libvirt.sh"
-    if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$OUT/e2e-libvirt.log"; then
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        local e2e_tmp="" e2e_rc=0
+        e2e_tmp="$(mktemp "$dir/e2e-libvirt.XXXXXX.log")"
+        if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$e2e_tmp"; then
+            e2e_rc=0
+        else
+            e2e_rc=$?
+        fi
+        sys_fs_ops publish-evidence-stdin "$OUT" "e2e-libvirt.log" <"$e2e_tmp" || true
+        rm -f "$e2e_tmp"
+        if [ "$e2e_rc" -eq 0 ]; then
+            mark libvirt_interop pass
+        else
+            mark libvirt_interop fail
+        fi
+    elif bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$OUT/e2e-libvirt.log"; then
         mark libvirt_interop pass
     else
         mark libvirt_interop fail

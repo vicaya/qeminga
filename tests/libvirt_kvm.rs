@@ -1745,7 +1745,7 @@ os.setxattr(p, b"system.posix_acl_access", raw)
         // group-only `0o710` (group 0) rather than world-searchable `0o711`.
         let grp0_check = Command::new("python3")
             .args([
-                "-I",
+                "-IB",
                 "-c",
                 r#"
 import importlib.util, os, sys
@@ -2457,7 +2457,7 @@ exec /usr/bin/id "$@"
     let victim_file = bad_run_dir.join("unrelated.dat");
     std::fs::write(&victim_file, b"must-survive-cleanup\n").unwrap();
 
-    let out_reject = dir.path().join("out-reject");
+    let out_reject = sys_root.join("out-reject");
     let run_reject = lane_env(
         &[
             "run",
@@ -2502,7 +2502,7 @@ exec /usr/bin/id "$@"
 
     // 2. Standalone `cmd_cleanup --out` against the same rejected shared-writable image root:
     //    MUST refuse cleanup, keep `unrelated.dat` intact, AND NOT leak `serial.log` into OUT!
-    let out_cleanup_reject = dir.path().join("out-cleanup-reject");
+    let out_cleanup_reject = sys_root.join("out-cleanup-reject");
     let cleanup_reject = lane_env(
         &[
             "cleanup",
@@ -2545,7 +2545,7 @@ exec /usr/bin/id "$@"
     //    - 3c: Standalone `cleanup` on trusted root removes ONLY the target run dir (leaving sibling).
     let good_images = sys_root.join("trusted-images");
     let run_sym_dir = good_images.join(format!("qeminga-e2e-102-1-{arch}"));
-    let out_sym = dir.path().join("out-sym");
+    let out_sym = sys_root.join("out-sym");
     let run_sym = lane_env(
         &[
             "run",
@@ -2591,7 +2591,7 @@ exec /usr/bin/id "$@"
     );
 
     let run_ok_dir = good_images.join(format!("qeminga-e2e-103-1-{arch}"));
-    let out_ok = dir.path().join("out-ok");
+    let out_ok = sys_root.join("out-ok");
     let run_ok = lane_env(
         &[
             "run",
@@ -2708,7 +2708,7 @@ fn sysfs_module_enforces_atomic_noreplace_recovers_failed_sync_and_isolates_root
     }
     let py = cmd
         .args([
-            "-I",
+            "-IB",
             "-c",
             r#"
 import ctypes, errno, importlib.util, os, stat, sys
@@ -3019,6 +3019,726 @@ fn private_fixture_helpers_create_0700_dirs_and_tools_even_under_umask_000() {
             && priv_body.contains("private_tempdir()")
             && priv_body.contains("create_private_dir(&bin)"),
         "privileged_kvm_system_lane_kernel_verdicts must create its fixture root and bin directory with 0700 permissions at creation"
+    );
+}
+
+#[test]
+fn sysfs_module_enforces_same_mount_id_and_reclaims_on_final_traversal_failure() {
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_private_dir(&sys_root);
+    std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+
+    let mut cmd = Command::new("python3");
+    if !acls_can_name_test_uids {
+        cmd.env("QEMINGA_TEST_DISABLE_ACL", "1");
+    }
+    let py = cmd
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import errno, importlib.util, os, sys
+
+mod_path = sys.argv[1]
+root_path = sys.argv[2]
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+assert hasattr(mod, "fd_mnt_id"), "libvirt_kvm_sysfs must expose fd_mnt_id"
+assert hasattr(mod, "scan_open_dir_same_mount"), "libvirt_kvm_sysfs must expose scan_open_dir_same_mount"
+
+egid = os.getegid()
+root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
+try:
+    images_path = os.path.join(root_path, "mnt-images")
+    mod.prepare_images_root(images_path, 64055, egid, {egid}, root_fd=root_fd, root_path=root_path)
+
+    # 1. Same-st_dev bind mount inside run dir: pre-scan MUST reject BEFORE unlinking any sibling!
+    run_bind_sub = "qeminga-e2e-301-1-x86_64"
+    run_bind_sub_path = os.path.join(images_path, run_bind_sub)
+    os.mkdir(run_bind_sub_path, 0o700)
+    sibling = os.path.join(run_bind_sub_path, "a_sibling.txt")
+    with open(sibling, "w", encoding="utf-8") as fh:
+        fh.write("sibling-must-survive\n")
+    bind_sub = os.path.join(run_bind_sub_path, "z_bind_sub")
+    os.mkdir(bind_sub, 0o700)
+    bind_secret = os.path.join(bind_sub, "mounted_secret.txt")
+    with open(bind_secret, "w", encoding="utf-8") as fh:
+        fh.write("host-bind-data\n")
+    bind_sub_id = (os.lstat(bind_sub).st_dev, os.lstat(bind_sub).st_ino)
+    orig_fd_mnt_id = mod.fd_mnt_id
+    triggered = []
+    def fake_bind_sub_mnt_id(fd):
+        st = os.fstat(fd)
+        mid = orig_fd_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == bind_sub_id:
+            triggered.append("z_bind_sub")
+            return mid + 77
+        return mid
+    mod.fd_mnt_id = fake_bind_sub_mnt_id
+    try:
+        try:
+            mod.cleanup_run_dir(images_path, run_bind_sub, root_fd=root_fd, root_path=root_path)
+            raise AssertionError("cleanup_run_dir must reject same-st_dev bind mount subdir")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+            assert "z_bind_sub" in str(exc), f"expected rejection on z_bind_sub, got {exc}"
+    finally:
+        mod.fd_mnt_id = orig_fd_mnt_id
+    assert triggered == ["z_bind_sub"], f"expected z_bind_sub mount-id mismatch, got {triggered}"
+    assert os.path.isfile(sibling), "pre-scan must abort BEFORE unlinking sibling files"
+    assert os.path.isfile(bind_secret), "same-st_dev bind mount target files must survive"
+
+    # 2. Same-st_dev bind mount directly at run_dir itself: MUST reject with EXDEV!
+    run_bind_self_id = (os.lstat(run_bind_sub_path).st_dev, os.lstat(run_bind_sub_path).st_ino)
+    triggered_self = []
+    def fake_bind_self_mnt_id(fd):
+        st = os.fstat(fd)
+        mid = orig_fd_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == run_bind_self_id:
+            triggered_self.append("run_dir")
+            return mid + 88
+        return mid
+    mod.fd_mnt_id = fake_bind_self_mnt_id
+    try:
+        try:
+            mod.cleanup_run_dir(images_path, run_bind_sub, root_fd=root_fd, root_path=root_path)
+            raise AssertionError("cleanup_run_dir must reject same-st_dev bind mount at run_dir")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.fd_mnt_id = orig_fd_mnt_id
+    assert triggered_self == ["run_dir"], f"expected run_dir mount-id mismatch, got {triggered_self}"
+    assert os.path.isfile(sibling)
+
+    # 3. Same-st_dev single-file bind mount at serial.log: collect_serial_log MUST reject with EXDEV!
+    slog = os.path.join(run_bind_sub_path, "serial.log")
+    with open(slog, "w", encoding="utf-8") as fh:
+        fh.write("BIND_MOUNTED_SECRET\n")
+    slog_id = (os.lstat(slog).st_dev, os.lstat(slog).st_ino)
+    out_dir = os.path.join(root_path, "out-bind-serial")
+    os.mkdir(out_dir, 0o755)
+    triggered_slog = []
+    def fake_bind_serial_mnt_id(fd):
+        st = os.fstat(fd)
+        mid = orig_fd_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == slog_id:
+            triggered_slog.append("serial.log")
+            return mid + 99
+        return mid
+    mod.fd_mnt_id = fake_bind_serial_mnt_id
+    try:
+        try:
+            mod.collect_serial_log(
+                images_path, run_bind_sub, out_dir, "serial.log", root_fd=root_fd, root_path=root_path
+            )
+            raise AssertionError("collect_serial_log must reject bind-mounted serial.log")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.fd_mnt_id = orig_fd_mnt_id
+    assert triggered_slog == ["serial.log"], f"expected serial.log mount-id mismatch, got {triggered_slog}"
+    assert not os.path.exists(os.path.join(out_dir, "serial.log"))
+
+    # Positive controls (including on Linux overlayfs where file st_dev != dir st_dev while mnt_id matches):
+    assert mod.collect_serial_log(
+        images_path, run_bind_sub, out_dir, "serial.log", root_fd=root_fd, root_path=root_path
+    ) is True
+    assert open(os.path.join(out_dir, "serial.log"), encoding="utf-8").read().strip() == "BIND_MOUNTED_SECRET"
+    assert mod.cleanup_run_dir(images_path, run_bind_sub, root_fd=root_fd, root_path=root_path) == "removed"
+    assert not os.path.exists(run_bind_sub_path)
+
+    # 4. Transient EAGAIN on the final kernel_verdict_traversal in create_run_dir:
+    #    MUST reclaim this invocation's still-empty run dir while descriptors remain open,
+    #    allowing an ordinary retry to succeed cleanly!
+    final_run = "qeminga-e2e-302-1-x86_64"
+    final_run_path = os.path.join(images_path, final_run)
+    orig_kvt = mod.kernel_verdict_traversal
+    calls = []
+    def fail_final_kvt(path, u, g, grps):
+        calls.append(path)
+        if os.path.normpath(path) == os.path.normpath(final_run_path):
+            assert os.path.isdir(final_run_path), "run dir must exist when final check runs"
+            raise OSError(errno.EAGAIN, "simulated transient final traversal error")
+        return orig_kvt(path, u, g, grps)
+    mod.kernel_verdict_traversal = fail_final_kvt
+    try:
+        try:
+            mod.create_run_dir(
+                images_path, final_run, 64055, egid, {egid}, root_fd=root_fd, root_path=root_path
+            )
+            raise AssertionError("expected EAGAIN from final kernel_verdict_traversal")
+        except OSError as exc:
+            assert exc.errno == errno.EAGAIN, exc
+    finally:
+        mod.kernel_verdict_traversal = orig_kvt
+    assert os.path.normpath(final_run_path) in [os.path.normpath(c) for c in calls], (
+        f"final kernel_verdict_traversal must be invoked on {final_run_path}, got {calls}"
+    )
+    assert not os.path.exists(final_run_path), (
+        "create_run_dir must reclaim its still-empty run dir when final traversal check fails"
+    )
+    # Ordinary retry now succeeds cleanly!
+    mod.create_run_dir(
+        images_path, final_run, 64055, egid, {egid}, root_fd=root_fd, root_path=root_path
+    )
+    assert os.path.isdir(final_run_path)
+finally:
+    os.close(root_fd)
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "mount-id and final-traversal rollback tests failed:\n{}",
+        text(&py)
+    );
+    assert!(
+        !root().join("scripts/ci/__pycache__").exists(),
+        "Python test invocations must pass -B and never leave scripts/ci/__pycache__ behind"
+    );
+}
+
+#[test]
+fn system_mode_protects_evidence_destination_and_verifies_domain_before_destroy() {
+    require_jq();
+    let arch = std::env::consts::ARCH;
+    assert!(arch == "x86_64" || arch == "aarch64");
+
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let sys_root = dir.path().join("sys-root");
+    create_private_dir(&bin);
+    create_private_dir(&sys_root);
+    std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let binary = dir.path().join("qeminga-bin");
+    std::fs::write(&binary, b"fake release binary\n").unwrap();
+    let candidate = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        candidate.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "105",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "test-runner",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&candidate.join("qeminga"));
+    let img_key = lane(&["image-key", arch]);
+    assert!(img_key.status.success(), "{}", text(&img_key));
+    let pinned_image_sha = String::from_utf8(img_key.stdout)
+        .unwrap()
+        .trim()
+        .rsplit('-')
+        .next()
+        .unwrap()
+        .to_string();
+    let caller_grp_num = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-g")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let qemu_user_spec = "+64055";
+    let qemu_group_spec = format!("+{caller_grp_num}");
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+    let disable_acl_flag = if acls_can_name_test_uids { "0" } else { "1" };
+
+    write_exec(
+        &bin.join("virsh"),
+        r#"#!/bin/sh
+case "$1" in --connect=*) shift ;; esac
+if [ -n "${FAKE_VIRSH_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_VIRSH_LOG"; fi
+case "$1" in
+    version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    capabilities) exit 0 ;;
+    domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
+    net-info) echo "Active:         yes"; exit 0 ;;
+    list)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ] && [ -f "$FAKE_DOM_STATE_FILE" ]; then
+            st="$(cat "$FAKE_DOM_STATE_FILE")"
+            if [ "$st" != "absent" ]; then printf '%s\n' "${FAKE_DOM_NAME:-}"; fi
+        fi
+        exit 0
+        ;;
+    domstate)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ] && [ -f "$FAKE_DOM_STATE_FILE" ]; then
+            st="$(cat "$FAKE_DOM_STATE_FILE")"
+            if [ "$st" != "absent" ]; then echo "$st"; exit 0; fi
+        fi
+        echo "error: failed to get domain '$2'" >&2; exit 1
+        ;;
+    dumpxml)
+        if [ -n "${FAKE_DUMPXML_CONTENT:-}" ]; then
+            printf '%s\n' "$FAKE_DUMPXML_CONTENT"
+            exit 0
+        fi
+        exit 1
+        ;;
+    destroy)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ]; then echo "shut off" > "$FAKE_DOM_STATE_FILE"; fi
+        exit 0
+        ;;
+    undefine)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ]; then echo "absent" > "$FAKE_DOM_STATE_FILE"; fi
+        exit 0
+        ;;
+    define) exit 0 ;;
+    start)
+        if [ -n "${FAKE_PLANT_SERIAL_CONTENT:-}" ]; then
+            printf '%s\n' "${FAKE_PLANT_SERIAL_CONTENT}" > "${FAKE_PLANT_SERIAL_DEST:?}"
+        fi
+        exit 42
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("genisoimage"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -output) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join(format!("qemu-system-{arch}")),
+        "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf 'fake qcow2 bytes\n' > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("sha256sum"),
+        r#"#!/bin/sh
+case "$1" in
+    *.qcow2.part) printf '%s  %s\n' "${FAKE_IMAGE_SHA:?}" "$1"; exit 0 ;;
+esac
+exec /usr/bin/sha256sum "$@"
+"#,
+    );
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
+    );
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo "0"; exit 0; fi
+exec /usr/bin/id "$@"
+"#,
+    );
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    // 1. Evidence destination protection:
+    //    - Pre-existing private `0600` file in OUT MUST keep mode `0600` (no `chmod -R a+rX`!).
+    //    - Pre-existing hard-linked `serial.log`, `domain.xml`, and `qemu.log` MUST NEVER have
+    //      their shared victim inodes truncated or chmodded!
+    let good_images = sys_root.join("trusted-ev-images");
+    let qemu_log_dir = sys_root.join("qemu-logs");
+    create_private_dir(&qemu_log_dir);
+    let run_name = format!("qeminga-e2e-105-1-{arch}");
+    let run_dir = good_images.join(&run_name);
+    let qlog_file = qemu_log_dir.join(format!("{run_name}.log"));
+    std::fs::write(&qlog_file, b"QEMU_LOG_LINE\n").unwrap();
+
+    let out_ev = sys_root.join("out-evidence");
+    create_private_dir(&out_ev);
+    std::fs::set_permissions(&out_ev, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let unrelated_priv = out_ev.join("unrelated.key");
+    std::fs::write(&unrelated_priv, b"PRIVATE_KEY_MATERIAL\n").unwrap();
+    std::fs::set_permissions(&unrelated_priv, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let victim_dir = sys_root.join("victims");
+    create_private_dir(&victim_dir);
+    let victim_serial = victim_dir.join("victim-serial.txt");
+    let victim_dom = victim_dir.join("victim-dom.txt");
+    let victim_qemu = victim_dir.join("victim-qemu.txt");
+    for (v, orig, dest_name) in [
+        (&victim_serial, "ORIGINAL_SERIAL\n", "serial.log"),
+        (&victim_dom, "ORIGINAL_DOM\n", "domain.xml"),
+        (&victim_qemu, "ORIGINAL_QEMU\n", "qemu.log"),
+    ] {
+        std::fs::write(v, orig).unwrap();
+        std::fs::set_permissions(v, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::hard_link(v, out_ev.join(dest_name)).unwrap();
+    }
+
+    let matching_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+        run_dir.display(),
+        run_dir.display()
+    );
+    let run_ev = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_ev.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qemu_log_dir.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ("FAKE_DUMPXML_CONTENT", &matching_xml),
+            ("FAKE_PLANT_SERIAL_CONTENT", "FRESH_SERIAL_OUTPUT"),
+            (
+                "FAKE_PLANT_SERIAL_DEST",
+                run_dir.join("serial.log").to_str().unwrap(),
+            ),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_ev.status.success(), "{}", text(&run_ev));
+    assert_eq!(
+        std::fs::metadata(&unrelated_priv)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "system-mode diagnostics MUST NOT chmod unrelated pre-existing files in OUT"
+    );
+    for (v, expected_orig, dest_name, expected_new) in [
+        (
+            &victim_serial,
+            "ORIGINAL_SERIAL",
+            "serial.log",
+            "FRESH_SERIAL_OUTPUT",
+        ),
+        (&victim_dom, "ORIGINAL_DOM", "domain.xml", "<domain"),
+        (&victim_qemu, "ORIGINAL_QEMU", "qemu.log", "QEMU_LOG_LINE"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(v).unwrap().trim(),
+            expected_orig,
+            "hard-linked victim for {dest_name} MUST NOT be truncated or overwritten"
+        );
+        assert_eq!(
+            std::fs::metadata(v).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "hard-linked victim for {dest_name} MUST keep original 0600 permissions"
+        );
+        let published = std::fs::read_to_string(out_ev.join(dest_name)).unwrap_or_default();
+        assert!(
+            published.contains(expected_new),
+            "published {dest_name} should contain {expected_new:?}, got:\n{published}"
+        );
+        assert_eq!(
+            std::fs::metadata(out_ev.join(dest_name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "newly published {dest_name} should be 0644"
+        );
+    }
+
+    // Untrusted/shared-writable OUT dir (0777 ancestor) MUST be refused!
+    let bad_out_parent = sys_root.join("shared-out-0777");
+    create_private_dir(&bad_out_parent);
+    std::fs::set_permissions(&bad_out_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let bad_out = bad_out_parent.join("evidence");
+    let run_bad_out = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "106",
+            "--run-attempt",
+            "1",
+            "--out",
+            bad_out.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !run_bad_out.status.success() && !bad_out.exists(),
+        "system-mode run MUST refuse shared-writable OUT directory before writing evidence: {}",
+        text(&run_bad_out)
+    );
+
+    // 2. Domain verification BEFORE destructive `virsh destroy` / `undefine` in `cmd_cleanup`:
+    let virsh_log = dir.path().join("cleanup-virsh.log");
+    let dom_state_file = dir.path().join("dom.state");
+
+    // 2a: Rejected image root (0777 ancestor) with a RUNNING domain -> MUST fail BEFORE destroy/undefine!
+    let bad_img_root = bad_out_parent.join("images");
+    let bad_run_dir = bad_img_root.join(&run_name);
+    std::fs::create_dir_all(&bad_run_dir).unwrap();
+    let bad_keep = bad_run_dir.join("keep.dat");
+    std::fs::write(&bad_keep, b"keep").unwrap();
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_bad_root = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", bad_img_root.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DUMPXML_CONTENT", &matching_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_bad = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_bad_root.status.success()
+            && !vlog_bad.contains("destroy")
+            && !vlog_bad.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running"
+            && bad_keep.is_file(),
+        "cleanup MUST refuse rejected image root BEFORE destroying/undefining domain (virsh_log:\n{vlog_bad}): {}",
+        text(&clean_bad_root)
+    );
+
+    // 2b: Trusted image root, RUNNING domain whose XML points to an UNRELATED disk -> MUST fail
+    //     BEFORE destroy/undefine and leave BOTH domain and storage intact!
+    let unrelated_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><devices><disk type='file'><source file='/var/lib/libvirt/images/unrelated-prod/root.qcow2'/></disk></devices></domain>"
+    );
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_mismatch = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DUMPXML_CONTENT", &unrelated_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_mis = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_mismatch.status.success()
+            && !vlog_mis.contains("destroy")
+            && !vlog_mis.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running"
+            && run_dir.is_dir(),
+        "cleanup MUST refuse domain whose XML disk source does not match expected run dir (virsh_log:\n{vlog_mis}): {}",
+        text(&clean_mismatch)
+    );
+
+    // 2b-ii: Domain with a non-file block disk attached alongside run root.qcow2 -> MUST fail
+    //        BEFORE destroy/undefine!
+    let block_disk_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><devices><disk type='file'><source file='{}/root.qcow2'/></disk><disk type='block'><source dev='/dev/nvme0n1'/></disk></devices></domain>",
+        run_dir.display()
+    );
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_block = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DUMPXML_CONTENT", &block_disk_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_blk = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_block.status.success()
+            && !vlog_blk.contains("destroy")
+            && !vlog_blk.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running"
+            && run_dir.is_dir(),
+        "cleanup MUST refuse domain with non-file block disk BEFORE destroy/undefine (virsh_log:\n{vlog_blk}): {}",
+        text(&clean_block)
+    );
+
+    // 2b-iii: Shared-writable --out on cmd_cleanup -> MUST fail closed before touching virsh or run_dir!
+    let bad_clean_out = bad_out_parent.join("clean-evidence");
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_bad_out = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+            "--out",
+            bad_clean_out.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DUMPXML_CONTENT", &matching_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_cout = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_bad_out.status.success()
+            && !bad_clean_out.exists()
+            && !vlog_cout.contains("destroy")
+            && !vlog_cout.contains("undefine")
+            && run_dir.is_dir(),
+        "cleanup MUST refuse shared-writable --out BEFORE touching virsh or run dir: {}",
+        text(&clean_bad_out)
+    );
+
+    // 2c: Trusted image root AND matching XML -> destroys, undefines, and removes run_dir cleanly!
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_match = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DUMPXML_CONTENT", &matching_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_ok = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        clean_match.status.success()
+            && vlog_ok.contains("destroy")
+            && vlog_ok.contains("undefine")
+            && !run_dir.exists(),
+        "cleanup with trusted image root and matching domain XML should destroy, undefine, and remove run dir (virsh_log:\n{vlog_ok}): {}",
+        text(&clean_match)
+    );
+    assert!(
+        !root().join("scripts/ci/__pycache__").exists(),
+        "libvirt-kvm-smoke.sh must invoke python3 with -B so scripts/ci/__pycache__ is never created"
     );
 }
 

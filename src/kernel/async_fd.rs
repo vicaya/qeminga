@@ -200,7 +200,16 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(nix::libc::EPERM), "{err}");
     }
 
-    #[tokio::test]
+    /// Pumps Tokio's I/O reactor (`epoll_wait(0)`) under `start_paused = true`
+    /// without advancing virtual time or relying on wall-clock sleeps.
+    async fn pump_reactor() {
+        tokio::time::advance(Duration::ZERO).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn into_fd_refreshes_registration_after_real_epollhup_without_spinning() {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
@@ -223,27 +232,25 @@ mod tests {
         let n = poll_fn(|cx| old.poll_read(cx, &mut buf)).await.unwrap();
         assert_eq!(&buf[..n], b"first\n");
 
-        // Drain the initial READABLE bit so `old` parks on epoll; dropping
-        // `writer1` then wakes it via a real kernel EPOLLHUP, latching
+        // Synchronously drain the initial READABLE bit until `poll_read`
+        // genuinely returns `Poll::Pending` (parked on epoll); dropping
+        // `writer1` then delivers a real kernel EPOLLHUP, latching
         // Mio/Tokio's sticky READ_CLOSED bit on `old`.
-        let parked = tokio::time::timeout(
-            Duration::from_millis(20),
-            poll_fn(|cx| old.poll_read(cx, &mut buf)),
-        )
-        .await;
         assert!(
-            parked.is_err(),
-            "reader should park on epoll while writer1 is idle"
+            poll_fn(|cx| Poll::Ready(old.poll_read(cx, &mut buf)))
+                .await
+                .is_pending(),
+            "reader must synchronously park on epoll while writer1 is idle"
         );
 
         drop(writer1);
-        let n = tokio::time::timeout(
-            Duration::from_secs(5),
-            poll_fn(|cx| old.poll_read(cx, &mut buf)),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        pump_reactor().await;
+        let n = match poll_fn(|cx| Poll::Ready(old.poll_read(cx, &mut buf))).await {
+            Poll::Ready(res) => res.unwrap(),
+            Poll::Pending => {
+                panic!("EOF must be delivered via kernel EPOLLHUP after writer1 closed")
+            }
+        };
         assert_eq!(
             n, 0,
             "EOF delivered via kernel EPOLLHUP after writer1 closed"
@@ -253,40 +260,40 @@ mod tests {
         // returns EAGAIN). The stale registration still has READ_CLOSED
         // latched, so `poll_read` must NOT busy-spin (it surfaces EOF), and
         // refreshing the registration via `into_fd` + `register` parks cleanly
-        // until data arrives.
+        // across an idle virtual-time window until data arrives.
         let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
-        let stale = tokio::time::timeout(
-            Duration::from_millis(200),
-            poll_fn(|cx| old.poll_read(cx, &mut buf)),
-        )
-        .await
-        .expect("stale READ_CLOSED registration must surface EOF rather than spinning")
-        .unwrap();
+        let stale = match poll_fn(|cx| Poll::Ready(old.poll_read(cx, &mut buf))).await {
+            Poll::Ready(res) => res.unwrap(),
+            Poll::Pending => panic!("stale READ_CLOSED registration must surface EOF immediately"),
+        };
         assert_eq!(stale, 0);
 
         let fresh = OwnedAsyncFd::register(old.into_fd()).unwrap();
-        let pending = tokio::time::timeout(
-            Duration::from_millis(50),
-            poll_fn(|cx| fresh.poll_read(cx, &mut buf)),
-        )
-        .await;
         assert!(
-            pending.is_err(),
+            poll_fn(|cx| Poll::Ready(fresh.poll_read(cx, &mut buf)))
+                .await
+                .is_pending(),
             "fresh registration on idle connected peer must park in Pending"
+        );
+        tokio::time::advance(Duration::from_millis(50)).await;
+        pump_reactor().await;
+        assert!(
+            poll_fn(|cx| Poll::Ready(fresh.poll_read(cx, &mut buf)))
+                .await
+                .is_pending(),
+            "fresh registration must remain Pending across the idle window"
         );
 
         nix::unistd::write(&writer2, b"second\n").unwrap();
-        let n = tokio::time::timeout(
-            Duration::from_secs(5),
-            poll_fn(|cx| fresh.poll_read(cx, &mut buf)),
-        )
-        .await
-        .expect("fresh registration wakes on new writer data")
-        .unwrap();
+        pump_reactor().await;
+        let n = match poll_fn(|cx| Poll::Ready(fresh.poll_read(cx, &mut buf))).await {
+            Poll::Ready(res) => res.unwrap(),
+            Poll::Pending => panic!("fresh registration must wake on new writer data"),
+        };
         assert_eq!(&buf[..n], b"second\n");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn poll_write_refuses_io_after_real_epollerr_even_when_new_reader_is_ready() {
         use nix::errno::Errno;
         use nix::fcntl::{OFlag, open};
@@ -310,30 +317,26 @@ mod tests {
         .unwrap();
         let old = OwnedAsyncFd::register(writer_fd).unwrap();
 
-        // Fill the FIFO pipe buffer until `poll_write` clears initial WRITABLE
-        // and parks on epoll; closing `reader1` then delivers a real kernel
-        // EPOLLERR, latching Mio/Tokio's sticky WRITE_CLOSED bit on `old`.
+        // Synchronously fill the FIFO pipe buffer until `poll_write` clears
+        // initial WRITABLE and genuinely returns `Poll::Pending`; closing
+        // `reader1` then delivers a real kernel EPOLLERR, latching
+        // Mio/Tokio's sticky WRITE_CLOSED bit on `old`.
         let chunk = [b'a'; 4096];
         loop {
-            let res = tokio::time::timeout(
-                Duration::from_millis(20),
-                poll_fn(|cx| old.poll_write(cx, &chunk)),
-            )
-            .await;
-            if res.is_err() {
-                break;
+            match poll_fn(|cx| Poll::Ready(old.poll_write(cx, &chunk))).await {
+                Poll::Pending => break,
+                Poll::Ready(res) => {
+                    res.unwrap();
+                }
             }
-            res.unwrap().unwrap();
         }
 
         drop(reader1);
-        let err = tokio::time::timeout(
-            Duration::from_secs(5),
-            poll_fn(|cx| old.poll_write(cx, b"x")),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        pump_reactor().await;
+        let err = match poll_fn(|cx| Poll::Ready(old.poll_write(cx, b"x"))).await {
+            Poll::Ready(res) => res.unwrap_err(),
+            Poll::Pending => panic!("EPOLLERR must wake writer and latch WRITE_CLOSED"),
+        };
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
 
         // Reconnect a ready reader2 (draining any old buffered bytes so the
@@ -348,13 +351,10 @@ mod tests {
         let mut drain = [0u8; 4096];
         while nix::unistd::read(&reader2, &mut drain).is_ok_and(|n| n > 0) {}
 
-        let refused = tokio::time::timeout(
-            Duration::from_secs(5),
-            poll_fn(|cx| old.poll_write(cx, b"stale-reply\n")),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
+        let refused = match poll_fn(|cx| Poll::Ready(old.poll_write(cx, b"stale-reply\n"))).await {
+            Poll::Ready(res) => res.unwrap_err(),
+            Poll::Pending => panic!("latched WRITE_CLOSED must refuse write immediately"),
+        };
         assert_eq!(
             refused.kind(),
             io::ErrorKind::BrokenPipe,
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(&got[..n], b"fresh-reply\n");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn poll_read_checked_refuses_read_on_latched_read_closed_when_stop_on_hangup_holds() {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
@@ -397,29 +397,33 @@ mod tests {
         let old = OwnedAsyncFd::register(reader).unwrap();
 
         let mut buf = [0u8; 32];
-        let parked = tokio::time::timeout(
-            Duration::from_millis(20),
-            poll_fn(|cx| old.poll_read(cx, &mut buf)),
-        )
-        .await;
-        assert!(parked.is_err());
+        assert!(
+            poll_fn(|cx| Poll::Ready(old.poll_read(cx, &mut buf)))
+                .await
+                .is_pending(),
+            "reader must synchronously park on epoll while writer1 is idle"
+        );
 
         drop(writer1);
-        assert_eq!(
-            poll_fn(|cx| old.poll_read(cx, &mut buf)).await.unwrap(),
-            0,
-            "EPOLLHUP latches READ_CLOSED"
-        );
+        pump_reactor().await;
+        let eof = match poll_fn(|cx| Poll::Ready(old.poll_read(cx, &mut buf))).await {
+            Poll::Ready(res) => res.unwrap(),
+            Poll::Pending => panic!("EPOLLHUP must latch READ_CLOSED"),
+        };
+        assert_eq!(eof, 0, "EPOLLHUP latches READ_CLOSED");
 
         // Writer 2 reconnects and ALREADY sends its first request before the
         // old registration polls again: `poll_read_checked(..., || true)` must
         // return Ok(0) WITHOUT consuming writer2's request!
         let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
         nix::unistd::write(&writer2, b"new-request\n").unwrap();
+        pump_reactor().await;
 
-        let n = poll_fn(|cx| old.poll_read_checked(cx, &mut buf, || true))
-            .await
-            .unwrap();
+        let n = match poll_fn(|cx| Poll::Ready(old.poll_read_checked(cx, &mut buf, || true))).await
+        {
+            Poll::Ready(res) => res.unwrap(),
+            Poll::Pending => panic!("latched READ_CLOSED must return EOF immediately"),
+        };
         assert_eq!(
             n, 0,
             "latched READ_CLOSED must return EOF before calling read(2)"

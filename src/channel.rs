@@ -1579,6 +1579,49 @@ mod tests {
         }
     }
 
+    /// Reads from `peer` under `start_paused = true` across at most 64 reactor
+    /// pumps, returning `None` instead of hanging forever if the server omits a
+    /// reply (for example under mutation testing).
+    async fn try_read_bounded(peer: &mut Channel, out: &mut [u8]) -> Option<io::Result<usize>> {
+        for _ in 0..64 {
+            pump_reactor().await;
+            if let Poll::Ready(res) =
+                std::future::poll_fn(|cx| Poll::Ready(peer.fd.poll_read(cx, out))).await
+            {
+                return Some(res);
+            }
+        }
+        None
+    }
+
+    /// Bounded [`Channel::read`] for `start_paused = true` tests.
+    async fn read_bounded(peer: &mut Channel, out: &mut [u8]) -> io::Result<usize> {
+        try_read_bounded(peer, out)
+            .await
+            .expect("channel test peer read did not complete within 64 reactor pumps")
+    }
+
+    /// Joins `handle` under `start_paused = true` across at most 64 reactor
+    /// pumps, aborting it and returning `None` instead of hanging forever if a
+    /// task fails to terminate after cancellation.
+    async fn try_join_bounded<T>(handle: tokio::task::JoinHandle<T>) -> Option<T> {
+        for _ in 0..64 {
+            pump_reactor().await;
+            if handle.is_finished() {
+                return Some(handle.await.unwrap());
+            }
+        }
+        handle.abort();
+        None
+    }
+
+    /// Bounded [`tokio::task::JoinHandle`] completion for `start_paused = true` tests.
+    async fn join_bounded<T>(handle: tokio::task::JoinHandle<T>) -> T {
+        try_join_bounded(handle)
+            .await
+            .expect("channel test server task did not finish within 64 reactor pumps")
+    }
+
     /// Runs a session test under a real-time bound. A decoder or session
     /// that never replies then fails this test alone instead of hanging
     /// the test binary until cargo-mutants kills it: a mutant that breaks
@@ -3163,7 +3206,7 @@ mod tests {
         peer.write_all(b"ping\n").await.unwrap();
         pump_reactor().await;
         let mut out = [0u8; 16];
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(&out[..n], b"PING\n");
         assert_eq!(
             opened.load(Ordering::SeqCst),
@@ -3172,7 +3215,7 @@ mod tests {
         );
         tx.send(true).unwrap();
         pump_reactor().await;
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3239,7 +3282,7 @@ mod tests {
             .unwrap();
         pump_reactor().await;
         let mut out = [0u8; 32];
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(&out[..n], b"ONE\n");
 
         // Host disconnects: flip probe and deliver a 0-byte packet (EOF) on the open socket.
@@ -3272,19 +3315,19 @@ mod tests {
         assert!(ready_probes.load(Ordering::SeqCst) > before_reconnect);
         peer.write_all(b"two\n").await.unwrap();
         pump_reactor().await;
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(&out[..n], b"TWO\n");
         assert_eq!(opened.load(Ordering::SeqCst), 1);
 
         // Fast reconnect: host disconnects and reconnects before probe runs (Ready + received > 0).
         peer.write_all(b"three\npartial-two").await.unwrap();
         pump_reactor().await;
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(&out[..n], b"THREE\n");
         nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty()).unwrap();
         peer.write_all(b"four\n").await.unwrap();
         pump_reactor().await;
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(&out[..n], b"FOUR\n");
         assert_eq!(
             opened.load(Ordering::SeqCst),
@@ -3294,7 +3337,7 @@ mod tests {
 
         tx.send(true).unwrap();
         pump_reactor().await;
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3364,7 +3407,11 @@ mod tests {
         // First fd must be dropped when hot-unplugged while waiting.
         let mut peer1 = Channel::from_fd(peer1).unwrap();
         let mut buf = [0u8; 16];
-        assert_eq!(peer1.read(&mut buf).await.unwrap(), 0, "first fd closed");
+        assert_eq!(
+            read_bounded(&mut peer1, &mut buf).await.unwrap(),
+            0,
+            "first fd closed"
+        );
 
         // Advance past reopen backoff so fd #2 opens and serves normally.
         tokio::time::advance(TEST_BACKOFF.initial).await;
@@ -3374,12 +3421,12 @@ mod tests {
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"after\n").await.unwrap();
         pump_reactor().await;
-        let n = peer2.read(&mut buf).await.unwrap();
+        let n = read_bounded(&mut peer2, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"AFTER\n");
 
         tx.send(true).unwrap();
         pump_reactor().await;
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
     }
 
     #[test]
@@ -3406,12 +3453,6 @@ mod tests {
         // idle reconnected port parks cleanly without spinning or repeatedly
         // ending sessions, while keeping the same underlying fd open
         // (`opened == 0`).
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
 
         let dir = private_fifo_dir();
         let fifo = make_private_fifo(dir.path(), "virtio-sim.fifo");
@@ -3475,7 +3516,7 @@ mod tests {
         // Session 1: `shutdown*` yields no reply (FIFO reader is O_RDONLY).
         nix::unistd::write(&writer1, b"shutdown1\n").unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if !handler.seen.lock().unwrap().is_empty() {
                 break;
             }
@@ -3483,11 +3524,11 @@ mod tests {
         assert_eq!(handler.seen.lock().unwrap().len(), 1);
         // Pump so Session 1 hits EAGAIN and parks on epoll before writer1
         // closes, ensuring the kernel delivers a real EPOLLHUP into AsyncFd.
-        pump().await;
+        pump_reactor().await;
         drop(writer1);
 
         for _ in 0..32 {
-            pump().await;
+            pump_reactor().await;
             if hup_probes.load(Ordering::SeqCst) >= 3 {
                 break;
             }
@@ -3505,7 +3546,7 @@ mod tests {
         let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
         for _ in 0..32 {
             tokio::time::advance(Duration::from_millis(20)).await;
-            pump().await;
+            pump_reactor().await;
             if ready_probes.load(Ordering::SeqCst) > before_reconnect {
                 break;
             }
@@ -3521,7 +3562,7 @@ mod tests {
         // probes (a stale READ_CLOSED registration would spin/re-probe here).
         for _ in 0..12 {
             tokio::time::advance(Duration::from_millis(10)).await;
-            pump().await;
+            pump_reactor().await;
         }
         let delta_ready = ready_probes.load(Ordering::SeqCst) - after_reconnect;
         assert_eq!(
@@ -3536,7 +3577,7 @@ mod tests {
 
         nix::unistd::write(&writer2, b"shutdown2\n").unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 2 {
                 break;
             }
@@ -3544,19 +3585,12 @@ mod tests {
         assert_eq!(handler.seen.lock().unwrap().len(), 2);
         assert_eq!(opened.load(Ordering::SeqCst), 0);
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_abandons_undelivered_replies_on_virtio_disconnect_while_finishing_commands() {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         let (ours, peer) = nix::sys::socket::socketpair(
             nix::sys::socket::AddressFamily::Unix,
             nix::sys::socket::SockType::SeqPacket,
@@ -3611,14 +3645,20 @@ mod tests {
 
         // Start a command that blocks until released.
         peer.write_all(b"slow-1\n").await.unwrap();
-        handler.running_is(1).await;
+        for _ in 0..64 {
+            pump_reactor().await;
+            if handler.running.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+        }
+        assert_eq!(handler.running.load(Ordering::SeqCst), 1);
 
         // Host disconnects while `slow-1` is still running.
         mode.store(1, Ordering::SeqCst);
         nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty()).unwrap();
-        pump().await;
+        pump_reactor().await;
         tokio::time::advance(Duration::from_millis(30)).await;
-        pump().await;
+        pump_reactor().await;
         assert_eq!(
             handler.running.load(Ordering::SeqCst),
             1,
@@ -3629,7 +3669,7 @@ mod tests {
         // moves into the host-disconnected wait on the same open fd.
         handler.release.notify_waiters();
         for _ in 0..32 {
-            pump().await;
+            pump_reactor().await;
             if wait_probes.load(Ordering::SeqCst) >= 3 {
                 break;
             }
@@ -3642,10 +3682,10 @@ mod tests {
         // Next connection must receive ONLY its own reply, never `slow-1\n`.
         mode.store(0, Ordering::SeqCst);
         tokio::time::advance(Duration::from_millis(20)).await;
-        pump().await;
+        pump_reactor().await;
         peer.write_all(b"quick-2\n").await.unwrap();
         let mut out = [0u8; 32];
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(
             &out[..n],
             b"quick-2\n",
@@ -3654,8 +3694,8 @@ mod tests {
         assert_eq!(opened.load(Ordering::SeqCst), 1);
 
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3743,7 +3783,7 @@ mod tests {
         peer.write_all(b"fresh1\n").await.unwrap();
         pump_reactor().await;
         let mut out = [0u8; 64];
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(
             &out[..n],
             b"FRESH1\n",
@@ -3789,7 +3829,7 @@ mod tests {
         assert!(ready_probes.load(Ordering::SeqCst) > before_ready2);
         peer.write_all(b"fresh2\n").await.unwrap();
         pump_reactor().await;
-        let n = peer.read(&mut out).await.unwrap();
+        let n = read_bounded(&mut peer, &mut out).await.unwrap();
         assert_eq!(
             &out[..n],
             b"FRESH2\n",
@@ -3799,7 +3839,7 @@ mod tests {
 
         tx.send(true).unwrap();
         pump_reactor().await;
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3932,19 +3972,12 @@ mod tests {
         assert_eq!(opened.load(Ordering::SeqCst), 1);
 
         tx.send(true).unwrap();
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_ends_session_on_latched_hangup_without_joining_new_peer_request_to_old_partial_frame()
      {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Part A (read side): fill MAX_QUEUED slots + leave a partial frame
         // in Session 1's decoder via one atomic FIFO write so `can_read` is
         // false; drop writer1 so epoll latches READ_CLOSED while `can_read`
@@ -4050,7 +4083,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.running.load(Ordering::SeqCst) > 0 {
                 break;
             }
@@ -4060,7 +4093,7 @@ mod tests {
         // Drop writer1 while `can_read` is false and pump epoll so the reactor
         // latches READ_CLOSED before writer2 reconnects.
         drop(writer1);
-        pump().await;
+        pump_reactor().await;
         // Reconnect writer2 and send its first request BEFORE `hold-1` finishes.
         let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
         nix::unistd::write(&writer2, b"new-peer\n").unwrap();
@@ -4071,13 +4104,13 @@ mod tests {
         // session without an empty drain while disconnected.
         handler.release.notify_waiters();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 8 {
                 break;
             }
         }
         tokio::time::advance(TEST_BACKOFF.initial).await;
-        pump().await;
+        pump_reactor().await;
         let seen_after_s1 = handler.seen.lock().unwrap().clone();
         assert_eq!(
             seen_after_s1.len(),
@@ -4094,7 +4127,7 @@ mod tests {
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"new-peer\n").await.unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 9 {
                 break;
             }
@@ -4108,8 +4141,8 @@ mod tests {
             String::from_utf8_lossy(&seen[8])
         );
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
 
         // Part B (write side): a session whose writer registration already
         // latched WRITE_CLOSED (via real FIFO EPOLLERR) must NOT deliver an
@@ -4143,7 +4176,7 @@ mod tests {
         drop(r1);
         // Pump Tokio's reactor so it observes the real kernel EPOLLERR and
         // latches WRITE_CLOSED in the background without any prior write failing.
-        pump().await;
+        pump_reactor().await;
         // Reconnect r2 and drain the pipe so write(2) WOULD succeed if called.
         let r2 = open(
             &wfifo,
@@ -4175,7 +4208,7 @@ mod tests {
             (report, w_chan)
         });
         peer_in.write_all(b"quick-old\n").await.unwrap();
-        let (report, w_chan) = sess.await.unwrap();
+        let (report, w_chan) = join_bounded(sess).await;
         assert!(
             matches!(report.end, SessionEnd::WriteError(ref e) if e.kind() == io::ErrorKind::BrokenPipe),
             "{}",
@@ -4198,13 +4231,6 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn serve_resets_port_on_ambiguous_drain_bytes_when_host_becomes_ready() {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Case A: a complete request from the departed peer (`stale-old-cmd\n`)
         // is queued in fd #1 when `probe` reports VirtioHostDisconnected, and
         // the replacement peer becomes Ready right as `read(2)` returns those
@@ -4283,9 +4309,9 @@ mod tests {
             });
 
             // Advance past reopen backoff after fd #1 resets so fd #2 opens.
-            pump().await;
+            pump_reactor().await;
             tokio::time::advance(TEST_BACKOFF.initial).await;
-            pump().await;
+            pump_reactor().await;
 
             // fd #1 must be closed (transport reset) with ZERO reply bytes
             // leaked to peer1, and the stale command must NEVER have run.
@@ -4306,26 +4332,19 @@ mod tests {
             // Replacement peer retries on fd #2 and receives only its own reply.
             let mut peer2 = Channel::from_fd(peer2).unwrap();
             peer2.write_all(fresh_req).await.unwrap();
-            pump().await;
-            let n = peer2.read(&mut buf).await.unwrap();
+            pump_reactor().await;
+            let n = read_bounded(&mut peer2, &mut buf).await.unwrap();
             assert_eq!(&buf[..n], fresh_reply);
             assert_eq!(opened.load(Ordering::SeqCst), 2);
 
             tx.send(true).unwrap();
-            pump().await;
-            server.await.unwrap().unwrap();
+            pump_reactor().await;
+            join_bounded(server).await.unwrap();
         }
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_resets_port_when_host_reconnects_between_disconnect_and_drain_probes() {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Session 1 runs on fd #1, then the host disconnects while leaving a
         // complete unread request (`old-unread\n`) queued in the kernel. The
         // post-session probe observes `VirtioHostDisconnected`, retaining fd #1
@@ -4407,8 +4426,8 @@ mod tests {
         let mut peer1 = Channel::from_fd(peer1).unwrap();
         let mut buf = [0u8; 64];
         peer1.write_all(b"first\n").await.unwrap();
-        pump().await;
-        let n = peer1.read(&mut buf).await.unwrap();
+        pump_reactor().await;
+        let n = read_bounded(&mut peer1, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"FIRST\n");
 
         // Trigger host disconnect (0-byte SEQPACKET = EOF) with a complete
@@ -4423,9 +4442,9 @@ mod tests {
         )
         .unwrap();
 
-        pump().await;
+        pump_reactor().await;
         tokio::time::advance(TEST_BACKOFF.initial).await;
-        pump().await;
+        pump_reactor().await;
 
         // fd #1 must have been closed (transport reset) and `old-unread` must
         // NEVER have been dispatched or replied to.
@@ -4449,26 +4468,19 @@ mod tests {
         // Replacement peer opens on fd #2 and receives ONLY its own reply.
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"new-peer\n").await.unwrap();
-        pump().await;
-        let n = peer2.read(&mut buf).await.unwrap();
+        pump_reactor().await;
+        let n = read_bounded(&mut peer2, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"NEW-PEER\n");
         assert_eq!(opened.load(Ordering::SeqCst), 2);
 
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_resets_port_when_host_reconnects_while_accepted_command_finishes_after_disconnect()
      {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Session 1 accepts `slow-1\n`. While `slow-1` is running, the departed
         // host disconnects (`VirtioHostDisconnected` observed at EOF inside
         // `run_session_inner`) while leaving a complete unread command
@@ -4538,7 +4550,7 @@ mod tests {
         let mut peer1 = Channel::from_fd(peer1).unwrap();
         peer1.write_all(b"slow-1\n").await.unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.running.load(Ordering::SeqCst) == 1 {
                 break;
             }
@@ -4556,7 +4568,7 @@ mod tests {
         )
         .unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if saw_hup_in_session.load(Ordering::SeqCst) >= 1 {
                 break;
             }
@@ -4570,9 +4582,9 @@ mod tests {
         // Replacement host reconnects WHILE `slow-1` is still finishing!
         mode.store(0, Ordering::SeqCst);
         handler.release.notify_waiters();
-        pump().await;
+        pump_reactor().await;
         tokio::time::advance(TEST_BACKOFF.initial).await;
-        pump().await;
+        pump_reactor().await;
 
         // fd #1 must be reset (closed), and `old-shutdown` must NEVER run.
         let mut buf = [0u8; 64];
@@ -4593,26 +4605,19 @@ mod tests {
         // Replacement peer retries on fd #2 and receives only its own reply.
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"quick-new\n").await.unwrap();
-        pump().await;
-        let n = peer2.read(&mut buf).await.unwrap();
+        pump_reactor().await;
+        let n = read_bounded(&mut peer2, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"quick-new\n");
         assert_eq!(opened.load(Ordering::SeqCst), 2);
 
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_resets_port_when_latched_read_closed_ends_session_even_if_every_probe_sees_ready()
      {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Real Linux FIFO: writer1 fills MAX_QUEUED (8 commands, pausing
         // `can_read`), then queues an unread complete command `old-shutdown\n`
         // in the kernel FIFO buffer and closes (delivering a real kernel
@@ -4718,7 +4723,7 @@ mod tests {
         // Fill all MAX_QUEUED (= 8) places so `can_read` becomes false.
         nix::unistd::write(&writer1, b"hold-1\nq1\nq2\nq3\nq4\nq5\nq6\nq7\n").unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.running.load(Ordering::SeqCst) > 0 {
                 break;
             }
@@ -4729,7 +4734,7 @@ mod tests {
         // `can_read` is false, then disconnects so epoll latches READ_CLOSED.
         nix::unistd::write(&writer1, b"old-shutdown\n").unwrap();
         drop(writer1);
-        pump().await;
+        pump_reactor().await;
 
         // Replacement peer opens the FIFO BEFORE `hold-1` finishes, clearing
         // POLLHUP so every subsequent port probe observes `HostState::Ready`.
@@ -4738,13 +4743,13 @@ mod tests {
         // Release `hold-1` and advance past reopen backoff.
         handler.release.notify_waiters();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 8 {
                 break;
             }
         }
         tokio::time::advance(TEST_BACKOFF.initial).await;
-        pump().await;
+        pump_reactor().await;
 
         assert_eq!(
             hup_probes.load(Ordering::SeqCst),
@@ -4786,7 +4791,7 @@ mod tests {
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"new-peer\n").await.unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 9 {
                 break;
             }
@@ -4796,20 +4801,13 @@ mod tests {
         assert_eq!(seen[8], b"new-peer");
 
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn serve_resets_port_when_hangup_latches_after_direct_eof_while_accepted_command_finishes()
      {
-        async fn pump() {
-            tokio::time::advance(Duration::ZERO).await;
-            for _ in 0..8 {
-                tokio::task::yield_now().await;
-            }
-        }
-
         // Real Linux FIFO: Session 1 accepts `slow-1\n` and then observes a
         // direct `read(2) -> 0` EOF (before epoll latches READ_CLOSED), while
         // `writer2` connects just before `on_eof` probes so `on_eof` observes
@@ -4942,7 +4940,7 @@ mod tests {
         });
 
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.running.load(Ordering::SeqCst) == 1
                 && probe_calls.load(Ordering::SeqCst) >= 2
             {
@@ -4961,20 +4959,20 @@ mod tests {
         let writer2 = writer2_slot.lock().unwrap().take().unwrap();
         nix::unistd::write(&writer2, b"old-shutdown\n").unwrap();
         drop(writer2);
-        pump().await;
+        pump_reactor().await;
         let writer3 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
-        pump().await;
+        pump_reactor().await;
 
         // Release `slow-1` and advance past reopen backoff.
         handler.release.notify_waiters();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if !handler.seen.lock().unwrap().is_empty() {
                 break;
             }
         }
         tokio::time::advance(TEST_BACKOFF.initial).await;
-        pump().await;
+        pump_reactor().await;
 
         assert_eq!(
             hup_probes.load(Ordering::SeqCst),
@@ -5012,7 +5010,7 @@ mod tests {
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"quick-new\n").await.unwrap();
         for _ in 0..64 {
-            pump().await;
+            pump_reactor().await;
             if handler.seen.lock().unwrap().len() >= 2 {
                 break;
             }
@@ -5021,8 +5019,8 @@ mod tests {
         assert_eq!(seen, vec![b"slow-1".to_vec(), b"quick-new".to_vec()]);
 
         tx.send(true).unwrap();
-        pump().await;
-        server.await.unwrap().unwrap();
+        pump_reactor().await;
+        join_bounded(server).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -5116,7 +5114,7 @@ mod tests {
         // bytes signals EOF or ConnectionReset to `peer1`.
         let mut peer1 = Channel::from_fd(peer1).unwrap();
         let mut buf = [0u8; 32];
-        let peer1_res = peer1.read(&mut buf).await;
+        let peer1_res = read_bounded(&mut peer1, &mut buf).await;
         assert!(
             matches!(peer1_res, Ok(0))
                 || matches!(&peer1_res, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
@@ -5131,11 +5129,33 @@ mod tests {
         let mut peer2 = Channel::from_fd(peer2).unwrap();
         peer2.write_all(b"clean\n").await.unwrap();
         pump_reactor().await;
-        let n = peer2.read(&mut buf).await.unwrap();
+        let n = read_bounded(&mut peer2, &mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"CLEAN\n");
 
         tx.send(true).unwrap();
         pump_reactor().await;
-        server.await.unwrap().unwrap();
+        join_bounded(server).await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paused_read_and_join_helpers_fail_fast_without_hanging() {
+        let (_silent_server, peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let mut peer = Channel::from_fd(peer).unwrap();
+        let mut buf = [0u8; 16];
+        assert!(
+            try_read_bounded(&mut peer, &mut buf).await.is_none(),
+            "withheld reply must terminate bounded read rather than hanging"
+        );
+        let stuck = tokio::spawn(std::future::pending::<()>());
+        assert!(
+            try_join_bounded(stuck).await.is_none(),
+            "stuck server task must terminate bounded join rather than hanging"
+        );
     }
 }

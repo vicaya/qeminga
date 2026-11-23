@@ -6428,6 +6428,12 @@ ensure_owned_service_stopped() {
                 return 1
             fi
             REC_UPDATE_WAS_ACTIVE="1"
+            if [ "${_UPDATE_ROLLBACK_ACTIVE:-0}" -eq 1 ]; then
+                _UPDATE_WAS_ACTIVE=1
+            fi
+            if [ "${_INSTALL_REINSTALL_ROLLBACK:-0}" -eq 1 ]; then
+                _INSTALL_REINSTALL_WAS_ACTIVE=1
+            fi
         fi
     fi
     say "stopping ${OPT_SERVICE}.service (state: ${state})"
@@ -6639,53 +6645,71 @@ _inspect_record_entry() {
 _rollback_runner_package_tx() {
     local rec_path="$1" expected_vol="$2" backup_dir="$3" backup_id="$4" work_child="$5" was_active="$6"
     local cfg_dir="${7:-}" hook_dir="${8:-}" hook_vol="${9:-}" unit_path="${10:-}" unit_vol="${11:-}"
+    if [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "1" ] || [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
+        was_active=1
+    fi
+    if [ "$was_active" -ne 1 ] && [ -n "$rec_path" ]; then
+        local wa_rc=0
+        _inspect_record_entry "$rec_path" "UPDATE_WAS_ACTIVE" "1" || wa_rc=$?
+        if [ "$wa_rc" -eq 0 ]; then
+            was_active=1
+        elif [ "$wa_rc" -ne 1 ]; then
+            warn "unable to read UPDATE_WAS_ACTIVE from journal '$rec_path' during rollback; preserving updating record for manual recovery"
+            return 0
+        fi
+    fi
     local restore_ok=1
     if [ -n "$backup_dir" ]; then
         if [ -n "$backup_id" ]; then
-            if ! ensure_owned_service_stopped_for_restore rollback; then
+            if ! ensure_owned_service_stopped_for_restore rollback "$rec_path" "publishing" "" "" "$backup_dir" "$backup_id"; then
                 warn "rollback could not stop active ${OPT_SERVICE}.service; preserving updating record at '$rec_path' and backup '$backup_dir'"
                 restore_ok=0
-            elif fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$expected_vol" "$backup_dir" "$backup_id" "$work_child" "0" "$cfg_dir" "$hook_dir" "$hook_vol" "$unit_path" "$unit_vol"; then
-                local rec_saved=1
-                if [ -n "$rec_path" ]; then
-                    if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "$backup_dir" "$backup_id" "$was_active" ); then
-                        warn "rollback restored previous runner files but failed to persist UPDATE_PHASE=restored to '$rec_path'; retaining verified backup container '$backup_dir' for retry"
-                        rec_saved=0
-                        restore_ok=0
-                    fi
+            else
+                if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ] || [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "1" ]; then
+                    was_active=1
                 fi
-                if [ "$rec_saved" -eq 1 ]; then
-                    if ! fs_ops safe-rmtree-id "$backup_dir" "$backup_id"; then
-                        warn "rollback restored previous runner files and saved UPDATE_PHASE=restored, but failed to prune '$backup_dir'; preserving record for inspection"
-                        restore_ok=0
-                    elif [ -n "$rec_path" ]; then
-                        if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "" "" "$was_active" ); then
-                            warn "rollback pruned '$backup_dir' but failed to clear UPDATE_BACKUP_DIR in '$rec_path'; preserving restored record for retry"
+                if fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$expected_vol" "$backup_dir" "$backup_id" "$work_child" "0" "$cfg_dir" "$hook_dir" "$hook_vol" "$unit_path" "$unit_vol"; then
+                    local rec_saved=1
+                    if [ -n "$rec_path" ]; then
+                        if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "$backup_dir" "$backup_id" "$was_active" ); then
+                            warn "rollback restored previous runner files but failed to persist UPDATE_PHASE=restored to '$rec_path'; retaining verified backup container '$backup_dir' for retry"
+                            rec_saved=0
                             restore_ok=0
                         fi
                     fi
-                fi
-                if [ "$restore_ok" -eq 1 ]; then
-                    if ! (
-                        OPT_ALLOW_AUTO_UPDATE="${REC_ALLOW_AUTO_UPDATE:-0}"
-                        OPT_EPHEMERAL="${REC_EPHEMERAL:-0}"
-                        RESOLVED_WORK_DIR="${REC_WORK_DIR:-}"
-                        VOL_INSTALL_DIR="$expected_vol"
-                        lock_runner_permissions
-                    ); then
-                        warn "rollback restored previous runner files but failed to re-lock permissions on '$OPT_INSTALL_DIR'; preserving updating record for retry"
-                        restore_ok=0
+                    if [ "$rec_saved" -eq 1 ]; then
+                        if ! fs_ops safe-rmtree-id "$backup_dir" "$backup_id"; then
+                            warn "rollback restored previous runner files and saved UPDATE_PHASE=restored, but failed to prune '$backup_dir'; preserving record for inspection"
+                            restore_ok=0
+                        elif [ -n "$rec_path" ]; then
+                            if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "" "" "$was_active" ); then
+                                warn "rollback pruned '$backup_dir' but failed to clear UPDATE_BACKUP_DIR in '$rec_path'; preserving restored record for retry"
+                                restore_ok=0
+                            fi
+                        fi
                     fi
-                fi
-                if [ "$restore_ok" -eq 1 ] && { [ "${REC_OWNED_UNIT:-0}" = "1" ] || [ "${OWNED_UNIT:-0}" = "1" ]; }; then
-                    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl daemon-reload 9>&-; then
-                        warn "rollback restored previous runner unit/files but systemctl daemon-reload failed or systemctl is unavailable; preserving updating record for retry"
-                        restore_ok=0
+                    if [ "$restore_ok" -eq 1 ]; then
+                        if ! (
+                            OPT_ALLOW_AUTO_UPDATE="${REC_ALLOW_AUTO_UPDATE:-0}"
+                            OPT_EPHEMERAL="${REC_EPHEMERAL:-0}"
+                            RESOLVED_WORK_DIR="${REC_WORK_DIR:-}"
+                            VOL_INSTALL_DIR="$expected_vol"
+                            lock_runner_permissions
+                        ); then
+                            warn "rollback restored previous runner files but failed to re-lock permissions on '$OPT_INSTALL_DIR'; preserving updating record for retry"
+                            restore_ok=0
+                        fi
                     fi
+                    if [ "$restore_ok" -eq 1 ] && { [ "${REC_OWNED_UNIT:-0}" = "1" ] || [ "${OWNED_UNIT:-0}" = "1" ]; }; then
+                        if ! command -v systemctl >/dev/null 2>&1 || ! systemctl daemon-reload 9>&-; then
+                            warn "rollback restored previous runner unit/files but systemctl daemon-reload failed or systemctl is unavailable; preserving updating record for retry"
+                            restore_ok=0
+                        fi
+                    fi
+                else
+                    warn "rollback could not restore previous runner from '$backup_dir'; preserving updating record at '$rec_path' for retry"
+                    restore_ok=0
                 fi
-            else
-                warn "rollback could not restore previous runner from '$backup_dir'; preserving updating record at '$rec_path' for retry"
-                restore_ok=0
             fi
         else
             warn "rollback missing captured identity for '$backup_dir'; preserving updating record at '$rec_path' for inspection"

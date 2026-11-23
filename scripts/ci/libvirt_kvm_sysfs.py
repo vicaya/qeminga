@@ -21,6 +21,9 @@ PATH_NOFOLLOW_FLAGS = os.O_PATH | os.O_NOFOLLOW
 RENAME_NOREPLACE = 1
 SYMLOOP_MAX = 40
 RUN_NAME_RE = re.compile(r"^qeminga-e2e-[0-9]+-[0-9]+-(x86_64|aarch64)$")
+UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 ALLOWED_EVIDENCE_FILES = frozenset(
     {
         "domain.xml",
@@ -1219,20 +1222,16 @@ def read_evidence_bytes(
         os.close(out_fd)
 
 
-def collect_serial_log(
-    images_dir,
-    run_name,
-    out_dir,
-    dest_name="serial.log",
-    *,
-    root_fd=None,
-    root_path="/",
-):
-    """Copy ``serial.log`` from a verified run directory into a verified evidence directory."""
+def _open_verified_run_dir_ro(images_dir, run_name, *, root_fd=None, root_path="/"):
+    """Read-only verification of image root and run directory shared by diagnostics and cleanup.
+
+    Returns ``(status, img_fd, rfd, rst, run_mnt, lexical_run, resolved_run)``.
+    When ``status == "absent"``, ``img_fd`` and ``rfd`` are ``None`` and ``resolved_run``
+    preserves every missing image-root component plus ``run_name`` so callers never
+    collapse an absent image root onto an ancestor directory.
+    """
     if not RUN_NAME_RE.fullmatch(run_name):
         raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
-    if dest_name != "serial.log":
-        raise OSError(errno.EINVAL, f"unexpected serial log filename '{dest_name}'")
     trusted_uids = trusted_owner_uids()
     img_fd, img_path, _, remaining = walk_existing_prefix(
         images_dir,
@@ -1243,19 +1242,24 @@ def collect_serial_log(
         root_fd=root_fd,
         root_path=root_path,
     )
+    lexical_run = os.path.join(os.path.normpath(images_dir), run_name)
+    resolved_images = os.path.join(img_path, *remaining) if remaining else img_path
+    resolved_run = os.path.join(resolved_images, run_name)
     try:
         if remaining:
-            return False
+            os.close(img_fd)
+            return ("absent", None, None, None, None, lexical_run, resolved_run)
         img_st = os.fstat(img_fd)
         img_mnt = fd_mnt_id(img_fd)
         try:
             lst = os.lstat(run_name, dir_fd=img_fd)
         except FileNotFoundError:
-            return False
+            os.close(img_fd)
+            return ("absent", None, None, None, None, lexical_run, resolved_run)
         if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
             raise OSError(
                 errno.ENOTDIR,
-                f"refusing non-directory run path '{os.path.join(img_path, run_name)}'",
+                f"refusing non-directory run path '{resolved_run}'",
             )
         rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
         try:
@@ -1264,61 +1268,87 @@ def collect_serial_log(
             if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
                 raise OSError(
                     errno.EXDEV,
-                    f"run directory '{os.path.join(img_path, run_name)}' changed during verification",
+                    f"run directory '{resolved_run}' changed during verification",
                 )
             if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
                 raise OSError(
                     errno.EXDEV,
-                    f"refusing cross-mount run directory '{os.path.join(img_path, run_name)}'",
+                    f"refusing cross-mount run directory '{resolved_run}'",
                 )
             verify_dir_fd(
                 rfd,
-                os.path.join(img_path, run_name),
+                resolved_run,
                 0,
                 {0},
                 trusted_uids,
                 allow_sticky_writable=False,
                 check_traversal=False,
             )
-            try:
-                ffd = os.open(
-                    "serial.log",
-                    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-                    dir_fd=rfd,
-                )
-            except FileNotFoundError:
-                return False
-            try:
-                fst = os.fstat(ffd)
-                if fd_mnt_id(ffd) != run_mnt:
-                    raise OSError(
-                        errno.EXDEV,
-                        "refusing cross-mount or bind-mounted 'serial.log'",
-                    )
-                if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
-                    raise OSError(
-                        errno.EINVAL,
-                        "refusing unsafe diagnostic file 'serial.log' "
-                        "(must be regular file with nlink == 1)",
-                    )
-                out_fd, _ = _open_verified_evidence_dir(
-                    out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
-                )
-                try:
-                    _publish_evidence_stream(
-                        out_fd,
-                        dest_name,
-                        lambda dst: _copy_fd_to_fd(ffd, dst),
-                        mode=0o644,
-                    )
-                finally:
-                    os.close(out_fd)
-            finally:
-                os.close(ffd)
-            return True
-        finally:
+        except Exception:
             os.close(rfd)
+            raise
+        return ("present", img_fd, rfd, rst, run_mnt, lexical_run, resolved_run)
+    except Exception:
+        os.close(img_fd)
+        raise
+
+
+def collect_serial_log(
+    images_dir,
+    run_name,
+    out_dir,
+    dest_name="serial.log",
+    *,
+    root_fd=None,
+    root_path="/",
+):
+    """Copy ``serial.log`` from a verified run directory into a verified evidence directory."""
+    if dest_name != "serial.log":
+        raise OSError(errno.EINVAL, f"unexpected serial log filename '{dest_name}'")
+    status, img_fd, rfd, _, run_mnt, _, _ = _open_verified_run_dir_ro(
+        images_dir, run_name, root_fd=root_fd, root_path=root_path
+    )
+    if status != "present":
+        return False
+    try:
+        try:
+            ffd = os.open(
+                "serial.log",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=rfd,
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            fst = os.fstat(ffd)
+            if fd_mnt_id(ffd) != run_mnt:
+                raise OSError(
+                    errno.EXDEV,
+                    "refusing cross-mount or bind-mounted 'serial.log'",
+                )
+            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                raise OSError(
+                    errno.EINVAL,
+                    "refusing unsafe diagnostic file 'serial.log' "
+                    "(must be regular file with nlink == 1)",
+                )
+            out_fd, _ = _open_verified_evidence_dir(
+                out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
+            )
+            try:
+                _publish_evidence_stream(
+                    out_fd,
+                    dest_name,
+                    lambda dst: _copy_fd_to_fd(ffd, dst),
+                    mode=0o644,
+                )
+            finally:
+                os.close(out_fd)
+        finally:
+            os.close(ffd)
+        return True
     finally:
+        os.close(rfd)
         os.close(img_fd)
 
 
@@ -1440,67 +1470,23 @@ def collect_serial_log_session(images_dir, run_name, out_dir, dest_name="serial.
 
 def verify_cleanup_target(images_dir, run_name, *, root_fd=None, root_path="/"):
     """Read-only verification of image root and run directory before destructive virsh calls."""
-    if not RUN_NAME_RE.fullmatch(run_name):
-        raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
-    trusted_uids = trusted_owner_uids()
-    img_fd, img_path, _, remaining = walk_existing_prefix(
-        images_dir,
-        0,
-        {0},
-        trusted_uids,
-        check_traversal=False,
-        root_fd=root_fd,
-        root_path=root_path,
+    status, img_fd, rfd, rst, run_mnt, lexical_run, resolved_run = (
+        _open_verified_run_dir_ro(
+            images_dir, run_name, root_fd=root_fd, root_path=root_path
+        )
     )
-    lexical_run = os.path.join(os.path.normpath(images_dir), run_name)
-    resolved_run = os.path.join(img_path, run_name)
+    if status != "present":
+        return ("absent", lexical_run, resolved_run)
     try:
-        if remaining:
-            return lexical_run, resolved_run
-        img_st = os.fstat(img_fd)
-        img_mnt = fd_mnt_id(img_fd)
-        try:
-            lst = os.lstat(run_name, dir_fd=img_fd)
-        except FileNotFoundError:
-            return lexical_run, resolved_run
-        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
-            raise OSError(
-                errno.ENOTDIR,
-                f"refusing non-directory run path '{resolved_run}'",
-            )
-        rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
-        try:
-            rst = os.fstat(rfd)
-            run_mnt = fd_mnt_id(rfd)
-            if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
-                raise OSError(
-                    errno.EXDEV,
-                    f"run directory '{resolved_run}' changed during verification",
-                )
-            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
-                raise OSError(
-                    errno.EXDEV,
-                    f"refusing cross-mount run directory '{resolved_run}'",
-                )
-            verify_dir_fd(
-                rfd,
-                resolved_run,
-                0,
-                {0},
-                trusted_uids,
-                allow_sticky_writable=False,
-                check_traversal=False,
-            )
-            scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
-        finally:
-            os.close(rfd)
-        return lexical_run, resolved_run
+        scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
+        return ("present", lexical_run, resolved_run)
     finally:
+        os.close(rfd)
         os.close(img_fd)
 
 
 def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir):
-    """Confirm a libvirt domain's XML belongs strictly to this run directory before destroy."""
+    """Confirm a libvirt domain's XML belongs strictly to this run directory and return its UUID."""
     if not RUN_NAME_RE.fullmatch(expected_name):
         raise OSError(errno.EINVAL, f"invalid domain name '{expected_name}'")
     try:
@@ -1513,6 +1499,13 @@ def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir
         raise OSError(
             errno.EACCES,
             f"domain XML <name> '{dom_name}' does not match expected '{expected_name}'",
+        )
+    uuid_el = root.find("uuid")
+    dom_uuid = (uuid_el.text or "").strip().lower() if uuid_el is not None else ""
+    if not UUID_RE.fullmatch(dom_uuid):
+        raise OSError(
+            errno.EACCES,
+            f"domain '{expected_name}' XML is missing a valid <uuid>",
         )
     allowed_dirs = {
         os.path.normpath(p).rstrip("/") + "/"
@@ -1580,76 +1573,32 @@ def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir
             errno.EACCES,
             f"domain '{expected_name}' XML does not reference expected run root.qcow2; refusing destructive cleanup",
         )
+    return dom_uuid
 
 
 def cleanup_run_dir(images_dir, run_name, *, root_fd=None, root_path="/"):
     """Verify ancestor trust, run-dir identity, and same-mount tree before removing."""
-    if not RUN_NAME_RE.fullmatch(run_name):
-        raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
-    trusted_uids = trusted_owner_uids()
-    img_fd, img_path, _, remaining = walk_existing_prefix(
-        images_dir,
-        0,
-        {0},
-        trusted_uids,
-        check_traversal=False,
-        root_fd=root_fd,
-        root_path=root_path,
+    status, img_fd, rfd, rst, run_mnt, _, resolved_run = _open_verified_run_dir_ro(
+        images_dir, run_name, root_fd=root_fd, root_path=root_path
     )
+    if status != "present":
+        return "absent"
     try:
-        if remaining:
-            return "absent"
-        img_st = os.fstat(img_fd)
-        img_mnt = fd_mnt_id(img_fd)
-        try:
-            lst = os.lstat(run_name, dir_fd=img_fd)
-        except FileNotFoundError:
-            return "absent"
-        run_path = os.path.join(img_path, run_name)
-        if stat.S_ISLNK(lst.st_mode) or not stat.S_ISDIR(lst.st_mode):
+        # Pass 1: verify EVERY entry stays on (rst.st_dev, run_mnt) BEFORE the first unlink.
+        scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
+        # Pass 2: remove entries while rechecking every opened descriptor's mount ID.
+        rmtree_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
+        # Re-verify identity while `rfd` is still open before unlinking the directory.
+        cur_lst = os.lstat(run_name, dir_fd=img_fd)
+        if cur_lst.st_dev != rst.st_dev or cur_lst.st_ino != rst.st_ino:
             raise OSError(
-                errno.ENOTDIR,
-                f"refusing non-directory run path '{run_path}'",
+                errno.EXDEV,
+                f"run directory '{resolved_run}' changed before removal",
             )
-        rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
-        try:
-            rst = os.fstat(rfd)
-            run_mnt = fd_mnt_id(rfd)
-            if rst.st_dev != lst.st_dev or rst.st_ino != lst.st_ino:
-                raise OSError(
-                    errno.EXDEV,
-                    f"run directory '{run_path}' changed during verification",
-                )
-            if rst.st_dev != img_st.st_dev or run_mnt != img_mnt:
-                raise OSError(
-                    errno.EXDEV,
-                    f"refusing cross-mount run directory '{run_path}'",
-                )
-            verify_dir_fd(
-                rfd,
-                run_path,
-                0,
-                {0},
-                trusted_uids,
-                allow_sticky_writable=False,
-                check_traversal=False,
-            )
-            # Pass 1: verify EVERY entry stays on (rst.st_dev, run_mnt) BEFORE the first unlink.
-            scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, run_path)
-            # Pass 2: remove entries while rechecking every opened descriptor's mount ID.
-            rmtree_same_mount(rfd, rst.st_dev, run_mnt, run_path)
-            # Re-verify identity while `rfd` is still open before unlinking the directory.
-            cur_lst = os.lstat(run_name, dir_fd=img_fd)
-            if cur_lst.st_dev != rst.st_dev or cur_lst.st_ino != rst.st_ino:
-                raise OSError(
-                    errno.EXDEV,
-                    f"run directory '{run_path}' changed before removal",
-                )
-            os.rmdir(run_name, dir_fd=img_fd)
-        finally:
-            os.close(rfd)
+        os.rmdir(run_name, dir_fd=img_fd)
         return "removed"
     finally:
+        os.close(rfd)
         os.close(img_fd)
 
 
@@ -1715,7 +1664,8 @@ def main(argv):
             return 0
         if op == "verify-domain-xml":
             xml_text = sys.stdin.read()
-            verify_domain_xml(xml_text, argv[1], argv[2], argv[3])
+            dom_uuid = verify_domain_xml(xml_text, argv[1], argv[2], argv[3])
+            print(dom_uuid)
             return 0
 
         root_fd, root_path = resolve_cli_root()
@@ -1795,10 +1745,10 @@ def main(argv):
                 root_path=root_path,
             )
         elif op == "verify-cleanup-target":
-            lexical_run, resolved_run = verify_cleanup_target(
+            status, lexical_run, resolved_run = verify_cleanup_target(
                 argv[1], argv[2], root_fd=root_fd, root_path=root_path
             )
-            print(f"{lexical_run}\t{resolved_run}")
+            print(f"{status}\t{lexical_run}\t{resolved_run}")
         elif op == "cleanup-run-dir":
             status = cleanup_run_dir(
                 argv[1],

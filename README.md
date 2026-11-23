@@ -14,9 +14,11 @@ the guest.
 **Status:** 0.1.0. Every command in the design is implemented and tested
 (unit, property, fuzz, end-to-end over a pty, and privileged tests on
 loop-mounted filesystems, natively on x86-64 and aarch64) and exercised
-against real libvirt in CI under QEMU's TCG emulator on both
-architectures. One item stays open, tracked in
-[`docs/tasks.md`](docs/tasks.md) §7: a libvirt run under KVM (AC16).
+against real libvirt in CI under real KVM on GitHub-hosted x86-64
+(`ubuntu-24.04`) and under QEMU's TCG emulator on both architectures.
+Remaining items (aarch64 KVM run on a self-hosted arm64 runner and the
+full release-qualification suite) are tracked in
+[`docs/tasks.md`](docs/tasks.md) §7.
 
 ## Commands
 
@@ -53,10 +55,10 @@ confidential VM (CVM) deployment guidance — using the data-protection
 profile (`packaging/config-data-protection.toml`) as the CVM default and
 noting the v1 single-freezer assumption — are in
 [`packaging/README.md`](packaging/README.md). The libvirt
-interoperability checks (the TCG smoke lane in CI, the self-hosted
-`x86_64` / `arm64` KVM lane and community runner setup script
-`scripts/setup-kvm-runner.sh`, and the manual KVM recipe) are described
-in [`docs/testing.md`](docs/testing.md).
+interoperability checks (the TCG smoke lane in CI, the GitHub-hosted
+`x86_64` KVM smoke lane, the self-hosted `x86_64` / `arm64` KVM lane
+and community runner setup script `scripts/setup-kvm-runner.sh`, and the
+manual KVM recipe) are described in [`docs/testing.md`](docs/testing.md).
 
 - [`docs/design.md`](docs/design.md) — the design document (normative).
 - [`docs/tasks.md`](docs/tasks.md) — the implementation task list, with

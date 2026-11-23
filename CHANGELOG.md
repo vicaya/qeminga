@@ -60,6 +60,19 @@ semantic versioning.
 
 ### Added
 
+- GitHub-hosted `x86_64` libvirt KVM smoke lane
+  (`.github/workflows/libvirt-kvm-hosted.yml`, T6.11, #53 in part): on
+  GitHub-hosted `ubuntu-24.04` runners, enables `/dev/kvm` for the
+  unprivileged `runner` user via the `99-kvm4all.rules` udev workaround
+  (`OPTIONS+="static_node=kvm"`, with a fail-fast `test -r /dev/kvm &&
+  test -w /dev/kvm` guard), reuses `scripts/ci/libvirt-kvm-smoke.sh` in
+  unprivileged `qemu:///session` mode (no `sudo` during the run, no
+  `libvirt-daemon-system`), proves hardware KVM acceleration (`info kvm`
+  enabled, `-accel kvm`, no TCG fallback), installs the SHA-256-anchored
+  release candidate inside a pinned Ubuntu 24.04 guest, runs
+  `scripts/e2e-libvirt.sh` (AC16), shuts down via the agent, and records
+  `suite: "libvirt-kvm-smoke-v1"` with `accelerator: "kvm"`.
+
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
   part): on GitHub-hosted runners, natively on x86-64 and aarch64, the
   release candidate built in the same run is installed with the shipped

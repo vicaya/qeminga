@@ -3472,87 +3472,136 @@ mod tests {
         .await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn serve_preserves_idle_port_on_fast_reconnect_before_first_request_and_paces_empty_eofs()
     {
-        bounded(async {
-            let (ours, peer) = nix::sys::socket::socketpair(
-                nix::sys::socket::AddressFamily::Unix,
-                nix::sys::socket::SockType::SeqPacket,
+        let (ours, peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::SeqPacket,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        set_nonblocking(peer.as_fd()).unwrap();
+        let first = Arc::new(Mutex::new(Some(ours)));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let o = opened.clone();
+        let open: OpenFn = Arc::new(move |_| {
+            o.fetch_add(1, Ordering::SeqCst);
+            first
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+        });
+        let handler = Arc::new(FakeDispatcher::default());
+        let (tx, cancel) = cancel_pair();
+        let h = handler.clone();
+        let server = tokio::spawn(async move {
+            serve_inner_with_probe(
+                Path::new("/dev/virtio-ports/fake"),
+                open,
+                h.as_ref(),
+                cancel,
                 None,
-                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
-            )
-            .unwrap();
-            let first = Arc::new(Mutex::new(Some(ours)));
-            let opened = Arc::new(AtomicUsize::new(0));
-            let o = opened.clone();
-            let open: OpenFn = Arc::new(move |_| {
-                o.fetch_add(1, Ordering::SeqCst);
-                first
-                    .lock()
-                    .unwrap()
-                    .take()
-                    .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
-            });
-            let handler = Arc::new(FakeDispatcher::default());
-            let (tx, cancel) = cancel_pair();
-            let h = handler.clone();
-            let server = tokio::spawn(async move {
-                serve_inner_with_probe(
-                    Path::new("/dev/virtio-ports/fake"),
-                    open,
-                    h.as_ref(),
-                    cancel,
-                    None,
-                    ServeTimers {
-                        reopen: TEST_BACKOFF,
-                        host_wait: Backoff {
-                            initial: Duration::from_millis(15),
-                            max: Duration::from_millis(60),
-                        },
+                ServeTimers {
+                    reopen: TEST_BACKOFF,
+                    host_wait: Backoff {
+                        initial: Duration::from_millis(15),
+                        max: Duration::from_millis(60),
                     },
-                    |_| HostState::Ready,
-                )
-                .await
-            });
-            let mut peer = Channel::from_fd(peer).unwrap();
+                },
+                |_| HostState::Ready,
+            )
+            .await
+        });
 
-            // Fast reconnect BEFORE the first request (received == 0 while
-            // probe already observes Ready): must keep the descriptor open
-            // and answer the new peer's first request without reopening.
+        let try_read_peer = |peer: &OwnedFd| -> Option<Vec<u8>> {
+            let mut out = [0u8; 32];
+            match nix::unistd::read(peer, &mut out) {
+                Ok(n) => Some(out[..n].to_vec()),
+                Err(Errno::EAGAIN) => None,
+                Err(err) => panic!("unexpected peer read error: {err}"),
+            }
+        };
+
+        // Fast reconnect BEFORE the first request (received == 0 while probe
+        // already observes Ready): must keep the descriptor open and answer the
+        // new peer's first request at t = 0 without reopening or sleeping.
+        let t0 = tokio::time::Instant::now();
+        nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty()).unwrap();
+        nix::unistd::write(&peer, b"first\n").unwrap();
+        let mut reply = None;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if let Some(bytes) = try_read_peer(&peer) {
+                reply = Some(bytes);
+                break;
+            }
+        }
+        assert_eq!(reply.as_deref(), Some(&b"FIRST\n"[..]));
+        assert_eq!(
+            t0.elapsed(),
+            Duration::ZERO,
+            "first idle fast reconnect must incur zero virtual delay"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "idle fast reconnect before first request must not reopen"
+        );
+
+        // End the `first\n` session (received > 0, resetting pacing to 0),
+        // then send 4 consecutive empty EOFs with Ready followed by `after\n`.
+        // The 4 empty sessions must be paced by 0 + 15 + 30 + 60 = 105 ms of
+        // virtual time while keeping the single descriptor open (`opened == 1`).
+        let start = tokio::time::Instant::now();
+        for _ in 0..5 {
             nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty())
                 .unwrap();
-            peer.write_all(b"first\n").await.unwrap();
-            let mut out = [0u8; 32];
-            let n = peer.read(&mut out).await.unwrap();
-            assert_eq!(&out[..n], b"FIRST\n");
-            assert_eq!(
-                opened.load(Ordering::SeqCst),
-                1,
-                "idle fast reconnect before first request must not reopen"
-            );
+        }
+        nix::unistd::write(&peer, b"after\n").unwrap();
+        // Pump the reactor at t = 0 so `server` wakes from epoll, finishes the
+        // `first\n` session, handles the unpaced first empty EOF, and arms the
+        // 15 ms sleep at virtual t = 0.
+        tokio::time::advance(Duration::ZERO).await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(try_read_peer(&peer), None, "must be paused at t = 0");
 
-            // End the `first\n` session (received > 0), then send 4 consecutive
-            // empty EOFs with Ready: must keep the fd open and pace with
-            // bounded backoff (0 + 15 + 30 + 60 = 105 ms) rather than spinning.
-            let start = std::time::Instant::now();
-            for _ in 0..5 {
-                nix::sys::socket::send(peer.as_raw_fd(), &[], nix::sys::socket::MsgFlags::empty())
-                    .unwrap();
+        // Advance step-by-step across 15 ms, 30 ms, and 60 ms sleeps; `AFTER\n`
+        // must NOT arrive before the full 105 ms virtual backoff elapses.
+        for step in [14u64, 1, 29, 1, 59] {
+            tokio::time::advance(Duration::from_millis(step)).await;
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
             }
-            peer.write_all(b"after\n").await.unwrap();
-            let n = peer.read(&mut out).await.unwrap();
-            assert_eq!(&out[..n], b"AFTER\n");
-            assert_eq!(opened.load(Ordering::SeqCst), 1);
-            assert!(
-                start.elapsed() >= Duration::from_millis(90),
-                "repeated empty EOFs must be paced, elapsed={:?}",
+            assert_eq!(
+                try_read_peer(&peer),
+                None,
+                "reply arrived too early at {:?}",
                 start.elapsed()
             );
+        }
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let mut after = None;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+            if let Some(bytes) = try_read_peer(&peer) {
+                after = Some(bytes);
+                break;
+            }
+        }
+        assert_eq!(after.as_deref(), Some(&b"AFTER\n"[..]));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(105),
+            "repeated empty EOFs must complete at exact 15 + 30 + 60 ms virtual pacing"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
 
-            tx.send(true).unwrap();
-            server.await.unwrap().unwrap();
-        })
-        .await;
+        tx.send(true).unwrap();
+        server.await.unwrap().unwrap();
     }
 }

@@ -272,40 +272,29 @@ collect_diagnostics() {
         fi
         return 0
     fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        # Omit session diagnostics if the verified atomic 0600 publisher is unavailable
+        # rather than reopening destination paths by name with redirection or cp/chmod.
+        return 0
+    fi
     mkdir -p "$out"
     if [ "$domain_owned" = "1" ]; then
         local sess_dom_xml=""
         sess_dom_xml="$(v dumpxml "${domain_ref:-$name}" 2>/dev/null || true)"
         if [ -n "$sess_dom_xml" ]; then
-            (
-                umask 0077
-                printf '%s\n' "$sess_dom_xml" >"$out/domain.xml"
-            ) 2>/dev/null || true
+            printf '%s\n' "$sess_dom_xml" \
+                | sys_fs_ops publish-evidence-stdin-session "$out" "domain.xml" 2>/dev/null || true
         fi
         if [ -n "$qlog_cursor" ]; then
-            if command -v python3 >/dev/null 2>&1; then
-                local c_st="" c_dev="" c_ino="" c_off=""
-                IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
-                if [ -n "$c_st" ]; then
-                    sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
-                fi
-            elif [ ! -L "$qlog" ] && [ -f "$qlog" ]; then
-                (
-                    umask 0077
-                    cp -- "$qlog" "$out/qemu.log" && chmod 0600 "$out/qemu.log"
-                ) || true
+            local c_st="" c_dev="" c_ino="" c_off=""
+            IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
+            if [ -n "$c_st" ]; then
+                sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
             fi
         fi
     fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
-        elif [ ! -L "$dir/serial.log" ] && [ -f "$dir/serial.log" ]; then
-            (
-                umask 0077
-                cp -- "$dir/serial.log" "$out/serial.log" && chmod 0600 "$out/serial.log"
-            ) || true
-        fi
+        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
     fi
 }
 
@@ -933,7 +922,18 @@ EOF
         RUN_DOMAIN_REF="$def_uuid"
         RUN_DOMAIN_OWNED=1
     else
-        RUN_DOMAIN_REF="$name"
+        local sess_uuid=""
+        sess_uuid="$(v domuuid "$name" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ ! "$sess_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            local sess_xml=""
+            sess_xml="$(v dumpxml "$name" 2>/dev/null || true)"
+            sess_uuid="$(sed -n 's/.*<uuid>\([0-9a-fA-F-]\{36\}\)<\/uuid>.*/\1/p' <<<"$sess_xml" | head -n 1 || true)"
+        fi
+        if [[ "$sess_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            RUN_DOMAIN_REF="$sess_uuid"
+        else
+            RUN_DOMAIN_REF="$name"
+        fi
         RUN_DOMAIN_OWNED=1
     fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then

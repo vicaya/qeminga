@@ -1374,43 +1374,70 @@ def _read_all_fd(ffd):
 def _extract_uuid_launch_blocks(data, expected_uuid, *, require_uuid):
     """Filter QEMU log bytes to launch blocks consistent with ``expected_uuid``.
 
-    When ``require_uuid`` is True (rotated inode), ONLY launch blocks that
-    explicitly declare ``expected_uuid`` (and no conflicting domain UUID) are
-    accepted; unverified or foreign logs return ``None``.
+    Returns ``(out_bytes, first_match_offset, matched_uuid)`` or ``(None, 0, False)``.
+    When ``require_uuid`` is True (rotated inode or pinned verified cursor), ONLY
+    launch blocks that explicitly declare ``expected_uuid`` (and no conflicting
+    domain UUID) are accepted; unverified or foreign logs return ``(None, 0, False)``.
     """
     if not data:
-        return None
+        return (None, 0, False)
     exp_bytes = None
     if expected_uuid:
         norm_uuid = expected_uuid.strip().lower()
         if UUID_RE.fullmatch(norm_uuid):
             exp_bytes = norm_uuid.encode("ascii")
     if require_uuid and exp_bytes is None:
-        return None
+        return (None, 0, False)
 
     blocks = []
     current = []
+    cur_start = 0
+    pos = 0
     for line in data.splitlines(keepends=True):
         if QEMU_LOG_LAUNCH_HEADER_RE.match(line) and current:
-            blocks.append(b"".join(current))
+            blocks.append((cur_start, b"".join(current)))
             current = [line]
+            cur_start = pos
         else:
+            if not current:
+                cur_start = pos
             current.append(line)
+        pos += len(line)
     if current:
-        blocks.append(b"".join(current))
+        blocks.append((cur_start, b"".join(current)))
 
     kept = []
-    for block in blocks:
+    uuid_kept = []
+    first_off = None
+    first_uuid_off = None
+    matched_uuid = False
+    for blk_off, block in blocks:
         uuids = {m.group(1).lower() for m in QEMU_LOG_UUID_RE.finditer(block)}
         if require_uuid:
             if uuids == {exp_bytes}:
+                if first_off is None:
+                    first_off = blk_off
+                if first_uuid_off is None:
+                    first_uuid_off = blk_off
+                matched_uuid = True
                 kept.append(block)
+                uuid_kept.append(block)
         else:
             if exp_bytes is not None and uuids and uuids != {exp_bytes}:
                 continue
+            if first_off is None:
+                first_off = blk_off
+            if exp_bytes is not None and uuids == {exp_bytes}:
+                if first_uuid_off is None:
+                    first_uuid_off = blk_off
+                matched_uuid = True
+                uuid_kept.append(block)
             kept.append(block)
-    out = b"".join(kept)
-    return out if out else None
+    out = b"".join(uuid_kept if matched_uuid else kept)
+    pin_off = first_uuid_off if matched_uuid else first_off
+    if not out or pin_off is None:
+        return (None, 0, False)
+    return (out, pin_off, matched_uuid)
 
 
 def _read_verified_qemu_log_segment(
@@ -1424,15 +1451,17 @@ def _read_verified_qemu_log_segment(
 ):
     """Read ONLY bytes belonging to this run's verified launch.
 
-    Returns ``(data, ("present", st_dev, st_ino, start_offset))`` or ``(None, None)``.
+    Returns ``(data, (status, st_dev, st_ino, start_offset))`` or ``(None, None)``.
     If ``cursor`` was ``present`` and the filename rotated to a different inode,
     accepts the replacement ONLY if it carries a verified launch block for
-    ``expected_uuid``; otherwise omits the segment.
+    ``expected_uuid`` and returns a ``verified`` cursor positioned at that
+    launch block's exact byte offset so later reads preserve both the byte range
+    and strict UUID filtering.
     """
     if cursor is None:
         return (None, None)
     c_status, c_dev, c_ino, c_offset = cursor
-    if c_status not in ("absent", "present"):
+    if c_status not in ("absent", "present", "verified"):
         raise OSError(errno.EINVAL, f"invalid QEMU log cursor status '{c_status}'")
     pfd, ffd, fst = _open_verified_qemu_log_ro(
         qlog_path, session=session, root_fd=root_fd, root_path=root_path
@@ -1440,36 +1469,76 @@ def _read_verified_qemu_log_segment(
     if ffd is None:
         return (None, None)
     try:
+        if c_status == "verified":
+            if (fst.st_dev, fst.st_ino) == (c_dev, c_ino):
+                if fst.st_size <= c_offset:
+                    return (None, None)
+                os.lseek(ffd, c_offset, os.SEEK_SET)
+                base_off = c_offset
+            else:
+                if fst.st_size == 0:
+                    return (None, None)
+                base_off = 0
+            raw = _read_all_fd(ffd)
+            data, first_off, _ = _extract_uuid_launch_blocks(
+                raw, expected_uuid, require_uuid=True
+            )
+            if not data:
+                return (None, None)
+            return (data, ("verified", fst.st_dev, fst.st_ino, base_off + first_off))
         if c_status == "present" and (fst.st_dev, fst.st_ino) == (c_dev, c_ino):
             if fst.st_size <= c_offset:
                 return (None, None)
             os.lseek(ffd, c_offset, os.SEEK_SET)
             raw = _read_all_fd(ffd)
-            data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=False)
+            data, first_off, matched_uuid = _extract_uuid_launch_blocks(
+                raw, expected_uuid, require_uuid=False
+            )
             if not data:
                 return (None, None)
-            return (data, ("present", fst.st_dev, fst.st_ino, c_offset))
+            pin_status = "verified" if matched_uuid else "present"
+            return (data, (pin_status, fst.st_dev, fst.st_ino, c_offset + first_off))
         if c_status == "present":
             # Rotated to a new inode: NEVER blindly accept from byte 0; require
-            # an explicit launch boundary bound to expected_uuid.
+            # an explicit launch boundary bound to expected_uuid and preserve
+            # both the verified launch offset and strict UUID filtering.
             if fst.st_size == 0:
                 return (None, None)
             raw = _read_all_fd(ffd)
-            data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=True)
+            data, first_off, _ = _extract_uuid_launch_blocks(
+                raw, expected_uuid, require_uuid=True
+            )
             if not data:
                 return (None, None)
-            return (data, ("present", fst.st_dev, fst.st_ino, 0))
+            return (data, ("verified", fst.st_dev, fst.st_ino, first_off))
         # c_status == "absent": file created after pre-start snapshot.
         if fst.st_size == 0:
             return (None, None)
         raw = _read_all_fd(ffd)
-        data = _extract_uuid_launch_blocks(raw, expected_uuid, require_uuid=False)
+        data, first_off, matched_uuid = _extract_uuid_launch_blocks(
+            raw, expected_uuid, require_uuid=False
+        )
         if not data:
             return (None, None)
-        return (data, ("present", fst.st_dev, fst.st_ino, 0))
+        pin_status = "verified" if matched_uuid else "present"
+        return (data, (pin_status, fst.st_dev, fst.st_ino, first_off))
     finally:
         os.close(ffd)
         os.close(pfd)
+
+
+def publish_evidence_bytes_session(out_dir, dest_name, data):
+    """Atomically publish an allowlisted session diagnostic file with private 0600 mode."""
+    if dest_name not in ALLOWED_EVIDENCE_FILES:
+        raise OSError(errno.EINVAL, f"unexpected evidence filename '{dest_name}'")
+    os.makedirs(out_dir, exist_ok=True)
+    out_fd = os.open(out_dir, READ_DIR_FLAGS)
+    try:
+        _publish_evidence_stream(
+            out_fd, dest_name, lambda fd: _write_all_fd(fd, data), mode=0o600
+        )
+    finally:
+        os.close(out_fd)
 
 
 def pin_qemu_log_cursor(
@@ -1863,6 +1932,10 @@ def main(argv):
     try:
         if op == "strip-session-dir-acl":
             strip_session_dir_acl(argv[1])
+            return 0
+        if op == "publish-evidence-stdin-session":
+            data = sys.stdin.buffer.read()
+            publish_evidence_bytes_session(argv[1], argv[2], data)
             return 0
         if op == "collect-serial-log-session":
             collect_serial_log_session(

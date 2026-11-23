@@ -4571,6 +4571,13 @@ case "$1" in
         fi
         exit 0
         ;;
+    domuuid)
+        if [ -n "${FAKE_DOM_UUID:-}" ]; then
+            printf '%s\n' "$FAKE_DOM_UUID"
+            exit 0
+        fi
+        exit 1
+        ;;
     define) exit 0 ;;
     start)
         if [ -n "${FAKE_PLANT_SERIAL_DEST:-}" ] && [ -n "${FAKE_PLANT_SERIAL_CONTENT:-}" ]; then
@@ -4580,6 +4587,10 @@ case "$1" in
             mv "${FAKE_SWAP_RUN_DIR_ON_START}" "${FAKE_SWAP_RUN_DIR_ON_START}.swapped"
             mkdir -m 0700 "${FAKE_SWAP_RUN_DIR_ON_START}"
             printf 'FOREIGN_REPLACEMENT_RUN_SERIAL\n' > "${FAKE_SWAP_RUN_DIR_ON_START}/serial.log"
+        fi
+        if [ -n "${FAKE_ROTATE_QLOG_ON_START:-}" ] && [ -n "${FAKE_ROTATE_QLOG_TEXT:-}" ]; then
+            mv "${FAKE_ROTATE_QLOG_ON_START}" "${FAKE_ROTATE_QLOG_ON_START}.prev"
+            (umask 0077; printf '%s\n' "${FAKE_ROTATE_QLOG_TEXT}" > "${FAKE_ROTATE_QLOG_ON_START}")
         fi
         if [ -n "${FAKE_APPEND_QLOG_FILE:-}" ] && [ -n "${FAKE_APPEND_QLOG_TEXT:-}" ]; then
             (umask 0077; printf '%s\n' "${FAKE_APPEND_QLOG_TEXT}" >> "${FAKE_APPEND_QLOG_FILE}")
@@ -5044,20 +5055,42 @@ try:
     seg_other = mod.read_qemu_log_segment(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
     assert seg_other is None, f"rotated inode belonging to another UUID MUST be rejected, got {seg_other!r}"
 
-    # Rotate to an inode containing our verified launch block followed by another launch ->
-    # MUST return ONLY our launch block!
+    # Rotate to an inode starting with an unattributed prefix from an older launch,
+    # followed by our verified launch block, followed by another launch ->
+    # 1. `read_qemu_log_segment` drops BOTH the unattributed prefix and the later foreign launch.
+    # 2. `pin_qemu_log_cursor` preserves the verified byte offset (skipping the prefix) AND
+    #    strict UUID filtering so `collect_qemu_log` with the pinned cursor NEVER leaks the prefix!
     os.rename(qlog, qlog + ".3")
+    prefix = b"UNATTRIBUTED_OLD_LAUNCH_TAIL\n"
     with open(qlog, "wb") as fh:
         fh.write(
-            f"2026-11-23 12:10:00.000+0000: starting up\nqemu -uuid {our_uuid} -accel kvm\nour rotated launch\n"
-            f"2026-11-23 12:15:00.000+0000: starting up\nqemu -uuid {other_uuid} -accel tcg\nlater foreign launch\n".encode()
+            prefix
+            + f"2026-11-23 12:10:00.000+0000: starting up\nqemu -uuid {our_uuid} -accel kvm\nour rotated launch\n"
+            f"2026-11-23 12:15:00.000+0000: starting up\nqemu -uuid {other_uuid} -accel tcg\nlater foreign launch\n"
+            f"2026-11-23 12:20:00.000+0000: starting up\nunattributed later launch\n".encode()
         )
     seg_ours = mod.read_qemu_log_segment(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
     assert (
         seg_ours is not None
         and b"our rotated launch" in seg_ours
+        and b"UNATTRIBUTED_OLD_LAUNCH_TAIL" not in seg_ours
         and b"later foreign launch" not in seg_ours
+        and b"unattributed later launch" not in seg_ours
     ), f"expected only our launch block from rotated inode, got {seg_ours!r}"
+
+    pinned = mod.pin_qemu_log_cursor(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert pinned is not None and pinned[0] == "verified" and pinned[3] == len(prefix), (
+        f"pinned rotated cursor must preserve verified status and exact launch offset {len(prefix)}, got {pinned!r}"
+    )
+    ok_col = mod.collect_qemu_log(qlog, out_dir, "qemu.log", cursor=pinned, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert ok_col is True, "collect_qemu_log with pinned rotated cursor must succeed"
+    pub = open(os.path.join(out_dir, "qemu.log"), "rb").read()
+    assert (
+        b"our rotated launch" in pub
+        and b"UNATTRIBUTED_OLD_LAUNCH_TAIL" not in pub
+        and b"later foreign launch" not in pub
+        and b"unattributed later launch" not in pub
+    ), f"pinned collect_qemu_log MUST NOT leak discarded prefix or unattributed later launch, got {pub!r}"
 finally:
     os.close(root_fd)
 "#,
@@ -5555,6 +5588,228 @@ fn evidence_dir_init_run_clears_stale_diagnostics_and_session_logs_stay_private(
     assert!(
         !sess_out.join("qemu.log").exists() && !sess_out.join("serial.log").exists(),
         "reused session OUT MUST clear stale qemu.log and serial.log from earlier runs"
+    );
+}
+
+#[test]
+fn session_mode_captures_uuid_for_rotated_logs_and_atomically_replaces_domain_xml() {
+    let fx = SystemMockLibvirtFixture::new();
+    let dom_uuid = "33333333-4444-5555-6666-777777777777";
+
+    let sess_images = fx.dir.path().join("sess-rot-images");
+    let sess_qlogs = fx.dir.path().join("sess-rot-qlogs");
+    let sess_out = fx.dir.path().join("sess-rot-out-0755");
+    create_private_dir(&sess_qlogs);
+    std::fs::create_dir_all(&sess_out).unwrap();
+    std::fs::set_permissions(&sess_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // 1. Session-mode legitimate log rotation through the real shell path:
+    //    `cmd_run` captures the domain UUID after `define`, passes it to `prove_kvm`,
+    //    `pin-qemu-log-cursor-session`, and EXIT-trap `collect_diagnostics`.
+    //    Even with an unattributed prefix from an older launch in the rotated file:
+    //    - `accelerator_kvm` MUST pass!
+    //    - `out/qemu.log` MUST be `0600`, contain ONLY our launch, and exclude the prefix!
+    let rot_name = fx.run_name("125");
+    let rot_run_dir = sess_images.join(&rot_name);
+    let rot_qlog = sess_qlogs.join(format!("{rot_name}.log"));
+    std::fs::write(&rot_qlog, b"PRIOR_INODE_LOG\n").unwrap();
+    std::fs::set_permissions(&rot_qlog, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let rot_xml = format!(
+        "<domain type='kvm'><name>{rot_name}</name><uuid>{dom_uuid}</uuid><devices><disk type='file'><source file='{}/root.qcow2'/></disk></devices></domain>",
+        rot_run_dir.display()
+    );
+    let rotated_log_body = format!(
+        "UNATTRIBUTED_OLD_PREFIX\n2026-11-23 12:10:00.000+0000: starting up\nqemu -uuid {dom_uuid} -accel kvm\nSESSION_ROTATED_LAUNCH"
+    );
+    // Keep dom_state_file absent so stale-check passes and wait_for_guest exits promptly after prove_kvm.
+    std::fs::write(&fx.dom_state_file, "absent\n").unwrap();
+    let _ = std::fs::remove_file(&fx.virsh_log);
+    let sess_rot = lane_env(
+        &[
+            "run",
+            "--arch",
+            fx.arch,
+            "--candidate",
+            fx.candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "125",
+            "--run-attempt",
+            "1",
+            "--out",
+            sess_out.to_str().unwrap(),
+            "--expect-sha256",
+            &fx.digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///session"),
+            ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
+            ("FAKE_VIRSH_LOG", fx.virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &rot_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &rot_xml),
+            ("FAKE_START_EXIT", "0"),
+            ("FAKE_ROTATE_QLOG_ON_START", rot_qlog.to_str().unwrap()),
+            ("FAKE_ROTATE_QLOG_TEXT", &rotated_log_body),
+        ],
+        Some(&fx.session_bin),
+    );
+    assert!(!sess_rot.status.success(), "{}", text(&sess_rot));
+    let rot_res: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sess_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(
+        rot_res["tests"]["accelerator_kvm"],
+        "pass",
+        "session cmd_run MUST capture domain UUID and pass prove_kvm on a verified rotated log:\n{}",
+        text(&sess_rot)
+    );
+    let pub_qlog = std::fs::read_to_string(sess_out.join("qemu.log")).unwrap_or_default();
+    assert!(
+        pub_qlog.contains("SESSION_ROTATED_LAUNCH")
+            && !pub_qlog.contains("UNATTRIBUTED_OLD_PREFIX")
+            && !pub_qlog.contains("PRIOR_INODE_LOG"),
+        "session rotated qemu.log MUST contain only our launch without discarded prefix, got:\n{pub_qlog}"
+    );
+    assert_eq!(
+        std::fs::metadata(sess_out.join("qemu.log"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "session qemu.log MUST be private 0600"
+    );
+
+    // 2. Standalone session `cleanup --out` with a pre-existing `0644` (and hard-linked!)
+    //    `domain.xml` in an existing `0755` output directory MUST atomically replace it with
+    //    a brand-new `0600` file without truncating or modifying the pre-existing victim inode!
+    let clean_out = fx.dir.path().join("sess-clean-out-0755");
+    std::fs::create_dir_all(&clean_out).unwrap();
+    std::fs::set_permissions(&clean_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let victim_dom = fx.dir.path().join("victim-sess-domain.xml");
+    std::fs::write(&victim_dom, b"OLD_WORLD_READABLE_XML\n").unwrap();
+    std::fs::set_permissions(&victim_dom, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&victim_dom, clean_out.join("domain.xml")).unwrap();
+
+    std::fs::write(&fx.dom_state_file, "running\n").unwrap();
+    let sess_clean = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            fx.arch,
+            "--run-id",
+            "125",
+            "--run-attempt",
+            "1",
+            "--out",
+            clean_out.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///session"),
+            ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &rot_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &rot_xml),
+        ],
+        Some(&fx.session_bin),
+    );
+    assert!(sess_clean.status.success(), "{}", text(&sess_clean));
+    assert_eq!(
+        std::fs::read_to_string(&victim_dom).unwrap().trim(),
+        "OLD_WORLD_READABLE_XML",
+        "session standalone cleanup MUST atomically replace domain.xml without truncating pre-existing inode"
+    );
+    let updated_dom = std::fs::read_to_string(clean_out.join("domain.xml")).unwrap_or_default();
+    assert!(
+        updated_dom.contains(dom_uuid),
+        "updated session domain.xml should contain current domain XML, got:\n{updated_dom}"
+    );
+    let dom_mode = std::fs::metadata(clean_out.join("domain.xml"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        dom_mode, 0o600,
+        "atomically replaced session domain.xml MUST be private 0600 (not pre-existing 0644), got {dom_mode:04o}"
+    );
+
+    // 3. Session `collect_diagnostics` without `python3` MUST omit diagnostics rather than
+    //    falling back to unsafe `>` / `cp` / `chmod` reopening destination paths by name!
+    let nopy_bin = fx.dir.path().join("nopy-bin");
+    create_private_dir(&nopy_bin);
+    for tool in [
+        "bash", "mkdir", "sed", "tr", "head", "cat", "rm", "dirname", "grep", "cp", "chmod",
+    ] {
+        for dir_cand in ["/usr/bin", "/bin"] {
+            let p = Path::new(dir_cand).join(tool);
+            if p.is_file() {
+                let _ = std::os::unix::fs::symlink(&p, nopy_bin.join(tool));
+                break;
+            }
+        }
+    }
+    let _ = std::os::unix::fs::symlink(fx.session_bin.join("virsh"), nopy_bin.join("virsh"));
+    let nopy_images = fx.dir.path().join("nopy-images");
+    create_private_dir(&nopy_images);
+    let nopy_run = nopy_images.join(&rot_name);
+    create_private_dir(&nopy_run);
+    std::fs::write(nopy_run.join("serial.log"), b"SECRET_SERIAL\n").unwrap();
+    let nopy_out = fx.dir.path().join("nopy-out");
+    std::fs::create_dir_all(&nopy_out).unwrap();
+    let nopy_dom_victim = fx.dir.path().join("nopy-victim-dom.xml");
+    std::fs::write(&nopy_dom_victim, b"UNTOUCHED_VICTIM\n").unwrap();
+    std::fs::set_permissions(&nopy_dom_victim, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::hard_link(&nopy_dom_victim, nopy_out.join("domain.xml")).unwrap();
+    std::fs::write(&fx.dom_state_file, "running\n").unwrap();
+
+    let nopy_probe = Command::new("/usr/bin/env")
+        .args([
+            "-i",
+            &format!("PATH={}", nopy_bin.display()),
+            &format!("HOME={}", fx.dir.path().display()),
+            "QEMINGA_E2E_CONNECT=qemu:///session",
+            &format!("QEMINGA_E2E_IMAGES={}", nopy_images.display()),
+            &format!("QEMINGA_E2E_QEMU_LOG_DIR={}", sess_qlogs.display()),
+            &format!("FAKE_DOM_STATE_FILE={}", fx.dom_state_file.display()),
+            &format!("FAKE_DOM_NAME={rot_name}"),
+            &format!("FAKE_DOM_UUID={dom_uuid}"),
+            &format!("FAKE_DUMPXML_CONTENT={rot_xml}"),
+            "bash",
+            root()
+                .join("scripts/ci/libvirt-kvm-smoke.sh")
+                .to_str()
+                .unwrap(),
+            "cleanup",
+            "--arch",
+            fx.arch,
+            "--run-id",
+            "125",
+            "--run-attempt",
+            "1",
+            "--out",
+            nopy_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(nopy_probe.status.success(), "{}", text(&nopy_probe));
+    assert_eq!(
+        std::fs::read_to_string(&nopy_dom_victim).unwrap().trim(),
+        "UNTOUCHED_VICTIM",
+        "without python3 publisher, session collect_diagnostics MUST NOT overwrite pre-existing domain.xml"
+    );
+    assert!(
+        !nopy_out.join("serial.log").exists() && !nopy_out.join("qemu.log").exists(),
+        "without python3 publisher, session collect_diagnostics MUST omit serial.log and qemu.log rather than unsafe cp/chmod"
     );
 }
 

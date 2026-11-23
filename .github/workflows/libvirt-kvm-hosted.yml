@@ -1,0 +1,191 @@
+# libvirt + QEMU KVM smoke lane (#53, AC16) on GitHub-hosted x86_64 runners.
+#
+# GitHub-hosted standard Linux x86_64 runners (`ubuntu-24.04`) expose /dev/kvm
+# (nested virtualization on Azure, enabled for Android virtualization since
+# 2024-04-02), whereas GitHub-hosted arm64 runners (`ubuntu-24.04-arm`) do not
+# expose KVM at any tier. On `ubuntu-24.04`, the `runner` user is not in the
+# `kvm` group (and `usermod` cannot take effect inside the running session), so
+# this workflow installs the 99-kvm4all.rules udev workaround (including
+# `OPTIONS+="static_node=kvm"` so subsequent udev events / package installs
+# cannot reset /dev/kvm permissions) and asserts `test -r /dev/kvm && test -w
+# /dev/kvm` fail-fast before installing packages or booting a VM.
+#
+# Because GitHub-hosted runners are ephemeral, this workflow safely runs on
+# `push` to `main`, `pull_request`, and `workflow_dispatch` (gated on
+# `scripts/ci/docs-only.sh`). It reuses `scripts/ci/libvirt-kvm-smoke.sh` in
+# unprivileged `qemu:///session` mode (zero `sudo` during the smoke run, no
+# `libvirt-daemon-system`, user-mode networking via libslirp) and anchors the
+# tested binary to the build job's reported SHA-256. Self-hosted x86_64 and
+# aarch64 KVM runners remain in `.github/workflows/libvirt-kvm.yml`
+# (`workflow_dispatch` only). `tests/libvirt_kvm.rs` checks this file's shape.
+name: libvirt KVM smoke (hosted x86_64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libvirt-kvm-hosted-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Same classification as ci.yml and libvirt-tcg.yml: a change touching only
+  # Markdown no check reads skips the lane.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code=true
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } \
+              && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE" "$GITHUB_SHA" | tee changed.txt
+            if scripts/ci/docs-only.sh < changed.txt; then code=false; fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  candidate:
+    name: candidate (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native x86_64 machine
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$RUNNER_ARCH" = "X64"
+          rustc -vV | grep -qx "host: x86_64-unknown-linux-gnu"
+      - name: Release build
+        run: cargo build --release --locked --features seccomp
+      # Taken from the built file, not from the manifest, and handed to the
+      # smoke job through the job output, not through the artifact.
+      - name: Digest of the built binary
+        id: digest
+        run: echo "sha256=$(sha256sum target/release/qeminga | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - name: Candidate and manifest
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
+          scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
+            --binary target/release/qeminga --arch x86_64 --source-sha "$GITHUB_SHA" \
+            --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner ubuntu-24.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-kvm-hosted-x86_64
+          path: candidate/
+          if-no-files-found: error
+
+  smoke:
+    name: libvirt KVM smoke (hosted x86_64)
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ARCH: x86_64
+      QEMINGA_E2E_CONNECT: qemu:///session
+      OUT: ${{ github.workspace }}/libvirt-kvm-out
+      IMAGE_CACHE: ${{ github.workspace }}/libvirt-kvm-image-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The runner is a native x86_64 machine
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$RUNNER_ARCH" = "X64"
+      # Fail fast if a runner-image rollout drops /dev/kvm, and grant the
+      # unprivileged runner user rw access without a new login session.
+      # OPTIONS+="static_node=kvm" prevents later udev triggers from resetting
+      # the device mode (actions/runner-images#8670).
+      - name: Enable /dev/kvm for the runner user
+        run: |
+          test -c /dev/kvm || { echo "::error::/dev/kvm is absent on this GitHub-hosted runner"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle --timeout=30
+          ls -la /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm || {
+            echo "::error::/dev/kvm is not readable and writable by $(id -un) after udev workaround"
+            exit 1
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-kvm-hosted-x86_64
+          path: candidate
+      # Keyed with a distinct prefix so the cache path never collides with
+      # libvirt-tcg-lane.yml's libvirt-tcg-image-cache directory; the script
+      # verifies the pinned SHA-256 again after restore.
+      - name: Guest image cache key
+        id: image
+        run: echo "key=kvm-hosted-$(scripts/ci/libvirt-kvm-smoke.sh image-key "$ARCH")" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.IMAGE_CACHE }}
+          key: ${{ steps.image.outputs.key }}
+      - name: Install session libvirt and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libvirt-daemon libvirt-daemon-driver-qemu libvirt-clients \
+            qemu-system-x86 qemu-utils genisoimage
+      - name: Boot, prove KVM, install, AC16, agent shutdown
+        run: |
+          mkdir -p "$IMAGE_CACHE"
+          scripts/ci/libvirt-kvm-smoke.sh run --arch "$ARCH" \
+            --candidate candidate --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
+            --image-cache "$IMAGE_CACHE" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Clean up this run's domain and disks
+        if: always()
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$ARCH" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Result summary
+        if: always()
+        run: |
+          {
+            echo "## libvirt KVM smoke (hosted $ARCH)"
+            echo
+            echo '```json'
+            cat "$OUT/result.json" 2>/dev/null || echo '{"result": "missing"}'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvirt-kvm-hosted-x86_64
+          path: ${{ env.OUT }}/
+          if-no-files-found: error

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# libvirt + QEMU KVM smoke lane (#53, AC16) for self-hosted x86_64 and aarch64
-# KVM runners (community-donated or maintainer-operated).
+# libvirt + QEMU KVM smoke lane (#53, AC16) for GitHub-hosted x86_64 runners
+# (.github/workflows/libvirt-kvm-hosted.yml) and self-hosted x86_64 / aarch64
+# KVM runners (.github/workflows/libvirt-kvm.yml).
 #
 # Runs completely unprivileged by default against `qemu:///session` with
 # user-mode networking (`<interface type='user'>` via libslirp), requiring zero

@@ -857,6 +857,15 @@ the answer is a one-line change, and leave the question here.
 - **Implement (green):** `scripts/setup-kvm-runner.sh` (`preflight`, `install`, `render-unit`, `render-hooks`, `fetch-runner`, `status`, `update`, `uninstall`), `scripts/ci/libvirt-smoke-common.sh`, `scripts/ci/libvirt-kvm-smoke.sh` (unprivileged `qemu:///session` default, `prove_kvm` requiring `type='kvm'`, HMP `kvm support: enabled`, and `-accel kvm`/`accel=kvm` with no TCG), `.github/workflows/libvirt-kvm.yml` and `.github/workflows/libvirt-kvm-lane.yml`, and documentation in `docs/testing.md`.
 - **Done when:** all tests above, `shellcheck`, `systemd-analyze verify`, and the full CI check suite pass.
 
+#### T6.11 — GitHub-hosted x86-64 KVM smoke lane with udev `/dev/kvm` workaround (#53, part) ∥
+- **Status:** in-progress (workflow, tests, and docs ready; awaiting live verification on a GitHub-hosted `ubuntu-24.04` runner)
+- **Design:** AC16, §3, §8.5; #53 (x86-64 KVM smoke on GitHub-hosted `ubuntu-24.04` runners, stacked on T6.10 to reuse `scripts/ci/libvirt-kvm-smoke.sh` and `scripts/ci/libvirt-smoke-common.sh`).
+- **Depends on:** T6.10
+- **Files:** `.github/workflows/libvirt-kvm-hosted.yml`, `scripts/ci/libvirt-kvm-smoke.sh`, `tests/libvirt_kvm.rs`, `docs/testing.md`, `docs/tasks.md`, `AGENTS.md`, `README.md`, `CHANGELOG.md`.
+- **Tests first (red):** `tests/libvirt_kvm.rs`: `hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_session_kvm` (triggers on `push` to `main`, `pull_request`, and `workflow_dispatch`; gated on `scripts/ci/docs-only.sh`; never targets `self-hosted`; native `ubuntu-24.04` `x86_64` candidate build with `--features seccomp` only, anchored via job output `sha256`; fail-fast `99-kvm4all.rules` udev workaround with `OPTIONS+="static_node=kvm"`, `udevadm control --reload-rules`, `udevadm trigger --name-match=kvm`, `udevadm settle`, and `test -c /dev/kvm` + `test -r /dev/kvm && test -w /dev/kvm` before `apt-get` and before `run`; minimal session virtualization packages without `libvirt-daemon-system`; distinct `kvm-hosted-` guest-image cache key prefix; unprivileged `qemu:///session` invocation of `libvirt-kvm-smoke.sh run` and `cleanup` without `sudo`; `if: always()` cleanup and evidence upload; strict Ruby Psych YAML parse), plus `run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device` (missing or regular-file `QEMINGA_KVM_DEVICE` fails closed with `result: "fail"` and `accelerator: "unknown"`, never TCG).
+- **Implement (green):** `.github/workflows/libvirt-kvm-hosted.yml` reusing `scripts/ci/libvirt-kvm-smoke.sh` in unprivileged `qemu:///session` mode on GitHub-hosted `ubuntu-24.04`.
+- **Done when:** `.github/workflows/libvirt-kvm-hosted.yml` passes live on a GitHub-hosted `ubuntu-24.04` runner with `result: pass` and `accelerator: kvm` recorded, and the full CI check suite passes.
+
 ---
 
 ## 6. Acceptance-criteria traceability

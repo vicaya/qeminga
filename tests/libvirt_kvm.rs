@@ -1,18 +1,24 @@
-//! The libvirt + QEMU KVM smoke lane (#53, AC16): builds the production
-//! release candidate on GitHub-hosted runners and exercises it under real
-//! libvirt + KVM on self-hosted x86_64 and aarch64 runners without root,
-//! `sudo`, or a Rust toolchain on the runner host.
+//! The libvirt + QEMU KVM smoke lanes (#53, AC16):
 //!
-//! Mirrors `tests/libvirt_tcg_smoke.rs` for the KVM lane: candidate manifest
+//! - `.github/workflows/libvirt-kvm-hosted.yml`: builds the production release
+//!   candidate on GitHub-hosted `ubuntu-24.04` (`x86_64`), enables `/dev/kvm`
+//!   for the unprivileged `runner` user via the `99-kvm4all.rules` udev
+//!   workaround (`OPTIONS+="static_node=kvm"`), and exercises the candidate
+//!   under real libvirt + KVM (`qemu:///session`, no `sudo` during the run) on
+//!   `push` (`main`), `pull_request`, and `workflow_dispatch`.
+//! - `.github/workflows/libvirt-kvm.yml` + `libvirt-kvm-lane.yml`:
+//!   `workflow_dispatch`-only lane that builds on GitHub-hosted runners and
+//!   exercises the exact candidate on self-hosted `x86_64` and `aarch64` KVM
+//!   runners without root, `sudo`, or a Rust toolchain.
+//!
+//! Mirrors `tests/libvirt_tcg_smoke.rs` for the KVM lanes: candidate manifest
 //! and fail-closed verification, image-pin parity with the TCG script, KVM
 //! domain XML (`type='kvm'`, `host-passthrough`, aarch64 UEFI + `gic host`,
 //! unprivileged `user` networking under `qemu:///session`), URI validation,
-//! stale-domain and cleanup namespace guards, the `libvirt-kvm-smoke-v1`
-//! result contract (refusing TCG as a pass), and workflow security invariants
-//! (never triggered by `pull_request` / `pull_request_target`, no `sudo` or
-//! build tools on the self-hosted runner, checks out `$GITHUB_SHA` directly
-//! without a user-controlled ref input, bounded concurrency with
-//! `cancel-in-progress: false`).
+//! missing/non-char `/dev/kvm` fail-closed preflight, stale-domain and cleanup
+//! namespace guards, the `libvirt-kvm-smoke-v1` result contract (refusing TCG
+//! as a pass), and workflow security/shape invariants for both the self-hosted
+//! and GitHub-hosted workflows.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -695,7 +701,7 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     let upload_step = &kvm[kvm[..upload_idx].rfind("- name:").unwrap()..upload_idx];
     assert!(upload_step.contains("if: always()"), "{upload_step}");
 
-    // Validate strict YAML syntax for both workflow files when Ruby Psych is installed.
+    // Validate strict YAML syntax for all KVM workflow files when Ruby Psych is installed.
     let has_ruby = Command::new("ruby")
         .args(["-ryaml", "-e", "exit 0"])
         .output()
@@ -704,6 +710,7 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
         for rel in [
             ".github/workflows/libvirt-kvm.yml",
             ".github/workflows/libvirt-kvm-lane.yml",
+            ".github/workflows/libvirt-kvm-hosted.yml",
         ] {
             let path = root().join(rel);
             let out = Command::new("ruby")
@@ -717,5 +724,220 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
                 self::text(&out)
             );
         }
+    }
+}
+
+fn hosted_workflow() -> String {
+    let path = root().join(".github/workflows/libvirt-kvm-hosted.yml");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+#[test]
+fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_session_kvm() {
+    let text = hosted_workflow();
+
+    // Runs automatically on pushes to main, pull requests, and manual dispatch
+    // because GitHub-hosted ubuntu-24.04 runners are ephemeral.
+    assert!(text.contains("push:\n    branches: [main]"), "{text}");
+    assert!(text.contains("pull_request:"), "{text}");
+    assert!(text.contains("workflow_dispatch:"), "{text}");
+    assert!(text.contains("permissions:\n  contents: read"), "{text}");
+    assert!(
+        text.contains("cancel-in-progress: ${{ github.event_name == 'pull_request' }}"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("self-hosted"),
+        "hosted workflow must never target self-hosted runners:\n{text}"
+    );
+
+    // Gated on docs-only change classification just like ci.yml and libvirt-tcg.yml.
+    let changes = job(&text, "changes");
+    assert!(changes.contains("runs-on: ubuntu-24.04\n"), "{changes}");
+    assert!(changes.contains("persist-credentials: false"), "{changes}");
+    assert!(changes.contains("scripts/ci/docs-only.sh"), "{changes}");
+
+    // Candidate build job: native x86_64, production features only, digest anchored.
+    let build = job(&text, "candidate");
+    assert!(build.contains("needs: changes"), "{build}");
+    assert!(
+        build.contains("if: needs.changes.outputs.code == 'true'"),
+        "{build}"
+    );
+    assert!(build.contains("runs-on: ubuntu-24.04\n"), "{build}");
+    assert!(build.contains("timeout-minutes:"), "{build}");
+    assert!(!build.contains("continue-on-error"), "{build}");
+    assert!(build.contains("persist-credentials: false"), "{build}");
+    assert!(
+        build.contains(r#"test "$(uname -m)" = "x86_64""#),
+        "{build}"
+    );
+    assert!(build.contains(r#"test "$RUNNER_ARCH" = "X64""#), "{build}");
+    assert!(
+        build.contains(r#"rustc -vV | grep -qx "host: x86_64-unknown-linux-gnu""#),
+        "{build}"
+    );
+    assert!(build.contains("cargo build --release --locked --features seccomp\n"));
+    assert!(build.contains("sha256: ${{ steps.digest.outputs.sha256 }}"));
+    assert!(build.contains("sha256sum target/release/qeminga"));
+    assert!(build.contains("scripts/ci/libvirt-kvm-smoke.sh manifest"));
+    for forbidden in ["--all-features", "test-fakes", "seccomp-log"] {
+        assert!(!build.contains(forbidden), "candidate: {forbidden}");
+    }
+
+    // Hosted KVM smoke job: native ubuntu-24.04, fail-fast udev workaround for /dev/kvm,
+    // minimal session packages, unprivileged qemu:///session run, always() cleanup & upload.
+    let smoke = job(&text, "smoke");
+    assert!(smoke.contains("needs: candidate"), "{smoke}");
+    assert!(smoke.contains("runs-on: ubuntu-24.04\n"), "{smoke}");
+    assert!(smoke.contains("timeout-minutes:"), "{smoke}");
+    assert!(!smoke.contains("continue-on-error"), "{smoke}");
+    assert!(smoke.contains("persist-credentials: false"), "{smoke}");
+    assert!(
+        smoke.contains(r#"test "$(uname -m)" = "x86_64""#),
+        "{smoke}"
+    );
+    assert!(smoke.contains(r#"test "$RUNNER_ARCH" = "X64""#), "{smoke}");
+    assert!(
+        smoke.contains("QEMINGA_E2E_CONNECT: qemu:///session"),
+        "{smoke}"
+    );
+    for forbidden in ["cargo ", "rustup", "libvirt-daemon-system"] {
+        assert!(
+            !smoke.contains(forbidden),
+            "hosted smoke job must not use {forbidden:?}:\n{smoke}"
+        );
+    }
+
+    // The exact udev workaround from GitHub's 2024-04-02 changelog / randax/talos-box#74,
+    // including OPTIONS+="static_node=kvm" so package installs or udev reloads cannot reset
+    // /dev/kvm permissions, plus an explicit fail-fast check BEFORE apt-get or smoke run.
+    let udev_rule = r#"KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm""#;
+    let udev_idx = smoke
+        .find(udev_rule)
+        .unwrap_or_else(|| panic!("missing 99-kvm4all.rules with static_node=kvm:\n{smoke}"));
+    assert!(
+        smoke.contains("/etc/udev/rules.d/99-kvm4all.rules"),
+        "{smoke}"
+    );
+    assert!(smoke.contains("udevadm control --reload-rules"), "{smoke}");
+    assert!(
+        smoke.contains("udevadm trigger --name-match=kvm"),
+        "{smoke}"
+    );
+    assert!(smoke.contains("udevadm settle"), "{smoke}");
+    assert!(smoke.contains("test -c /dev/kvm"), "{smoke}");
+    let rw_idx = smoke
+        .find("test -r /dev/kvm && test -w /dev/kvm")
+        .unwrap_or_else(|| panic!("missing fail-fast /dev/kvm rw check:\n{smoke}"));
+    let apt_idx = smoke.find("apt-get install").unwrap();
+    let run_idx = smoke.find("libvirt-kvm-smoke.sh run").unwrap();
+    assert!(
+        udev_idx < rw_idx && rw_idx < apt_idx && apt_idx < run_idx,
+        "udev workaround and fail-fast /dev/kvm check must happen before apt-get and run"
+    );
+
+    // Minimal unprivileged session virtualization packages (no root libvirtd-system).
+    for pkg in [
+        "libvirt-daemon",
+        "libvirt-daemon-driver-qemu",
+        "libvirt-clients",
+        "qemu-system-x86",
+        "qemu-utils",
+        "genisoimage",
+    ] {
+        assert!(smoke.contains(pkg), "missing package {pkg}:\n{smoke}");
+    }
+
+    // Guest image cached under a distinct key prefix so its path never collides with TCG's.
+    assert!(
+        smoke.contains("scripts/ci/libvirt-kvm-smoke.sh image-key"),
+        "{smoke}"
+    );
+    assert!(smoke.contains("kvm-hosted-"), "{smoke}");
+    assert!(smoke.contains("uses: actions/cache@"), "{smoke}");
+    assert!(smoke.contains("--image-cache"), "{smoke}");
+
+    // Binary digest anchored to build job output; smoke and cleanup run unprivileged (no sudo).
+    assert!(
+        smoke.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#),
+        "{smoke}"
+    );
+    for line in smoke.lines().filter(|l| l.contains("libvirt-kvm-smoke.sh")) {
+        assert!(
+            !line.contains("sudo"),
+            "hosted qemu:///session invocation must not use sudo: {line}"
+        );
+    }
+
+    // Cleanup and artifact upload run even on failure.
+    let cleanup_idx = smoke.find("libvirt-kvm-smoke.sh cleanup").unwrap();
+    let cleanup_step = &smoke[smoke[..cleanup_idx].rfind("- name:").unwrap()..cleanup_idx];
+    assert!(cleanup_step.contains("if: always()"), "{cleanup_step}");
+    let upload_idx = smoke.find("actions/upload-artifact").unwrap();
+    let upload_step = &smoke[smoke[..upload_idx].rfind("- name:").unwrap()..upload_idx];
+    assert!(upload_step.contains("if: always()"), "{upload_step}");
+}
+
+#[test]
+fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device() {
+    require_jq();
+    let arch = std::env::consts::ARCH;
+    if arch != "x86_64" && arch != "aarch64" {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("no-such-kvm");
+    let regular = dir.path().join("regular-file-kvm");
+    std::fs::write(&regular, b"").unwrap();
+    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    for (label, kvm_path) in [("missing", &missing), ("regular", &regular)] {
+        let out_dir = dir.path().join(format!("out-{label}"));
+        let output = lane_env(
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                dir.path().join("candidate").to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "42",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &"a".repeat(64),
+            ],
+            &[
+                ("QEMINGA_KVM_DEVICE", kvm_path.to_str().unwrap()),
+                (
+                    "QEMINGA_E2E_IMAGES",
+                    dir.path().join("images").to_str().unwrap(),
+                ),
+            ],
+            None,
+        );
+        assert!(
+            !output.status.success(),
+            "{label}: expected failure: {}",
+            text(&output)
+        );
+        let result_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
+                .unwrap_or_else(|e| panic!("{label}: {e}: {}", text(&output)));
+        assert_eq!(result_json["suite"], "libvirt-kvm-smoke-v1", "{label}");
+        assert_eq!(result_json["result"], "fail", "{label}");
+        assert_eq!(
+            result_json["virtualization"]["accelerator"], "unknown",
+            "{label}: must never silently fall back to tcg"
+        );
+        assert_eq!(
+            result_json["tests"]["accelerator_kvm"], "not_run",
+            "{label}"
+        );
     }
 }

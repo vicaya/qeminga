@@ -10,7 +10,8 @@ for the aarch64 seccomp profile (AC15), and each leg proves its
 architecture (`uname -m`, `RUNNER_ARCH`, the rustc host triple) before
 it builds anything. This page also covers interoperability with a real libvirt/QEMU host
 (AC16, T5.4): an automated smoke lane under QEMU's TCG accelerator on
-both architectures, a `workflow_dispatch`-only KVM smoke lane on
+both architectures, an automated KVM smoke lane on GitHub-hosted x86-64
+runners (`ubuntu-24.04`), a `workflow_dispatch`-only KVM smoke lane on
 self-hosted x86-64 and aarch64 (arm64) runners with a hardened community
 runner setup script (`scripts/setup-kvm-runner.sh`), and the manual
 recipe for a KVM host.
@@ -113,12 +114,51 @@ sudo scripts/ci/libvirt-tcg-smoke.sh run --arch "$(uname -m)" --candidate /tmp/c
 sudo scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$(uname -m)" --run-id 1 --run-attempt 1
 ```
 
-## libvirt KVM smoke lane & community runner setup (x86_64 and arm64)
+## libvirt KVM smoke lanes & community runner setup (hosted x86_64; self-hosted x86_64 and arm64)
+
+### GitHub-hosted x86_64 KVM smoke lane (CI)
+
+`.github/workflows/libvirt-kvm-hosted.yml` (#53, part) exercises real
+hardware-accelerated KVM on GitHub-hosted `ubuntu-24.04` (`x86_64`)
+runners on every code-changing push to `main`, pull request, and
+`workflow_dispatch` (gated on `scripts/ci/docs-only.sh`):
+
+- **Why `x86_64` only on hosted runners:** standard GitHub-hosted Linux
+  `x86_64` runners expose `/dev/kvm` via Azure nested virtualization
+  (enabled since 2024-04-02), whereas GitHub-hosted `ubuntu-24.04-arm`
+  runners do not expose `/dev/kvm` at any tier (Azure Arm VM SKUs do
+  not yet offer nested virtualization).
+- **`/dev/kvm` udev workaround and fail-fast guard:** on `ubuntu-24.04`,
+  the `runner` user is not in the `kvm` group (and `usermod` cannot take
+  effect inside an already-running Actions job). Before installing any
+  packages or booting a guest, the `smoke` job checks `test -c /dev/kvm`,
+  installs `/etc/udev/rules.d/99-kvm4all.rules` with
+  `KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"`
+  (the `OPTIONS+="static_node=kvm"` clause prevents later udev reloads
+  or package installs from resetting the mode), runs
+  `udevadm control --reload-rules`, `udevadm trigger --name-match=kvm`,
+  and `udevadm settle`, and fails fast unless `test -r /dev/kvm && test
+  -w /dev/kvm` succeeds as the unprivileged `runner` user.
+- **Unprivileged `qemu:///session` reuse:** the `candidate` job builds
+  `cargo build --release --locked --features seccomp` on `ubuntu-24.04`
+  and reports the binary's SHA-256 as a job output; the `smoke` job has
+  no Rust toolchain, installs only minimal session virtualization
+  packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
+  `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `genisoimage` —
+  no `libvirt-daemon-system`), and runs `scripts/ci/libvirt-kvm-smoke.sh`
+  completely unprivileged under `QEMINGA_E2E_CONNECT=qemu:///session`
+  with `<interface type='user'>` (libslirp), proving KVM acceleration
+  (refusing any TCG fallback) and producing `suite: "libvirt-kvm-smoke-v1"`
+  with `accelerator: "kvm"`. Because KVM on GitHub-hosted runners is an
+  undocumented capability without an SLA, the hosted TCG smoke lane
+  (`.github/workflows/libvirt-tcg.yml`) stays alongside it.
+
+### Self-hosted KVM smoke lane & community runner setup (x86_64 and arm64)
 
 `.github/workflows/libvirt-kvm.yml` (calling `.github/workflows/libvirt-kvm-lane.yml`
 independently per architecture) exercises real hardware-accelerated KVM on
 self-hosted `x86_64` and `aarch64` (`arm64`) Linux servers alongside the
-hosted TCG lane:
+hosted TCG and hosted `x86_64` KVM lanes:
 
 - **Trust boundary:** `libvirt-kvm.yml` is triggered **only** via
   `workflow_dispatch` (never `pull_request`, `pull_request_target`, or

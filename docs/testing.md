@@ -300,75 +300,93 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    state is unknown), anchors image verification and recursive same-mount
    run-directory and `WORK_DIR` removal strictly to their trusted parent
    FDs via kernel `O_PATH | O_DIRECTORY | O_NOFOLLOW` ancestor traversal
-   (supporting search-only `0711` parents), verifies the opened parent FD
-   against the `STATE_VOL` / `INSTALL_VOL` volume fingerprint recorded at
-   install in root-owned `policy.env` (matching filesystem type,
-   filesystem-relative root path, block UUID/source, and `f_fsid` —
-   tolerating systemd's own `ProtectSystem=strict` self-bind-mounts while
-   failing closed on parent overmounts or replacement bind mounts), plus
-   `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` on the enumerated directory and
-   `/proc/self/mountinfo` + `/proc/self/fdinfo` `mnt_id` verification (so
-   symlinks, cross-device mounts, and same-filesystem bind mounts — whether
-   directly at `WORK_DIR`/`$STATE_DIR/images` or beneath them — fail closed
-   without touching external targets), restricts `WORK_DIR` to exact
+   (supporting search-only `0711` parents), requires a non-empty
+   `STATE_VOL` / `INSTALL_VOL` volume fingerprint recorded in root-owned
+   `policy.env` (failing closed on legacy empty values and directing to
+   `migrate-record --confirm-volumes`), verifies the opened parent FD
+   against that unprivileged-verifiable fingerprint (matching filesystem
+   type, filesystem-relative root path, `/dev/disk/by-uuid` UUID or mount
+   source, and `f_fsid` — tolerating systemd's own `ProtectSystem=strict`
+   self-bind-mounts while failing closed on parent overmounts or
+   replacement bind mounts), plus `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` on
+   the enumerated directory and `/proc/self/mountinfo` +
+   `/proc/self/fdinfo` `mnt_id` verification (so symlinks, cross-device
+   mounts, and same-filesystem bind mounts — whether directly at
+   `WORK_DIR`/`$STATE_DIR/images` or beneath them — fail closed without
+   touching external targets), restricts `WORK_DIR` to exact
    `$STATE_DIR/work` or a single non-reserved child under `$INSTALL_DIR`,
    and keeps the SHA-256-verified image cache.
 6. **Pinned, read-only runner binaries & safe update/reinstall/uninstall:**
    downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
    pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
-   extraction. `install`, `update`, `migrate-record`, and `uninstall`
-   serialize overlapping invocations for the same `--config-dir` with an
-   exclusive root-owned `flock` under `/run/.qeminga-runner.locks` (a
-   hidden path outside the service `RuntimeDirectory=` namespace, with
-   explicit collision checks against `--service` and any custom
-   `QEMINGA_LOCK_DIR`) before reading `install.env`. Fresh installs write a
-   durable `RECORD_STATE=user-pending` record with a unique `INSTALL_ID`
-   before `useradd`, stamp `qeminga-runner-<INSTALL_ID>` into the new
-   account's GECOS (verified alongside numeric UID/GID across bootstrap,
-   `install`, `update`, and `uninstall`, so an unrelated or recycled-UID
-   account is never adopted, modified, or purged while legacy records
-   without `INSTALL_ID` remain distinguishable during migration), record
-   each owned path's backing volume fingerprint (`VOL_*`) by resolving the
-   opened `O_PATH` FD's kernel `mnt_id` in `/proc/self/mountinfo` together
-   with its persistent filesystem UUID / `f_fsid` (catching directory
-   overmounts and reusable `/dev/sdX` device names across remounts),
-   enforce mount-bounded and hard-link-safe ownership changes
-   (`fs_ops safe-chown-tree` / `safe-chown-file`, pre-counting in-tree
-   inode links to reject any file hard-linked outside the managed
-   directory, rejecting special files, and applying `os.fchown` directly on
-   still-open verified FDs), publish managed hooks, launchers,
-   `policy.env`, `jitconfig`, `install.env`, and updated units via private
-   sibling temp files and mount-checked `rename(2)` (`fs_ops replace-file`,
-   never opening or truncating an existing destination file), and publish
-   fresh systemd units with `ln -T` so an existing file, mask symlink, or
-   directory destination fails closed. Registration tokens are refused on
-   the command line (`--token` is rejected) and passed solely via the
-   inherited `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls
-   verify all owned resource volumes and check owned directories/unit for
-   active mounts upfront (including refusing absent legacy directories with
-   no recorded `VOL_*`) and inspect existing `.runner` registrations before
-   stopping the service (reusing matching registrations, refusing
-   incompatible ones, and restoring locked permissions + restarting the
-   service if reconfiguration fails). Auto-updates are disabled by default
+   extraction into a private `0700` root-owned sibling staging tree
+   (`.qeminga-extract.*/payload`), where internal archive hard links are
+   materialized into independent `st_nlink == 1` files, special files are
+   refused, `bin/installdependencies.sh` executes FD-pinned relative to
+   the staging descriptor (`./bin/installdependencies.sh`) without reopening
+   pathnames in the live tree, and verified entries are published
+   atomically via `rename(2)` into a volume-verified directory FD.
+   `install`, `update`, `migrate-record`, and `uninstall` serialize
+   overlapping invocations for the same `--config-dir` with an exclusive
+   root-owned `flock` under `/run/.qeminga-runner.locks` (a hidden path
+   outside the service `RuntimeDirectory=` namespace, with explicit
+   collision checks against `--service` and any custom `QEMINGA_LOCK_DIR`)
+   before reading `install.env`. Fresh installs write a durable
+   `RECORD_STATE=user-pending` record with a unique `INSTALL_ID` before
+   `useradd`, stamp `qeminga-runner-<INSTALL_ID>` into the new account's
+   GECOS (verified via strict `getent passwd` lookup alongside numeric
+   UID/GID across bootstrap, `install`, `update`, and `uninstall`, so an
+   unavailable lookup or unrelated/recycled-UID account is never adopted,
+   modified, or purged while legacy records without `INSTALL_ID` remain
+   distinguishable during migration), record each owned path's backing
+   volume fingerprint (`VOL_*`) using unprivileged-verifiable
+   `/proc/self/mountinfo` + `/dev/disk/by-uuid` (never root-only `blkid`)
+   or mount source + kernel `fstatvfs` `f_fsid` (catching directory
+   overmounts and reusable `/dev/sdX` device names while ensuring the
+   unprivileged cleanup hook agrees with the installer), enforce
+   mount-bounded and strict `st_nlink == 1` ownership changes
+   (`fs_ops safe-chown-tree` / `safe-chown-file`, rejecting multiply linked
+   files and special files on both scan and still-open `os.fchown` FDs),
+   render managed hooks, launchers, `policy.env`, `jitconfig`,
+   `install.env`, and updated units completely to private sibling temp
+   files and check producer exit status before finalizing and calling
+   mount-checked `rename(2)` (`fs_ops replace-file`, never piping
+   concurrent producers or opening/truncating an existing destination
+   file), and publish fresh systemd units with `ln -T` so an existing
+   file, mask symlink, or directory destination fails closed. Registration
+   tokens are refused on the command line (`--token` is rejected) and
+   passed solely via the inherited `ACTIONS_RUNNER_INPUT_TOKEN`
+   environment variable. Reinstalls verify all owned resource volumes and
+   check owned directories/unit for active mounts upfront (including
+   refusing absent legacy directories with no recorded `VOL_*`) and
+   inspect existing `.runner` registrations before stopping the service
+   (reusing matching registrations, refusing incompatible ones, and
+   restoring locked permissions + restarting the service if
+   reconfiguration fails). Auto-updates are disabled by default
    (`--disableupdate`) so runner binaries stay kernel-read-only; GitHub
    requires runner updates within 30 days of a new release — update cleanly
    with `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
-   root-owned `install.env` in `installed` state, verifies live numeric
-   UID/GID, `INSTALL_ID` marker, recorded backing volumes, and absence of
-   nested mounts both before download and again right after download before
-   stopping the service, pins deletion of `bin/` + `externals/` and `tar`
-   extraction to a single volume-verified directory FD via `fchdir`, and
-   refuses mismatched flags, or opt in to GitHub self-updates with
-   `--allow-auto-update`). Operators upgrading pre-UUID 4-field `VOL_*`
-   records or pre-marker managed accounts whose record already gained an
-   `INSTALL_ID` can run
+   root-owned `install.env` in `installed` state with non-empty recorded
+   `VOL_INSTALL_DIR` and `VOL_UNIT`, directing legacy empty records to
+   `migrate-record --confirm-volumes` before download or service stop;
+   verifies live numeric UID/GID, `INSTALL_ID` marker, recorded backing
+   volumes, and absence of nested mounts both before and after download;
+   stages and sanitizes the verified archive in a private `0700` sibling
+   before stopping the service and publishing relative to a checked
+   directory FD; and refuses mismatched flags, or opt in to GitHub
+   self-updates with `--allow-auto-update`). Operators upgrading legacy
+   empty/4-field `VOL_*` records or pre-marker managed accounts can run
    `sudo scripts/setup-kvm-runner.sh migrate-record --confirm-volumes`
    and/or `--confirm-account-marker` after confirming the host storage and
-   account (`migrate-record` refuses `user-pending` records, mismatched
-   legacy or strong UUID volumes, absent paths, and any account with
-   non-empty unrelated GECOS, and refreshes `STATE_VOL`/`INSTALL_VOL` in
-   `policy.env`). Remove only resources owned by the recorded installation
-   with
+   account (`migrate-record` refuses `user-pending` records, failed
+   `getent passwd` lookups, mismatched legacy or strong UUID volumes,
+   absent paths, and any non-empty GECOS including comma-separated contact
+   metadata; checks moved `STAGED_*` payloads before vacated public paths
+   during interrupted `partial-uninstall` recovery across all four slots;
+   persists any newly generated `INSTALL_ID` to `install.env` before
+   invoking `usermod` so interrupted attempts stay idempotent on retry;
+   and refreshes `STATE_VOL`/`INSTALL_VOL` in `policy.env`). Remove only
+   resources owned by the recorded installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
    (uninstall shares the same record, numeric UID/GID, `INSTALL_ID` marker,
    volume, and mount checks BEFORE any `runuser`, `chown`, service stop, or

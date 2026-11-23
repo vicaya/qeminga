@@ -691,22 +691,21 @@ cmd_fetch_runner() {
 
 # ---- render-hooks ---------------------------------------------------------
 
-# Atomically publish stdin to a managed file without opening or truncating the
-# destination path: writes to a private 0600 sibling temp file, applies final
-# ownership/mode, and replaces $dest via fs_ops replace-file (checking live
-# kernel mnt_id, mountinfo, non-symlink/regular-file destination, and rename(2)).
-publish_managed_file() {
-    local dest="$1" mode="$2" owner="${3:-}" group="${4:-}"
-    local parent base tmp
+# Create a private 0600 sibling staging path next to $dest (using pure bash
+# path splitting so minimal PATH environments need no external dirname/basename).
+stage_managed_file_path() {
+    local dest="$1" parent base
     base="${dest##*/}"
     parent="${dest%/*}"
     [ -n "$parent" ] || parent="/"
-    tmp="$(umask 0077 && mktemp "${parent}/.${base}.XXXXXX")" \
-        || die "failed to create staging file in '$parent' for '$dest'"
-    if ! cat >"$tmp"; then
-        rm -f "$tmp"
-        die "failed to write staging file for '$dest'"
-    fi
+    umask 0077 && mktemp "${parent}/.${base}.XXXXXX"
+}
+
+# Finalize ownership/mode on an already-complete private staging file $tmp and
+# atomically replace $dest via fs_ops replace-file (checking live kernel mnt_id,
+# mountinfo, non-symlink/regular-file destination, and rename(2)).
+commit_managed_file() {
+    local tmp="$1" dest="$2" mode="$3" owner="${4:-}" group="${5:-}"
     if [ -n "$owner" ] && [ -n "$group" ]; then
         if ! chown -h "${owner}:${group}" "$tmp"; then
             rm -f "$tmp"
@@ -721,6 +720,38 @@ publish_managed_file() {
         rm -f "$tmp"
         die "refusing to overwrite '$dest' (mount point, symlink, or unsafe destination)"
     fi
+}
+
+# Render using a producer command/function directly into a private 0600 sibling
+# staging file, check the producer's exit status BEFORE finalizing ownership,
+# mode, or rename(2), and remove the staging file on any failure so a failed
+# producer can never replace $dest with partial output.
+publish_managed_file_cmd() {
+    local dest="$1" mode="$2" owner="$3" group="$4"
+    shift 4
+    local tmp
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    if ! "$@" >"$tmp"; then
+        rm -f "$tmp"
+        die "failed to render managed file '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" "$mode" "$owner" "$group"
+}
+
+# Atomically publish a materialized heredoc/file from stdin to a managed file
+# without opening or truncating the destination path. Never pipe a concurrent
+# producer into this helper (use publish_managed_file_cmd or stage+commit).
+publish_managed_file() {
+    local dest="$1" mode="$2" owner="${3:-}" group="${4:-}"
+    local tmp
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    if ! cat >"$tmp"; then
+        rm -f "$tmp"
+        die "failed to write staging file for '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" "$mode" "$owner" "$group"
 }
 
 write_policy_file() {
@@ -1288,11 +1319,15 @@ def open_child_dir_same_mount(parent_fd, name, child_abs, mountpoints):
 
 
 def open_images_fd(state_dir, expected_state_vol, entries, mountpoints):
+    if not expected_state_vol:
+        raise OSError(
+            errno.EINVAL,
+            "missing recorded STATE_VOL in policy.env; refusing cleanup (run 'migrate-record --confirm-volumes' or reinstall)",
+        )
     images_root = f"{state_dir.rstrip('/')}/images"
     state_fd = open_chain_opath(state_dir)
     try:
-        if expected_state_vol:
-            verify_parent_volume_matches(state_fd, state_dir, expected_state_vol, entries)
+        verify_parent_volume_matches(state_fd, state_dir, expected_state_vol, entries)
         try:
             return open_child_dir_same_mount(state_fd, "images", images_root, mountpoints)
         except FileNotFoundError:
@@ -1382,14 +1417,20 @@ if op == "scrub-work":
         norm_install = install_dir.rstrip("/") if install_dir else ""
         if parent == norm_state:
             expected_parent_vol = state_vol
+            vol_key = "STATE_VOL"
         elif norm_install and parent == norm_install:
             expected_parent_vol = install_vol
+            vol_key = "INSTALL_VOL"
         else:
             raise OSError(errno.EXDEV, f"unexpected WORK_DIR parent '{parent}'")
+        if not expected_parent_vol:
+            raise OSError(
+                errno.EINVAL,
+                f"missing recorded {vol_key} in policy.env; refusing work cleanup (run 'migrate-record --confirm-volumes' or reinstall)",
+            )
         pfd = open_chain_opath(parent)
         try:
-            if expected_parent_vol:
-                verify_parent_volume_matches(pfd, parent, expected_parent_vol, entries)
+            verify_parent_volume_matches(pfd, parent, expected_parent_vol, entries)
             try:
                 wfd = open_child_dir_same_mount(pfd, base, work_dir, mountpoints)
             except FileNotFoundError:
@@ -1618,8 +1659,13 @@ write_egress_firewall_check() {
         py_allow_cidrs="${py_allow_cidrs}${py_allow_cidrs:+, }\"${ip}\""
     done
 
-    {
-        cat <<'EOF'
+    local tmp
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    if ! {
+        cat <<'EOF' \
+            && printf 'DENY_LAN = %s\nALLOW_CIDRS = [%s]\n' "$py_deny_lan" "$py_allow_cidrs" \
+            && cat <<'EOF2'
 #!/usr/bin/env bash
 # Root-owned egress firewall gate (invoked by run-runner.sh / run-jit.sh as
 # the main service process before exec'ing the runner listener): verifies that
@@ -1646,8 +1692,6 @@ import socket
 import sys
 
 EOF
-        printf 'DENY_LAN = %s\nALLOW_CIDRS = [%s]\n' "$py_deny_lan" "$py_allow_cidrs"
-        cat <<'EOF'
 ALLOW_NETS = [ipaddress.ip_network(c, strict=False) for c in ALLOW_CIDRS]
 
 UNROUTED = {
@@ -1753,14 +1797,21 @@ if DENY_LAN:
 
 print("qeminga-egress-check: PASS (unit cgroup BPF IPAddressDeny= actively blocks sentinel, IMDS, and configured LAN ranges)")
 PY
-EOF
-    } | publish_managed_file "$dest" 0755 "$owner" "$group"
+EOF2
+    } >"$tmp"; then
+        rm -f "$tmp"
+        die "failed to render egress firewall check '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" 0755 "$owner" "$group"
 }
 
 write_runner_launcher() {
     local dest="$1" owner="${2:-}" group="${3:-}"
-    {
-        cat <<EOF
+    local tmp
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    if ! {
+        cat <<EOF && cat <<'EOF2'
 #!/usr/bin/env bash
 # Root-owned main-process runner launcher: verifies this unit's cgroup BPF
 # egress firewall inside the main service process (so exit 78 triggers
@@ -1772,7 +1823,6 @@ set -euo pipefail
 HOOK_DIR="${OPT_HOOK_DIR}"
 INSTALL_DIR="${OPT_INSTALL_DIR}"
 EOF
-        cat <<'EOF'
 "${HOOK_DIR}/check-egress-firewall.sh" || exit 78
 target="${INSTALL_DIR}/bin/runsvc.sh"
 [ -x "$target" ] || { echo "missing executable runner launcher: $target" >&2; exit 1; }
@@ -1789,14 +1839,21 @@ if sock_path:
         s.close()
 os.execv(target, [target])
 ' "$target"
-EOF
-    } | publish_managed_file "$dest" 0755 "$owner" "$group"
+EOF2
+    } >"$tmp"; then
+        rm -f "$tmp"
+        die "failed to render runner launcher '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" 0755 "$owner" "$group"
 }
 
 write_jit_launcher() {
     local dest="$1" owner="${2:-}" group="${3:-}"
-    {
-        cat <<EOF
+    local tmp
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    if ! {
+        cat <<EOF && cat <<'EOF2'
 #!/usr/bin/env bash
 # Root-owned one-shot JIT runner launcher: verifies this unit's cgroup BPF
 # egress firewall inside the main service process (so exit 78 triggers
@@ -1810,7 +1867,6 @@ set -euo pipefail
 HOOK_DIR="${OPT_HOOK_DIR}"
 INSTALL_DIR="${OPT_INSTALL_DIR}"
 EOF
-        cat <<'EOF'
 "${HOOK_DIR}/check-egress-firewall.sh" || exit 78
 cred="${CREDENTIALS_DIRECTORY:?missing CREDENTIALS_DIRECTORY}/jitconfig"
 [ -r "$cred" ] || { echo "missing jitconfig credential" >&2; exit 1; }
@@ -1831,8 +1887,12 @@ if sock_path:
         s.close()
 os.execv(target, [target, "run", "--startuptype", "service"])
 ' "$target"
-EOF
-    } | publish_managed_file "$dest" 0755 "$owner" "$group"
+EOF2
+    } >"$tmp"; then
+        rm -f "$tmp"
+        die "failed to render JIT launcher '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" 0755 "$owner" "$group"
 }
 
 cmd_render_hooks() {
@@ -1846,6 +1906,14 @@ cmd_render_hooks() {
         unset jit_cfg
     fi
     finalize_policy_defaults
+    VOL_STATE_DIR=""
+    VOL_INSTALL_DIR=""
+    if [ -d "$OPT_STATE_DIR" ] && [ ! -L "$OPT_STATE_DIR" ]; then
+        VOL_STATE_DIR="$(fs_ops volume-id "$OPT_STATE_DIR" 2>/dev/null || true)"
+    fi
+    if [ -d "$OPT_INSTALL_DIR" ] && [ ! -L "$OPT_INSTALL_DIR" ]; then
+        VOL_INSTALL_DIR="$(fs_ops volume-id "$OPT_INSTALL_DIR" 2>/dev/null || true)"
+    fi
     mkdir -p "$OPT_OUT"
     local out_dir="$OPT_OUT"
     if [[ "$out_dir" != /* ]]; then
@@ -2311,11 +2379,20 @@ fs_ops() {
     shift
     local py="/usr/bin/python3"
     [ -x "$py" ] || die "/usr/bin/python3 is required for safe filesystem operations"
-    env -i PATH=/usr/bin:/bin HOME=/nonexistent \
-        "QEMINGA_MOUNTINFO=${QEMINGA_MOUNTINFO:-}" \
-        "QEMINGA_FS_UUID_MAP=${QEMINGA_FS_UUID_MAP:-}" \
-        "QEMINGA_TEST_MNT_ID=${QEMINGA_TEST_MNT_ID:-}" \
-        "$py" -I -S - "$op" "$@" <<'PY'
+    local py_cmd=()
+    if [ "$op" = "install-runner-archive" ]; then
+        py_cmd=("$py" -I -S - "$op" "$@")
+    else
+        py_cmd=(
+            env -i PATH=/usr/bin:/bin HOME=/nonexistent
+            "QEMINGA_MOUNTINFO=${QEMINGA_MOUNTINFO:-}"
+            "QEMINGA_FS_UUID_MAP=${QEMINGA_FS_UUID_MAP:-}"
+            "QEMINGA_TEST_MNT_ID=${QEMINGA_TEST_MNT_ID:-}"
+            "QEMINGA_BY_UUID_DIR=${QEMINGA_BY_UUID_DIR:-}"
+            "$py" -I -S - "$op" "$@"
+        )
+    fi
+    "${py_cmd[@]}" <<'PY'
 import errno
 import os
 import re
@@ -2496,7 +2573,11 @@ def resolve_fs_uuid(entry):
     if not stat.S_ISBLK(src_st.st_mode):
         return ""
 
-    by_uuid = "/dev/disk/by-uuid"
+    # Only use /dev/disk/by-uuid (stat-only, available to the unprivileged
+    # cleanup account under DevicePolicy=closed). Never fall back to root-only
+    # raw-device probing so installer and cleanup hook always agree on a strong
+    # identity (falling back to src + kernel fstatvfs f_fsid when absent).
+    by_uuid = os.environ.get("QEMINGA_BY_UUID_DIR") or "/dev/disk/by-uuid"
     try:
         for name in sorted(os.listdir(by_uuid)):
             try:
@@ -2507,21 +2588,6 @@ def resolve_fs_uuid(entry):
                 return name
     except OSError:
         pass
-
-    for blkid in ("/usr/sbin/blkid", "/sbin/blkid"):
-        if os.path.isfile(blkid) and os.access(blkid, os.X_OK):
-            try:
-                res = subprocess.run(
-                    [blkid, "-s", "UUID", "-o", "value", src],
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                val = res.stdout.strip()
-                if res.returncode == 0 and re.fullmatch(r"[A-Za-z0-9._-]+", val):
-                    return val
-            except OSError:
-                pass
     return ""
 
 
@@ -2547,7 +2613,7 @@ def volume_id_of_fd(fd, norm_path, entries):
         if not fsid_hex and entry["source"].startswith("/dev/") and not CUSTOM_MOUNTINFO:
             raise OSError(
                 errno.EINVAL,
-                f"cannot establish persistent filesystem identifier for block device '{entry['source']}' at '{norm_path}'",
+                f"cannot establish service-verifiable persistent filesystem identifier for block device '{entry['source']}' at '{norm_path}'",
             )
         parts.append(f"src:{pct_encode(entry['source'])}")
         if fsid_hex:
@@ -2687,7 +2753,7 @@ def legacy_vol_of_entry(entry):
     )
 
 
-def scan_tree_for_chown(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints, link_counts, max_nlink):
+def scan_tree_for_chown(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints):
     for entry in os.listdir(dir_fd):
         child_path = f"{cur_path}/{entry}"
         est = assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path, mountpoints)
@@ -2697,23 +2763,22 @@ def scan_tree_for_chown(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints, li
                 cst = os.fstat(cfd)
                 if cst.st_dev != root_dev or fd_mnt_id(cfd) != root_mnt_id:
                     raise OSError(errno.EXDEV, f"'{child_path}' crosses mount boundary")
-                scan_tree_for_chown(
-                    cfd, root_dev, root_mnt_id, child_path, mountpoints, link_counts, max_nlink
-                )
+                scan_tree_for_chown(cfd, root_dev, root_mnt_id, child_path, mountpoints)
             finally:
                 os.close(cfd)
         elif stat.S_ISLNK(est.st_mode):
             continue
         elif stat.S_ISREG(est.st_mode):
-            ino_key = (est.st_dev, est.st_ino)
-            link_counts[ino_key] = link_counts.get(ino_key, 0) + 1
-            if est.st_nlink > max_nlink.get(ino_key, 0):
-                max_nlink[ino_key] = est.st_nlink
+            if est.st_nlink != 1:
+                raise OSError(
+                    errno.EMLINK,
+                    f"refusing ownership change on multiply-linked file '{child_path}' (st_nlink={est.st_nlink})",
+                )
         else:
             raise OSError(errno.EINVAL, f"refusing unexpected special file '{child_path}'")
 
 
-def apply_chown_tree(dir_fd, uid, gid, root_dev, root_mnt_id, cur_path, mountpoints, link_counts, apply_chown):
+def apply_chown_tree(dir_fd, uid, gid, root_dev, root_mnt_id, cur_path, mountpoints, apply_chown):
     if apply_chown:
         os.fchown(dir_fd, uid, gid)
     for entry in os.listdir(dir_fd):
@@ -2725,9 +2790,7 @@ def apply_chown_tree(dir_fd, uid, gid, root_dev, root_mnt_id, cur_path, mountpoi
                 cst = os.fstat(cfd)
                 if cst.st_dev != root_dev or fd_mnt_id(cfd) != root_mnt_id:
                     raise OSError(errno.EXDEV, f"'{child_path}' crosses mount boundary")
-                apply_chown_tree(
-                    cfd, uid, gid, root_dev, root_mnt_id, child_path, mountpoints, link_counts, apply_chown
-                )
+                apply_chown_tree(cfd, uid, gid, root_dev, root_mnt_id, child_path, mountpoints, apply_chown)
             finally:
                 os.close(cfd)
         elif stat.S_ISLNK(est.st_mode):
@@ -2740,11 +2803,10 @@ def apply_chown_tree(dir_fd, uid, gid, root_dev, root_mnt_id, cur_path, mountpoi
                     raise OSError(errno.EINVAL, f"'{child_path}' changed file type during chown")
                 if fd_mnt_id(ffd) != root_mnt_id:
                     raise OSError(errno.EXDEV, f"'{child_path}' crosses mount boundary")
-                inside = link_counts.get((fst.st_dev, fst.st_ino), 0)
-                if inside == 0 or fst.st_nlink > inside:
+                if fst.st_nlink != 1:
                     raise OSError(
                         errno.EMLINK,
-                        f"refusing ownership change on '{child_path}': hard links ({fst.st_nlink}) exceed links inside managed tree ({inside})",
+                        f"refusing ownership change on multiply-linked file '{child_path}' (st_nlink={fst.st_nlink})",
                     )
                 if apply_chown:
                     os.fchown(ffd, uid, gid)
@@ -2752,6 +2814,206 @@ def apply_chown_tree(dir_fd, uid, gid, root_dev, root_mnt_id, cur_path, mountpoi
                 os.close(ffd)
         else:
             raise OSError(errno.EINVAL, f"refusing unexpected special file '{child_path}'")
+
+
+def sanitize_staged_tree(dir_fd, root_dev, root_mnt_id, cur_path, apply_root_chown):
+    if apply_root_chown:
+        os.fchown(dir_fd, 0, 0)
+    for entry in os.listdir(dir_fd):
+        child_path = f"{cur_path}/{entry}"
+        efd = os.open(entry, os.O_PATH | os.O_NOFOLLOW, dir_fd=dir_fd)
+        try:
+            est = os.fstat(efd)
+            if fd_mnt_id(efd) != root_mnt_id:
+                raise OSError(errno.EXDEV, f"staged '{child_path}' crosses mount boundary")
+        finally:
+            os.close(efd)
+        if stat.S_ISDIR(est.st_mode):
+            if est.st_dev != root_dev:
+                raise OSError(errno.EXDEV, f"staged '{child_path}' crosses filesystem boundary")
+            cfd = os.open(entry, READ_DIR_FLAGS, dir_fd=dir_fd)
+            try:
+                cst = os.fstat(cfd)
+                if cst.st_dev != root_dev or fd_mnt_id(cfd) != root_mnt_id:
+                    raise OSError(errno.EXDEV, f"staged '{child_path}' crosses mount boundary")
+                sanitize_staged_tree(cfd, root_dev, root_mnt_id, child_path, apply_root_chown)
+            finally:
+                os.close(cfd)
+        elif stat.S_ISLNK(est.st_mode):
+            continue
+        elif stat.S_ISREG(est.st_mode):
+            ffd = os.open(entry, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+            try:
+                fst = os.fstat(ffd)
+                if not stat.S_ISREG(fst.st_mode):
+                    raise OSError(errno.EINVAL, f"staged '{child_path}' changed file type")
+                if fst.st_nlink > 1:
+                    # Break internal archive hard links into independent st_nlink==1 copies
+                    # inside the private 0700 staging tree before publishing.
+                    counter = 0
+                    while True:
+                        cand = f".qeminga-dedup-{os.getpid()}-{fst.st_ino}-{counter}"
+                        try:
+                            nfd = os.open(
+                                cand,
+                                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                0o600,
+                                dir_fd=dir_fd,
+                            )
+                            break
+                        except FileExistsError:
+                            counter += 1
+                    try:
+                        while True:
+                            chunk = os.read(ffd, 65536)
+                            if not chunk:
+                                break
+                            view = memoryview(chunk)
+                            while view:
+                                written = os.write(nfd, view)
+                                view = view[written:]
+                        os.fchmod(nfd, fst.st_mode & 0o7777)
+                        if apply_root_chown:
+                            os.fchown(nfd, 0, 0)
+                    except Exception:
+                        os.close(nfd)
+                        try:
+                            os.unlink(cand, dir_fd=dir_fd)
+                        except OSError:
+                            pass
+                        raise
+                    os.close(nfd)
+                    os.rename(cand, entry, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                elif apply_root_chown:
+                    os.fchown(ffd, 0, 0)
+            finally:
+                os.close(ffd)
+        else:
+            raise OSError(errno.EINVAL, f"refusing unexpected special file '{child_path}' in archive")
+
+
+RESERVED_LIVE_RUNNER_ENTRIES = {
+    ".runner",
+    ".credentials",
+    ".credentials_rsaparams",
+    ".path",
+    ".env",
+    "_diag",
+    "_work",
+}
+
+
+def extract_tarball_into_stage(tfd, sfd, sst, s_mnt, stage_dir):
+    # Extract into a nested `payload` dir so an archive's `.` entry
+    # can never alter the enclosing private 0700 stage_dir mode.
+    os.mkdir("payload", 0o700, dir_fd=sfd)
+    p_sfd = os.open("payload", READ_DIR_FLAGS, dir_fd=sfd)
+    try:
+        os.fchdir(p_sfd)
+        tar_bin = "/usr/bin/tar" if os.path.isfile("/usr/bin/tar") else "/bin/tar"
+        tar_env = {"PATH": "/usr/bin:/bin", "HOME": "/nonexistent"}
+        res = subprocess.run([tar_bin, "--no-same-owner", "-xz"], stdin=tfd, env=tar_env, check=False)
+        if res.returncode != 0:
+            raise OSError(errno.EIO, f"tar extraction exited with status {res.returncode}")
+        pst_sub = os.fstat(p_sfd)
+        if pst_sub.st_dev != sst.st_dev or fd_mnt_id(p_sfd) != s_mnt:
+            raise OSError(errno.EXDEV, f"staging payload '{stage_dir}/payload' crosses mount boundary")
+        sanitize_staged_tree(p_sfd, sst.st_dev, s_mnt, f"{stage_dir}/payload", os.geteuid() == 0)
+        if (os.fstat(sfd).st_mode & 0o777) != 0o700:
+            raise OSError(errno.EACCES, f"staging dir '{stage_dir}' mode changed during extraction")
+        return p_sfd
+    except Exception:
+        os.close(p_sfd)
+        raise
+
+
+def run_staged_installdependencies(p_sfd, sfd, sst, s_mnt, stage_dir):
+    if (os.fstat(sfd).st_mode & 0o777) != 0o700 or os.fstat(sfd).st_uid != os.geteuid():
+        raise OSError(errno.EACCES, f"staging dir '{stage_dir}' permissions changed before dependency setup")
+    try:
+        bfd = os.open("bin", READ_DIR_FLAGS, dir_fd=p_sfd)
+    except FileNotFoundError:
+        return
+    try:
+        bst = os.fstat(bfd)
+        if bst.st_dev != sst.st_dev or fd_mnt_id(bfd) != s_mnt:
+            raise OSError(errno.EXDEV, f"staging dir '{stage_dir}/payload/bin' crosses mount boundary")
+        try:
+            dfd = os.open("installdependencies.sh", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=bfd)
+        except FileNotFoundError:
+            return
+        try:
+            dst = os.fstat(dfd)
+            if not stat.S_ISREG(dst.st_mode):
+                raise OSError(errno.EINVAL, "staged bin/installdependencies.sh is not a regular file")
+            if fd_mnt_id(dfd) != s_mnt or dst.st_nlink != 1:
+                raise OSError(errno.EINVAL, "staged bin/installdependencies.sh failed safety checks")
+            if (dst.st_mode & 0o111) == 0:
+                return
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(bfd)
+    # cwd is pinned directly to the open, verified p_sfd directory descriptor so
+    # ./bin/installdependencies.sh executes strictly from the verified archive
+    # without reopening any pathname above the staging container.
+    os.fchdir(p_sfd)
+    sys.stdout.write("== installing actions/runner runtime dependencies\n")
+    sys.stdout.flush()
+    res = subprocess.run(
+        ["./bin/installdependencies.sh"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        close_fds=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise OSError(errno.EIO, f"installdependencies.sh exited with status {res.returncode}")
+    sanitize_staged_tree(p_sfd, sst.st_dev, s_mnt, f"{stage_dir}/payload", os.geteuid() == 0)
+    if (os.fstat(sfd).st_mode & 0o777) != 0o700:
+        raise OSError(errno.EACCES, f"staging dir '{stage_dir}' mode changed during dependency setup")
+
+
+def publish_staged_payload(rfd, rst, r_mnt, target, p_sfd, mountpoints):
+    staged_names = sorted(os.listdir(p_sfd))
+    for name in staged_names:
+        if name in RESERVED_LIVE_RUNNER_ENTRIES:
+            raise OSError(
+                errno.EINVAL,
+                f"refusing runner archive overwriting reserved live state entry '{name}'",
+            )
+    to_check = set(staged_names) | {"bin", "externals"}
+    for sub in sorted(to_check):
+        sub_path = f"{target}/{sub}"
+        try:
+            est = assert_entry_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(est.st_mode):
+            scan_dir_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
+    for sub in ("bin", "externals"):
+        sub_path = f"{target}/{sub}"
+        try:
+            est = assert_entry_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
+        except FileNotFoundError:
+            continue
+        if stat.S_ISDIR(est.st_mode):
+            rmtree_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
+        else:
+            os.unlink(sub, dir_fd=rfd)
+    for name in staged_names:
+        dst_path = f"{target}/{name}"
+        sst_entry = os.lstat(name, dir_fd=p_sfd)
+        try:
+            est = assert_entry_same_mount(rfd, name, rst.st_dev, r_mnt, dst_path, mountpoints)
+        except FileNotFoundError:
+            est = None
+        if est is not None:
+            if stat.S_ISDIR(est.st_mode):
+                rmtree_same_mount(rfd, name, rst.st_dev, r_mnt, dst_path, mountpoints)
+            elif stat.S_ISDIR(sst_entry.st_mode):
+                os.unlink(name, dir_fd=rfd)
+        os.rename(name, name, src_dir_fd=p_sfd, dst_dir_fd=rfd)
 
 
 op = sys.argv[1]
@@ -2913,19 +3175,34 @@ try:
             os.rename(src_base, dst_base, src_dir_fd=pfd, dst_dir_fd=pfd)
         finally:
             os.close(pfd)
-    elif op == "extract-runner-update":
+    elif op == "install-runner-archive":
         target = norm_abs(sys.argv[2])
         expected_vol = sys.argv[3]
         tarball = norm_abs(sys.argv[4])
+        stage_dir = norm_abs(sys.argv[5])
+        run_deps = sys.argv[6] == "1"
+        if not expected_vol:
+            raise OSError(
+                errno.EINVAL,
+                f"refusing to install runner archive into '{target}' without a recorded backing volume fingerprint",
+            )
+        parent = os.path.dirname(target) or "/"
+        base = os.path.basename(target)
+        stage_parent = os.path.dirname(stage_dir) or "/"
+        stage_base = os.path.basename(stage_dir)
+        if stage_parent != parent or stage_base == base:
+            raise OSError(
+                errno.EINVAL,
+                f"stage directory '{stage_dir}' must be a sibling of runner directory '{target}'",
+            )
         entries = parse_mountinfo()
         mountpoints = visible_mountpoints(entries)
         assert_no_mount_at_or_under(target, mountpoints)
+        assert_no_mount_at_or_under(stage_dir, mountpoints)
         tfd = os.open(tarball, os.O_RDONLY | os.O_NOFOLLOW)
         try:
             if not stat.S_ISREG(os.fstat(tfd).st_mode):
                 raise OSError(errno.EINVAL, f"runner archive '{tarball}' is not a regular file")
-            parent = os.path.dirname(target) or "/"
-            base = os.path.basename(target)
             pfd = open_chain_opath(parent)
             try:
                 pst = os.fstat(pfd)
@@ -2936,42 +3213,197 @@ try:
                     r_mnt = fd_mnt_id(rfd)
                     if rst.st_dev != pst.st_dev or r_mnt != p_mnt:
                         raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
-                    if expected_vol:
-                        actual = volume_id_of_fd(rfd, target, entries)
-                        if actual != expected_vol:
-                            raise OSError(
-                                errno.EXDEV,
-                                f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual}'",
-                            )
-                    for sub in ("bin", "externals"):
-                        sub_path = f"{target}/{sub}"
-                        try:
-                            est = assert_entry_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
-                        except FileNotFoundError:
-                            continue
-                        if stat.S_ISDIR(est.st_mode):
-                            scan_dir_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
-                    for sub in ("bin", "externals"):
-                        sub_path = f"{target}/{sub}"
-                        try:
-                            est = assert_entry_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
-                        except FileNotFoundError:
-                            continue
-                        if stat.S_ISDIR(est.st_mode):
-                            rmtree_same_mount(rfd, sub, rst.st_dev, r_mnt, sub_path, mountpoints)
-                        else:
-                            os.unlink(sub, dir_fd=rfd)
-                    os.fchdir(rfd)
-                    tar_bin = "/usr/bin/tar" if os.path.isfile("/usr/bin/tar") else "/bin/tar"
-                    res = subprocess.run([tar_bin, "--no-same-owner", "-xz"], stdin=tfd, check=False)
-                    if res.returncode != 0:
-                        raise OSError(errno.EIO, f"tar extraction exited with status {res.returncode}")
+                    actual = volume_id_of_fd(rfd, target, entries)
+                    if actual != expected_vol:
+                        raise OSError(
+                            errno.EXDEV,
+                            f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual}'",
+                        )
                 finally:
                     os.close(rfd)
+                sfd = os.open(stage_base, READ_DIR_FLAGS, dir_fd=pfd)
+                try:
+                    sst = os.fstat(sfd)
+                    s_mnt = fd_mnt_id(sfd)
+                    if sst.st_dev != pst.st_dev or s_mnt != p_mnt:
+                        raise OSError(errno.EXDEV, f"staging dir '{stage_dir}' crosses mount boundary")
+                    if sst.st_uid != os.geteuid() or (sst.st_mode & 0o777) != 0o700:
+                        raise OSError(
+                            errno.EACCES,
+                            f"staging dir '{stage_dir}' must be owned by current user with mode 0700",
+                        )
+                    if os.listdir(sfd):
+                        raise OSError(errno.ENOTEMPTY, f"staging dir '{stage_dir}' is not empty")
+                    p_sfd = extract_tarball_into_stage(tfd, sfd, sst, s_mnt, stage_dir)
+                    try:
+                        if run_deps:
+                            run_staged_installdependencies(p_sfd, sfd, sst, s_mnt, stage_dir)
+                        entries_pub = parse_mountinfo()
+                        mountpoints_pub = visible_mountpoints(entries_pub)
+                        assert_no_mount_at_or_under(target, mountpoints_pub)
+                        assert_no_mount_at_or_under(stage_dir, mountpoints_pub)
+                        if os.listdir(sfd) != ["payload"]:
+                            raise OSError(errno.EINVAL, f"staging dir '{stage_dir}' has unexpected entries")
+                        rfd_pub = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
+                        try:
+                            rst_pub = os.fstat(rfd_pub)
+                            r_mnt_pub = fd_mnt_id(rfd_pub)
+                            if rst_pub.st_dev != pst.st_dev or r_mnt_pub != p_mnt:
+                                raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
+                            actual_pub = volume_id_of_fd(rfd_pub, target, entries_pub)
+                            if actual_pub != expected_vol:
+                                raise OSError(
+                                    errno.EXDEV,
+                                    f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual_pub}'",
+                                )
+                            if sst.st_dev != rst_pub.st_dev or s_mnt != r_mnt_pub:
+                                raise OSError(errno.EXDEV, f"staging dir '{stage_dir}' is not on same mount as '{target}'")
+                            publish_staged_payload(rfd_pub, rst_pub, r_mnt_pub, target, p_sfd, mountpoints_pub)
+                        finally:
+                            os.close(rfd_pub)
+                    finally:
+                        os.close(p_sfd)
+                    os.rmdir("payload", dir_fd=sfd)
+                finally:
+                    os.close(sfd)
+                os.rmdir(stage_base, dir_fd=pfd)
             finally:
                 os.close(pfd)
         finally:
             os.close(tfd)
+    elif op == "stage-runner-archive":
+        target = norm_abs(sys.argv[2])
+        expected_vol = sys.argv[3]
+        tarball = norm_abs(sys.argv[4])
+        stage_dir = norm_abs(sys.argv[5])
+        if not expected_vol:
+            raise OSError(
+                errno.EINVAL,
+                f"refusing to stage runner archive for '{target}' without a recorded backing volume fingerprint",
+            )
+        parent = os.path.dirname(target) or "/"
+        base = os.path.basename(target)
+        stage_parent = os.path.dirname(stage_dir) or "/"
+        stage_base = os.path.basename(stage_dir)
+        if stage_parent != parent or stage_base == base:
+            raise OSError(
+                errno.EINVAL,
+                f"stage directory '{stage_dir}' must be a sibling of runner directory '{target}'",
+            )
+        entries = parse_mountinfo()
+        mountpoints = visible_mountpoints(entries)
+        assert_no_mount_at_or_under(target, mountpoints)
+        assert_no_mount_at_or_under(stage_dir, mountpoints)
+        tfd = os.open(tarball, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            if not stat.S_ISREG(os.fstat(tfd).st_mode):
+                raise OSError(errno.EINVAL, f"runner archive '{tarball}' is not a regular file")
+            pfd = open_chain_opath(parent)
+            try:
+                pst = os.fstat(pfd)
+                p_mnt = fd_mnt_id(pfd)
+                rfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
+                try:
+                    rst = os.fstat(rfd)
+                    r_mnt = fd_mnt_id(rfd)
+                    if rst.st_dev != pst.st_dev or r_mnt != p_mnt:
+                        raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
+                    actual = volume_id_of_fd(rfd, target, entries)
+                    if actual != expected_vol:
+                        raise OSError(
+                            errno.EXDEV,
+                            f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual}'",
+                        )
+                finally:
+                    os.close(rfd)
+                sfd = os.open(stage_base, READ_DIR_FLAGS, dir_fd=pfd)
+                try:
+                    sst = os.fstat(sfd)
+                    s_mnt = fd_mnt_id(sfd)
+                    if sst.st_dev != pst.st_dev or s_mnt != p_mnt:
+                        raise OSError(errno.EXDEV, f"staging dir '{stage_dir}' crosses mount boundary")
+                    if sst.st_uid != os.geteuid() or (sst.st_mode & 0o777) != 0o700:
+                        raise OSError(
+                            errno.EACCES,
+                            f"staging dir '{stage_dir}' must be owned by current user with mode 0700",
+                        )
+                    if os.listdir(sfd):
+                        raise OSError(errno.ENOTEMPTY, f"staging dir '{stage_dir}' is not empty")
+                    p_sfd = extract_tarball_into_stage(tfd, sfd, sst, s_mnt, stage_dir)
+                    os.close(p_sfd)
+                finally:
+                    os.close(sfd)
+            finally:
+                os.close(pfd)
+        finally:
+            os.close(tfd)
+    elif op == "publish-runner-stage":
+        target = norm_abs(sys.argv[2])
+        expected_vol = sys.argv[3]
+        stage_dir = norm_abs(sys.argv[4])
+        if not expected_vol:
+            raise OSError(
+                errno.EINVAL,
+                f"refusing to publish staged runner payload into '{target}' without a recorded backing volume fingerprint",
+            )
+        parent = os.path.dirname(target) or "/"
+        base = os.path.basename(target)
+        stage_parent = os.path.dirname(stage_dir) or "/"
+        stage_base = os.path.basename(stage_dir)
+        if stage_parent != parent or stage_base == base:
+            raise OSError(
+                errno.EINVAL,
+                f"stage directory '{stage_dir}' must be a sibling of runner directory '{target}'",
+            )
+        entries = parse_mountinfo()
+        mountpoints = visible_mountpoints(entries)
+        assert_no_mount_at_or_under(target, mountpoints)
+        assert_no_mount_at_or_under(stage_dir, mountpoints)
+        pfd = open_chain_opath(parent)
+        try:
+            pst = os.fstat(pfd)
+            p_mnt = fd_mnt_id(pfd)
+            rfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
+            try:
+                rst = os.fstat(rfd)
+                r_mnt = fd_mnt_id(rfd)
+                if rst.st_dev != pst.st_dev or r_mnt != p_mnt:
+                    raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
+                actual = volume_id_of_fd(rfd, target, entries)
+                if actual != expected_vol:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual}'",
+                    )
+                sfd = os.open(stage_base, READ_DIR_FLAGS, dir_fd=pfd)
+                try:
+                    sst = os.fstat(sfd)
+                    s_mnt = fd_mnt_id(sfd)
+                    if sst.st_dev != rst.st_dev or s_mnt != r_mnt:
+                        raise OSError(errno.EXDEV, f"staging dir '{stage_dir}' is not on same mount as '{target}'")
+                    if sst.st_uid != os.geteuid() or (sst.st_mode & 0o777) != 0o700:
+                        raise OSError(
+                            errno.EACCES,
+                            f"staging dir '{stage_dir}' must be owned by current user with mode 0700",
+                        )
+                    if os.listdir(sfd) != ["payload"]:
+                        raise OSError(errno.EINVAL, f"staging dir '{stage_dir}' has unexpected entries")
+                    p_sfd = os.open("payload", READ_DIR_FLAGS, dir_fd=sfd)
+                    try:
+                        p_sst = os.fstat(p_sfd)
+                        if p_sst.st_dev != rst.st_dev or fd_mnt_id(p_sfd) != r_mnt:
+                            raise OSError(errno.EXDEV, f"staging payload '{stage_dir}/payload' is not on same mount as '{target}'")
+                        publish_staged_payload(rfd, rst, r_mnt, target, p_sfd, mountpoints)
+                    finally:
+                        os.close(p_sfd)
+                    os.rmdir("payload", dir_fd=sfd)
+                finally:
+                    os.close(sfd)
+                os.rmdir(stage_base, dir_fd=pfd)
+            finally:
+                os.close(rfd)
+        finally:
+            os.close(pfd)
     elif op == "safe-chown-tree":
         target = norm_abs(sys.argv[2])
         uid = int(sys.argv[3])
@@ -2999,20 +3431,9 @@ try:
                             errno.EXDEV,
                             f"backing volume mismatch for '{target}': expected '{expected_vol}', found '{actual}'",
                         )
-                link_counts = {}
-                max_nlink = {}
-                scan_tree_for_chown(rfd, rst.st_dev, r_mnt, target, mountpoints, link_counts, max_nlink)
-                for ino_key, observed_nlink in max_nlink.items():
-                    inside = link_counts.get(ino_key, 0)
-                    if observed_nlink > inside:
-                        raise OSError(
-                            errno.EMLINK,
-                            f"refusing ownership change on '{target}': inode {ino_key[1]} has {observed_nlink} hard links but only {inside} inside '{target}'",
-                        )
+                scan_tree_for_chown(rfd, rst.st_dev, r_mnt, target, mountpoints)
                 apply_chown = os.geteuid() == 0
-                apply_chown_tree(
-                    rfd, uid, gid, rst.st_dev, r_mnt, target, mountpoints, link_counts, apply_chown
-                )
+                apply_chown_tree(rfd, uid, gid, rst.st_dev, r_mnt, target, mountpoints, apply_chown)
             finally:
                 os.close(rfd)
         finally:
@@ -3651,11 +4072,20 @@ EOF
 }
 
 write_migrated_record() {
-    local dest="$1"
+    local dest="$1" tmp
     check_trusted_parent_dir "$dest"
     [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
-    {
-        cat <<EOF
+    tmp="$(stage_managed_file_path "$dest")" \
+        || die "failed to create staging file for '$dest'"
+    local staged_block=""
+    if [ "$REC_STATE" = "partial-uninstall" ]; then
+        staged_block="STAGED_UNIT=${REC_STAGED_UNIT}
+STAGED_INSTALL_DIR=${REC_STAGED_INSTALL_DIR}
+STAGED_HOOK_DIR=${REC_STAGED_HOOK_DIR}
+STAGED_STATE_DIR=${REC_STAGED_STATE_DIR}
+"
+    fi
+    if ! cat >"$tmp" <<EOF
 # Managed by scripts/setup-kvm-runner.sh — root-owned installation record.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
 RECORD_SCHEMA=1
@@ -3682,22 +4112,16 @@ OWNED_STATE_DIR=${REC_OWNED_STATE_DIR}
 OWNED_INSTALL_DIR=${REC_OWNED_INSTALL_DIR}
 OWNED_HOOK_DIR=${REC_OWNED_HOOK_DIR}
 OWNED_UNIT=${REC_OWNED_UNIT}
-EOF
-        if [ "$REC_STATE" = "partial-uninstall" ]; then
-            cat <<EOF
-STAGED_UNIT=${REC_STAGED_UNIT}
-STAGED_INSTALL_DIR=${REC_STAGED_INSTALL_DIR}
-STAGED_HOOK_DIR=${REC_STAGED_HOOK_DIR}
-STAGED_STATE_DIR=${REC_STAGED_STATE_DIR}
-EOF
-        fi
-        cat <<EOF
-VOL_UNIT=${REC_VOL_UNIT}
+${staged_block}VOL_UNIT=${REC_VOL_UNIT}
 VOL_INSTALL_DIR=${REC_VOL_INSTALL_DIR}
 VOL_HOOK_DIR=${REC_VOL_HOOK_DIR}
 VOL_STATE_DIR=${REC_VOL_STATE_DIR}
 EOF
-    } | publish_managed_file "$dest" 0600 root root
+    then
+        rm -f "$tmp"
+        die "failed to write installation record '$dest'"
+    fi
+    commit_managed_file "$tmp" "$dest" 0600 root root
 }
 
 update_policy_volumes() {
@@ -3705,18 +4129,17 @@ update_policy_volumes() {
     [ -e "$policy_path" ] || [ -L "$policy_path" ] || return 0
     [ ! -L "$policy_path" ] || die "refusing symlinked policy file '$policy_path'"
     [ -f "$policy_path" ] || die "refusing non-regular policy file '$policy_path'"
-    local updated_body
-    updated_body="$(awk -v sv="$state_vol" -v iv="$install_vol" '
-        BEGIN { seen_s = 0; seen_i = 0 }
-        /^STATE_VOL=/ { print "STATE_VOL=" sv; seen_s = 1; next }
-        /^INSTALL_VOL=/ { print "INSTALL_VOL=" iv; seen_i = 1; next }
-        { print }
-        END {
-            if (!seen_s) print "STATE_VOL=" sv
-            if (!seen_i) print "INSTALL_VOL=" iv
-        }
-    ' "$policy_path")" || die "failed to update volume fields in '$policy_path'"
-    printf '%s\n' "$updated_body" | publish_managed_file "$policy_path" 0640 root "$OPT_USER"
+    publish_managed_file_cmd "$policy_path" 0640 root "$OPT_USER" \
+        awk -v sv="$state_vol" -v iv="$install_vol" '
+            BEGIN { seen_s = 0; seen_i = 0 }
+            /^STATE_VOL=/ { print "STATE_VOL=" sv; seen_s = 1; next }
+            /^INSTALL_VOL=/ { print "INSTALL_VOL=" iv; seen_i = 1; next }
+            { print }
+            END {
+                if (!seen_s) print "STATE_VOL=" sv
+                if (!seen_i) print "INSTALL_VOL=" iv
+            }
+        ' "$policy_path"
 }
 
 write_user_only_record() {
@@ -3776,20 +4199,49 @@ EOF
     fi
 }
 
+# Strictly query the passwd database for <user>, verifying getent exit status,
+# exact 7 colon-delimited fields, matching username, and optional numeric
+# UID/GID match. Prints the complete untrimmed 5th (GECOS) field on stdout;
+# returns non-zero on lookup failure or malformed entry so callers never
+# confuse a failed lookup with an empty legacy GECOS.
+lookup_passwd_gecos_strict() {
+    local user="$1" expect_uid="${2:-}" expect_gid="${3:-}"
+    local passwd_line colons
+    passwd_line="$(getent passwd "$user" 2>/dev/null)" || return 1
+    [ -n "$passwd_line" ] || return 1
+    case "$passwd_line" in
+        *$'\n'*) return 1 ;;
+    esac
+    colons="${passwd_line//[^:]/}"
+    [ "${#colons}" -eq 6 ] || return 1
+    local p_name p_uid p_gid p_gecos _
+    IFS=':' read -r p_name _ p_uid p_gid p_gecos _ _ <<<"$passwd_line"
+    [ "$p_name" = "$user" ] || return 1
+    [[ "$p_uid" =~ ^[0-9]+$ ]] && [[ "$p_gid" =~ ^[0-9]+$ ]] || return 1
+    if [ -n "$expect_uid" ] && [ "$p_uid" != "$expect_uid" ]; then
+        return 1
+    fi
+    if [ -n "$expect_gid" ] && [ "$p_gid" != "$expect_gid" ]; then
+        return 1
+    fi
+    printf '%s' "$p_gecos"
+}
+
 # Verify the live account's GECOS carries qeminga-runner-<REC_INSTALL_ID>.
 # Leaves install.env intact on mismatch so an operator can inspect safely.
 verify_user_install_marker() {
     local mode="$1" label="${2:-service user}"
-    local expected_marker passwd_line gecos hint=""
+    local expected_marker full_gecos primary_gecos hint=""
     expected_marker="qeminga-runner-${REC_INSTALL_ID}"
-    passwd_line="$(getent passwd "$OPT_USER" 2>/dev/null || true)"
-    gecos="$(printf '%s\n' "$passwd_line" | awk -F: 'NR==1 { print $5 }')"
-    gecos="${gecos%%,*}"
-    if [ "$gecos" != "$expected_marker" ]; then
-        if [ -z "$gecos" ] && [ "${REC_STATE:-}" != "user-pending" ]; then
+    if ! full_gecos="$(lookup_passwd_gecos_strict "$OPT_USER" "${REC_USER_UID:-}" "${REC_USER_GID:-}")"; then
+        die "${mode}: failed to look up passwd entry for ${label} '$OPT_USER' while verifying installation marker '${expected_marker}'; refusing to adopt, modify, or delete an unverified account (leaving $OPT_CONFIG_DIR/install.env intact for manual inspection)"
+    fi
+    primary_gecos="${full_gecos%%,*}"
+    if [ "$primary_gecos" != "$expected_marker" ]; then
+        if [ -z "$full_gecos" ] && [ "${REC_STATE:-}" != "user-pending" ]; then
             hint=" (if this is a pre-marker managed account from an earlier upgrade, verify it and run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-account-marker')"
         fi
-        die "${mode}: ${label} '$OPT_USER' does not carry installation marker '${expected_marker}' (found '${gecos:-<empty>}'); refusing to adopt, modify, or delete an unverified account (leaving $OPT_CONFIG_DIR/install.env intact for manual inspection)${hint}"
+        die "${mode}: ${label} '$OPT_USER' does not carry installation marker '${expected_marker}' (found '${full_gecos:-<empty>}'); refusing to adopt, modify, or delete an unverified account (leaving $OPT_CONFIG_DIR/install.env intact for manual inspection)${hint}"
     fi
 }
 
@@ -3937,8 +4389,13 @@ _INSTALL_BOOTSTRAP_DIR=""
 _INSTALL_BOOTSTRAP_UNIT=""
 _INSTALL_BOOTSTRAP_USER=""
 _INSTALL_BOOTSTRAP_TARBALL=""
+_INSTALL_BOOTSTRAP_STAGE=""
 
 cleanup_install_exit() {
+    if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
+        fs_ops safe-rmtree "$_INSTALL_BOOTSTRAP_STAGE" 2>/dev/null || true
+        _INSTALL_BOOTSTRAP_STAGE=""
+    fi
     if [ -n "${_INSTALL_BOOTSTRAP_TARBALL:-}" ]; then
         rm -f "$_INSTALL_BOOTSTRAP_TARBALL"
         _INSTALL_BOOTSTRAP_TARBALL=""
@@ -4549,6 +5006,7 @@ cmd_install() {
     _INSTALL_BOOTSTRAP_UNIT=""
     _INSTALL_BOOTSTRAP_USER=""
     _INSTALL_BOOTSTRAP_TARBALL=""
+    _INSTALL_BOOTSTRAP_STAGE=""
     trap 'cleanup_install_exit' EXIT
     if [ "$OWNED_CONFIG_DIR" -ne 1 ]; then
         reserve_fresh_dir config "$OPT_CONFIG_DIR"
@@ -4568,8 +5026,11 @@ cmd_install() {
     claim_managed_dir state OWNED_STATE_DIR "$OPT_STATE_DIR" 0700 "$OPT_USER" "$OPT_USER" "$runner_name"
     init_state_subdirs
 
-    # Download, SHA-256 verify, and extract actions/runner.
-    local tarball fetch_args=()
+    # Download, SHA-256 verify, and extract actions/runner into a private 0700
+    # root-owned sibling staging directory so installdependencies.sh executes
+    # strictly from verified root-private content before publishing into the
+    # volume-verified runner directory.
+    local tarball stage_dir fetch_args=()
     tarball="$(mktemp /tmp/qeminga-actions-runner.XXXXXX.tar.gz)"
     _INSTALL_BOOTSTRAP_TARBALL="$tarball"
     fetch_args=(--arch "$arch" --dest "$tarball" --version "$OPT_RUNNER_VERSION")
@@ -4578,15 +5039,18 @@ cmd_install() {
     cmd_fetch_runner "${fetch_args[@]}"
 
     claim_managed_dir runner OWNED_INSTALL_DIR "$OPT_INSTALL_DIR" 0755 root root "$runner_name"
-    fs_ops extract-runner-update "$OPT_INSTALL_DIR" "$VOL_INSTALL_DIR" "$tarball" \
-        || die "failed to extract verified actions/runner archive into '$OPT_INSTALL_DIR'"
+    stage_dir="$(umask 0077 && mktemp -d "$(dirname "$OPT_INSTALL_DIR")/.qeminga-extract.XXXXXX")" \
+        || die "failed to create private staging directory beside '$OPT_INSTALL_DIR'"
+    _INSTALL_BOOTSTRAP_STAGE="$stage_dir"
+    chown -h root:root "$stage_dir"
+    chmod 0700 "$stage_dir"
+    local run_deps=0
+    [ "$OPT_SKIP_PACKAGES" -eq 0 ] && run_deps=1
+    fs_ops install-runner-archive "$OPT_INSTALL_DIR" "$VOL_INSTALL_DIR" "$tarball" "$stage_dir" "$run_deps" \
+        || die "failed to stage, configure dependencies, and publish verified actions/runner archive into '$OPT_INSTALL_DIR'"
     rm -f "$tarball"
     _INSTALL_BOOTSTRAP_TARBALL=""
-
-    if [ "$OPT_SKIP_PACKAGES" -eq 0 ] && [ -x "$OPT_INSTALL_DIR/bin/installdependencies.sh" ]; then
-        say "installing actions/runner runtime dependencies"
-        "$OPT_INSTALL_DIR/bin/installdependencies.sh" >/dev/null 9>&-
-    fi
+    _INSTALL_BOOTSTRAP_STAGE=""
 
     # Install root-owned hooks, egress firewall gate, main-process launcher, and policy.
     say "installing root-owned job guard, egress check, launcher, and cleanup hooks"
@@ -4602,7 +5066,7 @@ cmd_install() {
         say "installing one-shot JIT config credential (workspace: ${RESOLVED_WORK_DIR})"
         fs_ops safe-rmtree "$OPT_HOOK_DIR/run-runner.sh"
         write_jit_launcher "$OPT_HOOK_DIR/run-jit.sh" root root
-        printf '%s\n' "$jit_config" | publish_managed_file "$OPT_CONFIG_DIR/jitconfig" 0600 root root
+        publish_managed_file_cmd "$OPT_CONFIG_DIR/jitconfig" 0600 root root printf '%s\n' "$jit_config"
         unset jit_config
     else
         fs_ops safe-rmtree "$OPT_HOOK_DIR/run-jit.sh"
@@ -4750,6 +5214,20 @@ cmd_status() {
 
 # ---- update ---------------------------------------------------------------
 
+_UPDATE_TMP_TARBALL=""
+_UPDATE_TMP_STAGE=""
+
+cleanup_update_exit() {
+    if [ -n "${_UPDATE_TMP_STAGE:-}" ]; then
+        fs_ops safe-rmtree "$_UPDATE_TMP_STAGE" 2>/dev/null || true
+        _UPDATE_TMP_STAGE=""
+    fi
+    if [ -n "${_UPDATE_TMP_TARBALL:-}" ]; then
+        rm -f "$_UPDATE_TMP_TARBALL"
+        _UPDATE_TMP_TARBALL=""
+    fi
+}
+
 cmd_update() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "update must run as root"
@@ -4761,6 +5239,8 @@ cmd_update() {
 
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR does not exist"
+    [ -n "${REC_VOL_INSTALL_DIR:-}" ] \
+        || die "update: installation record '$OPT_CONFIG_DIR/install.env' is missing VOL_INSTALL_DIR; verify the runner directory and run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' before updating"
     verify_resource_volume install "runner directory" "$OPT_INSTALL_DIR"
     fs_ops check-no-mounts "$OPT_INSTALL_DIR" \
         || die "refusing to update runner directory '$OPT_INSTALL_DIR' containing an active mount or bind mount"
@@ -4770,22 +5250,26 @@ cmd_update() {
         unit_dir="${unit_dir%/}"
         check_abs_path "systemd unit dir" "$unit_dir"
         unit_path="${unit_dir}/${OPT_SERVICE}.service"
+        [ -n "${REC_VOL_UNIT:-}" ] \
+            || die "update: installation record '$OPT_CONFIG_DIR/install.env' is missing VOL_UNIT; verify the systemd unit and run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' before updating"
         verify_resource_volume unit "systemd unit" "$unit_path"
     fi
     local arch
     arch="$(normalize_arch "$(uname -m)")"
 
-    local tarball fetch_args=()
+    local tarball stage_dir fetch_args=()
     tarball="$(mktemp /tmp/qeminga-actions-runner-update.XXXXXX.tar.gz)"
-    trap 'rm -f "${tarball:-}"' EXIT
+    _UPDATE_TMP_TARBALL="$tarball"
+    _UPDATE_TMP_STAGE=""
+    trap 'cleanup_update_exit' EXIT
     fetch_args=(--arch "$arch" --dest "$tarball" --version "$OPT_RUNNER_VERSION")
     if [ -n "$OPT_RUNNER_SHA256" ]; then fetch_args+=(--sha256 "$OPT_RUNNER_SHA256"); fi
     if [ -n "$OPT_URL" ]; then fetch_args+=(--url "$OPT_URL"); fi
     cmd_fetch_runner "${fetch_args[@]}"
 
     # Re-verify backing volume and mount invariants AFTER the network download
-    # and BEFORE stopping the live service so an unmount/swap during download
-    # fails closed without touching the service or an underlying replacement tree.
+    # and BEFORE staging or stopping the live service so an unmount/swap during
+    # download fails closed without touching the service or an underlying tree.
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR no longer exists after download"
     verify_resource_volume install "runner directory" "$OPT_INSTALL_DIR"
@@ -4795,6 +5279,19 @@ cmd_update() {
         verify_resource_volume unit "systemd unit" "$unit_path"
     fi
 
+    # Extract and sanitize the verified archive in a private 0700 root-owned
+    # sibling staging directory BEFORE stopping the live service, then publish
+    # atomically relative to the volume-verified runner directory FD.
+    stage_dir="$(umask 0077 && mktemp -d "$(dirname "$OPT_INSTALL_DIR")/.qeminga-extract.XXXXXX")" \
+        || die "failed to create private staging directory beside '$OPT_INSTALL_DIR'"
+    _UPDATE_TMP_STAGE="$stage_dir"
+    chown -h root:root "$stage_dir"
+    chmod 0700 "$stage_dir"
+    fs_ops stage-runner-archive "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$tarball" "$stage_dir" \
+        || die "refusing runner update staging beside '$OPT_INSTALL_DIR' (volume changed, mount boundary, or extraction error)"
+    rm -f "$tarball"
+    _UPDATE_TMP_TARBALL=""
+
     local was_active=0
     if systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
         was_active=1
@@ -4802,12 +5299,9 @@ cmd_update() {
         systemctl stop "${OPT_SERVICE}.service" 9>&-
     fi
 
-    # Open the verified runner directory FD once, confirm REC_VOL_INSTALL_DIR on
-    # that live FD, remove old bin/ and externals/ strictly relative to it, and
-    # fchdir(rfd) before extracting so tar stays pinned to the verified volume.
-    fs_ops extract-runner-update "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$tarball" \
-        || die "refusing runner update extraction in '$OPT_INSTALL_DIR' (volume changed, mount boundary, or extraction error)"
-    rm -f "$tarball"
+    fs_ops publish-runner-stage "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$stage_dir" \
+        || die "refusing runner update publish into '$OPT_INSTALL_DIR' (volume changed, mount boundary, or unsafe destination)"
+    _UPDATE_TMP_STAGE=""
     trap - EXIT
 
     lock_runner_permissions
@@ -4821,17 +5315,44 @@ cmd_update() {
 
 # ---- migrate-record -------------------------------------------------------
 
+# Verify and upgrade one resource slot's recorded volume fingerprint during
+# `migrate-record --confirm-volumes`. Mirrors `reconcile_staged_entry`: when a
+# partial-uninstall record has already moved the managed payload into a private
+# STAGED_* directory (even if interrupted before persisting OWNED_*=0), verify
+# the staged container instead of the vacated/potentially-replaced public path.
+migrate_slot_volume() {
+    local label="$1" public_path="$2" owned_val="$3" staged_dir="$4" old_vol="$5"
+    if [ "$REC_STATE" = "partial-uninstall" ] && [ -n "$staged_dir" ]; then
+        validate_staged_path "$label" "$public_path" "$staged_dir"
+        local payload
+        payload="${staged_dir}/$(basename "$public_path")"
+        if [ -e "$payload" ] || [ -L "$payload" ] || [ "$owned_val" != "1" ]; then
+            fs_ops verify-legacy-volume "$staged_dir" "$old_vol" \
+                || die "migrate-record: refusing to upgrade staged ${label} volume for '$staged_dir'"
+            return 0
+        fi
+    fi
+    if [ "$owned_val" = "1" ]; then
+        check_trusted_parent_dir "$public_path"
+        fs_ops verify-legacy-volume "$public_path" "$old_vol" \
+            || die "migrate-record: refusing to upgrade ${label} volume for '$public_path'"
+        return 0
+    fi
+    printf '%s' "$old_vol"
+}
+
 # Operator-confirmed migration for existing records created by earlier versions
 # of setup-kvm-runner.sh:
 #   --confirm-volumes: upgrades empty or matching legacy 4-field VOL_* records
 #     (mp,root,fs,src without uuid/fsid) to strong persistent UUID/fsid
-#     fingerprints after verifying each owned path exists with no nested mounts
-#     and matches the legacy fields; refreshes STATE_VOL/INSTALL_VOL in
-#     policy.env when present. Never overwrites a mismatched strong UUID/fsid.
+#     fingerprints after verifying each owned (or staged) path exists with no
+#     nested mounts and matches the legacy fields; refreshes STATE_VOL and
+#     INSTALL_VOL in policy.env when present. Never overwrites a mismatched
+#     strong UUID/fsid.
 #   --confirm-account-marker: stamps qeminga-runner-<INSTALL_ID> onto a
 #     verified legacy managed account whose numeric UID/GID and groups match
-#     install.env and whose current GECOS is empty (refusing user-pending
-#     records and any non-empty unrelated GECOS).
+#     install.env and whose complete untrimmed GECOS is empty (refusing
+#     user-pending records, failed passwd lookups, and any non-empty GECOS).
 cmd_migrate_record() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "migrate-record must run as root"
@@ -4879,14 +5400,21 @@ cmd_migrate_record() {
         OPT_INSTALL_DIR="$REC_INSTALL_DIR"
         OPT_STATE_DIR="$REC_STATE_DIR"
         OPT_HOOK_DIR="$REC_HOOK_DIR"
-        local d
-        for d in "$OPT_INSTALL_DIR" "$OPT_STATE_DIR" "$OPT_HOOK_DIR"; do
+        local dirs=("$OPT_INSTALL_DIR" "$OPT_STATE_DIR" "$OPT_HOOK_DIR")
+        local labels=("runner directory" "state directory" "hook directory")
+        local owned=("$REC_OWNED_INSTALL_DIR" "$REC_OWNED_STATE_DIR" "$REC_OWNED_HOOK_DIR")
+        local staged=("$REC_STAGED_INSTALL_DIR" "$REC_STAGED_STATE_DIR" "$REC_STAGED_HOOK_DIR")
+        local i d
+        for i in 0 1 2; do
+            d="${dirs[$i]}"
             check_abs_path "managed directory" "$d"
             if is_reserved_system_dir "$d"; then
                 die "refusing shared system directory '$d' as a managed runner directory"
             fi
-            [ ! -L "$d" ] || die "refusing symlinked managed directory '$d'"
             check_trusted_parent_dir "$d"
+            if [ "${owned[$i]}" = "1" ] && ! staged_payload_exists "${labels[$i]}" "$d" "${staged[$i]}"; then
+                [ ! -L "$d" ] || die "refusing symlinked managed directory '$d'"
+            fi
         done
     elif [ "$OPT_CONFIRM_VOLUMES" -eq 1 ]; then
         die "migrate-record: --confirm-volumes does not apply to user-only record '$rec_path'"
@@ -4909,7 +5437,7 @@ cmd_migrate_record() {
     if [ "$OPT_CONFIRM_ACCOUNT_MARKER" -eq 1 ]; then
         [ "${REC_USER_CREATED:-0}" = "1" ] \
             || die "migrate-record: refusing --confirm-account-marker because '$OPT_USER' was not created by this installer (USER_CREATED=${REC_USER_CREATED:-0})"
-        local pgroup groups g passwd_line gecos
+        local pgroup groups g full_gecos primary_gecos
         pgroup="$(id -gn "$OPT_USER")"
         if [ "$pgroup" != "$OPT_USER" ]; then
             die "migrate-record: service user '$OPT_USER' primary group '$pgroup' does not match '$OPT_USER'"
@@ -4925,13 +5453,14 @@ cmd_migrate_record() {
             generated_id=1
         fi
         expected_marker="qeminga-runner-${REC_INSTALL_ID}"
-        passwd_line="$(getent passwd "$OPT_USER" 2>/dev/null || true)"
-        gecos="$(printf '%s\n' "$passwd_line" | awk -F: 'NR==1 { print $5 }')"
-        gecos="${gecos%%,*}"
-        if [ "$gecos" = "$expected_marker" ]; then
+        if ! full_gecos="$(lookup_passwd_gecos_strict "$OPT_USER" "$REC_USER_UID" "$REC_USER_GID")"; then
+            die "migrate-record: failed to look up passwd entry for service user '$OPT_USER' (${REC_USER_UID}:${REC_USER_GID}); refusing to stamp account marker"
+        fi
+        primary_gecos="${full_gecos%%,*}"
+        if [ "$full_gecos" = "$expected_marker" ] || [ "$primary_gecos" = "$expected_marker" ]; then
             need_gecos_stamp=0
-        elif [ -n "$gecos" ]; then
-            die "migrate-record: refusing to overwrite non-empty GECOS '${gecos}' on account '$OPT_USER' (expected empty legacy GECOS or '${expected_marker}')"
+        elif [ -n "$full_gecos" ]; then
+            die "migrate-record: refusing to overwrite non-empty GECOS '${full_gecos}' on account '$OPT_USER' (expected empty legacy GECOS or '${expected_marker}')"
         else
             command -v usermod >/dev/null 2>&1 || die "usermod is required for --confirm-account-marker"
             need_gecos_stamp=1
@@ -4948,42 +5477,25 @@ cmd_migrate_record() {
         check_abs_path "systemd unit dir" "$unit_dir"
         local unit_path="${unit_dir}/${OPT_SERVICE}.service"
 
-        if [ "$REC_OWNED_UNIT" = "1" ]; then
-            check_trusted_parent_dir "$unit_path"
-            new_vol_unit="$(fs_ops verify-legacy-volume "$unit_path" "$REC_VOL_UNIT")" \
-                || die "migrate-record: refusing to upgrade systemd unit volume for '$unit_path'"
-        elif [ "$REC_STATE" = "partial-uninstall" ] && [ -n "$REC_STAGED_UNIT" ]; then
-            validate_staged_path "systemd unit" "$unit_path" "$REC_STAGED_UNIT"
-            new_vol_unit="$(fs_ops verify-legacy-volume "$REC_STAGED_UNIT" "$REC_VOL_UNIT")" \
-                || die "migrate-record: refusing to upgrade staged systemd unit volume for '$REC_STAGED_UNIT'"
-        fi
-        if [ "$REC_OWNED_INSTALL_DIR" = "1" ]; then
-            new_vol_install="$(fs_ops verify-legacy-volume "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR")" \
-                || die "migrate-record: refusing to upgrade runner directory volume for '$OPT_INSTALL_DIR'"
-        elif [ "$REC_STATE" = "partial-uninstall" ] && [ -n "$REC_STAGED_INSTALL_DIR" ]; then
-            validate_staged_path "runner directory" "$OPT_INSTALL_DIR" "$REC_STAGED_INSTALL_DIR"
-            new_vol_install="$(fs_ops verify-legacy-volume "$REC_STAGED_INSTALL_DIR" "$REC_VOL_INSTALL_DIR")" \
-                || die "migrate-record: refusing to upgrade staged runner directory volume for '$REC_STAGED_INSTALL_DIR'"
-        fi
-        if [ "$REC_OWNED_HOOK_DIR" = "1" ]; then
-            new_vol_hook="$(fs_ops verify-legacy-volume "$OPT_HOOK_DIR" "$REC_VOL_HOOK_DIR")" \
-                || die "migrate-record: refusing to upgrade hook directory volume for '$OPT_HOOK_DIR'"
-        elif [ "$REC_STATE" = "partial-uninstall" ] && [ -n "$REC_STAGED_HOOK_DIR" ]; then
-            validate_staged_path "hook directory" "$OPT_HOOK_DIR" "$REC_STAGED_HOOK_DIR"
-            new_vol_hook="$(fs_ops verify-legacy-volume "$REC_STAGED_HOOK_DIR" "$REC_VOL_HOOK_DIR")" \
-                || die "migrate-record: refusing to upgrade staged hook directory volume for '$REC_STAGED_HOOK_DIR'"
-        fi
-        if [ "$REC_OWNED_STATE_DIR" = "1" ]; then
-            new_vol_state="$(fs_ops verify-legacy-volume "$OPT_STATE_DIR" "$REC_VOL_STATE_DIR")" \
-                || die "migrate-record: refusing to upgrade state directory volume for '$OPT_STATE_DIR'"
-        elif [ "$REC_STATE" = "partial-uninstall" ] && [ -n "$REC_STAGED_STATE_DIR" ]; then
-            validate_staged_path "state directory" "$OPT_STATE_DIR" "$REC_STAGED_STATE_DIR"
-            new_vol_state="$(fs_ops verify-legacy-volume "$REC_STAGED_STATE_DIR" "$REC_VOL_STATE_DIR")" \
-                || die "migrate-record: refusing to upgrade staged state directory volume for '$REC_STAGED_STATE_DIR'"
-        fi
+        new_vol_unit="$(migrate_slot_volume "systemd unit" "$unit_path" "$REC_OWNED_UNIT" "$REC_STAGED_UNIT" "$REC_VOL_UNIT")"
+        new_vol_install="$(migrate_slot_volume "runner directory" "$OPT_INSTALL_DIR" "$REC_OWNED_INSTALL_DIR" "$REC_STAGED_INSTALL_DIR" "$REC_VOL_INSTALL_DIR")"
+        new_vol_hook="$(migrate_slot_volume "hook directory" "$OPT_HOOK_DIR" "$REC_OWNED_HOOK_DIR" "$REC_STAGED_HOOK_DIR" "$REC_VOL_HOOK_DIR")"
+        new_vol_state="$(migrate_slot_volume "state directory" "$OPT_STATE_DIR" "$REC_OWNED_STATE_DIR" "$REC_STAGED_STATE_DIR" "$REC_VOL_STATE_DIR")"
     fi
 
     # Phase 2: All preconditions passed — apply mutations cleanly.
+    # Persist any newly generated INSTALL_ID to install.env BEFORE calling
+    # usermod so any crash/interruption during or after usermod stays
+    # idempotent and retries reuse the exact same installation ID.
+    if [ "$generated_id" -eq 1 ]; then
+        if [ "$REC_STATE" = "user-only" ]; then
+            write_user_only_record "$rec_path" \
+                "$REC_USER" "$REC_USER_UID" "$REC_USER_GID" "$REC_USER_CREATED" "$REC_CONFIG_DIR" "$REC_INSTALL_ID"
+        else
+            write_migrated_record "$rec_path"
+        fi
+    fi
+
     if [ "$need_gecos_stamp" -eq 1 ]; then
         usermod -c "$expected_marker" "$OPT_USER" \
             || die "migrate-record: usermod failed to stamp '${expected_marker}' onto '$OPT_USER'"
@@ -4999,13 +5511,6 @@ cmd_migrate_record() {
         write_migrated_record "$rec_path"
         update_policy_volumes "$OPT_CONFIG_DIR/policy.env" "$REC_VOL_STATE_DIR" "$REC_VOL_INSTALL_DIR"
         say "upgraded backing volume fingerprints in $rec_path"
-    elif [ "$generated_id" -eq 1 ]; then
-        if [ "$REC_STATE" = "user-only" ]; then
-            write_user_only_record "$rec_path" \
-                "$REC_USER" "$REC_USER_UID" "$REC_USER_GID" "$REC_USER_CREATED" "$REC_CONFIG_DIR" "$REC_INSTALL_ID"
-        else
-            write_migrated_record "$rec_path"
-        fi
     fi
 }
 
@@ -5381,11 +5886,11 @@ cmd_uninstall() {
         fi
 
         local cleanup_hook_dir policy_state_vol="${REC_VOL_STATE_DIR:-}"
-        if [ -n "${QEMINGA_MOUNTINFO:-}" ]; then
+        if [ -n "${QEMINGA_MOUNTINFO:-}" ] && [ -n "$policy_state_vol" ]; then
             # In tests using synthetic QEMINGA_MOUNTINFO, verify_resource_volume
-            # above already checked REC_VOL_STATE_DIR; the isolated hook reads
-            # only real /proc/self/mountinfo so synthetic fingerprints cannot match.
-            policy_state_vol=""
+            # above already checked REC_VOL_STATE_DIR; bridge to the real host
+            # volume identity because the isolated hook reads only /proc/self/mountinfo.
+            policy_state_vol="$(QEMINGA_MOUNTINFO="" QEMINGA_FS_UUID_MAP="" QEMINGA_TEST_MNT_ID="" fs_ops volume-id "$OPT_STATE_DIR")"
         fi
         cleanup_hook_dir="$(umask 0077 && mktemp -d "${runtime_root}/qeminga-uninstall-hook.XXXXXX")"
         _UNINSTALL_TEMP_HOOK_DIR="$cleanup_hook_dir"

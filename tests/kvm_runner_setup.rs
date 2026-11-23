@@ -1872,10 +1872,15 @@ fn provision_state_dirs_uses_runner_uid_and_stops_service_before_mutating() {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
+    write_exec(&bin.join("chown"), FAKE_CHOWN);
     write_exec(&bin.join("install"), FAKE_INSTALL);
     write_exec(
         &bin.join("stat"),
         r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then
+    echo 0
+    exit 0
+fi
 if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
     echo "0:755"
     exit 0
@@ -1897,7 +1902,10 @@ exec "$@"
 "#,
     );
 
+    let cfg_dir = dir.path().join("cfg");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
     let state_dir = dir.path().join("state");
+    let chown_log = dir.path().join("chown.log");
     let install_log = dir.path().join("install.log");
     let runuser_log = dir.path().join("runuser.log");
     let path_env = format!(
@@ -1908,24 +1916,50 @@ exec "$@"
     let ok = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_STATE_DIR="$2"; OPT_USER="qeminga-runner"; provision_state_dirs"#,
+            r#"source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_STATE_DIR="$3"
+OPT_INSTALL_DIR="$4/runner"
+OPT_HOOK_DIR="$4/hooks"
+OPT_USER="qeminga-runner"
+OPT_SERVICE="qeminga-test"
+TARGET_URL="https://github.com/vicaya/qeminga-kvm-controller"
+RESOLVED_WORK_DIR="$OPT_STATE_DIR/work"
+MANAGED_USER_UID=995
+MANAGED_USER_GID=995
+MANAGED_USER_CREATED=1
+OWNED_CONFIG_DIR=1
+OWNED_STATE_DIR=0
+claim_managed_dir state OWNED_STATE_DIR "$OPT_STATE_DIR" 0700 "$OPT_USER" "$OPT_USER" test-runner
+grep -qx 'OWNED_STATE_DIR=1' "$OPT_CONFIG_DIR/install.env"
+init_state_subdirs"#,
             "_",
             script().to_str().unwrap(),
+            cfg_dir.to_str().unwrap(),
             state_dir.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
         ])
         .env("PATH", &path_env)
+        .env("FAKE_CHOWN_LOG", &chown_log)
         .env("FAKE_INSTALL_LOG", &install_log)
         .env("FAKE_RUNUSER_LOG", &runuser_log)
         .output()
         .unwrap();
     assert!(
         ok.status.success(),
-        "provision_state_dirs failed: {}",
+        "claim_managed_dir + init_state_subdirs failed: {}",
         text(&ok)
     );
 
-    // Root install -d must touch ONLY the top-level state directory, never any descendant.
-    let root_installs = std::fs::read_to_string(&install_log).unwrap();
+    // Root chown/install must touch ONLY the top-level state directory, never any descendant.
+    let root_chowns = std::fs::read_to_string(&chown_log).unwrap();
+    assert!(
+        !root_chowns.contains("/work")
+            && !root_chowns.contains("/images")
+            && !root_chowns.contains("/.local"),
+        "root chown must not touch state descendants: {root_chowns}"
+    );
+    let root_installs = std::fs::read_to_string(&install_log).unwrap_or_default();
     assert!(
         !root_installs.contains("/work")
             && !root_installs.contains("/images")
@@ -1948,34 +1982,58 @@ exec "$@"
         assert!(state_dir.join(sub).is_dir(), "missing state subdir {sub}");
     }
 
-    // Symlinked top-level state dir must be refused.
+    // Symlinked top-level state dir must be refused by both claim_managed_dir and init_state_subdirs.
     let real_target = dir.path().join("real-target");
     std::fs::create_dir_all(&real_target).unwrap();
     let sym_state = dir.path().join("sym-state");
     symlink(&real_target, &sym_state).unwrap();
-    let bad = Command::new("bash")
+    let bad_claim = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_STATE_DIR="$2"; OPT_USER="qeminga-runner"; provision_state_dirs"#,
+            r#"source "$1"; OPT_CONFIG_DIR="$2"; OPT_STATE_DIR="$3"; OPT_USER="qeminga-runner"; claim_managed_dir state OWNED_STATE_DIR "$OPT_STATE_DIR" 0700 "$OPT_USER" "$OPT_USER" test-runner"#,
+            "_",
+            script().to_str().unwrap(),
+            cfg_dir.to_str().unwrap(),
+            sym_state.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_CHOWN_LOG", &chown_log)
+        .env("FAKE_INSTALL_LOG", &install_log)
+        .env("FAKE_RUNUSER_LOG", &runuser_log)
+        .output()
+        .unwrap();
+    assert!(
+        !bad_claim.status.success(),
+        "claim_managed_dir must refuse symlinked state dir"
+    );
+    let bad_init = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_STATE_DIR="$2"; OPT_USER="qeminga-runner"; init_state_subdirs"#,
             "_",
             script().to_str().unwrap(),
             sym_state.to_str().unwrap(),
         ])
         .env("PATH", &path_env)
+        .env("FAKE_CHOWN_LOG", &chown_log)
         .env("FAKE_INSTALL_LOG", &install_log)
         .env("FAKE_RUNUSER_LOG", &runuser_log)
         .output()
         .unwrap();
-    assert!(!bad.status.success(), "symlinked state dir must be refused");
+    assert!(
+        !bad_init.status.success(),
+        "init_state_subdirs must refuse symlinked state dir"
+    );
 
-    // In cmd_install, systemctl stop must happen before provision_state_dirs.
+    // In cmd_install, systemctl stop must happen before claiming or initializing state dirs.
     let body = std::fs::read_to_string(script()).unwrap();
     let install_fn = &body[body.find("cmd_install()").unwrap()..];
     let stop_pos = install_fn.find("systemctl stop").unwrap();
-    let prov_pos = install_fn.find("provision_state_dirs").unwrap();
+    let claim_pos = install_fn.find("claim_managed_dir state").unwrap();
+    let prov_pos = install_fn.find("init_state_subdirs").unwrap();
     assert!(
-        stop_pos < prov_pos,
-        "cmd_install must stop the existing service before mutating state directories"
+        stop_pos < claim_pos && claim_pos < prov_pos,
+        "cmd_install must stop the existing service before claiming and initializing state directories"
     );
 }
 
@@ -2385,18 +2443,33 @@ exec "$@"
         text(&unmanaged)
     );
 
-    // 3. Uninstall preserves state/images when hook-job-completed.sh reports failure (unknown domain state).
+    // 3. Uninstall preserves state/images when hook-job-completed.sh reports failure (unknown domain state),
+    //    releases ownership of the removed unit & runner dir via RECORD_STATE=partial-uninstall,
+    //    blocks update/install while partial-uninstall is pending, and leaves independently created
+    //    replacement services/runner directories untouched on the documented retry (even with --token-file).
     let case3 = dir.path().join("preserve-images");
     let inst3 = case3.join("runner");
     let state3 = case3.join("state");
     let hooks3 = case3.join("hooks");
     let cfg3 = case3.join("cfg");
+    let units3 = case3.join("etc-systemd");
+    let sc_log3 = case3.join("systemctl.log");
+    let chown_log3 = case3.join("chown.log");
+    let cg_ctrls3 = case3.join("cgroup.controllers");
+    let aavmf_code3 = case3.join("AAVMF_CODE.fd");
+    let aavmf_vars3 = case3.join("AAVMF_VARS.fd");
     let vm_disk = state3.join("images/qeminga-e2e-55-1-x86_64/root.qcow2");
     std::fs::create_dir_all(vm_disk.parent().unwrap()).unwrap();
     std::fs::create_dir_all(&inst3).unwrap();
     std::fs::create_dir_all(&hooks3).unwrap();
     std::fs::create_dir_all(&cfg3).unwrap();
+    std::fs::create_dir_all(&units3).unwrap();
+    std::fs::write(&cg_ctrls3, "cpu memory pids\n").unwrap();
+    std::fs::write(&aavmf_code3, b"code").unwrap();
+    std::fs::write(&aavmf_vars3, b"vars").unwrap();
     std::fs::write(&vm_disk, b"active-vm-disk").unwrap();
+    let unit3 = units3.join("qeminga-test-preserve.service");
+    std::fs::write(&unit3, "[Unit]\nDescription=original qeminga runner\n").unwrap();
     std::fs::write(
         cfg3.join("policy.env"),
         "ALLOWED_REPOSITORY=vicaya/qeminga-kvm-controller\n",
@@ -2419,8 +2492,77 @@ exec "$@"
     )
     .unwrap();
 
+    // Dedicated bin with logged systemctl/chown plus userdel/groupdel for the full retry flow.
+    let bin3 = case3.join("bin");
+    std::fs::create_dir_all(&bin3).unwrap();
+    let user_flag3 = case3.join("user_exists");
+    std::fs::write(&user_flag3, b"").unwrap();
+    write_exec(
+        &bin3.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+if [ "$1" = "-g" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin3.join("userdel"),
+        "#!/bin/sh\nrm -f \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin3.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin3.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin3.join("systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin3.join("chown"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_CHOWN_LOG:?}"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin3.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin3.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+
     let rt_root = dir.path().join("run");
     std::fs::create_dir_all(&rt_root).unwrap();
+    let unit_dir3 = units3.to_str().unwrap();
+    let env3 = [
+        ("FAKE_USER_FLAG", user_flag3.to_str().unwrap()),
+        ("FAKE_SC_LOG", sc_log3.to_str().unwrap()),
+        ("FAKE_CHOWN_LOG", chown_log3.to_str().unwrap()),
+        ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+        ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir3),
+        ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir3),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls3.to_str().unwrap()),
+        ("QEMINGA_AAVMF_CODE", aavmf_code3.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", aavmf_vars3.to_str().unwrap()),
+    ];
     let fail_uninst = run_setup_env(
         &[
             "uninstall",
@@ -2435,8 +2577,8 @@ exec "$@"
             "--config-dir",
             cfg3.to_str().unwrap(),
         ],
-        &[("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap())],
-        Some(&bin),
+        &env3,
+        Some(&bin3),
     );
     assert!(
         !fail_uninst.status.success(),
@@ -2446,6 +2588,144 @@ exec "$@"
     assert!(
         vm_disk.exists(),
         "VM disk under images/ MUST be preserved when cleanup hook fails"
+    );
+    assert!(
+        !unit3.exists() && !inst3.exists(),
+        "partial uninstall removes the owned unit file and runner binary dir"
+    );
+    let partial_rec = std::fs::read_to_string(cfg3.join("install.env")).unwrap();
+    for expected in [
+        "RECORD_STATE=partial-uninstall\n",
+        "OWNED_UNIT=0\n",
+        "OWNED_INSTALL_DIR=0\n",
+        "OWNED_CONFIG_DIR=1\n",
+        "OWNED_STATE_DIR=1\n",
+        "OWNED_HOOK_DIR=1\n",
+    ] {
+        assert!(
+            partial_rec.contains(expected),
+            "partial uninstall must persist released ownership flags ({expected:?}):\n{partial_rec}"
+        );
+    }
+
+    // Independently created replacement service and runner directory now claim the released names!
+    let repl_unit_body = "[Unit]\nDescription=independently created replacement service\n";
+    std::fs::write(&unit3, repl_unit_body).unwrap();
+    std::fs::create_dir_all(&inst3).unwrap();
+    std::fs::write(inst3.join("replacement.txt"), b"do-not-delete-replacement").unwrap();
+    let repl_cfg_log = case3.join("replacement-config-sh.log");
+    write_exec(
+        &inst3.join("config.sh"),
+        &format!(
+            "#!/bin/sh\nprintf 'INVOKED args=%s token=%s\\n' \"$*\" \"${{ACTIONS_RUNNER_INPUT_TOKEN:-}}\" > \"{}\"\nexit 0\n",
+            repl_cfg_log.display()
+        ),
+    );
+
+    // update MUST reject RECORD_STATE=partial-uninstall without touching replacements.
+    let upd_partial = run_setup_env(
+        &["update", "--config-dir", cfg3.to_str().unwrap()],
+        &env3,
+        Some(&bin3),
+    );
+    assert!(
+        !upd_partial.status.success(),
+        "update MUST reject partial-uninstall state: {}",
+        text(&upd_partial)
+    );
+    assert!(
+        text(&upd_partial).contains("partial-uninstall"),
+        "update refusal should mention partial-uninstall state: {}",
+        text(&upd_partial)
+    );
+
+    // install MUST also reject RECORD_STATE=partial-uninstall until uninstall finishes.
+    let rm_tok = case3.join("rm-token");
+    std::fs::write(&rm_tok, "SECRET_REMOVAL_TOKEN\n").unwrap();
+    std::fs::set_permissions(&rm_tok, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let inst_partial = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--service",
+            "qeminga-test-preserve",
+            "--install-dir",
+            inst3.to_str().unwrap(),
+            "--state-dir",
+            state3.to_str().unwrap(),
+            "--hook-dir",
+            hooks3.to_str().unwrap(),
+            "--config-dir",
+            cfg3.to_str().unwrap(),
+            "--token-file",
+            rm_tok.to_str().unwrap(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &env3,
+        Some(&bin3),
+    );
+    assert!(
+        !inst_partial.status.success(),
+        "install MUST reject partial-uninstall state: {}",
+        text(&inst_partial)
+    );
+
+    // Now libvirt domain cleanup succeeds and the operator runs the documented retry WITH --token-file.
+    write_exec(
+        &hooks3.join("hook-job-completed.sh"),
+        &format!(
+            "#!/bin/sh\nrm -rf -- \"{}\"\nexit 0\n",
+            vm_disk.parent().unwrap().display()
+        ),
+    );
+    let _ = std::fs::remove_file(&sc_log3);
+    let _ = std::fs::remove_file(&chown_log3);
+    let retry_uninst = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg3.to_str().unwrap(),
+            "--token-file",
+            rm_tok.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &env3,
+        Some(&bin3),
+    );
+    assert!(
+        retry_uninst.status.success(),
+        "partial-uninstall retry must succeed once domain cleanup succeeds: {}",
+        text(&retry_uninst)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&unit3).unwrap(),
+        repl_unit_body,
+        "retry MUST preserve independently created replacement systemd unit"
+    );
+    let retry_sc = std::fs::read_to_string(&sc_log3).unwrap_or_default();
+    assert!(
+        !retry_sc.contains("stop qeminga-test-preserve.service")
+            && !retry_sc.contains("disable qeminga-test-preserve.service"),
+        "retry MUST NOT stop or disable replacement unit with OWNED_UNIT=0: {retry_sc}"
+    );
+    assert!(
+        inst3.join("replacement.txt").exists(),
+        "retry MUST preserve independently created replacement runner directory"
+    );
+    assert!(
+        !repl_cfg_log.exists(),
+        "retry with --token-file MUST NEVER hand the removal token to a replacement directory's config.sh"
+    );
+    let retry_chown = std::fs::read_to_string(&chown_log3).unwrap_or_default();
+    assert!(
+        !retry_chown.contains(inst3.to_str().unwrap()),
+        "retry MUST NOT chown a replacement runner directory with OWNED_INSTALL_DIR=0: {retry_chown}"
+    );
+    assert!(
+        !state3.exists() && !hooks3.exists() && !cfg3.exists() && !user_flag3.exists(),
+        "owned state dir, hook dir, config dir, and managed user must be cleaned up on retry"
     );
 }
 
@@ -5168,5 +5448,603 @@ exit 0
                 .unwrap()
                 .contains("RECORD_STATE=installed\n"),
         "JIT bootstrap install must complete cleanly"
+    );
+}
+
+#[test]
+fn fresh_install_refuses_config_or_state_dir_created_after_preflight_without_mutating_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let etc_units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(&rt_root).unwrap();
+
+    let user_flag = dir.path().join("user_exists");
+    let chown_log = dir.path().join("chown.log");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+    let tok_file = dir.path().join("token");
+    std::fs::write(&tok_file, "FAKE_REG_TOKEN\n").unwrap();
+    std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // Fake apt-get simulates another provisioning process creating $RACE_CREATE_DIR
+    // with restrictive permissions and foreign contents AFTER preflight has already passed.
+    write_exec(
+        &bin.join("apt-get"),
+        r#"#!/bin/sh
+if [ "$1" = "install" ] && [ -n "${RACE_CREATE_DIR:-}" ]; then
+    mkdir -m "${RACE_CREATE_MODE:-0700}" -p "$RACE_CREATE_DIR"
+    printf 'foreign-owner-data\n' > "$RACE_CREATE_DIR/foreign-service.conf"
+fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("userdel"),
+        "#!/bin/sh\nrm -f \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("chown"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_CHOWN_LOG:?}"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+for a in "$@"; do
+    case "$a" in *api.github.com/repos/*) printf '404'; exit 0 ;; esac
+done
+exit 22
+"#,
+    );
+
+    let unit_dir = etc_units.to_str().unwrap();
+
+    // 1. Another process creates --config-dir after preflight (during install_packages):
+    //    install MUST fail atomically on EEXIST without changing group/mode or writing install.env.
+    let cfg1 = dir.path().join("race-cfg");
+    let state1 = dir.path().join("race-state-1");
+    let inst1 = dir.path().join("race-runner-1");
+    let hooks1 = dir.path().join("race-hooks-1");
+    let cfg_race = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--service",
+            "qeminga-race-cfg",
+            "--install-dir",
+            inst1.to_str().unwrap(),
+            "--state-dir",
+            state1.to_str().unwrap(),
+            "--hook-dir",
+            hooks1.to_str().unwrap(),
+            "--config-dir",
+            cfg1.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ("RACE_CREATE_DIR", cfg1.to_str().unwrap()),
+            ("RACE_CREATE_MODE", "0700"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !cfg_race.status.success(),
+        "install MUST fail closed if --config-dir appears after preflight: {}",
+        text(&cfg_race)
+    );
+    assert!(
+        cfg1.join("foreign-service.conf").exists(),
+        "foreign file in raced --config-dir must remain intact"
+    );
+    assert!(
+        !cfg1.join("install.env").exists(),
+        "install MUST NEVER write install.env into a pre-existing raced --config-dir"
+    );
+    let cfg1_mode = std::fs::metadata(&cfg1).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        cfg1_mode, 0o700,
+        "install MUST NEVER alter mode of a raced --config-dir (got {cfg1_mode:#o})"
+    );
+    let chowns1 = std::fs::read_to_string(&chown_log).unwrap_or_default();
+    assert!(
+        !chowns1.contains(cfg1.to_str().unwrap()),
+        "install MUST NEVER chown a raced --config-dir: {chowns1}"
+    );
+
+    // 2. Another process creates --state-dir after preflight (during install_packages):
+    //    install MUST fail atomically on EEXIST, leave the foreign state dir untouched,
+    //    and record OWNED_STATE_DIR=0 so uninstall cleans up only our config dir & user.
+    let _ = std::fs::remove_file(&user_flag);
+    let _ = std::fs::remove_file(&chown_log);
+    let cfg2 = dir.path().join("race-cfg-2");
+    let state2 = dir.path().join("race-state-2");
+    let inst2 = dir.path().join("race-runner-2");
+    let hooks2 = dir.path().join("race-hooks-2");
+    let state_race = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--service",
+            "qeminga-race-state",
+            "--install-dir",
+            inst2.to_str().unwrap(),
+            "--state-dir",
+            state2.to_str().unwrap(),
+            "--hook-dir",
+            hooks2.to_str().unwrap(),
+            "--config-dir",
+            cfg2.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ("RACE_CREATE_DIR", state2.to_str().unwrap()),
+            ("RACE_CREATE_MODE", "0755"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !state_race.status.success(),
+        "install MUST fail closed if --state-dir appears after preflight: {}",
+        text(&state_race)
+    );
+    assert!(
+        state2.join("foreign-service.conf").exists(),
+        "foreign file in raced --state-dir must remain intact"
+    );
+    let state2_mode = std::fs::metadata(&state2).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        state2_mode, 0o755,
+        "install MUST NEVER alter mode of a raced --state-dir (got {state2_mode:#o})"
+    );
+    let chowns2 = std::fs::read_to_string(&chown_log).unwrap_or_default();
+    assert!(
+        !chowns2.contains(state2.to_str().unwrap()),
+        "install MUST NEVER chown a raced --state-dir: {chowns2}"
+    );
+    let rec2 = std::fs::read_to_string(cfg2.join("install.env")).unwrap();
+    assert!(
+        rec2.contains("OWNED_CONFIG_DIR=1\n") && rec2.contains("OWNED_STATE_DIR=0\n"),
+        "install record must mark raced state dir unowned:\n{rec2}"
+    );
+    let cleanup2 = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg2.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        cleanup2.status.success(),
+        "uninstall after raced state dir should clean up owned resources: {}",
+        text(&cleanup2)
+    );
+    assert!(
+        state2.join("foreign-service.conf").exists() && !cfg2.exists() && !user_flag.exists(),
+        "uninstall must keep raced foreign state dir while removing owned config dir and user"
+    );
+}
+
+#[test]
+fn state_subdir_init_failure_persists_owned_state_dir_for_retry_and_uninstall() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let etc_units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let fake_tar_src = dir.path().join("tar-src");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&etc_units).unwrap();
+    std::fs::create_dir_all(&rt_root).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("bin")).unwrap();
+    std::fs::create_dir_all(fake_tar_src.join("externals")).unwrap();
+
+    write_exec(
+        &fake_tar_src.join("bin/Runner.Listener"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    write_exec(&fake_tar_src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("run.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("config.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&fake_tar_src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+    let good_tarball = dir.path().join("runner-state-init.tar.gz");
+    let tar_out = Command::new("tar")
+        .args([
+            "-czf",
+            good_tarball.to_str().unwrap(),
+            "-C",
+            fake_tar_src.to_str().unwrap(),
+            ".",
+        ])
+        .output()
+        .unwrap();
+    assert!(tar_out.status.success(), "{}", text(&tar_out));
+    let good_sha = sha256_of(&std::fs::read(&good_tarball).unwrap());
+
+    let user_flag = dir.path().join("user_exists");
+    let fail_runuser_flag = dir.path().join("fail_runuser");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+    let tok_file = dir.path().join("token");
+    std::fs::write(&tok_file, "FAKE_REG_TOKEN\n").unwrap();
+    std::fs::set_permissions(&tok_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ ! -f "${FAKE_USER_FLAG:?}" ]; then exit 1; fi
+case "$1" in
+    -u) echo 995 ;;
+    -g) echo 995 ;;
+    -gn) echo qeminga-runner ;;
+    -nG) echo "qeminga-runner kvm" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(
+        &bin.join("useradd"),
+        "#!/bin/sh\n: > \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(
+        &bin.join("userdel"),
+        "#!/bin/sh\nrm -f \"${FAKE_USER_FLAG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("passwd"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("install"),
+        r#"#!/bin/sh
+args=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|-g) shift 2 ;;
+        *) args="$args $(printf '%s' "$1" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+    esac
+done
+eval "exec /usr/bin/install $args"
+"#,
+    );
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+if [ -f "${FAKE_FAIL_RUNUSER:?}" ]; then
+    echo "runuser: simulated PAM session / disk quota failure" >&2
+    exit 1
+fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "show" ]; then echo "not-found"; exit 0; fi
+if [ "$1" = "is-active" ]; then exit 3; fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("systemd-analyze"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+for a in "$@"; do
+    case "$a" in *api.github.com/repos/*) printf '404'; exit 0 ;; esac
+done
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac
+done
+cp "${FAKE_GOOD_TARBALL:?}" "$out"
+exit 0
+"#,
+    );
+
+    let unit_dir = etc_units.to_str().unwrap();
+    let common_env = [
+        ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+        ("FAKE_FAIL_RUNUSER", fail_runuser_flag.to_str().unwrap()),
+        ("FAKE_GOOD_TARBALL", good_tarball.to_str().unwrap()),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+        ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+        ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+        ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+    ];
+
+    // Path A: runuser fails while initializing state subdirs -> OWNED_STATE_DIR=1 is already
+    // persisted, so ordinary retry succeeds once runuser works again.
+    let cfg_a = dir.path().join("cfg-a");
+    let state_a = dir.path().join("state-a");
+    let inst_a = dir.path().join("runner-a");
+    let hooks_a = dir.path().join("hooks-a");
+    std::fs::write(&fail_runuser_flag, b"1").unwrap();
+    let fail_a = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "state-init-box-a",
+            "--service",
+            "qeminga-state-init-a",
+            "--install-dir",
+            inst_a.to_str().unwrap(),
+            "--state-dir",
+            state_a.to_str().unwrap(),
+            "--hook-dir",
+            hooks_a.to_str().unwrap(),
+            "--config-dir",
+            cfg_a.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(
+        !fail_a.status.success(),
+        "first install should fail when runuser cannot create state subdirs: {}",
+        text(&fail_a)
+    );
+    assert!(
+        state_a.is_dir(),
+        "top-level state dir was created before child initialization failed"
+    );
+    let rec_a = std::fs::read_to_string(cfg_a.join("install.env")).unwrap();
+    for expected in [
+        "RECORD_STATE=installing\n",
+        "OWNED_CONFIG_DIR=1\n",
+        "OWNED_STATE_DIR=1\n",
+        "OWNED_INSTALL_DIR=0\n",
+        "OWNED_HOOK_DIR=0\n",
+        "OWNED_UNIT=0\n",
+    ] {
+        assert!(
+            rec_a.contains(expected),
+            "OWNED_STATE_DIR=1 must be persisted BEFORE runuser child init ({expected:?}):\n{rec_a}"
+        );
+    }
+
+    // Clear runuser failure and verify ordinary install retry succeeds cleanly!
+    std::fs::remove_file(&fail_runuser_flag).unwrap();
+    let retry_a = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "state-init-box-a",
+            "--service",
+            "qeminga-state-init-a",
+            "--install-dir",
+            inst_a.to_str().unwrap(),
+            "--state-dir",
+            state_a.to_str().unwrap(),
+            "--hook-dir",
+            hooks_a.to_str().unwrap(),
+            "--config-dir",
+            cfg_a.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(
+        retry_a.status.success(),
+        "ordinary retry after state-subdir init failure must succeed: {}",
+        text(&retry_a)
+    );
+    for sub in [
+        "work",
+        "images",
+        "image-cache",
+        ".config",
+        ".cache",
+        ".local/share",
+    ] {
+        assert!(
+            state_a.join(sub).is_dir(),
+            "retry must initialize state subdir {sub}"
+        );
+    }
+    let rec_a_done = std::fs::read_to_string(cfg_a.join("install.env")).unwrap();
+    assert!(
+        rec_a_done.contains("RECORD_STATE=installed\n"),
+        "retry must finalize RECORD_STATE=installed:\n{rec_a_done}"
+    );
+
+    // Path B: runuser fails while initializing state subdirs -> uninstall --purge-user
+    // cleans up the created state root, managed user, and config dir cleanly!
+    let _ = std::fs::remove_file(&user_flag);
+    std::fs::write(&fail_runuser_flag, b"1").unwrap();
+    let cfg_b = dir.path().join("cfg-b");
+    let state_b = dir.path().join("state-b");
+    let inst_b = dir.path().join("runner-b");
+    let hooks_b = dir.path().join("hooks-b");
+    let fail_b = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "state-init-box-b",
+            "--service",
+            "qeminga-state-init-b",
+            "--install-dir",
+            inst_b.to_str().unwrap(),
+            "--state-dir",
+            state_b.to_str().unwrap(),
+            "--hook-dir",
+            hooks_b.to_str().unwrap(),
+            "--config-dir",
+            cfg_b.to_str().unwrap(),
+            "--token-file",
+            tok_file.to_str().unwrap(),
+            "--runner-sha256",
+            good_sha.as_str(),
+            "--skip-packages",
+            "--no-start",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(!fail_b.status.success(), "{}", text(&fail_b));
+    assert!(state_b.is_dir(), "state root created before runuser failed");
+
+    std::fs::remove_file(&fail_runuser_flag).unwrap();
+    let uninst_b = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg_b.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &common_env,
+        Some(&bin),
+    );
+    assert!(
+        uninst_b.status.success(),
+        "uninstall after state-subdir init failure must succeed: {}",
+        text(&uninst_b)
+    );
+    assert!(
+        !state_b.exists() && !cfg_b.exists() && !user_flag.exists(),
+        "uninstall must clean up the created state root, config dir, and managed user"
     );
 }

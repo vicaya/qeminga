@@ -221,14 +221,18 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    world-writable modes), refuses to adopt unrelated pre-existing accounts
    (or accounts in any group beyond `{qeminga-runner, kvm}`), unmanaged
    pre-existing directories, or existing systemd units (including vendor
-   units) without a matching unit ownership record. It records the
-   provisioned UID/GID, dedicated non-overlapping paths, and per-resource
-   acquisition markers (`OWNED_CONFIG_DIR`, `OWNED_STATE_DIR`,
-   `OWNED_INSTALL_DIR`, `OWNED_HOOK_DIR`, `OWNED_UNIT`) in root-owned
-   `/etc/qeminga-runner/install.env` (`0600`) incrementally as each
-   resource is actually created (`RECORD_STATE=installing`, finalized to
+   units) without a matching unit ownership record. It claims each new
+   top-level managed directory (and fresh unit file) exclusively so a
+   concurrent creation after preflight fails atomically without mutating
+   foreign files, and records the provisioned UID/GID, dedicated
+   non-overlapping paths, and per-resource acquisition markers
+   (`OWNED_CONFIG_DIR`, `OWNED_STATE_DIR`, `OWNED_INSTALL_DIR`,
+   `OWNED_HOOK_DIR`, `OWNED_UNIT`) in root-owned
+   `/etc/qeminga-runner/install.env` (`0600`) immediately upon creation
+   and before initializing contents (`RECORD_STATE=installing`, finalized to
    `installed` only after startup readiness succeeds unless `--no-start`
-   is set), so an interrupted first install stays recoverable without ever
+   is set), so an interrupted first install (including a failure while
+   initializing state subdirectories) stays recoverable without ever
    claiming a unit name or directory created independently afterwards,
    stops an existing runner service only when owned by this installation,
    and creates runtime state subdirectories (`work/`, `images/`,
@@ -307,17 +311,20 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    binaries stay kernel-read-only; GitHub requires runner updates within
    30 days of a new release — update cleanly with
    `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
-   root-owned `install.env`, verifies live numeric UID/GID, and refuses
-   mismatched flags, or opt in to GitHub self-updates with
-   `--allow-auto-update`). Remove only resources owned by the recorded
+   root-owned `install.env` in `installed` state, verifies live numeric
+   UID/GID, and refuses mismatched flags, or opt in to GitHub self-updates
+   with `--allow-auto-update`). Remove only resources owned by the recorded
    installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
    (uninstall shares the same record and live numeric UID/GID checks BEFORE
    any `runuser`, `chown`, service stop, or token handoff — leaving
    `install.env` intact on mismatch — refuses to touch unowned units or
-   paths, preserves `$STATE_DIR/images` if session domain cleanup cannot
-   confirm domains are gone, and when run without `--purge-user` retains a
-   minimal `RECORD_STATE=user-only` UID/GID record in
+   paths, clears each `OWNED_*` flag in `RECORD_STATE=partial-uninstall` as
+   resources are removed so retries never touch independently created
+   replacement services or directories even if `--token-file` is passed,
+   preserves `$STATE_DIR/images` if session domain cleanup cannot confirm
+   domains are gone, and when run without `--purge-user` retains a minimal
+   `RECORD_STATE=user-only` UID/GID record in
    `/etc/qeminga-runner/install.env` so a later default reinstall or
    `uninstall --purge-user` recognizes the surviving managed account).
 

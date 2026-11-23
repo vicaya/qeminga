@@ -176,6 +176,12 @@ impl Channel {
         })
     }
 
+    /// Reports whether Tokio's reactor has already latched hangup or error
+    /// readiness on this registration (checked before [`Channel::into_fd`]).
+    fn has_latched_hangup(&self) -> bool {
+        self.fd.has_latched_hangup()
+    }
+
     /// Deregisters the channel from the Tokio reactor and returns the still-open
     /// descriptor so the next session can establish a fresh reactor registration.
     pub fn into_fd(self) -> OwnedFd {
@@ -216,7 +222,7 @@ where
                     // has latched `READ_CLOSED` (`EPOLLHUP` / `EPOLLRDHUP`),
                     // meaning a hangup occurred on this registration even if
                     // the probe now reports `HostState::Ready`. Preserve
-                    // `NeedsBoundary` in `SessionReport` so `serve` does not
+                    // `NeedsBoundary` in `SessionOutcome` so `serve` does not
                     // skip draining or resetting the transport (§5.7).
                     self.2.store(true, Ordering::SeqCst);
                     (self.1)(self.0.fd.as_fd()) != HostState::Closed
@@ -662,6 +668,14 @@ where
         || HostState::Closed,
     )
     .await
+    .report
+}
+
+/// Private session result returned by [`run_session_inner`] to [`serve`] so
+/// virtio input-queue bookkeeping stays out of the public [`SessionReport`].
+struct SessionOutcome {
+    report: SessionReport,
+    input: InputQueue,
 }
 
 async fn run_session_inner<R, W, H, F>(
@@ -672,7 +686,7 @@ async fn run_session_inner<R, W, H, F>(
     cancel: &mut Cancel,
     saw_disconnect: &AtomicBool,
     on_eof: F,
-) -> SessionReport
+) -> SessionOutcome
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -684,15 +698,14 @@ where
     // Once the sender is gone there is nothing left to wait for.
     let mut cancel_live = true;
     let mut input = InputQueue::Clean;
-    let report = |end, received, input| {
+    let outcome = |end, received, input| {
         let input = if saw_disconnect.load(Ordering::SeqCst) {
             InputQueue::NeedsBoundary
         } else {
             input
         };
-        SessionReport {
-            end,
-            received,
+        SessionOutcome {
+            report: SessionReport { end, received },
             input,
         }
     };
@@ -731,7 +744,7 @@ where
                         () = std::future::ready(()) => {}
                     }
                 }
-                return report(SessionEnd::Cancelled, received, input);
+                return outcome(SessionEnd::Cancelled, received, input);
             }
             // A command that was running froze the guest: the stop is
             // withdrawn until the thaw (C-21).
@@ -752,7 +765,7 @@ where
             && (outbox.is_empty() || write_failed)
             && let Some(end) = input_end.take()
         {
-            return report(end, received, input);
+            return outcome(end, received, input);
         }
         let finished_bytes: usize = slots
             .iter()
@@ -800,6 +813,14 @@ where
                             outbox.abandon();
                         }
                         HostState::Ready => {
+                            // When accepted work outlives direct EOF, reads
+                            // stay disabled until those commands finish;
+                            // require a fresh boundary so an intervening
+                            // disconnect during that window cannot reuse the
+                            // descriptor as Clean (§5.7).
+                            if !slots.is_empty() {
+                                input = InputQueue::NeedsBoundary;
+                            }
                             write_failed = true;
                             outbox.abandon();
                         }
@@ -818,7 +839,7 @@ where
             else => {
                 // Nothing running, nothing to write, nothing to read and
                 // no cancellation to wait for: the input has ended.
-                return report(input_end.take().unwrap_or(SessionEnd::Eof), received, input);
+                return outcome(input_end.take().unwrap_or(SessionEnd::Eof), received, input);
             }
         }
     }
@@ -832,10 +853,6 @@ pub struct SessionReport {
     pub end: SessionEnd,
     /// Bytes read from the channel during the session.
     pub received: u64,
-    /// Input-queue boundary state observed during the session; [`serve`] uses
-    /// this so a reconnect while accepted commands finish after an observed
-    /// disconnect resets the transport rather than skipping the drain (§5.7).
-    input: InputQueue,
 }
 
 /// A cancellation signal for [`serve`]: `true` once cancelled.
@@ -1422,7 +1439,7 @@ where
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
         let mut decoder = FrameDecoder::new();
         let saw_disconnect = AtomicBool::new(false);
-        let report = run_session_inner(
+        let SessionOutcome { report, mut input } = run_session_inner(
             ChannelReadRef(&channel, &probe, &saw_disconnect),
             ChannelRef(&channel),
             handler,
@@ -1434,6 +1451,13 @@ where
         .await;
         if matches!(report.end, SessionEnd::Cancelled) {
             return Ok(());
+        }
+        // Check cached reactor closed/error readiness BEFORE deregistering so
+        // any hangup latched after the final read (e.g., while reads were
+        // disabled or between the last read and `into_fd`) is preserved instead
+        // of discarded (§5.7).
+        if channel.has_latched_hangup() {
+            input = InputQueue::NeedsBoundary;
         }
         // Deregister from Tokio before keeping or inspecting the descriptor so
         // any latched READ_CLOSED/WRITE_CLOSED bits from a virtio hangup never
@@ -1457,8 +1481,7 @@ where
                     continue;
                 }
                 HostState::Ready
-                    if matches!(report.end, SessionEnd::Eof)
-                        && report.input == InputQueue::Clean =>
+                    if matches!(report.end, SessionEnd::Eof) && input == InputQueue::Clean =>
                 {
                     tracing::warn!(
                         event = "channel_closed",
@@ -1528,6 +1551,24 @@ mod tests {
     use super::*;
     use crate::state::{FreezeState, FreezeStateMachine};
     use std::sync::Mutex;
+
+    /// Creates a temporary directory with explicit owner-only `0700`
+    /// permissions at creation time (independent of process `umask`) so
+    /// repeated FIFO pathname opens cannot race another local user.
+    fn private_fifo_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
+    /// Creates a `0600` FIFO inside an already-private `0700` directory.
+    fn make_private_fifo(dir: &Path, name: &str) -> std::path::PathBuf {
+        let fifo = dir.join(name);
+        nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+        fifo
+    }
 
     /// Runs a session test under a real-time bound. A decoder or session
     /// that never replies then fails this test alone instead of hanging
@@ -3333,9 +3374,8 @@ mod tests {
             }
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("virtio-sim.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let dir = private_fifo_dir();
+        let fifo = make_private_fifo(dir.path(), "virtio-sim.fifo");
 
         let reader = open(
             &fifo,
@@ -3859,9 +3899,8 @@ mod tests {
             }
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("fast-reconnect-read.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let dir = private_fifo_dir();
+        let fifo = make_private_fifo(dir.path(), "fast-reconnect-read.fifo");
         let reader = open(
             &fifo,
             OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
@@ -3999,8 +4038,7 @@ mod tests {
         // Part B (write side): a session whose writer registration already
         // latched WRITE_CLOSED (via real FIFO EPOLLERR) must NOT deliver an
         // old reply even after a replacement reader opens ready to accept it.
-        let wfifo = dir.path().join("fast-reconnect-write.fifo");
-        nix::unistd::mkfifo(&wfifo, Mode::S_IRWXU).unwrap();
+        let wfifo = make_private_fifo(dir.path(), "fast-reconnect-write.fifo");
         let r1 = open(
             &wfifo,
             OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
@@ -4530,9 +4568,8 @@ mod tests {
             }
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("latched-read-closed-ready.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let dir = private_fifo_dir();
+        let fifo = make_private_fifo(dir.path(), "latched-read-closed-ready.fifo");
         let reader1 = open(
             &fifo,
             OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
@@ -4681,6 +4718,231 @@ mod tests {
         let seen = handler.seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 9);
         assert_eq!(seen[8], b"new-peer");
+
+        tx.send(true).unwrap();
+        pump().await;
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn serve_resets_port_when_hangup_latches_after_direct_eof_while_accepted_command_finishes()
+     {
+        async fn pump() {
+            tokio::time::advance(Duration::ZERO).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Real Linux FIFO: Session 1 accepts `slow-1\n` and then observes a
+        // direct `read(2) -> 0` EOF (before epoll latches READ_CLOSED), while
+        // `writer2` connects just before `on_eof` probes so `on_eof` observes
+        // `HostState::Ready` (leaving `input == Clean` and disabling further
+        // reads via `input_end`). While `slow-1` is still finishing,
+        // intervening `writer2` queues `old-shutdown\n` and closes — latching
+        // real kernel EPOLLHUP onto the still-registered `Channel` — and
+        // replacement `writer3` opens the FIFO so kernel POLLHUP clears (every
+        // port probe observes `HostState::Ready`, and a fresh registration on
+        // `reader1` would not see EPOLLHUP). Before deregistering via
+        // `channel.into_fd()`, `serve` must preserve the latched hangup (and
+        // post-EOF accepted work) as `NeedsBoundary` and reset fd #1 (opening
+        // fd #2) instead of reusing fd #1 and executing `old-shutdown\n`.
+        struct HoldNoReply {
+            writer1: Mutex<Option<OwnedFd>>,
+            release: tokio::sync::Notify,
+            seen: Mutex<Vec<Vec<u8>>>,
+            running: AtomicUsize,
+        }
+        impl Handle for HoldNoReply {
+            async fn handle(&self, event: DecodeEvent) -> Option<Vec<u8>> {
+                let DecodeEvent::Frame { bytes, .. } = event else {
+                    return None;
+                };
+                self.running.fetch_add(1, Ordering::SeqCst);
+                if bytes == b"slow-1" {
+                    // Drop `writer1` while Tokio's cached READABLE bit is still
+                    // set (`is_read_closed() == false`): the very next
+                    // `reader.read` in this same poll issues `read(2)` directly
+                    // and observes `Ok(0)` before `epoll_wait` runs.
+                    drop(self.writer1.lock().unwrap().take());
+                    self.release.notified().await;
+                }
+                self.seen.lock().unwrap().push(bytes);
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                None
+            }
+        }
+
+        let dir = private_fifo_dir();
+        let fifo = make_private_fifo(dir.path(), "post-eof-hangup.fifo");
+        let reader1 = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        nix::unistd::write(&writer1, b"slow-1\n").unwrap();
+
+        let (ours2, peer2) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let fds = Arc::new(Mutex::new(VecDeque::from([ours2])));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let o = opened.clone();
+        let open_fn: OpenFn = Arc::new(move |_| {
+            o.fetch_add(1, Ordering::SeqCst);
+            fds.lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+        });
+
+        let fifo_for_probe = fifo.clone();
+        let writer2_slot: Arc<Mutex<Option<OwnedFd>>> = Arc::new(Mutex::new(None));
+        let w2_probe = writer2_slot.clone();
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let pc = probe_calls.clone();
+        let hup_probes = Arc::new(AtomicUsize::new(0));
+        let hp = hup_probes.clone();
+
+        let handler = Arc::new(HoldNoReply {
+            writer1: Mutex::new(Some(writer1)),
+            release: tokio::sync::Notify::new(),
+            seen: Mutex::new(Vec::new()),
+            running: AtomicUsize::new(0),
+        });
+        let (tx, cancel) = cancel_pair();
+        let h = handler.clone();
+        let server = tokio::spawn(async move {
+            serve_inner_with_probe(
+                Path::new("/dev/virtio-ports/fake"),
+                open_fn,
+                h.as_ref(),
+                cancel,
+                Some(reader1),
+                ServeTimers {
+                    reopen: TEST_BACKOFF,
+                    host_wait: Backoff {
+                        initial: Duration::from_millis(5),
+                        max: Duration::from_millis(20),
+                    },
+                },
+                move |fd| {
+                    let n = pc.fetch_add(1, Ordering::SeqCst);
+                    if n == 1 {
+                        // `on_eof()` probe right after direct `read(2) -> 0`:
+                        // intervening `writer2` connects just in time to clear
+                        // kernel POLLHUP before `ppoll`.
+                        let w2 = open(
+                            &fifo_for_probe,
+                            OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+                            Mode::empty(),
+                        )
+                        .unwrap();
+                        *w2_probe.lock().unwrap() = Some(w2);
+                    }
+                    use nix::poll::{PollFd, ppoll};
+                    use nix::sys::time::TimeSpec;
+                    let mut pfds = [PollFd::new(fd, PollFlags::POLLIN)];
+                    let revents = match ppoll(&mut pfds, Some(TimeSpec::new(0, 0)), None) {
+                        Ok(0) => PollFlags::empty(),
+                        Ok(_) => pfds[0].revents().unwrap_or(PollFlags::POLLERR),
+                        Err(_) => PollFlags::POLLERR,
+                    };
+                    if revents.contains(PollFlags::POLLHUP) {
+                        hp.fetch_add(1, Ordering::SeqCst);
+                        HostState::VirtioHostDisconnected
+                    } else {
+                        HostState::Ready
+                    }
+                },
+            )
+            .await
+        });
+
+        for _ in 0..64 {
+            pump().await;
+            if handler.running.load(Ordering::SeqCst) == 1
+                && probe_calls.load(Ordering::SeqCst) >= 2
+            {
+                break;
+            }
+        }
+        assert_eq!(handler.running.load(Ordering::SeqCst), 1);
+        assert_eq!(probe_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(hup_probes.load(Ordering::SeqCst), 0);
+
+        // Reads are now disabled (`input_end = Some(SessionEnd::Eof)`).
+        // Intervening `writer2` queues `old-shutdown\n` and disconnects so
+        // Tokio latches real kernel EPOLLHUP onto the old registration while
+        // `slow-1` is finishing, and replacement `writer3` immediately opens
+        // the FIFO so kernel POLLHUP clears before `slow-1` finishes.
+        let writer2 = writer2_slot.lock().unwrap().take().unwrap();
+        nix::unistd::write(&writer2, b"old-shutdown\n").unwrap();
+        drop(writer2);
+        pump().await;
+        let writer3 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        pump().await;
+
+        // Release `slow-1` and advance past reopen backoff.
+        handler.release.notify_waiters();
+        for _ in 0..64 {
+            pump().await;
+            if !handler.seen.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        tokio::time::advance(TEST_BACKOFF.initial).await;
+        pump().await;
+
+        assert_eq!(
+            hup_probes.load(Ordering::SeqCst),
+            0,
+            "every port probe in this scenario must observe Ready"
+        );
+        let seen_before_peer2 = handler.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen_before_peer2,
+            vec![b"slow-1".to_vec()],
+            "hangup latched after direct EOF while accepted command finished must reset fd #1 without running old-shutdown (seen={:?})",
+            seen_before_peer2
+                .iter()
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .collect::<Vec<_>>()
+        );
+        // Verify fd #1 (`reader1`) was closed (POLLERR on FIFO write end).
+        {
+            use nix::poll::{PollFd, ppoll};
+            use nix::sys::time::TimeSpec;
+            let mut pfds = [PollFd::new(writer3.as_fd(), PollFlags::POLLOUT)];
+            let _ = ppoll(&mut pfds, Some(TimeSpec::new(0, 0)), None).unwrap();
+            assert!(
+                pfds[0]
+                    .revents()
+                    .unwrap_or(PollFlags::empty())
+                    .contains(PollFlags::POLLERR),
+                "reader1 must be closed on transport reset; writer3 revents={:?}",
+                pfds[0].revents()
+            );
+        }
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+        // Replacement peer retries on reopened fd #2 and executes cleanly.
+        let mut peer2 = Channel::from_fd(peer2).unwrap();
+        peer2.write_all(b"quick-new\n").await.unwrap();
+        for _ in 0..64 {
+            pump().await;
+            if handler.seen.lock().unwrap().len() >= 2 {
+                break;
+            }
+        }
+        let seen = handler.seen.lock().unwrap().clone();
+        assert_eq!(seen, vec![b"slow-1".to_vec(), b"quick-new".to_vec()]);
 
         tx.send(true).unwrap();
         pump().await;

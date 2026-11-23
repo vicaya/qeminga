@@ -46,6 +46,28 @@ impl OwnedAsyncFd {
         Ok(OwnedAsyncFd { inner })
     }
 
+    /// Reports whether Tokio's reactor has already latched hangup or error
+    /// readiness (`READ_CLOSED`, `WRITE_CLOSED`, or `ERROR`) on this
+    /// registration. Intended to be checked right before
+    /// [`OwnedAsyncFd::into_fd`] so hangups delivered while reads or writes
+    /// were paused are not discarded on deregistration (§5.7).
+    pub fn has_latched_hangup(&self) -> bool {
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let is_hangup = |ready: tokio::io::Ready| {
+            ready.is_read_closed() || ready.is_write_closed() || ready.is_error()
+        };
+        if matches!(
+            self.inner.poll_read_ready(&mut cx),
+            Poll::Ready(Ok(guard)) if is_hangup(guard.ready())
+        ) {
+            return true;
+        }
+        matches!(
+            self.inner.poll_write_ready(&mut cx),
+            Poll::Ready(Ok(guard)) if is_hangup(guard.ready())
+        )
+    }
+
     /// Deregisters the descriptor from the Tokio reactor and returns it
     /// still open. Consuming the registration drops any latched
     /// `READ_CLOSED`/`WRITE_CLOSED` readiness bits (for example after a
@@ -209,14 +231,28 @@ mod tests {
         }
     }
 
+    /// Creates a `0600` FIFO inside an owner-only `0700` temporary directory
+    /// (independent of process `umask`) so repeated pathname opens cannot race
+    /// another local user in the shared temp area.
+    fn private_fifo(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use nix::sys::stat::Mode;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
+        let fifo = dir.path().join(name);
+        nix::unistd::mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
+        (dir, fifo)
+    }
+
     #[tokio::test(start_paused = true)]
     async fn into_fd_refreshes_registration_after_real_epollhup_without_spinning() {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("port.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let (_dir, fifo) = private_fifo("port.fifo");
 
         let reader = open(
             &fifo,
@@ -299,9 +335,7 @@ mod tests {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("write-hup.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let (_dir, fifo) = private_fifo("write-hup.fifo");
 
         let reader1 = open(
             &fifo,
@@ -383,9 +417,7 @@ mod tests {
         use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
 
-        let dir = tempfile::tempdir().unwrap();
-        let fifo = dir.path().join("read-hup.fifo");
-        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        let (_dir, fifo) = private_fifo("read-hup.fifo");
 
         let reader = open(
             &fifo,
@@ -433,5 +465,46 @@ mod tests {
         let fresh = OwnedAsyncFd::register(old.into_fd()).unwrap();
         let n = poll_fn(|cx| fresh.poll_read(cx, &mut buf)).await.unwrap();
         assert_eq!(&buf[..n], b"new-request\n");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn has_latched_hangup_detects_real_epollhup_while_reads_are_idle() {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::Mode;
+
+        let (_dir, fifo) = private_fifo("idle-hup.fifo");
+
+        let reader = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        let reg = OwnedAsyncFd::register(reader).unwrap();
+
+        // Park reader on epoll while writer1 is open, then stop polling reads.
+        let mut buf = [0u8; 32];
+        assert!(
+            poll_fn(|cx| Poll::Ready(reg.poll_read(cx, &mut buf)))
+                .await
+                .is_pending()
+        );
+        assert!(
+            !reg.has_latched_hangup(),
+            "freshly registered idle peer must not report latched hangup"
+        );
+
+        // Writer 1 closes (real kernel EPOLLHUP latched by Tokio while no read
+        // or write is polled) and writer 2 reconnects (clearing kernel POLLHUP).
+        drop(writer1);
+        pump_reactor().await;
+        let _writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        pump_reactor().await;
+
+        assert!(
+            reg.has_latched_hangup(),
+            "cached reactor readiness must retain latched EPOLLHUP even after writer2 clears POLLHUP"
+        );
     }
 }

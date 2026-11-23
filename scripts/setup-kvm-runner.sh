@@ -6645,6 +6645,7 @@ _inspect_record_entry() {
 _rollback_runner_package_tx() {
     local rec_path="$1" expected_vol="$2" backup_dir="$3" backup_id="$4" work_child="$5" was_active="$6"
     local cfg_dir="${7:-}" hook_dir="${8:-}" hook_vol="${9:-}" unit_path="${10:-}" unit_vol="${11:-}"
+    local stage_dir="${12:-}" stage_id="${13:-}"
     if [ "${REC_UPDATE_WAS_ACTIVE:-0}" = "1" ] || [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
         was_active=1
     fi
@@ -6658,10 +6659,15 @@ _rollback_runner_package_tx() {
             return 0
         fi
     fi
+    local sync_stage_dir="" sync_stage_id=""
+    if [ -n "$stage_dir" ] && [ -n "$stage_id" ]; then
+        sync_stage_dir="$stage_dir"
+        sync_stage_id="$stage_id"
+    fi
     local restore_ok=1
     if [ -n "$backup_dir" ]; then
         if [ -n "$backup_id" ]; then
-            if ! ensure_owned_service_stopped_for_restore rollback "$rec_path" "publishing" "" "" "$backup_dir" "$backup_id"; then
+            if ! ensure_owned_service_stopped_for_restore rollback "$rec_path" "publishing" "$sync_stage_dir" "$sync_stage_id" "$backup_dir" "$backup_id"; then
                 warn "rollback could not stop active ${OPT_SERVICE}.service; preserving updating record at '$rec_path' and backup '$backup_dir'"
                 restore_ok=0
             else
@@ -6669,9 +6675,28 @@ _rollback_runner_package_tx() {
                     was_active=1
                 fi
                 if fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$expected_vol" "$backup_dir" "$backup_id" "$work_child" "0" "$cfg_dir" "$hook_dir" "$hook_vol" "$unit_path" "$unit_vol"; then
+                    if [ -n "$sync_stage_dir" ]; then
+                        local cur_stage_id=""
+                        cur_stage_id="$(fs_ops path-identity "$sync_stage_dir" 2>/dev/null || true)"
+                        if [ "$cur_stage_id" = "$sync_stage_id" ]; then
+                            if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id"; then
+                                sync_stage_dir=""
+                                sync_stage_id=""
+                            else
+                                warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
+                                restore_ok=0
+                            fi
+                        else
+                            # Recorded stage directory is already absent or replaced by an
+                            # unrelated directory left for manual inspection; do not block
+                            # finalizing rollback of the restored runner on it.
+                            sync_stage_dir=""
+                            sync_stage_id=""
+                        fi
+                    fi
                     local rec_saved=1
                     if [ -n "$rec_path" ]; then
-                        if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "$backup_dir" "$backup_id" "$was_active" ); then
+                        if ! ( write_update_record "$rec_path" "updating" "restored" "$sync_stage_dir" "$sync_stage_id" "$backup_dir" "$backup_id" "$was_active" ); then
                             warn "rollback restored previous runner files but failed to persist UPDATE_PHASE=restored to '$rec_path'; retaining verified backup container '$backup_dir' for retry"
                             rec_saved=0
                             restore_ok=0
@@ -6682,7 +6707,7 @@ _rollback_runner_package_tx() {
                             warn "rollback restored previous runner files and saved UPDATE_PHASE=restored, but failed to prune '$backup_dir'; preserving record for inspection"
                             restore_ok=0
                         elif [ -n "$rec_path" ]; then
-                            if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "" "" "$was_active" ); then
+                            if ! ( write_update_record "$rec_path" "updating" "restored" "$sync_stage_dir" "$sync_stage_id" "" "" "$was_active" ); then
                                 warn "rollback pruned '$backup_dir' but failed to clear UPDATE_BACKUP_DIR in '$rec_path'; preserving restored record for retry"
                                 restore_ok=0
                             fi
@@ -6832,13 +6857,17 @@ cleanup_install_exit() {
             _INSTALL_BOOTSTRAP_STAGE=""
             _INSTALL_BOOTSTRAP_STAGE_ID=""
         else
+            local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
                 if [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
                     if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
                         warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
+                        stage_remaining_dir="$_INSTALL_BOOTSTRAP_STAGE"
+                        stage_remaining_id="$_INSTALL_BOOTSTRAP_STAGE_ID"
                     fi
                 else
                     warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection (missing captured identity)"
+                    stage_remaining_dir="$_INSTALL_BOOTSTRAP_STAGE"
                 fi
                 _INSTALL_BOOTSTRAP_STAGE=""
                 _INSTALL_BOOTSTRAP_STAGE_ID=""
@@ -6858,7 +6887,9 @@ cleanup_install_exit() {
                 "$_INSTALL_REINSTALL_HOOK_DIR" \
                 "$_INSTALL_REINSTALL_HOOK_VOL" \
                 "$_INSTALL_REINSTALL_UNIT_PATH" \
-                "$_INSTALL_REINSTALL_UNIT_VOL"
+                "$_INSTALL_REINSTALL_UNIT_VOL" \
+                "$stage_remaining_dir" \
+                "$stage_remaining_id"
         fi
         _INSTALL_REINSTALL_BACKUP_DIR=""
         _INSTALL_REINSTALL_BACKUP_ID=""
@@ -7952,13 +7983,17 @@ cleanup_update_exit() {
             _UPDATE_TMP_STAGE=""
             _UPDATE_TMP_STAGE_ID=""
         else
+            local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_UPDATE_TMP_STAGE:-}" ]; then
                 if [ -n "${_UPDATE_TMP_STAGE_ID:-}" ]; then
                     if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
                         warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection because its identity or backing volume changed"
+                        stage_remaining_dir="$_UPDATE_TMP_STAGE"
+                        stage_remaining_id="$_UPDATE_TMP_STAGE_ID"
                     fi
                 else
                     warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection (missing captured identity)"
+                    stage_remaining_dir="$_UPDATE_TMP_STAGE"
                 fi
                 _UPDATE_TMP_STAGE=""
                 _UPDATE_TMP_STAGE_ID=""
@@ -7969,7 +8004,10 @@ cleanup_update_exit() {
                 "$_UPDATE_BACKUP_DIR" \
                 "$_UPDATE_BACKUP_ID" \
                 "$_UPDATE_WORK_CHILD" \
-                "$_UPDATE_WAS_ACTIVE"
+                "$_UPDATE_WAS_ACTIVE" \
+                "" "" "" "" "" \
+                "$stage_remaining_dir" \
+                "$stage_remaining_id"
         fi
         _UPDATE_BACKUP_DIR=""
         _UPDATE_BACKUP_ID=""

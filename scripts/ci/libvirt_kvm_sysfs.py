@@ -1891,67 +1891,161 @@ def collect_serial_log(
         os.close(img_fd)
 
 
-def collect_qemu_log(
-    qlog_path,
-    out_dir,
-    dest_name="qemu.log",
-    *,
-    root_fd=None,
-    root_path="/",
-):
-    """Copy a verified regular QEMU log file into a verified evidence directory."""
-    if dest_name != "qemu.log":
-        raise OSError(errno.EINVAL, f"unexpected QEMU log filename '{dest_name}'")
+def _open_verified_qemu_log_ro(qlog_path, *, session=False, root_fd=None, root_path="/"):
+    """Open a regular nlink==1 QEMU log read-only without following symlinks."""
     abs_qlog = os.path.abspath(qlog_path)
     parent = os.path.dirname(abs_qlog)
     base = os.path.basename(abs_qlog)
     if not base or base in (".", ".."):
-        return False
-    trusted_uids = trusted_owner_uids()
-    pfd, _, _, remaining = walk_existing_prefix(
-        parent,
-        0,
-        {0},
-        trusted_uids,
-        check_traversal=False,
-        root_fd=root_fd,
-        root_path=root_path,
-    )
-    try:
-        if remaining:
-            return False
+        return (None, None, None)
+    if session:
+        try:
+            pfd = os.open(parent, READ_DIR_FLAGS)
+        except FileNotFoundError:
+            return (None, None, None)
         p_mnt = fd_mnt_id(pfd)
+    else:
+        trusted_uids = trusted_owner_uids()
+        pfd, _, _, remaining = walk_existing_prefix(
+            parent,
+            0,
+            {0},
+            trusted_uids,
+            check_traversal=False,
+            root_fd=root_fd,
+            root_path=root_path,
+        )
+        if remaining:
+            os.close(pfd)
+            return (None, None, None)
+        p_mnt = fd_mnt_id(pfd)
+    try:
         try:
             ffd = os.open(
                 base, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd
             )
         except FileNotFoundError:
-            return False
+            os.close(pfd)
+            return (None, None, None)
         try:
             fst = os.fstat(ffd)
-            if fd_mnt_id(ffd) != p_mnt:
+            if not session and fd_mnt_id(ffd) != p_mnt:
                 raise OSError(errno.EXDEV, f"refusing cross-mount QEMU log '{base}'")
             if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
                 raise OSError(
                     errno.EINVAL,
                     f"refusing unsafe QEMU log '{base}' (must be regular file with nlink == 1)",
                 )
-            out_fd, _ = _open_verified_evidence_dir(
-                out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
-            )
-            try:
-                _publish_evidence_stream(
-                    out_fd,
-                    dest_name,
-                    lambda dst: _copy_fd_to_fd(ffd, dst),
-                    mode=0o644,
-                )
-            finally:
-                os.close(out_fd)
-            return True
-        finally:
+        except Exception:
             os.close(ffd)
+            raise
+        return (pfd, ffd, fst)
+    except Exception:
+        os.close(pfd)
+        raise
+
+
+def snapshot_qemu_log_cursor(qlog_path, *, session=False, root_fd=None, root_path="/"):
+    """Record the current QEMU log inode identity and byte offset before starting a guest."""
+    pfd, ffd, fst = _open_verified_qemu_log_ro(
+        qlog_path, session=session, root_fd=root_fd, root_path=root_path
+    )
+    if ffd is None:
+        return ("absent", 0, 0, 0)
+    try:
+        return ("present", fst.st_dev, fst.st_ino, fst.st_size)
     finally:
+        os.close(ffd)
+        os.close(pfd)
+
+
+def _seek_qemu_log_segment(ffd, fst, cursor):
+    """Position ``ffd`` at the start of the current run's newly written bytes.
+
+    Returns ``True`` when at least one new byte is available after ``cursor``,
+    or ``False`` when no new output was produced since ``cursor`` was recorded.
+    """
+    if cursor is None:
+        return False
+    c_status, c_dev, c_ino, c_offset = cursor
+    if c_status == "present" and (fst.st_dev, fst.st_ino) == (c_dev, c_ino):
+        if fst.st_size <= c_offset:
+            return False
+        os.lseek(ffd, c_offset, os.SEEK_SET)
+        return True
+    if c_status in ("absent", "present"):
+        if fst.st_size == 0:
+            return False
+        return True
+    raise OSError(errno.EINVAL, f"invalid QEMU log cursor status '{c_status}'")
+
+
+def read_qemu_log_segment(qlog_path, cursor, *, session=False, root_fd=None, root_path="/"):
+    """Return only the current run's newly appended QEMU log bytes, or None if none exist."""
+    pfd, ffd, fst = _open_verified_qemu_log_ro(
+        qlog_path, session=session, root_fd=root_fd, root_path=root_path
+    )
+    if ffd is None:
+        return None
+    try:
+        if not _seek_qemu_log_segment(ffd, fst, cursor):
+            return None
+        chunks = []
+        while True:
+            chunk = os.read(ffd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        data = b"".join(chunks)
+        return data if data else None
+    finally:
+        os.close(ffd)
+        os.close(pfd)
+
+
+def collect_qemu_log(
+    qlog_path,
+    out_dir,
+    dest_name="qemu.log",
+    *,
+    cursor=None,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Copy ONLY the current run's newly written QEMU log segment into an evidence directory."""
+    if dest_name != "qemu.log":
+        raise OSError(errno.EINVAL, f"unexpected QEMU log filename '{dest_name}'")
+    if cursor is None:
+        return False
+    pfd, ffd, fst = _open_verified_qemu_log_ro(
+        qlog_path, session=session, root_fd=root_fd, root_path=root_path
+    )
+    if ffd is None:
+        return False
+    try:
+        if not _seek_qemu_log_segment(ffd, fst, cursor):
+            return False
+        file_mode = 0o600 if session else 0o644
+        out_fd, _ = _open_verified_evidence_dir(
+            out_dir,
+            create_missing=True,
+            session=session,
+            root_fd=root_fd,
+            root_path=root_path,
+        )
+        try:
+            _publish_evidence_stream(
+                out_fd,
+                dest_name,
+                lambda dst: _copy_fd_to_fd(ffd, dst),
+                mode=file_mode,
+            )
+        finally:
+            os.close(out_fd)
+        return True
+    finally:
+        os.close(ffd)
         os.close(pfd)
 
 
@@ -2020,75 +2114,23 @@ def collect_serial_log_session(
         os.close(img_fd)
 
 
-def collect_qemu_log_session(
-    qlog_path,
-    out_dir,
-    dest_name="qemu.log",
-    *,
-    root_fd=None,
-    root_path="/",
-):
-    """Copy a session QEMU log file via O_NOFOLLOW + verified evidence dir + private 0600 publish."""
-    if dest_name != "qemu.log":
-        raise OSError(errno.EINVAL, f"unexpected QEMU log filename '{dest_name}'")
-    abs_qlog = os.path.abspath(qlog_path)
-    parent = os.path.dirname(abs_qlog)
-    base = os.path.basename(abs_qlog)
-    if not base or base in (".", ".."):
-        return False
-    try:
-        pfd = os.open(parent, READ_DIR_FLAGS)
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    try:
-        try:
-            ffd = os.open(
-                base, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd
-            )
-        except FileNotFoundError:
-            return False
-        try:
-            fst = os.fstat(ffd)
-            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
-                raise OSError(
-                    errno.EINVAL,
-                    f"refusing unsafe QEMU log '{base}' (must be regular file with nlink == 1)",
-                )
-            out_fd, _ = _open_verified_evidence_dir(
-                out_dir,
-                create_missing=True,
-                session=True,
-                root_fd=root_fd,
-                root_path=root_path,
-            )
-            try:
-                _publish_evidence_stream(
-                    out_fd,
-                    dest_name,
-                    lambda dst: _copy_fd_to_fd(ffd, dst),
-                    mode=0o600,
-                )
-            finally:
-                os.close(out_fd)
-            return True
-        finally:
-            os.close(ffd)
-    finally:
-        os.close(pfd)
-
-
 def verify_cleanup_target(images_dir, run_name, *, root_fd=None, root_path="/"):
-    """Read-only verification of image root and run directory before destructive virsh calls."""
+    """Read-only verification of image root and run directory before destructive virsh calls.
+
+    Returns ``(status, lexical_run, resolved_run, dir_id)``, where ``dir_id`` is
+    ``"<st_dev>:<st_ino>:<mnt_id>"`` when ``status == "present"`` and ``""`` when ``"absent"``.
+    """
     status, img_fd, rfd, rst, run_mnt, lexical_run, resolved_run = (
         _open_verified_run_dir_ro(
             images_dir, run_name, root_fd=root_fd, root_path=root_path
         )
     )
     if status != "present":
-        return ("absent", lexical_run, resolved_run)
+        return ("absent", lexical_run, resolved_run, "")
     try:
         scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
-        return ("present", lexical_run, resolved_run)
+        dir_id = f"{rst.st_dev}:{rst.st_ino}:{run_mnt}"
+        return ("present", lexical_run, resolved_run, dir_id)
     finally:
         os.close(rfd)
         os.close(img_fd)
@@ -2159,17 +2201,70 @@ def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir
                     f"domain '{expected_name}' references console path '{path_val}' outside expected run directory",
                 )
 
-    nvram = root.find("./os/nvram")
-    if nvram is not None:
+    os_el = root.find("./os")
+    nvrams = root.findall("./os/nvram")
+    if len(nvrams) > 1:
+        raise OSError(
+            errno.EACCES,
+            f"domain '{expected_name}' defines multiple <os><nvram> elements",
+        )
+    if os_el is not None and (os_el.attrib.get("firmware") or "").strip() and not nvrams:
+        raise OSError(
+            errno.EACCES,
+            f"domain '{expected_name}' uses auto-selected firmware without a verifiable <nvram> file path",
+        )
+    if nvrams:
+        nvram = nvrams[0]
+        nvram_type = (nvram.attrib.get("type") or "").strip()
+        if nvram_type not in ("", "file"):
+            raise OSError(
+                errno.EACCES,
+                f"domain '{expected_name}' uses unsupported non-file NVRAM type '{nvram_type}'",
+            )
+        for child in list(nvram):
+            if child.tag != "source":
+                raise OSError(
+                    errno.EACCES,
+                    f"domain '{expected_name}' has unexpected <nvram> child <{child.tag}>",
+                )
         nvram_paths = []
         nvram_text = (nvram.text or "").strip()
         if nvram_text:
             nvram_paths.append(nvram_text)
-        nvram_src = nvram.find("source")
-        if nvram_src is not None:
+        nvram_sources = nvram.findall("source")
+        if len(nvram_sources) > 1:
+            raise OSError(
+                errno.EACCES,
+                f"domain '{expected_name}' has multiple <nvram><source> elements",
+            )
+        if nvram_sources:
+            nvram_src = nvram_sources[0]
+            forbidden_src_attrs = set(nvram_src.attrib) & {
+                "dev",
+                "pool",
+                "volume",
+                "protocol",
+                "name",
+                "dir",
+                "path",
+            }
+            if forbidden_src_attrs:
+                raise OSError(
+                    errno.EACCES,
+                    f"domain '{expected_name}' <nvram><source> has unsupported storage attributes {sorted(forbidden_src_attrs)}",
+                )
             nvram_file = (nvram_src.attrib.get("file") or "").strip()
-            if nvram_file:
-                nvram_paths.append(nvram_file)
+            if not nvram_file:
+                raise OSError(
+                    errno.EACCES,
+                    f"domain '{expected_name}' <nvram><source> is missing a file path",
+                )
+            nvram_paths.append(nvram_file)
+        if not nvram_paths:
+            raise OSError(
+                errno.EACCES,
+                f"domain '{expected_name}' <nvram> does not specify a verifiable file path",
+            )
         for nvram_path in nvram_paths:
             if not path_in_run_dir(nvram_path):
                 raise OSError(
@@ -2185,14 +2280,29 @@ def verify_domain_xml(xml_text, expected_name, lexical_run_dir, resolved_run_dir
     return dom_uuid
 
 
-def cleanup_run_dir(images_dir, run_name, *, root_fd=None, root_path="/"):
+def cleanup_run_dir(
+    images_dir, run_name, *, expected_dir_id=None, root_fd=None, root_path="/"
+):
     """Verify ancestor trust, run-dir identity, and same-mount tree before removing."""
+    exp_triple = None
+    if expected_dir_id is not None:
+        parts = expected_dir_id.split(":")
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            raise OSError(
+                errno.EINVAL, f"invalid expected run directory identity '{expected_dir_id}'"
+            )
+        exp_triple = (int(parts[0]), int(parts[1]), int(parts[2]))
     status, img_fd, rfd, rst, run_mnt, _, resolved_run = _open_verified_run_dir_ro(
         images_dir, run_name, root_fd=root_fd, root_path=root_path
     )
     if status != "present":
         return "absent"
     try:
+        if exp_triple is not None and (rst.st_dev, rst.st_ino, run_mnt) != exp_triple:
+            raise OSError(
+                errno.EXDEV,
+                f"run directory '{resolved_run}' identity changed since verification; refusing removal",
+            )
         # Pass 1: verify EVERY entry stays on (rst.st_dev, run_mnt) BEFORE the first unlink.
         scan_open_dir_same_mount(rfd, rst.st_dev, run_mnt, resolved_run)
         # Pass 2: remove entries while rechecking every opened descriptor's mount ID.
@@ -2281,6 +2391,17 @@ def main(argv):
     try:
         if op == "strip-session-dir-acl":
             strip_session_dir_acl(argv[1])
+            return 0
+        if op == "snapshot-qemu-log-cursor-session":
+            c_st, c_dev, c_ino, c_off = snapshot_qemu_log_cursor(argv[1], session=True)
+            print(f"{c_st}\t{c_dev}\t{c_ino}\t{c_off}")
+            return 0
+        if op == "read-qemu-log-segment-session":
+            cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
+            data = read_qemu_log_segment(argv[1], cursor, session=True)
+            if data is None:
+                return 1
+            sys.stdout.buffer.write(data)
             return 0
         if op == "verify-domain-xml":
             xml_text = sys.stdin.read()
@@ -2423,31 +2544,42 @@ def main(argv):
                 root_fd=root_fd,
                 root_path=root_path,
             )
-        elif op == "collect-qemu-log":
+        elif op == "snapshot-qemu-log-cursor":
+            c_st, c_dev, c_ino, c_off = snapshot_qemu_log_cursor(
+                argv[1], session=False, root_fd=root_fd, root_path=root_path
+            )
+            print(f"{c_st}\t{c_dev}\t{c_ino}\t{c_off}")
+        elif op in ("collect-qemu-log", "collect-qemu-log-session"):
+            is_session = op == "collect-qemu-log-session"
+            cursor = (argv[4], int(argv[5]), int(argv[6]), int(argv[7]))
             collect_qemu_log(
                 argv[1],
                 argv[2],
-                argv[3] if len(argv) > 3 else "qemu.log",
+                argv[3],
+                cursor=cursor,
+                session=is_session,
                 root_fd=root_fd,
                 root_path=root_path,
             )
-        elif op == "collect-qemu-log-session":
-            collect_qemu_log_session(
-                argv[1],
-                argv[2],
-                argv[3] if len(argv) > 3 else "qemu.log",
-                root_fd=root_fd,
-                root_path=root_path,
+        elif op == "read-qemu-log-segment":
+            cursor = (argv[2], int(argv[3]), int(argv[4]), int(argv[5]))
+            data = read_qemu_log_segment(
+                argv[1], cursor, session=False, root_fd=root_fd, root_path=root_path
             )
+            if data is None:
+                return 1
+            sys.stdout.buffer.write(data)
         elif op == "verify-cleanup-target":
-            status, lexical_run, resolved_run = verify_cleanup_target(
+            status, lexical_run, resolved_run, dir_id = verify_cleanup_target(
                 argv[1], argv[2], root_fd=root_fd, root_path=root_path
             )
-            print(f"{status}\t{lexical_run}\t{resolved_run}")
+            print(f"{status}\t{lexical_run}\t{resolved_run}\t{dir_id}")
         elif op == "cleanup-run-dir":
+            expected_dir_id = argv[3] if len(argv) > 3 and argv[3] else None
             status = cleanup_run_dir(
                 argv[1],
                 argv[2],
+                expected_dir_id=expected_dir_id,
                 root_fd=root_fd,
                 root_path=root_path,
             )

@@ -4393,7 +4393,7 @@ exec /usr/bin/stat "$@"
 "#,
     );
 
-    for (label, live_uid, live_gid) in [
+    for (case_name, mock_u, mock_g) in [
         ("uid-reassigned", "996", "995"),
         ("gid-reassigned", "995", "996"),
         ("uid-zero", "0", "995"),
@@ -4407,8 +4407,8 @@ exec /usr/bin/stat "$@"
                 tok.to_str().unwrap(),
             ],
             &[
-                ("FAKE_LIVE_UID", live_uid),
-                ("FAKE_LIVE_GID", live_gid),
+                ("FAKE_LIVE_UID", mock_u),
+                ("FAKE_LIVE_GID", mock_g),
                 ("FAKE_RUNUSER_LOG", runuser_log.to_str().unwrap()),
                 ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
                 ("FAKE_SC_LOG", systemctl_log.to_str().unwrap()),
@@ -4419,26 +4419,26 @@ exec /usr/bin/stat "$@"
         );
         assert!(
             !out.status.success(),
-            "uninstall with {label} ({live_uid}:{live_gid}) MUST fail closed: {}",
+            "uninstall with {case_name} MUST fail closed: {}",
             text(&out)
         );
         assert!(
             !runuser_log.exists(),
-            "{label}: uninstall must NEVER invoke runuser before verifying UID/GID"
+            "{case_name}: uninstall must NEVER invoke runuser before verifying UID/GID"
         );
         assert!(
             !chown_log.exists(),
-            "{label}: uninstall must NEVER chown runner credentials before verifying UID/GID"
+            "{case_name}: uninstall must NEVER chown runner credentials before verifying UID/GID"
         );
         assert!(
             !systemctl_log.exists(),
-            "{label}: uninstall must NEVER stop/disable service before verifying UID/GID"
+            "{case_name}: uninstall must NEVER stop/disable service before verifying UID/GID"
         );
         assert!(
             cfg.join("install.env").exists()
                 && inst.join(".credentials").exists()
                 && unit_file.exists(),
-            "{label}: mismatch must leave install.env, credentials, and unit intact for recovery"
+            "{case_name}: mismatch must leave install.env, credentials, and unit intact for recovery"
         );
     }
 }

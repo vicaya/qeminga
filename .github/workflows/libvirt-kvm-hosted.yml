@@ -120,9 +120,14 @@ jobs:
     env:
       ARCH: x86_64
       QEMINGA_E2E_CONNECT: qemu:///session
-      OUT: ${{ runner.temp }}/libvirt-kvm-hosted-${{ github.run_id }}-${{ github.run_attempt }}
       IMAGE_CACHE: ${{ github.workspace }}/libvirt-kvm-image-cache
     steps:
+      - name: Prepare per-run output directory
+        run: |
+          out="${RUNNER_TEMP:?}/libvirt-kvm-hosted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf -- "$out"
+          mkdir -p -m 0700 "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
         with:
           persist-credentials: false

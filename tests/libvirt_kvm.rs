@@ -871,17 +871,29 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         );
     }
 
-    // Output directory must live under runner.temp (outside the checkout) so
-    // pre-existing files in the workspace cannot leak into early-failure evidence.
+    // Output directory must live under RUNNER_TEMP (outside the checkout) and
+    // be exported via GITHUB_ENV in an early step — GitHub Actions disallows
+    // the `runner` context inside job-level `env:`.
+    let smoke_env_end = smoke.find("\n    steps:\n").unwrap();
+    let smoke_job_header = &smoke[..smoke_env_end];
     assert!(
-        smoke.contains(
-            "OUT: ${{ runner.temp }}/libvirt-kvm-hosted-${{ github.run_id }}-${{ github.run_attempt }}"
-        ),
-        "OUT must use a fresh per-run directory under runner.temp:\n{smoke}"
+        !smoke_job_header.contains("${{ runner."),
+        "job-level env must not reference runner.* context (invalid in GitHub Actions):\n{smoke_job_header}"
     );
     assert!(
         !smoke.contains("OUT: ${{ github.workspace }}"),
         "OUT must not live under github.workspace:\n{smoke}"
+    );
+    let out_step_idx = smoke
+        .find(r#"out="${RUNNER_TEMP:?}/libvirt-kvm-hosted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}""#)
+        .unwrap_or_else(|| panic!("missing RUNNER_TEMP per-run OUT setup step:\n{smoke}"));
+    assert!(
+        smoke.contains(r#"echo "OUT=$out" >> "$GITHUB_ENV""#),
+        "per-run OUT must be exported via GITHUB_ENV:\n{smoke}"
+    );
+    assert!(
+        out_step_idx < udev_idx,
+        "OUT must be prepared before the first fail-fast check so early failures still publish evidence"
     );
 
     // Cleanup, fallback failure-result generation (for early exits before `run` installs its

@@ -3257,114 +3257,156 @@ mod tests {
         assert!(!is_host_disconnect_end(&SessionEnd::Cancelled));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn serve_refreshes_reactor_registration_after_real_epollhup_on_idle_reconnect() {
-        bounded(async {
-            // Real Linux FIFO: closing writer1 delivers an actual kernel
-            // EPOLLHUP into Tokio's epoll reactor (latching sticky READ_CLOSED
-            // on the old AsyncFd), and opening an idle writer2 clears POLLHUP
-            // so `read(2)` returns EAGAIN. `serve` must refresh the Tokio
-            // registration so the idle reconnected port parks cleanly without
-            // spinning or repeatedly ending sessions, while keeping the same
-            // underlying fd open (`opened == 0`).
-            let dir = tempfile::tempdir().unwrap();
-            let fifo = dir.path().join("virtio-sim.fifo");
-            nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+        // Real Linux FIFO: closing writer1 delivers an actual kernel EPOLLHUP
+        // into Tokio's epoll reactor (latching sticky READ_CLOSED on the old
+        // AsyncFd), and opening an idle writer2 clears POLLHUP so `read(2)`
+        // returns EAGAIN. `serve` must refresh the Tokio registration so the
+        // idle reconnected port parks cleanly without spinning or repeatedly
+        // ending sessions, while keeping the same underlying fd open
+        // (`opened == 0`).
+        async fn pump() {
+            tokio::time::advance(Duration::ZERO).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
 
-            let reader = open(
-                &fifo,
-                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
-                Mode::empty(),
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("virtio-sim.fifo");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+
+        let reader = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+
+        let opened = Arc::new(AtomicUsize::new(0));
+        let o = opened.clone();
+        let open_fn: OpenFn = Arc::new(move |_| {
+            o.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+        });
+        let hup_probes = Arc::new(AtomicUsize::new(0));
+        let ready_probes = Arc::new(AtomicUsize::new(0));
+        let hp = hup_probes.clone();
+        let rp = ready_probes.clone();
+        let handler = Arc::new(FakeDispatcher::default());
+        let (tx, cancel) = cancel_pair();
+        let h = handler.clone();
+        let server = tokio::spawn(async move {
+            serve_inner_with_probe(
+                Path::new("/dev/virtio-ports/fake"),
+                open_fn,
+                h.as_ref(),
+                cancel,
+                Some(reader),
+                ServeTimers {
+                    reopen: TEST_BACKOFF,
+                    host_wait: Backoff {
+                        initial: Duration::from_millis(5),
+                        max: Duration::from_millis(20),
+                    },
+                },
+                move |fd| {
+                    use nix::poll::{PollFd, ppoll};
+                    use nix::sys::time::TimeSpec;
+                    let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+                    let revents = match ppoll(&mut fds, Some(TimeSpec::new(0, 0)), None) {
+                        Ok(0) => PollFlags::empty(),
+                        Ok(_) => fds[0].revents().unwrap_or(PollFlags::POLLERR),
+                        Err(_) => PollFlags::POLLERR,
+                    };
+                    if revents.contains(PollFlags::POLLHUP) {
+                        hp.fetch_add(1, Ordering::SeqCst);
+                        HostState::VirtioHostDisconnected
+                    } else {
+                        rp.fetch_add(1, Ordering::SeqCst);
+                        HostState::Ready
+                    }
+                },
             )
-            .unwrap();
-            let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+            .await
+        });
 
-            let opened = Arc::new(AtomicUsize::new(0));
-            let o = opened.clone();
-            let open_fn: OpenFn = Arc::new(move |_| {
-                o.fetch_add(1, Ordering::SeqCst);
-                Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
-            });
-            let hup_probes = Arc::new(AtomicUsize::new(0));
-            let ready_probes = Arc::new(AtomicUsize::new(0));
-            let hp = hup_probes.clone();
-            let rp = ready_probes.clone();
-            let handler = Arc::new(FakeDispatcher::default());
-            let (tx, cancel) = cancel_pair();
-            let h = handler.clone();
-            let server = tokio::spawn(async move {
-                serve_inner_with_probe(
-                    Path::new("/dev/virtio-ports/fake"),
-                    open_fn,
-                    h.as_ref(),
-                    cancel,
-                    Some(reader),
-                    ServeTimers {
-                        reopen: TEST_BACKOFF,
-                        host_wait: Backoff {
-                            initial: Duration::from_millis(5),
-                            max: Duration::from_millis(20),
-                        },
-                    },
-                    move |fd| {
-                        use nix::poll::{PollFd, ppoll};
-                        use nix::sys::time::TimeSpec;
-                        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
-                        let revents = match ppoll(&mut fds, Some(TimeSpec::new(0, 0)), None) {
-                            Ok(0) => PollFlags::empty(),
-                            Ok(_) => fds[0].revents().unwrap_or(PollFlags::POLLERR),
-                            Err(_) => PollFlags::POLLERR,
-                        };
-                        if revents.contains(PollFlags::POLLHUP) {
-                            hp.fetch_add(1, Ordering::SeqCst);
-                            HostState::VirtioHostDisconnected
-                        } else {
-                            rp.fetch_add(1, Ordering::SeqCst);
-                            HostState::Ready
-                        }
-                    },
-                )
-                .await
-            });
-
-            // Session 1: `shutdown*` yields no reply (FIFO reader is O_RDONLY).
-            nix::unistd::write(&writer1, b"shutdown1\n").unwrap();
-            while handler.seen.lock().unwrap().is_empty() {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // Session 1: `shutdown*` yields no reply (FIFO reader is O_RDONLY).
+        nix::unistd::write(&writer1, b"shutdown1\n").unwrap();
+        for _ in 0..64 {
+            pump().await;
+            if !handler.seen.lock().unwrap().is_empty() {
+                break;
             }
-            // Let the session park on epoll before writer1 closes so the
-            // kernel delivers a real EPOLLHUP into the registered AsyncFd.
-            tokio::time::sleep(Duration::from_millis(25)).await;
-            drop(writer1);
+        }
+        assert_eq!(handler.seen.lock().unwrap().len(), 1);
+        // Pump so Session 1 hits EAGAIN and parks on epoll before writer1
+        // closes, ensuring the kernel delivers a real EPOLLHUP into AsyncFd.
+        pump().await;
+        drop(writer1);
 
-            while hup_probes.load(Ordering::SeqCst) < 3 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        for _ in 0..32 {
+            pump().await;
+            if hup_probes.load(Ordering::SeqCst) >= 3 {
+                break;
             }
+            tokio::time::advance(Duration::from_millis(20)).await;
+        }
+        assert!(
+            hup_probes.load(Ordering::SeqCst) >= 3,
+            "server must observe host disconnect via ppoll(POLLHUP)"
+        );
 
-            // Reconnect an idle writer2: POLLHUP clears and read() returns EAGAIN.
-            let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
-            let start_ready = ready_probes.load(Ordering::SeqCst);
-            tokio::time::sleep(Duration::from_millis(120)).await;
-            let delta_ready = ready_probes.load(Ordering::SeqCst) - start_ready;
-            assert!(
-                delta_ready <= 2,
-                "idle reconnected port must park on a fresh AsyncFd instead of spinning/re-probing ({delta_ready} probes in 120 ms)"
-            );
-            assert_eq!(
-                opened.load(Ordering::SeqCst),
-                0,
-                "initial descriptor stayed open across EPOLLHUP and idle reconnect"
-            );
-
-            nix::unistd::write(&writer2, b"shutdown2\n").unwrap();
-            while handler.seen.lock().unwrap().len() < 2 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
+        // Reconnect an idle writer2: POLLHUP clears and read() returns EAGAIN.
+        // Synchronize explicitly until the server observes `HostState::Ready`
+        // and enters Session 2 on a fresh AsyncFd BEFORE advancing virtual time.
+        let before_reconnect = ready_probes.load(Ordering::SeqCst);
+        let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        for _ in 0..32 {
+            tokio::time::advance(Duration::from_millis(20)).await;
+            pump().await;
+            if ready_probes.load(Ordering::SeqCst) > before_reconnect {
+                break;
             }
-            assert_eq!(opened.load(Ordering::SeqCst), 0);
-            tx.send(true).unwrap();
-            server.await.unwrap().unwrap();
-        })
-        .await;
+        }
+        let after_reconnect = ready_probes.load(Ordering::SeqCst);
+        assert!(
+            after_reconnect > before_reconnect,
+            "server must observe HostState::Ready after idle writer2 reconnects"
+        );
+
+        // Advance virtual time across a 120 ms idle window: a refreshed
+        // AsyncFd stays parked in Pending with zero additional session-end
+        // probes (a stale READ_CLOSED registration would spin/re-probe here).
+        for _ in 0..12 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            pump().await;
+        }
+        let delta_ready = ready_probes.load(Ordering::SeqCst) - after_reconnect;
+        assert_eq!(
+            delta_ready, 0,
+            "idle reconnected port must park on a fresh AsyncFd instead of spinning/re-probing ({delta_ready} extra probes in 120 ms)"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            0,
+            "initial descriptor stayed open across EPOLLHUP and idle reconnect"
+        );
+
+        nix::unistd::write(&writer2, b"shutdown2\n").unwrap();
+        for _ in 0..64 {
+            pump().await;
+            if handler.seen.lock().unwrap().len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(handler.seen.lock().unwrap().len(), 2);
+        assert_eq!(opened.load(Ordering::SeqCst), 0);
+        tx.send(true).unwrap();
+        pump().await;
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]

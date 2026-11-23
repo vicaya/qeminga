@@ -5116,6 +5116,60 @@ try:
                 os.close(tfd)
         finally:
             os.close(pfd)
+    elif op == "inspect-path-identity":
+        target = norm_abs(sys.argv[2])
+        ident = parse_path_identity(sys.argv[3], target)
+        parent = os.path.dirname(target) or "/"
+        base = os.path.basename(target)
+        pfd, _ = open_chain_rdir_or_opath(parent)
+        try:
+            entries = parse_mountinfo()
+            mountpoints = visible_mountpoints(entries)
+            pst = os.fstat(pfd)
+            p_mnt = fd_mnt_id(pfd)
+            verify_parent_identity(pfd, pst, parent, ident, entries, "inspect", target)
+            try:
+                lst = os.lstat(base, dir_fd=pfd)
+            except FileNotFoundError:
+                print("absent")
+                sys.exit(0)
+            if (
+                stat.S_ISLNK(lst.st_mode)
+                or not stat.S_ISDIR(lst.st_mode)
+                or lst.st_dev != pst.st_dev
+                or lst.st_ino != ident["t_ino"]
+                or target in mountpoints
+            ):
+                print("mismatch")
+                sys.exit(0)
+            tfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
+            try:
+                tst = os.fstat(tfd)
+                t_mnt = fd_mnt_id(tfd)
+                if (
+                    tst.st_dev != pst.st_dev
+                    or t_mnt != p_mnt
+                    or tst.st_ino != ident["t_ino"]
+                ):
+                    print("mismatch")
+                    sys.exit(0)
+                t_vol = volume_id_of_fd(tfd, target, entries)
+                if t_vol != ident["vol"]:
+                    print("mismatch")
+                    sys.exit(0)
+                live_tx = read_tx_marker(tfd, t_mnt, target, sync_file=False)
+                if live_tx == ident["tx"]:
+                    print("match")
+                elif not live_tx and not os.listdir(tfd):
+                    # Recognize the post-marker-unlink empty-directory retry window
+                    # without writing or recreating `.qeminga-tx-id`.
+                    print("match")
+                else:
+                    print("mismatch")
+            finally:
+                os.close(tfd)
+        finally:
+            os.close(pfd)
     elif op == "safe-rmtree-id":
         target = norm_abs(sys.argv[2])
         ident = parse_path_identity(sys.argv[3], target)
@@ -5749,8 +5803,9 @@ read_install_record() {
                     || die "missing UPDATE_BACKUP_DIR/UPDATE_BACKUP_ID in $REC_UPDATE_PHASE updating record '$rec'"
                 ;;
             restored)
-                [ -z "$REC_UPDATE_STAGE_DIR" ] \
-                    || die "unexpected UPDATE_STAGE_DIR in restored updating record '$rec'"
+                # Restored journals may still carry a validated stage and/or
+                # backup pair when rollback restored the runner but could not
+                # finish pruning a container; the next update/uninstall prunes both.
                 ;;
         esac
     fi
@@ -6396,11 +6451,11 @@ query_owned_service_state() {
 _SERVICE_WAS_ACTIVE=0
 ensure_owned_service_stopped() {
     local mode="$1" rec_path_to_sync="${2:-}"
-    local sync_phase="${3:-${REC_UPDATE_PHASE:-}}"
-    local sync_stage_dir="${4:-${REC_UPDATE_STAGE_DIR:-}}"
-    local sync_stage_id="${5:-${REC_UPDATE_STAGE_ID:-}}"
-    local sync_backup_dir="${6:-${REC_UPDATE_BACKUP_DIR:-}}"
-    local sync_backup_id="${7:-${REC_UPDATE_BACKUP_ID:-}}"
+    local sync_phase="${3-${REC_UPDATE_PHASE:-}}"
+    local sync_stage_dir="${4-${REC_UPDATE_STAGE_DIR:-}}"
+    local sync_stage_id="${5-${REC_UPDATE_STAGE_ID:-}}"
+    local sync_backup_dir="${6-${REC_UPDATE_BACKUP_DIR:-}}"
+    local sync_backup_id="${7-${REC_UPDATE_BACKUP_ID:-}}"
     _SERVICE_WAS_ACTIVE=0
     if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
         return 0
@@ -6676,22 +6731,33 @@ _rollback_runner_package_tx() {
                 fi
                 if fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$expected_vol" "$backup_dir" "$backup_id" "$work_child" "0" "$cfg_dir" "$hook_dir" "$hook_vol" "$unit_path" "$unit_vol"; then
                     if [ -n "$sync_stage_dir" ]; then
-                        local cur_stage_id=""
-                        cur_stage_id="$(fs_ops path-identity "$sync_stage_dir" 2>/dev/null || true)"
-                        if [ "$cur_stage_id" = "$sync_stage_id" ]; then
-                            if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id"; then
-                                sync_stage_dir=""
-                                sync_stage_id=""
-                            else
-                                warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
-                                restore_ok=0
-                            fi
+                        local stage_status=""
+                        if stage_status="$(fs_ops inspect-path-identity "$sync_stage_dir" "$sync_stage_id")"; then
+                            case "$stage_status" in
+                                absent | mismatch)
+                                    # Recorded stage directory is confirmed absent or replaced by an
+                                    # unrelated entry left for manual inspection; do not block
+                                    # finalizing rollback of the restored runner on it.
+                                    sync_stage_dir=""
+                                    sync_stage_id=""
+                                    ;;
+                                match)
+                                    if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id"; then
+                                        sync_stage_dir=""
+                                        sync_stage_id=""
+                                    else
+                                        warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
+                                        restore_ok=0
+                                    fi
+                                    ;;
+                                *)
+                                    warn "rollback got unexpected stage inspection status '${stage_status}' for '$sync_stage_dir'; retaining stage reference in restored journal for retry"
+                                    restore_ok=0
+                                    ;;
+                            esac
                         else
-                            # Recorded stage directory is already absent or replaced by an
-                            # unrelated directory left for manual inspection; do not block
-                            # finalizing rollback of the restored runner on it.
-                            sync_stage_dir=""
-                            sync_stage_id=""
+                            warn "rollback could not conclusively inspect staging directory '$sync_stage_dir'; retaining stage reference in restored journal for retry"
+                            restore_ok=0
                         fi
                     fi
                     local rec_saved=1
@@ -8162,7 +8228,7 @@ cmd_update() {
                 _UPDATE_WAS_ACTIVE=1
             fi
             if [ -n "$REC_UPDATE_STAGE_DIR" ] || [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-                say "pruning verified backup container from restored update (${REC_UPDATE_BACKUP_DIR})"
+                say "pruning leftover container(s) from restored update (${REC_UPDATE_STAGE_DIR:+$REC_UPDATE_STAGE_DIR }${REC_UPDATE_BACKUP_DIR})"
                 _sync_and_prune_update_containers update "$_UPDATE_RECORD_PATH" "restored" "updating" "restored" "$was_active"
             fi
             lock_runner_permissions

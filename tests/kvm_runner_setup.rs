@@ -15659,8 +15659,9 @@ esac
             .to_string(),
     );
     assert!(
-        swapped_stage.join("payload/bin/FORGED-marker").exists(),
-        "swapped forged stage dir must be left for inspection by safe-rmtree-id"
+        swapped_stage.join("payload/bin/FORGED-marker").exists()
+            && !swapped_stage.join(".qeminga-tx-id").exists(),
+        "swapped forged stage dir must be left unmodified (without stamping .qeminga-tx-id) for inspection"
     );
     std::fs::remove_dir_all(&swapped_stage).unwrap();
     let _ = std::fs::remove_dir_all(&saved_orig);
@@ -23100,4 +23101,354 @@ esac
         "active",
         "retry must honor preserved UPDATE_WAS_ACTIVE=1 and restart the service"
     );
+}
+
+#[test]
+fn restored_journal_retains_unpruned_stage_and_inspect_is_readonly_and_fail_closed() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("units");
+    let rt_root = dir.path().join("rt");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::create_dir_all(&units).unwrap();
+    std::fs::create_dir_all(&rt_root).unwrap();
+
+    // Part 1: Direct unit check of read-only `fs_ops inspect-path-identity`:
+    //   - Never creates `.qeminga-tx-id` in an empty post-marker-unlink dir (returns `match`).
+    //   - Never creates `.qeminga-tx-id` in a forged replacement dir (returns `mismatch`).
+    //   - Returns `absent` when the path is missing.
+    //   - Exits non-zero (indeterminate, never `mismatch`) on EACCES (`chmod 0000`)!
+    let inspect_parent = dir.path().join("inspect-parent");
+    std::fs::create_dir_all(&inspect_parent).unwrap();
+    let stage_a = inspect_parent.join(".qeminga-extract.empty1");
+    std::fs::create_dir(&stage_a).unwrap();
+    std::fs::set_permissions(&stage_a, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let id_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops path-identity "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(id_out.status.success(), "{}", text(&id_out));
+    let stage_a_id = String::from_utf8(id_out.stdout).unwrap().trim().to_string();
+
+    // Simulate post-marker-unlink crash window: `.qeminga-tx-id` unlinked, dir empty.
+    std::fs::remove_file(stage_a.join(".qeminga-tx-id")).unwrap();
+    let insp_empty = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_empty.status.success()
+            && String::from_utf8_lossy(&insp_empty.stdout).trim() == "match"
+            && !stage_a.join(".qeminga-tx-id").exists(),
+        "inspect-path-identity must recognize empty post-marker-unlink dir as `match` without stamping it: {}",
+        text(&insp_empty)
+    );
+
+    // Unreadable matching-inode dir (EACCES) MUST fail closed (non-zero, not mismatch/absent).
+    std::fs::set_permissions(&stage_a, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let insp_eacces = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&stage_a, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        !insp_eacces.status.success(),
+        "inspect-path-identity must exit non-zero on EACCES (indeterminate read error): {}",
+        text(&insp_eacces)
+    );
+
+    // Replace with forged directory (different inode): MUST return `mismatch` without stamping!
+    std::fs::remove_dir(&stage_a).unwrap();
+    std::fs::create_dir(&stage_a).unwrap();
+    std::fs::set_permissions(&stage_a, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let insp_forged = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_forged.status.success()
+            && String::from_utf8_lossy(&insp_forged.stdout).trim() == "mismatch"
+            && !stage_a.join(".qeminga-tx-id").exists(),
+        "inspect-path-identity must classify forged dir as `mismatch` without creating .qeminga-tx-id: {}",
+        text(&insp_forged)
+    );
+
+    // Missing path: MUST return `absent`.
+    std::fs::remove_dir(&stage_a).unwrap();
+    let insp_absent = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_absent.status.success()
+            && String::from_utf8_lossy(&insp_absent.stdout).trim() == "absent",
+        "inspect-path-identity must classify missing path as `absent`: {}",
+        text(&insp_absent)
+    );
+
+    // Part 2 & 3: End-to-end rollback where restore succeeds, backup is pruned, and:
+    //   - Case A (`chmod 0500` on stage): stage matches but cannot be removed -> `UPDATE_PHASE=restored`
+    //     retains stage fields, and retry `update` MUST read the restored journal cleanly, prune the
+    //     stage, install v2, and restart the service (`active`).
+    //   - Case B (`chmod 0000` on stage): inspect fails with EACCES (indeterminate) -> rollback MUST
+    //     NOT write `RECORD_STATE=installed`, keeping `UPDATE_PHASE=restored` + stage fields until
+    //     recovery (`update`) reclaims the stage and restarts the service!
+    install_standard_mock_bin(&bin);
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        v1_src.join("bin"),
+        v1_src.join("externals"),
+        v2_src.join("bin"),
+        v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let cfg_sh = runner_registration_config_script("restored-stage-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+    let (v2_tb, v2_sha) =
+        build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
+
+    let state_file = dir.path().join("svc.state");
+    let sc_count = dir.path().join("is_active.count");
+    let inst_parent = dir.path().join("install-parent");
+    std::fs::create_dir_all(&inst_parent).unwrap();
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    show)
+        for a in "$@"; do
+            if [ "$a" = "--value" ]; then echo "not-found"; exit 0; fi
+        done
+        echo "LoadState=loaded"
+        echo "FragmentPath=${FAKE_EXPECTED_FRAG:?}"
+        exit 0
+        ;;
+    is-active)
+        if [ -n "${FAKE_ARM_STAGE_MODE:-}" ] && [ -n "${FAKE_SC_COUNT:-}" ]; then
+            c="$(cat "${FAKE_SC_COUNT}" 2>/dev/null || echo 0)"
+            c=$((c + 1))
+            echo "$c" > "${FAKE_SC_COUNT}"
+            if [ "$c" -eq "${FAKE_ARM_ON_CALL:-3}" ]; then
+                for p in "${FAKE_INST_PARENT:?}"/.qeminga-extract.*; do
+                    [ -d "$p" ] && chmod "${FAKE_ARM_STAGE_MODE}" "$p" || true
+                done
+            fi
+        fi
+        st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+        case "$st" in
+            active) echo active; exit 0 ;;
+            inactive) echo inactive; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    start)
+        echo "active" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = inst_parent.join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let rec_path = cfg.join("install.env");
+    let unit_dir = units.to_str().unwrap();
+    let unit_file = units.join("qeminga-restored-stage-box.service");
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "restored-stage-box",
+            "--service",
+            "qeminga-restored-stage-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    for (case_label, stage_mode) in [
+        ("matching-unremovable-0500", "0500"),
+        ("indeterminate-0000", "0000"),
+    ] {
+        std::fs::write(&state_file, "active\n").unwrap();
+        let _ = std::fs::remove_file(&sc_count);
+        let upd_fail = run_setup_env(
+            &[
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("FAKE_SC_COUNT", sc_count.to_str().unwrap()),
+                ("FAKE_ARM_ON_CALL", "3"),
+                ("FAKE_ARM_STAGE_MODE", stage_mode),
+                ("FAKE_INST_PARENT", inst_parent.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        // Restore 0700 so we can inspect and run retry cleanly.
+        for entry in std::fs::read_dir(&inst_parent).unwrap().flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".qeminga-extract."))
+            {
+                let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        assert!(
+            !upd_fail.status.success(),
+            "{case_label}: {}",
+            text(&upd_fail)
+        );
+
+        let rec_after = std::fs::read_to_string(&rec_path).unwrap();
+        let stage_dir_val = rec_after
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_STAGE_DIR="))
+            .unwrap_or("");
+        let stage_id_val = rec_after
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_STAGE_ID="))
+            .unwrap_or("");
+        assert!(
+            rec_after.contains("RECORD_STATE=updating\n")
+                && rec_after.contains("UPDATE_PHASE=restored\n")
+                && rec_after.contains("UPDATE_WAS_ACTIVE=1\n")
+                && !stage_dir_val.is_empty()
+                && !stage_id_val.is_empty()
+                && std::path::Path::new(stage_dir_val).is_dir(),
+            "{case_label}: rollback after successful restore with unpruned stage MUST save readable UPDATE_PHASE=restored retaining stage fields (never installed):\n{rec_after}"
+        );
+
+        let retry_ok = run_setup_env(
+            &[
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            retry_ok.status.success(),
+            "{case_label}: retry update MUST read restored journal with stage fields and recover cleanly:\n{}",
+            text(&retry_ok)
+        );
+        assert!(
+            !std::path::Path::new(stage_dir_val).exists(),
+            "{case_label}: retry must reclaim retained stage {stage_dir_val}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap().trim(),
+            "active",
+            "{case_label}: retry must honor preserved UPDATE_WAS_ACTIVE=1 and restart service"
+        );
+    }
 }

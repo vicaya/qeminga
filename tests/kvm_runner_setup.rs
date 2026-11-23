@@ -7677,6 +7677,35 @@ exit 0
 "#,
     );
 
+    let real_flock = String::from_utf8(
+        Command::new("sh")
+            .args(["-c", "command -v flock"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(!real_flock.is_empty(), "flock must be available on PATH");
+    let lock_waiting_two = dir.path().join("lock_waiting_two");
+    let lock_acquired_two = dir.path().join("lock_acquired_two");
+    write_exec(
+        &bin.join("flock"),
+        &format!(
+            r#"#!/bin/sh
+if [ "${{INSTALL_ROLE:-}}" = "two" ]; then
+    : > "${{LOCK_WAITING_TWO:?}}"
+    "{real_flock}" "$@"
+    rc=$?
+    : > "${{LOCK_ACQUIRED_TWO:?}}"
+    exit "$rc"
+fi
+exec "{real_flock}" "$@"
+"#
+        ),
+    );
+
     let cfg = dir.path().join("cfg");
     let state = dir.path().join("state");
     let inst = dir.path().join("runner");
@@ -7715,6 +7744,8 @@ exit 0
             ])
             .env("PATH", &path_env)
             .env("INSTALL_ROLE", role)
+            .env("LOCK_WAITING_TWO", &lock_waiting_two)
+            .env("LOCK_ACQUIRED_TWO", &lock_acquired_two)
             .env("FAKE_USER_FLAG", &user_flag)
             .env("FAKE_GOOD_TARBALL", &good_tarball)
             .env("DOWNLOAD_STARTED", &download_started)
@@ -7755,9 +7786,61 @@ exit 0
         );
     }
 
-    // Launch overlapping second install while first install holds the lock mid-download!
-    let child2 = spawn_install("two");
-    std::thread::sleep(Duration::from_millis(200));
+    // Launch overlapping second install while first install holds the lock mid-download,
+    // and wait until child2 actually signals it has reached flock acquisition before
+    // releasing child1 so both installs genuinely contend even on slow workers.
+    let mut child2 = spawn_install("two");
+    let lock_deadline = Instant::now() + Duration::from_secs(30);
+    let mut child1_exited = false;
+    let mut child2_exited = false;
+    while !lock_waiting_two.exists() && Instant::now() < lock_deadline {
+        if child1.try_wait().unwrap().is_some() {
+            child1_exited = true;
+            break;
+        }
+        if child2.try_wait().unwrap().is_some() {
+            child2_exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !lock_waiting_two.exists() {
+        let _ = std::fs::write(&release_download, b"go");
+        if !child1_exited {
+            let _ = child1.kill();
+        }
+        if !child2_exited {
+            let _ = child2.kill();
+        }
+        let out1 = child1.wait_with_output().unwrap();
+        let out2 = child2.wait_with_output().unwrap();
+        panic!(
+            "second install should reach flock acquisition while first holds lock (child1_exited={child1_exited}, status1={:?}, child2_exited={child2_exited}, status2={:?}):\n--- child1 ---\n{}\n--- child2 ---\n{}",
+            out1.status,
+            out2.status,
+            text(&out1),
+            text(&out2)
+        );
+    }
+    // Give child2 a brief moment inside flock(2) and verify it stays blocked while child1 holds the lock.
+    std::thread::sleep(Duration::from_millis(50));
+    if lock_acquired_two.exists() || child2.try_wait().unwrap().is_some() {
+        let _ = std::fs::write(&release_download, b"go");
+        let _ = child1.kill();
+        if child2.try_wait().unwrap().is_none() {
+            let _ = child2.kill();
+        }
+        let out1 = child1.wait_with_output().unwrap();
+        let out2 = child2.wait_with_output().unwrap();
+        panic!(
+            "second install must block on flock until first install releases lock (lock_acquired_two={}, status1={:?}, status2={:?}):\n--- child1 ---\n{}\n--- child2 ---\n{}",
+            lock_acquired_two.exists(),
+            out1.status,
+            out2.status,
+            text(&out1),
+            text(&out2)
+        );
+    }
 
     // Release first install and wait for both processes to complete.
     std::fs::write(&release_download, b"go").unwrap();
@@ -7772,6 +7855,10 @@ exit 0
         out2.status.success(),
         "serialized second install should observe completed record and succeed: {}",
         text(&out2)
+    );
+    assert!(
+        lock_acquired_two.exists(),
+        "second install must acquire the lock after first install exits"
     );
 
     let final_rec = std::fs::read_to_string(cfg.join("install.env")).unwrap();

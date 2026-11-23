@@ -3027,8 +3027,12 @@ fn private_fixture_helpers_create_0700_dirs_and_tools_even_under_umask_000() {
 fn sysfs_module_enforces_same_mount_id_and_reclaims_on_final_traversal_failure() {
     let dir = private_tempdir();
     let sys_root = dir.path().join("sys-root");
+    let py_fixture_dir = dir.path().join("py-mod");
     create_private_dir(&sys_root);
+    create_private_dir(&py_fixture_dir);
     std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let py_fixture_mod = py_fixture_dir.join("libvirt_kvm_sysfs.py");
+    std::fs::copy(sysfs_module(), &py_fixture_mod).unwrap();
     let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
 
     let mut cmd = Command::new("python3");
@@ -3190,7 +3194,7 @@ try:
 finally:
     os.close(root_fd)
 "#,
-            sysfs_module().to_str().unwrap(),
+            py_fixture_mod.to_str().unwrap(),
             sys_root.to_str().unwrap(),
         ])
         .output()
@@ -3201,8 +3205,8 @@ finally:
         text(&py)
     );
     assert!(
-        !root().join("scripts/ci/__pycache__").exists(),
-        "Python test invocations must pass -B and never leave scripts/ci/__pycache__ behind"
+        !py_fixture_dir.join("__pycache__").exists(),
+        "Python -IB test invocation must not create __pycache__ in the test-owned module directory"
     );
 }
 
@@ -3280,7 +3284,12 @@ case "$1" in
     list)
         if [ -n "${FAKE_DOM_STATE_FILE:-}" ] && [ -f "$FAKE_DOM_STATE_FILE" ]; then
             st="$(cat "$FAKE_DOM_STATE_FILE")"
-            if [ "$st" != "absent" ]; then printf '%s\n' "${FAKE_DOM_NAME:-}"; fi
+            if [ "$st" != "absent" ]; then
+                case "$*" in
+                    *--uuid*) printf '%s\n' "${FAKE_DOM_UUID:-11111111-2222-3333-4444-555555555555}" ;;
+                    *) printf '%s\n' "${FAKE_DOM_NAME:-}" ;;
+                esac
+            fi
         fi
         exit 0
         ;;
@@ -3411,7 +3420,7 @@ exec /usr/bin/id "$@"
     }
 
     let matching_xml = format!(
-        "<domain type='kvm'><name>{run_name}</name><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+        "<domain type='kvm'><name>{run_name}</name><uuid>11111111-2222-3333-4444-555555555555</uuid><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
         run_dir.display(),
         run_dir.display()
     );
@@ -3737,9 +3746,618 @@ exec /usr/bin/id "$@"
         "cleanup with trusted image root and matching domain XML should destroy, undefine, and remove run dir (virsh_log:\n{vlog_ok}): {}",
         text(&clean_match)
     );
+    // Verify `-B` against a fresh test-owned copy of the scripts/ci files so any
+    // pre-existing checkout `__pycache__` never causes false failures.
+    let ci_fixture_dir = dir.path().join("ci-scripts");
+    create_private_dir(&ci_fixture_dir);
+    for fname in [
+        "libvirt-kvm-smoke.sh",
+        "libvirt-smoke-common.sh",
+        "libvirt_kvm_sysfs.py",
+    ] {
+        std::fs::copy(
+            root().join("scripts/ci").join(fname),
+            ci_fixture_dir.join(fname),
+        )
+        .unwrap();
+    }
+    std::fs::write(&dom_state_file, "absent\n").unwrap();
+    let fixture_clean = Command::new("bash")
+        .arg(ci_fixture_dir.join("libvirt-kvm-smoke.sh"))
+        .args([
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "105",
+            "--run-attempt",
+            "1",
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("QEMINGA_E2E_CONNECT", "qemu:///system")
+        .env("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap())
+        .env("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap())
+        .env("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap())
+        .output()
+        .unwrap();
     assert!(
-        !root().join("scripts/ci/__pycache__").exists(),
-        "libvirt-kvm-smoke.sh must invoke python3 with -B so scripts/ci/__pycache__ is never created"
+        fixture_clean.status.success(),
+        "fixture script cleanup failed: {}",
+        text(&fixture_clean)
+    );
+    assert!(
+        !ci_fixture_dir.join("__pycache__").exists(),
+        "libvirt-kvm-smoke.sh must invoke python3 with -B so __pycache__ is never created in the script directory"
+    );
+}
+
+#[test]
+fn system_mode_cleanup_and_diagnostics_enforce_domain_identity_and_result_errors() {
+    require_jq();
+    let arch = std::env::consts::ARCH;
+    assert!(arch == "x86_64" || arch == "aarch64");
+
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let sys_root = dir.path().join("sys-root");
+    create_private_dir(&bin);
+    create_private_dir(&sys_root);
+    std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let binary = dir.path().join("qeminga-bin");
+    std::fs::write(&binary, b"fake release binary\n").unwrap();
+    let candidate = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        candidate.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "107",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "test-runner",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&candidate.join("qeminga"));
+    let img_key = lane(&["image-key", arch]);
+    assert!(img_key.status.success(), "{}", text(&img_key));
+    let pinned_image_sha = String::from_utf8(img_key.stdout)
+        .unwrap()
+        .trim()
+        .rsplit('-')
+        .next()
+        .unwrap()
+        .to_string();
+    let caller_grp_num = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-g")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let qemu_user_spec = "+64055";
+    let qemu_group_spec = format!("+{caller_grp_num}");
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+    let disable_acl_flag = if acls_can_name_test_uids { "0" } else { "1" };
+
+    write_exec(
+        &bin.join("virsh"),
+        r#"#!/bin/sh
+case "$1" in --connect=*) shift ;; esac
+if [ -n "${FAKE_VIRSH_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_VIRSH_LOG"; fi
+case "$1" in
+    version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    capabilities) exit 0 ;;
+    domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
+    net-info) echo "Active:         yes"; exit 0 ;;
+    list)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ] && [ -f "$FAKE_DOM_STATE_FILE" ]; then
+            st="$(cat "$FAKE_DOM_STATE_FILE")"
+            if [ "$st" != "absent" ]; then
+                case "$*" in
+                    *--uuid*) printf '%s\n' "${FAKE_DOM_UUID:-}" ;;
+                    *) printf '%s\n' "${FAKE_DOM_NAME:-}" ;;
+                esac
+            fi
+        fi
+        exit 0
+        ;;
+    domstate)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ] && [ -f "$FAKE_DOM_STATE_FILE" ]; then
+            st="$(cat "$FAKE_DOM_STATE_FILE")"
+            if [ "$st" != "absent" ]; then echo "$st"; exit 0; fi
+        fi
+        echo "error: failed to get domain '$2'" >&2; exit 1
+        ;;
+    dumpxml)
+        shift
+        is_inactive=0
+        if [ "${1:-}" = "--inactive" ]; then
+            is_inactive=1
+            shift
+        fi
+        if [ "$is_inactive" -eq 1 ] && [ -n "${FAKE_DUMPXML_INACTIVE_CONTENT:-}" ]; then
+            printf '%s\n' "$FAKE_DUMPXML_INACTIVE_CONTENT"
+            exit 0
+        fi
+        if [ -n "${FAKE_DUMPXML_CONTENT:-}" ]; then
+            printf '%s\n' "$FAKE_DUMPXML_CONTENT"
+            exit 0
+        fi
+        exit 1
+        ;;
+    destroy)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ]; then echo "shut off" > "$FAKE_DOM_STATE_FILE"; fi
+        exit 0
+        ;;
+    undefine)
+        if [ -n "${FAKE_DOM_STATE_FILE:-}" ]; then echo "absent" > "$FAKE_DOM_STATE_FILE"; fi
+        exit 0
+        ;;
+    define)
+        exit "${FAKE_DEFINE_EXIT:-0}"
+        ;;
+    start) exit 42 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("genisoimage"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -output) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join(format!("qemu-system-{arch}")),
+        "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf 'fake qcow2 bytes\n' > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("sha256sum"),
+        r#"#!/bin/sh
+case "$1" in
+    *.qcow2.part) printf '%s  %s\n' "${FAKE_IMAGE_SHA:?}" "$1"; exit 0 ;;
+esac
+exec /usr/bin/sha256sum "$@"
+"#,
+    );
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
+    );
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo "0"; exit 0; fi
+exec /usr/bin/id "$@"
+"#,
+    );
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let run_name = format!("qeminga-e2e-107-1-{arch}");
+    let dom_uuid = "11111111-2222-3333-4444-555555555555";
+    let virsh_log = dir.path().join("virsh.log");
+    let dom_state_file = dir.path().join("dom.state");
+
+    // 1. Missing image-root components (`planned/images` absent):
+    //    - `verify_cleanup_target` MUST return distinct `absent` status AND preserve EVERY
+    //      missing component in the resolved path (never collapsing upward to `sys_root/<run>`).
+    //    - `cmd_cleanup` MUST preserve an existing same-named domain whose XML points at
+    //      `sys_root/<run>/root.qcow2` (zero destroy/undefine)!
+    let planned_images = sys_root.join("planned/images");
+    let py_check = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+root_fd = os.open(sys.argv[2], mod.READ_DIR_FLAGS)
+try:
+    res = mod.verify_cleanup_target(sys.argv[3], sys.argv[4], root_fd=root_fd, root_path=sys.argv[2])
+    assert isinstance(res, tuple) and len(res) == 3, f"expected 3-tuple (status, lexical, resolved), got {res!r}"
+    status, lex, resolved = res
+    assert status == "absent", f"expected status='absent', got {status!r}"
+    expected_tail = os.path.join("planned", "images", sys.argv[4])
+    assert resolved.endswith(expected_tail), f"resolved path dropped missing components: {resolved!r}"
+finally:
+    os.close(root_fd)
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+            planned_images.to_str().unwrap(),
+            &run_name,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py_check.status.success(),
+        "verify_cleanup_target must report absent status and preserve missing path components:\n{}",
+        text(&py_check)
+    );
+
+    let ancestor_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><uuid>{dom_uuid}</uuid><devices><disk type='file'><source file='{}/{run_name}/root.qcow2'/></disk></devices></domain>",
+        sys_root.display()
+    );
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_missing_root = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "107",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", planned_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &ancestor_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_miss = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_missing_root.status.success()
+            && !vlog_miss.contains("destroy")
+            && !vlog_miss.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running",
+        "cleanup MUST preserve an existing domain when configured image root is absent (virsh_log:\n{vlog_miss}): {}",
+        text(&clean_missing_root)
+    );
+
+    // 2. Persistent (`--inactive`) XML divergence + UUID pinning:
+    //    Live XML matches `run_dir`, but persistent `--inactive` XML points `<nvram>` outside
+    //    `run_dir` -> MUST fail closed BEFORE destroy/undefine, preserving domain and storage!
+    let good_images = sys_root.join("clean-images");
+    create_private_dir(&good_images);
+    let run_dir = good_images.join(&run_name);
+    create_private_dir(&run_dir);
+    let live_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><uuid>{dom_uuid}</uuid><os><nvram>{}/VARS.fd</nvram></os><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+        run_dir.display(),
+        run_dir.display(),
+        run_dir.display()
+    );
+    let bad_inactive_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><uuid>{dom_uuid}</uuid><os><nvram>/var/lib/libvirt/qemu/nvram/prod_VARS.fd</nvram></os><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+        run_dir.display(),
+        run_dir.display()
+    );
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_bad_inactive = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "107",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &live_xml),
+            ("FAKE_DUMPXML_INACTIVE_CONTENT", &bad_inactive_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_inact = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_bad_inactive.status.success()
+            && !vlog_inact.contains("destroy")
+            && !vlog_inact.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running"
+            && run_dir.is_dir(),
+        "cleanup MUST reject persistent --inactive XML referencing out-of-run NVRAM BEFORE destroy/undefine (virsh_log:\n{vlog_inact}): {}",
+        text(&clean_bad_inactive)
+    );
+
+    // Matching live AND persistent XML -> destructive virsh calls MUST pin domain UUID!
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_pinned = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "107",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &live_xml),
+            ("FAKE_DUMPXML_INACTIVE_CONTENT", &live_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_pin = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        clean_pinned.status.success()
+            && vlog_pin.contains(&format!("destroy {dom_uuid}"))
+            && vlog_pin.contains(&format!("undefine --nvram {dom_uuid}"))
+            && !run_dir.exists(),
+        "cleanup MUST pin domain UUID for destroy and undefine --nvram (virsh_log:\n{vlog_pin}): {}",
+        text(&clean_pinned)
+    );
+
+    // 3. Stale-domain preflight failure MUST emit result.json ("fail") WITHOUT disclosing
+    //    the stale domain's XML or host QEMU log into OUT as 0644 evidence!
+    let qemu_log_dir = sys_root.join("stale-qemu-logs");
+    create_private_dir(&qemu_log_dir);
+    std::fs::write(
+        qemu_log_dir.join(format!("{run_name}.log")),
+        b"STALE_HOST_QEMU_SECRET\n",
+    )
+    .unwrap();
+    let out_stale = sys_root.join("out-stale");
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let stale_xml = format!(
+        "<domain type='kvm'><name>{run_name}</name><uuid>99999999-8888-7777-6666-555555555555</uuid><devices><disk type='file'><source file='/var/lib/libvirt/images/stale-secret/root.qcow2'/></disk></devices></domain>"
+    );
+    let run_stale = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "107",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_stale.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qemu_log_dir.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run_name),
+            ("FAKE_DOM_UUID", "99999999-8888-7777-6666-555555555555"),
+            ("FAKE_DUMPXML_CONTENT", &stale_xml),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_stale.status.success(), "{}", text(&run_stale));
+    let stale_result: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_stale.join("result.json")).unwrap()).unwrap();
+    assert_eq!(stale_result["result"], "fail");
+    assert!(
+        !out_stale.join("domain.xml").exists() && !out_stale.join("qemu.log").exists(),
+        "stale-domain preflight failure MUST NOT publish another domain's domain.xml or qemu.log into OUT"
+    );
+
+    // 3b. Failing at `virsh define` AFTER `create_system_run_dir` MUST also refuse to publish
+    //     another domain's domain.xml or qemu.log!
+    let out_predef = sys_root.join("out-predef");
+    std::fs::write(&dom_state_file, "absent\n").unwrap();
+    let run_predef = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "108",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_predef.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qemu_log_dir.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DEFINE_EXIT", "1"),
+            ("FAKE_DUMPXML_CONTENT", &stale_xml),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_predef.status.success(), "{}", text(&run_predef));
+    assert!(
+        !out_predef.join("domain.xml").exists() && !out_predef.join("qemu.log").exists(),
+        "failed virsh define MUST NOT publish unowned domain.xml or qemu.log"
+    );
+
+    // 3c. Existing image root, ABSENT run dir, while a same-named domain is running:
+    //     cleanup MUST fail closed and preserve the domain because storage cannot be verified!
+    let missing_run_name = format!("qeminga-e2e-109-1-{arch}");
+    let missing_run_xml = format!(
+        "<domain type='kvm'><name>{missing_run_name}</name><uuid>{dom_uuid}</uuid><devices><disk type='file'><source file='{}/{missing_run_name}/root.qcow2'/></disk></devices></domain>",
+        good_images.display()
+    );
+    std::fs::write(&dom_state_file, "running\n").unwrap();
+    let _ = std::fs::remove_file(&virsh_log);
+    let clean_absent_run = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "109",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &missing_run_name),
+            ("FAKE_DOM_UUID", dom_uuid),
+            ("FAKE_DUMPXML_CONTENT", &missing_run_xml),
+        ],
+        Some(&bin),
+    );
+    let vlog_abs = std::fs::read_to_string(&virsh_log).unwrap_or_default();
+    assert!(
+        !clean_absent_run.status.success()
+            && !vlog_abs.contains("destroy")
+            && !vlog_abs.contains("undefine")
+            && std::fs::read_to_string(&dom_state_file).unwrap().trim() == "running",
+        "cleanup MUST preserve an existing domain when its expected run dir is absent (virsh_log:\n{vlog_abs}): {}",
+        text(&clean_absent_run)
+    );
+
+    // 4. `write_result` called under EXIT-trap semantics (`write_result ... || rc=1`, which
+    //    disables Bash `set -e` inside the function): with four passing markers and a directory
+    //    blocking `result.json`, MUST return nonzero and NOT print a passing JSON record!
+    let ci_probe_dir = dir.path().join("ci-probe");
+    create_private_dir(&ci_probe_dir);
+    for fname in ["libvirt-smoke-common.sh", "libvirt_kvm_sysfs.py"] {
+        std::fs::copy(
+            root().join("scripts/ci").join(fname),
+            ci_probe_dir.join(fname),
+        )
+        .unwrap();
+    }
+    let full_smoke = std::fs::read_to_string(script()).unwrap();
+    let dispatch_idx = full_smoke.find("# ---- dispatch").unwrap();
+    let probe_lib = ci_probe_dir.join("libvirt-kvm-smoke-lib.sh");
+    std::fs::write(&probe_lib, &full_smoke[..dispatch_idx]).unwrap();
+
+    for mode in ["qemu:///system", "qemu:///session"] {
+        let out_res = sys_root.join(format!("out-res-dir-{}", mode.replace([':', '/'], "_")));
+        std::fs::create_dir_all(out_res.join("tests")).unwrap();
+        for t in MANDATORY {
+            std::fs::write(out_res.join("tests").join(t), "pass\n").unwrap();
+        }
+        std::fs::create_dir(out_res.join("result.json")).unwrap();
+        let probe = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+set -euo pipefail
+source "$1"
+rc=0
+write_result "$2" "$3" "$4" "$5" kvm || rc=1
+exit "$rc"
+"#,
+                "_",
+                probe_lib.to_str().unwrap(),
+                out_res.to_str().unwrap(),
+                arch,
+                SHA,
+                &"a".repeat(64),
+            ])
+            .env("QEMINGA_E2E_CONNECT", mode)
+            .env("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap())
+            .output()
+            .unwrap();
+        assert!(
+            !probe.status.success(),
+            "write_result ({mode}) under EXIT-trap `|| rc=1` MUST fail when result.json is a directory:\n{}",
+            text(&probe)
+        );
+        let stdout_s = String::from_utf8_lossy(&probe.stdout);
+        assert!(
+            !stdout_s.contains("\"result\": \"pass\""),
+            "write_result ({mode}) MUST NOT print a passing JSON record when publication failed:\n{stdout_s}"
+        );
+    }
+    assert!(
+        !ci_probe_dir.join("__pycache__").exists(),
+        "write_result probe in qemu:///system mode must not write __pycache__"
     );
 }
 

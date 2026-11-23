@@ -224,16 +224,19 @@ cmd_stale_check() {
 }
 
 domain_state() {
-    local name="$1" out
-    if out="$(v domstate "$name" 2>&1)"; then
+    local ref="$1" out list_flag="--name"
+    if [[ "$ref" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        list_flag="--uuid"
+    fi
+    if out="$(v domstate "$ref" 2>&1)"; then
         printf '%s\n' "$out" | head -n 1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
         return 0
     fi
     case "$out" in
         *"failed to get domain"* | *"Domain not found"*)
-            local names
-            names="$(v list --all --name)" || return 1
-            if printf '%s\n' "$names" | grep -qx -- "$name"; then return 1; fi
+            local refs
+            refs="$(v list --all "$list_flag")" || return 1
+            if printf '%s\n' "$refs" | grep -iqx -- "$ref"; then return 1; fi
             echo absent
             ;;
         *) echo "$out" >&2; return 1 ;;
@@ -241,24 +244,30 @@ domain_state() {
 }
 
 collect_diagnostics() {
-    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" qlog
+    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" domain_owned="${5:-0}" domain_ref="${6:-}" verified_xml="${7:-}" qlog
     qlog="$(qemu_log_of "$name")"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         sys_fs_ops prepare-evidence-dir "$out" 2>/dev/null || return 0
-        local dom_xml=""
-        dom_xml="$(v dumpxml "$name" 2>/dev/null || true)"
-        if [ -n "$dom_xml" ]; then
-            printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+        if [ "$domain_owned" = "1" ]; then
+            local dom_xml="$verified_xml"
+            if [ -z "$dom_xml" ] && [ -n "$domain_ref" ]; then
+                dom_xml="$(v dumpxml "$domain_ref" 2>/dev/null || true)"
+            fi
+            if [ -n "$dom_xml" ]; then
+                printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+            fi
+            sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" 2>/dev/null || true
         fi
-        sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" 2>/dev/null || true
         if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
             sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
         fi
         return 0
     fi
     mkdir -p "$out"
-    v dumpxml "$name" >"$out/domain.xml" 2>/dev/null || true
-    if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
+    if [ "$domain_owned" = "1" ]; then
+        v dumpxml "${domain_ref:-$name}" >"$out/domain.xml" 2>/dev/null || true
+        if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
+    fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
         if command -v python3 >/dev/null 2>&1; then
             sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
@@ -301,46 +310,90 @@ cmd_cleanup() {
         return 0
     fi
 
+    local dom_ref="$name" dom_is_persistent=1 target_status="present"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         # Verify the image root, run directory, and same-mount tree BEFORE
-        # touching libvirt or collecting diagnostics, then verify any existing
-        # domain's XML belongs to this run directory BEFORE destroy/undefine.
-        local verified_paths="" expected_lexical_dir="" expected_resolved_dir=""
-        verified_paths="$(sys_fs_ops verify-cleanup-target "$IMAGES" "$name")" || exit 1
-        IFS=$'\t' read -r expected_lexical_dir expected_resolved_dir <<<"$verified_paths"
+        # touching libvirt or collecting diagnostics, then verify BOTH the live
+        # and persistent (`--inactive`) definitions of any existing domain belong
+        # to this present run directory and pin its UUID BEFORE destroy/undefine.
+        local verified_target="" expected_lexical_dir="" expected_resolved_dir=""
+        verified_target="$(sys_fs_ops verify-cleanup-target "$IMAGES" "$name")" || exit 1
+        IFS=$'\t' read -r target_status expected_lexical_dir expected_resolved_dir <<<"$verified_target"
 
         state="$(domain_state "$name")" \
             || die "the state of $name cannot be established; keeping $dir"
         if [ "$state" != absent ]; then
-            local dom_xml=""
-            dom_xml="$(v dumpxml "$name" 2>/dev/null)" \
-                || die "cannot inspect XML for $name before cleanup; keeping $dir"
-            printf '%s\n' "$dom_xml" \
-                | sys_fs_ops verify-domain-xml "$name" "$expected_lexical_dir" "$expected_resolved_dir" \
+            if [ "$target_status" != "present" ]; then
+                die "expected run directory '$expected_lexical_dir' is absent, so existing domain $name cannot be verified against its storage; preserving domain"
+            fi
+            local live_xml="" dom_uuid=""
+            live_xml="$(v dumpxml "$name" 2>/dev/null)" \
+                || die "cannot inspect live XML for $name before cleanup; keeping $dir"
+            dom_uuid="$(printf '%s\n' "$live_xml" \
+                | sys_fs_ops verify-domain-xml "$name" "$expected_lexical_dir" "$expected_resolved_dir")" \
                 || exit 1
+            local inactive_xml="" inactive_rc=0
+            inactive_xml="$(v dumpxml --inactive "$dom_uuid" 2>&1)" || inactive_rc=$?
+            if [ "$inactive_rc" -eq 0 ]; then
+                local inactive_uuid=""
+                inactive_uuid="$(printf '%s\n' "$inactive_xml" \
+                    | sys_fs_ops verify-domain-xml "$name" "$expected_lexical_dir" "$expected_resolved_dir")" \
+                    || exit 1
+                [ "$inactive_uuid" = "$dom_uuid" ] \
+                    || die "persistent domain UUID '$inactive_uuid' does not match live UUID '$dom_uuid'; preserving domain and $dir"
+            else
+                case "$inactive_xml" in
+                    *"is not persistent"*)
+                        if [ "$state" = "shut off" ]; then
+                            die "cannot inspect persistent XML for shut-off domain $name ($dom_uuid); preserving domain and $dir"
+                        fi
+                        dom_is_persistent=0
+                        ;;
+                    *)
+                        die "cannot inspect persistent XML for $name ($dom_uuid) before cleanup: $inactive_xml; preserving domain and $dir"
+                        ;;
+                esac
+            fi
+            dom_ref="$dom_uuid"
+            [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify 1 "$dom_uuid" "$live_xml"
+        elif [ -n "$out" ] && [ "$target_status" = "present" ]; then
+            collect_diagnostics "$name" "$dir" "$out" verify 0 "" ""
         fi
-        [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
     else
-        [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify
         state="$(domain_state "$name")" \
             || die "the state of $name cannot be established; keeping $dir"
+        if [ -n "$out" ]; then
+            if [ "$state" != absent ]; then
+                collect_diagnostics "$name" "$dir" "$out" verify 1 "$name"
+            else
+                collect_diagnostics "$name" "$dir" "$out" verify 0 ""
+            fi
+        fi
     fi
 
     if [ "$state" != absent ]; then
         if [ "$state" != "shut off" ]; then
-            v destroy "$name" || true
-            state="$(domain_state "$name")" || die "cannot establish $name's state after destroy; keeping $dir"
-            [ "$state" = "shut off" ] || die "$name is still '$state'; keeping $dir"
+            v destroy "$dom_ref" || true
+            state="$(domain_state "$dom_ref")" || die "cannot establish $name ($dom_ref) state after destroy; keeping $dir"
+            if [ "$dom_is_persistent" -eq 0 ]; then
+                [ "$state" = absent ] || die "transient domain $name ($dom_ref) is still '$state' after destroy; keeping $dir"
+            else
+                [ "$state" = "shut off" ] || die "$name ($dom_ref) is still '$state'; keeping $dir"
+            fi
         fi
-        v undefine --nvram "$name" || v undefine "$name" || die "cannot undefine $name; keeping $dir"
-        state="$(domain_state "$name")" || die "cannot confirm $name is gone; keeping $dir"
-        [ "$state" = absent ] || die "$name is still defined; keeping $dir"
+        if [ "$dom_is_persistent" -eq 1 ]; then
+            v undefine --nvram "$dom_ref" || v undefine "$dom_ref" || die "cannot undefine $name ($dom_ref); keeping $dir"
+            state="$(domain_state "$dom_ref")" || die "cannot confirm $name ($dom_ref) is gone; keeping $dir"
+            [ "$state" = absent ] || die "$name ($dom_ref) is still defined; keeping $dir"
+        fi
     fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        local cleanup_status=""
-        cleanup_status="$(sys_fs_ops cleanup-run-dir "$IMAGES" "$name")" || exit 1
-        if [ "$cleanup_status" = "removed" ]; then
-            echo "removed $dir"
+        if [ "$target_status" = "present" ]; then
+            local cleanup_status=""
+            cleanup_status="$(sys_fs_ops cleanup-run-dir "$IMAGES" "$name")" || exit 1
+            if [ "$cleanup_status" = "removed" ]; then
+                echo "removed $dir"
+            fi
         fi
     elif [ -d "$dir" ]; then
         rm -rf --one-file-system -- "$dir"
@@ -364,7 +417,7 @@ write_result() {
             status=not_run
         fi
         [ "$status" = pass ] || overall=fail
-        tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")"
+        tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")" || return 1
     done
     [ "$accel" = kvm ] || overall=fail
     result_json="$(jq -n \
@@ -378,11 +431,11 @@ write_result() {
           architecture: $arch, candidate_binary_sha256: $digest,
           virtualization: {hypervisor: "qemu", accelerator: $accel, machine: $machine},
           guest: {image: $image, image_release: $image_release, image_sha256: $image_sha},
-          tests: $tests, result: $result}')"
+          tests: $tests, result: $result}')" || return 1
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json"
+        printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json" || return 1
     else
-        printf '%s\n' "$result_json" >"$out/result.json"
+        printf '%s\n' "$result_json" >"$out/result.json" || return 1
     fi
     printf '%s\n' "$result_json"
     [ "$overall" = pass ]
@@ -717,10 +770,12 @@ cmd_run() {
     check_name "$RUN_NAME"
     RUN_DIR="$IMAGES/$RUN_NAME"
     RUN_DIR_VERIFIED=0
+    RUN_DOMAIN_OWNED=0
+    RUN_DOMAIN_REF=""
     local name="$RUN_NAME" dir="$RUN_DIR" digest
 
     # shellcheck disable=SC2154 # rc is assigned inside the trap
-    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
+    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED" "$RUN_DOMAIN_OWNED" "$RUN_DOMAIN_REF"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
 
     preflight "$arch"
     local versions_txt=""
@@ -798,6 +853,22 @@ EOF
 
     cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$(nproc)" >"$dir/domain.xml"
     v define "$dir/domain.xml"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        local target_info="" t_st="" t_lex="" t_res="" def_xml="" def_uuid=""
+        if target_info="$(sys_fs_ops verify-cleanup-target "$IMAGES" "$name" 2>/dev/null)"; then
+            IFS=$'\t' read -r t_st t_lex t_res <<<"$target_info"
+            if [ "$t_st" = "present" ] \
+                && def_xml="$(v dumpxml "$name" 2>/dev/null)" \
+                && [ -n "$def_xml" ] \
+                && def_uuid="$(printf '%s\n' "$def_xml" | sys_fs_ops verify-domain-xml "$name" "$t_lex" "$t_res" 2>/dev/null)"; then
+                RUN_DOMAIN_REF="$def_uuid"
+                RUN_DOMAIN_OWNED=1
+            fi
+        fi
+    else
+        RUN_DOMAIN_REF="$name"
+        RUN_DOMAIN_OWNED=1
+    fi
     v start "$name"
 
     say "accelerator"

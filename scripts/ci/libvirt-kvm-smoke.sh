@@ -309,7 +309,9 @@ write_result() {
         tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")"
     done
     [ "$accel" = kvm ] || overall=fail
-    jq -n \
+    local tmp="$out/.result.json.tmp.$$"
+    rm -f "$tmp"
+    if ! jq -n \
         --arg suite "$SUITE" --arg repo "$SOURCE_REPOSITORY" --arg sha "$sha" \
         --arg arch "$arch" --arg digest "$digest" --arg accel "$accel" \
         --arg machine "$(machine_of "$arch")" \
@@ -320,7 +322,11 @@ write_result() {
           architecture: $arch, candidate_binary_sha256: $digest,
           virtualization: {hypervisor: "qemu", accelerator: $accel, machine: $machine},
           guest: {image: $image, image_release: $image_release, image_sha256: $image_sha},
-          tests: $tests, result: $result}' >"$out/result.json"
+          tests: $tests, result: $result}' >"$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$out/result.json"
     cat "$out/result.json"
     [ "$overall" = pass ]
 }

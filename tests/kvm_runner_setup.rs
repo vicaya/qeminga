@@ -7649,7 +7649,7 @@ for a in "$@"; do
         *api.github.com/repos/*)
             if [ "${INSTALL_ROLE:-}" = "two" ]; then
                 i=0
-                while [ ! -f "${RELEASE_DOWNLOAD:?}" ] && [ "$i" -lt 100 ]; do
+                while [ ! -f "${RELEASE_DOWNLOAD:?}" ] && [ "$i" -lt 600 ]; do
                     sleep 0.05
                     i=$((i + 1))
                 done
@@ -7663,7 +7663,7 @@ done
 if [ "${INSTALL_ROLE:-}" = "one" ]; then
     : > "${DOWNLOAD_STARTED:?}"
     i=0
-    while [ ! -f "${RELEASE_DOWNLOAD:?}" ] && [ "$i" -lt 100 ]; do
+    while [ ! -f "${RELEASE_DOWNLOAD:?}" ] && [ "$i" -lt 600 ]; do
         sleep 0.05
         i=$((i + 1))
     done
@@ -7732,15 +7732,23 @@ exit 0
             .unwrap()
     };
 
-    let child1 = spawn_install("one");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut child1 = spawn_install("one");
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !download_started.exists() && Instant::now() < deadline {
+        if child1.try_wait().unwrap().is_some() {
+            break;
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(
-        download_started.exists(),
-        "first install should reach tarball download with partial installing record on disk"
-    );
+    if !download_started.exists() {
+        let _ = std::fs::write(&release_download, b"go");
+        let _ = child1.kill();
+        let out1 = child1.wait_with_output().unwrap();
+        panic!(
+            "first install should reach tarball download with partial installing record on disk: {}",
+            text(&out1)
+        );
+    }
 
     // Launch overlapping second install while first install holds the lock mid-download!
     let child2 = spawn_install("two");

@@ -16,7 +16,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -28,6 +29,10 @@ fn root() -> &'static Path {
 
 fn script() -> PathBuf {
     root().join("scripts/ci/libvirt-kvm-smoke.sh")
+}
+
+fn sysfs_module() -> PathBuf {
+    root().join("scripts/ci/libvirt_kvm_sysfs.py")
 }
 
 fn tcg_script() -> PathBuf {
@@ -74,9 +79,50 @@ fn require_jq() {
     );
 }
 
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
+fn create_private_dir(path: &Path) {
+    std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+}
+
+/// Returns true when `target` is mapped in the current user namespace's
+/// `/proc/self/uid_map` (always true on normal hosts, GitHub runners, and
+/// multi-UID containers; false for arbitrary test UIDs inside a single-UID
+/// `unshare -U --map-current-user` namespace where kernel `setxattr` rejects
+/// unmapped ACL UIDs with `EINVAL`).
+fn uid_is_mapped(target: u32) -> bool {
+    let Ok(map) = std::fs::read_to_string("/proc/self/uid_map") else {
+        return true;
+    };
+    for line in map.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(inside), Some(_outside), Some(len)) =
+            (parts.next(), parts.next(), parts.next())
+            && let (Ok(start), Ok(count)) = (inside.parse::<u64>(), len.parse::<u64>())
+            && u64::from(target) >= start
+            && u64::from(target) < start.saturating_add(count)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o700)
+        .open(path)
+        .unwrap();
+    f.write_all(body.as_bytes()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
 fn sha256_hex(path: &Path) -> String {
@@ -420,11 +466,11 @@ fn kvm_run_directory_permissions_match_libvirt_connection_mode() {
         "unexpected test arch {arch}"
     );
 
-    let dir = tempfile::tempdir().unwrap();
-    // Ensure the outer tempdir root itself is traversable (0755) for simulated QEMU checks.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = private_tempdir();
     let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    create_private_dir(&bin);
+    // Grant traversal on the fixture root for simulated QEMU checks while keeping `bin` 0700.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
 
     // Build a valid candidate bundle matching the host arch.
     let binary = dir.path().join("qeminga-bin");
@@ -566,7 +612,14 @@ exec /usr/bin/id "$@"
     std::fs::write(&aavmf_code, b"code").unwrap();
     std::fs::write(&aavmf_vars, b"vars").unwrap();
 
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+
     // Helper: run `libvirt-kvm-smoke.sh` under an explicit umask (e.g., 0077 or 0022).
+    // Simulated unprivileged `qemu:///system` runs anchor their trust walk at the
+    // fixture-owned `dir.path()` descriptor so the ordinary test suite stays portable
+    // inside unprivileged user namespaces where host `/` reports overflow UID 65534;
+    // the full host-root `/` walk is exercised as real root in
+    // `privileged_kvm_system_lane_kernel_verdicts`.
     let run_with_umask = |mask: &str, args: &[&str], env: &[(&str, &str)]| -> Output {
         let mut cmd = Command::new("bash");
         cmd.args(["-c", r#"umask "$1"; shift; exec bash "$@""#, "_"]);
@@ -577,6 +630,17 @@ exec /usr/bin/id "$@"
             std::env::var("PATH").unwrap_or_default()
         );
         cmd.env("PATH", path);
+        if env
+            .iter()
+            .any(|(k, v)| *k == "QEMINGA_E2E_CONNECT" && *v == "qemu:///system")
+        {
+            cmd.env("QEMINGA_TEST_SYSFS_ROOT", dir.path());
+            if !acls_can_name_test_uids
+                && !env.iter().any(|(k, _)| *k == "QEMINGA_TEST_DISABLE_ACL")
+            {
+                cmd.env("QEMINGA_TEST_DISABLE_ACL", "1");
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -1054,7 +1118,7 @@ else:
     //    and strip inherited `system.posix_acl_default` before creating children so unrelated
     //    accounts receive ZERO rights (`0`) on new image-root dirs, run dir, and `root.qcow2`
     //    while QEMU receives `--x` (`1`) traversal!
-    {
+    if acls_can_name_test_uids {
         let other_acct_num = "64099";
         let other_grp_num = "64099";
         let acl_parent = dir.path().join("with-default-acl");
@@ -1175,26 +1239,30 @@ except OSError:
     //    - 7a: world-writable `0777` ancestor
     //    - 7b: group-writable `0775` (non-root group) ancestor
     //    - 7c: sticky world-writable `1777` parent of missing image root
-    //    - 7d: access-ACL-writable (`u:64099:rwx`) ancestor
+    //    - 7d: access-ACL-writable (`u:64099:rwx`) ancestor (when test UIDs are mapped)
     {
         let shared_world = dir.path().join("shared-0777");
         let shared_group = dir.path().join("shared-0775");
         let shared_sticky = dir.path().join("shared-1777");
         let shared_acl = dir.path().join("shared-acl");
+        let mut shared_cases: Vec<PathBuf> = Vec::new();
         for (p, mode) in [
             (&shared_world, 0o777),
             (&shared_group, 0o775),
             (&shared_sticky, 0o1777),
-            (&shared_acl, 0o755),
         ] {
             std::fs::create_dir(p).unwrap();
             std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+            shared_cases.push(p.clone());
         }
-        let set_acc_acl = Command::new("python3")
-            .args([
-                "-I",
-                "-c",
-                r#"
+        if acls_can_name_test_uids {
+            std::fs::create_dir(&shared_acl).unwrap();
+            std::fs::set_permissions(&shared_acl, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let set_acc_acl = Command::new("python3")
+                .args([
+                    "-I",
+                    "-c",
+                    r#"
 import os, struct, sys
 p = sys.argv[1]
 entries = [
@@ -1207,16 +1275,15 @@ entries = [
 raw = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, perm, eid) for t, perm, eid in entries)
 os.setxattr(p, b"system.posix_acl_access", raw)
 "#,
-                shared_acl.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap();
-        assert!(set_acc_acl.status.success(), "{}", text(&set_acc_acl));
+                    shared_acl.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(set_acc_acl.status.success(), "{}", text(&set_acc_acl));
+            shared_cases.push(shared_acl);
+        }
 
-        for (idx, parent) in [&shared_world, &shared_group, &shared_sticky, &shared_acl]
-            .iter()
-            .enumerate()
-        {
+        for (idx, parent) in shared_cases.iter().enumerate() {
             let images = parent.join("images");
             let out_dir = dir.path().join(format!("out-sys-shared-{idx}"));
             let curl_log = dir.path().join(format!("curl-shared-{idx}.log"));
@@ -1330,7 +1397,11 @@ os.setxattr(p, b"system.posix_acl_access", raw)
             text(&run_out)
         );
 
-        let unmapped_grp_num = "64056";
+        let unmapped_grp_num = if acls_can_name_test_uids {
+            "64056"
+        } else {
+            caller_grp_num.as_str()
+        };
         let qemu_conf_num = dir.path().join("qemu-unprefixed-num.conf");
         std::fs::write(
             &qemu_conf_num,
@@ -1678,21 +1749,18 @@ os.setxattr(p, b"system.posix_acl_access", raw)
                 "-I",
                 "-c",
                 r#"
-import os, sys, types
+import importlib.util, os, sys
 
-src = open(sys.argv[1], "r", encoding="utf-8").read()
-fs_sec = src.split("sys_fs_ops() {\n", 1)[1].split("\nPY\n", 1)[0]
-py_body = fs_sec.split("<<'PY'\n", 1)[1].split("\nop = sys.argv[1]", 1)[0]
-
-ns = {"__name__": "__main__"}
-exec(py_body, ns)
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
 
 target = sys.argv[2]
 os.makedirs(target, mode=0o700)
 fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
 chowned = []
 chmodded = []
-orig_os = ns["os"]
+orig_os = mod.os
 class FakeStat:
     def __init__(self, real_st, gid_override):
         self._st = real_st
@@ -1715,19 +1783,20 @@ class SpyOs:
         return orig_os.fchmod(f, mode)
     def fstat(self, f):
         return FakeStat(orig_os.fstat(f), cur_gid[0])
-ns["os"] = SpyOs()
+mod.os = SpyOs()
 orig_os.environ["QEMINGA_TEST_DISABLE_ACL"] = "1"
 try:
-    ns["provision_private_dir_fd"](fd, 64055, 0, {0})
+    mod.provision_private_dir_fd(fd, 64055, 0, {0})
     assert (0, 0) in chowned, f"expected fchown(0, 0), got {chowned}"
     assert chmodded[-1] == 0o710, f"expected 0o710 for qemu_gid=0 fallback, got {oct(chmodded[-1])}"
-    st = ns["os"].fstat(fd)
-    assert ns["effective_perms_fd"](fd, st, 64055, {0}) == 1
-    assert ns["effective_perms_fd"](fd, st, 64099, {64099}) == 0
+    st = mod.os.fstat(fd)
+    assert mod.effective_perms_fd(fd, st, 64055, {0}) == 1
+    assert mod.effective_perms_fd(fd, st, 64099, {64099}) == 0
 finally:
+    mod.os = orig_os
     orig_os.close(fd)
 "#,
-                script().to_str().unwrap(),
+                sysfs_module().to_str().unwrap(),
                 dir.path().join("py-grp0-fallback").to_str().unwrap(),
             ])
             .output()
@@ -1753,10 +1822,22 @@ fn privileged_kvm_system_lane_kernel_verdicts() {
     let arch = std::env::consts::ARCH;
     assert!(arch == "x86_64" || arch == "aarch64");
 
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Keep the fixture root and root's PATH executable directory strictly `0700` from
+    // creation (even under `umask 000`). Use a separate sibling `data_dir` narrowed to
+    // traversal-only `0711` solely for the dropped non-root kernel-verdict child.
+    let dir = private_tempdir();
     let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    create_private_dir(&bin);
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&bin).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let data_dir = private_tempdir();
+    std::fs::set_permissions(data_dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
 
     let binary = dir.path().join("qeminga-bin");
     std::fs::write(&binary, b"fake release binary\n").unwrap();
@@ -1802,6 +1883,7 @@ case "$1" in
     domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
     net-info) echo "Active:         yes"; exit 0 ;;
     list) echo ""; exit 0 ;;
+    domstate) echo "error: failed to get domain '$2'" >&2; exit 1 ;;
     define) exit 0 ;;
     start) exit 42 ;;
     *) exit 0 ;;
@@ -1927,9 +2009,9 @@ elif op == "w":
     let other_grp = "64099";
 
     // A. Default ACL isolation verified by real Linux kernel as non-root 64055 vs 64099.
-    let acl_parent = dir.path().join("root-defacl");
-    std::fs::create_dir(&acl_parent).unwrap();
-    std::fs::set_permissions(&acl_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let acl_parent = data_dir.path().join("root-defacl");
+    create_private_dir(&acl_parent);
+    std::fs::set_permissions(&acl_parent, std::fs::Permissions::from_mode(0o711)).unwrap();
     let set_def = Command::new("python3")
         .args([
             "-I",
@@ -2004,7 +2086,7 @@ os.setxattr(p, b"system.posix_acl_default", raw)
     );
 
     // B. No-ACL fallback with non-root QEMU in group 0: mode 0710 (root:root), NOT 0711.
-    let images_grp0 = dir.path().join("root-grp0-images");
+    let images_grp0 = data_dir.path().join("root-grp0-images");
     let out_grp0 = run_root(
         &[
             "run",
@@ -2053,15 +2135,14 @@ os.setxattr(p, b"system.posix_acl_default", raw)
     );
 
     // C. Intermediate symlink through root-owned 0700 dir: kernel denies 64055 and helper agrees.
-    let secret = dir.path().join("root-secret-0700");
-    let pub_target = dir.path().join("root-pub-0755");
-    std::fs::create_dir(&secret).unwrap();
-    std::fs::create_dir(&pub_target).unwrap();
-    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&pub_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let secret = data_dir.path().join("root-secret-0700");
+    let pub_target = data_dir.path().join("root-pub-0711");
+    create_private_dir(&secret);
+    create_private_dir(&pub_target);
+    std::fs::set_permissions(&pub_target, std::fs::Permissions::from_mode(0o711)).unwrap();
     let hop = secret.join("hop");
     std::os::unix::fs::symlink(&pub_target, &hop).unwrap();
-    let alias = dir.path().join("root-alias");
+    let alias = data_dir.path().join("root-alias");
     std::os::unix::fs::symlink(&hop, &alias).unwrap();
     assert!(!kernel_can(&alias, qemu_acct, qemu_grp, "x"));
     let out_hop = run_root(
@@ -2099,15 +2180,23 @@ os.setxattr(p, b"system.posix_acl_default", raw)
         text(&out_hop)
     );
 
-    // D. Real non-root-owned (64099) ancestor directory MUST be refused by real root.
-    let nonroot_anc = dir.path().join("nonroot-owned-0755");
-    std::fs::create_dir(&nonroot_anc).unwrap();
+    // D. Real non-root-owned (64099) ancestor directory MUST be refused by real root in BOTH
+    //    `run` (without leaking pre-planted serial.log) AND standalone `cleanup` (without deleting).
+    let nonroot_anc = data_dir.path().join("nonroot-owned-0755");
+    create_private_dir(&nonroot_anc);
     std::fs::set_permissions(&nonroot_anc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let nonroot_images = nonroot_anc.join("images");
+    let nonroot_run_dir = nonroot_images.join(format!("qeminga-e2e-95-1-{arch}"));
+    std::fs::create_dir_all(&nonroot_run_dir).unwrap();
+    std::fs::write(nonroot_run_dir.join("serial.log"), b"NONROOT_SECRET\n").unwrap();
+    let nonroot_keep = nonroot_run_dir.join("keep.dat");
+    std::fs::write(&nonroot_keep, b"must-not-delete\n").unwrap();
     let ch = Command::new("/usr/bin/chown")
-        .args(["64099:64099", nonroot_anc.to_str().unwrap()])
+        .args(["-R", "64099:64099", nonroot_anc.to_str().unwrap()])
         .status()
         .unwrap();
     assert!(ch.success());
+    let out_nr_dir = dir.path().join("out-nonroot");
     let out_nr = run_root(
         &[
             "run",
@@ -2122,16 +2211,13 @@ os.setxattr(p, b"system.posix_acl_default", raw)
             "--run-attempt",
             "1",
             "--out",
-            dir.path().join("out-nonroot").to_str().unwrap(),
+            out_nr_dir.to_str().unwrap(),
             "--expect-sha256",
             &digest,
         ],
         &[
             ("QEMINGA_E2E_CONNECT", "qemu:///system"),
-            (
-                "QEMINGA_E2E_IMAGES",
-                nonroot_anc.join("images").to_str().unwrap(),
-            ),
+            ("QEMINGA_E2E_IMAGES", nonroot_images.to_str().unwrap()),
             ("QEMINGA_E2E_QEMU_USER", "+64055"),
             ("QEMINGA_E2E_QEMU_GROUP", "+64055"),
             ("QEMINGA_KVM_DEVICE", "/dev/null"),
@@ -2141,9 +2227,799 @@ os.setxattr(p, b"system.posix_acl_default", raw)
         ],
     );
     assert!(
-        !out_nr.status.success() && !nonroot_anc.join("images").exists(),
-        "real root lane must refuse non-root-owned ancestor before any mutation: {}",
+        !out_nr.status.success() && !out_nr_dir.join("serial.log").exists(),
+        "real root lane must refuse non-root-owned ancestor without leaking serial.log: {}",
         text(&out_nr)
+    );
+    let out_nr_clean_dir = dir.path().join("out-nonroot-clean");
+    let out_nr_clean = run_root(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "95",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_nr_clean_dir.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", nonroot_images.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        !out_nr_clean.status.success()
+            && nonroot_keep.is_file()
+            && !out_nr_clean_dir.join("serial.log").exists(),
+        "real root cleanup must refuse non-root-owned image root and leave files intact: {}",
+        text(&out_nr_clean)
+    );
+
+    // E. Real root MUST reject QEMINGA_TEST_SYSFS_ROOT (full host-root '/' walk cannot be bypassed).
+    let out_override = run_root(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "96",
+            "--run-attempt",
+            "1",
+            "--out",
+            dir.path().join("out-override").to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", images_acl.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", data_dir.path().to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_USER", "+64055"),
+            ("QEMINGA_E2E_QEMU_GROUP", "+64055"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+    );
+    assert!(
+        !out_override.status.success()
+            && text(&out_override).contains("QEMINGA_TEST_SYSFS_ROOT is forbidden"),
+        "real root must refuse QEMINGA_TEST_SYSFS_ROOT override: {}",
+        text(&out_override)
+    );
+}
+
+#[test]
+fn system_mode_diagnostics_and_cleanup_require_verified_image_root_and_regular_log() {
+    require_jq();
+    let arch = std::env::consts::ARCH;
+    assert!(arch == "x86_64" || arch == "aarch64");
+
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let sys_root = dir.path().join("sys-root");
+    create_private_dir(&bin);
+    create_private_dir(&sys_root);
+    std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let binary = dir.path().join("qeminga-bin");
+    std::fs::write(&binary, b"fake release binary\n").unwrap();
+    let candidate = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        candidate.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "101",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "test-runner",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&candidate.join("qeminga"));
+    let img_key = lane(&["image-key", arch]);
+    assert!(img_key.status.success(), "{}", text(&img_key));
+    let pinned_image_sha = String::from_utf8(img_key.stdout)
+        .unwrap()
+        .trim()
+        .rsplit('-')
+        .next()
+        .unwrap()
+        .to_string();
+    let caller_grp_num = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-g")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let qemu_user_spec = "+64055";
+    let qemu_group_spec = format!("+{caller_grp_num}");
+
+    write_exec(
+        &bin.join("virsh"),
+        r#"#!/bin/sh
+case "$1" in --connect=*) shift ;; esac
+case "$1" in
+    version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    capabilities) exit 0 ;;
+    domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
+    net-info) echo "Active:         yes"; exit 0 ;;
+    list) echo ""; exit 0 ;;
+    domstate) echo "error: failed to get domain '$2'" >&2; exit 1 ;;
+    define) exit 0 ;;
+    start)
+        if [ -n "${FAKE_PLANT_SERIAL_SYMLINK:-}" ]; then
+            ln -s "${FAKE_PLANT_SERIAL_SYMLINK}" "${FAKE_PLANT_SERIAL_DEST:?}"
+        elif [ -n "${FAKE_PLANT_SERIAL_CONTENT:-}" ]; then
+            printf '%s\n' "${FAKE_PLANT_SERIAL_CONTENT}" > "${FAKE_PLANT_SERIAL_DEST:?}"
+        fi
+        exit 42
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("genisoimage"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -output) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join(format!("qemu-system-{arch}")),
+        "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf 'fake qcow2 bytes\n' > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("sha256sum"),
+        r#"#!/bin/sh
+case "$1" in
+    *.qcow2.part) printf '%s  %s\n' "${FAKE_IMAGE_SHA:?}" "$1"; exit 0 ;;
+esac
+exec /usr/bin/sha256sum "$@"
+"#,
+    );
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
+    );
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo "0"; exit 0; fi
+exec /usr/bin/id "$@"
+"#,
+    );
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let host_secret = dir.path().join("host-secret.txt");
+    std::fs::write(&host_secret, b"TOP_SECRET_HOST_DATA\n").unwrap();
+
+    // 1. Rejected shared-writable QEMINGA_E2E_IMAGES with a pre-planted serial.log:
+    //    `cmd_run` exit trap MUST NOT copy serial.log into OUT, while still producing result.json.
+    let shared_parent = sys_root.join("shared-0777");
+    create_private_dir(&shared_parent);
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let bad_images = shared_parent.join("images");
+    let bad_run_name = format!("qeminga-e2e-101-1-{arch}");
+    let bad_run_dir = bad_images.join(&bad_run_name);
+    std::fs::create_dir_all(&bad_run_dir).unwrap();
+    std::fs::write(
+        bad_run_dir.join("serial.log"),
+        b"LEAKED_FROM_REJECTED_ROOT\n",
+    )
+    .unwrap();
+    let victim_file = bad_run_dir.join("unrelated.dat");
+    std::fs::write(&victim_file, b"must-survive-cleanup\n").unwrap();
+
+    let out_reject = dir.path().join("out-reject");
+    let run_reject = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "101",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_reject.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", bad_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_reject.status.success(), "{}", text(&run_reject));
+    assert!(
+        out_reject.join("result.json").is_file(),
+        "preflight failure should still emit result.json: {}",
+        text(&run_reject)
+    );
+    assert!(
+        !out_reject.join("serial.log").exists(),
+        "rejected QEMINGA_E2E_IMAGES MUST NOT leak serial.log into evidence dir"
+    );
+
+    // 2. Standalone `cmd_cleanup --out` against the same rejected shared-writable image root:
+    //    MUST refuse cleanup, keep `unrelated.dat` intact, AND NOT leak `serial.log` into OUT!
+    let out_cleanup_reject = dir.path().join("out-cleanup-reject");
+    let cleanup_reject = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "101",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_cleanup_reject.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", bad_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !cleanup_reject.status.success(),
+        "standalone cleanup MUST reject untrusted/shared-writable QEMINGA_E2E_IMAGES: {}",
+        text(&cleanup_reject)
+    );
+    assert!(
+        victim_file.is_file(),
+        "standalone cleanup MUST leave files in rejected image root untouched"
+    );
+    assert!(
+        !out_cleanup_reject.join("serial.log").exists(),
+        "standalone cleanup MUST NOT collect serial.log from rejected image root"
+    );
+
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+    let disable_acl_flag = if acls_can_name_test_uids { "0" } else { "1" };
+
+    // 3. Trusted image root:
+    //    - 3a: Symlinked `serial.log` inside verified run dir MUST be refused (`O_NOFOLLOW`).
+    //    - 3b: Regular `serial.log` inside verified run dir IS collected into OUT.
+    //    - 3c: Standalone `cleanup` on trusted root removes ONLY the target run dir (leaving sibling).
+    let good_images = sys_root.join("trusted-images");
+    let run_sym_dir = good_images.join(format!("qeminga-e2e-102-1-{arch}"));
+    let out_sym = dir.path().join("out-sym");
+    let run_sym = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "102",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_sym.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ("FAKE_PLANT_SERIAL_SYMLINK", host_secret.to_str().unwrap()),
+            (
+                "FAKE_PLANT_SERIAL_DEST",
+                run_sym_dir.join("serial.log").to_str().unwrap(),
+            ),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_sym.status.success(), "{}", text(&run_sym));
+    assert!(run_sym_dir.is_dir(), "{}", text(&run_sym));
+    assert!(
+        !out_sym.join("serial.log").exists(),
+        "symlinked serial.log inside verified run dir MUST NOT be copied into OUT"
+    );
+
+    let run_ok_dir = good_images.join(format!("qeminga-e2e-103-1-{arch}"));
+    let out_ok = dir.path().join("out-ok");
+    let run_ok = lane_env(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "103",
+            "--run-attempt",
+            "1",
+            "--out",
+            out_ok.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+            ("QEMINGA_TEST_DISABLE_ACL", disable_acl_flag),
+            ("QEMINGA_E2E_QEMU_USER", qemu_user_spec),
+            ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ("FAKE_PLANT_SERIAL_CONTENT", "VALID_GUEST_CONSOLE_LINE"),
+            (
+                "FAKE_PLANT_SERIAL_DEST",
+                run_ok_dir.join("serial.log").to_str().unwrap(),
+            ),
+        ],
+        Some(&bin),
+    );
+    assert!(!run_ok.status.success(), "{}", text(&run_ok));
+    assert_eq!(
+        std::fs::read_to_string(out_ok.join("serial.log"))
+            .unwrap_or_default()
+            .trim(),
+        "VALID_GUEST_CONSOLE_LINE",
+        "genuine regular serial.log in verified run dir should be collected"
+    );
+
+    // Symlinked run dir under trusted images root MUST be refused by cleanup without touching target.
+    let outside_victim = sys_root.join("outside-victim");
+    create_private_dir(&outside_victim);
+    let outside_file = outside_victim.join("keep.txt");
+    std::fs::write(&outside_file, b"keep").unwrap();
+    let sym_run = good_images.join(format!("qeminga-e2e-104-1-{arch}"));
+    std::os::unix::fs::symlink(&outside_victim, &sym_run).unwrap();
+    let clean_sym = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "104",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !clean_sym.status.success() && outside_file.is_file(),
+        "cleanup MUST refuse symlinked run directory and keep target untouched: {}",
+        text(&clean_sym)
+    );
+    std::fs::remove_file(&sym_run).unwrap();
+
+    // Legitimate cleanup removes run 103 while keeping sibling run 102 intact.
+    let clean_ok = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "103",
+            "--run-attempt",
+            "1",
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", good_images.to_str().unwrap()),
+            ("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        clean_ok.status.success() && !run_ok_dir.exists() && run_sym_dir.is_dir(),
+        "trusted system cleanup must remove only the target run dir: {}",
+        text(&clean_ok)
+    );
+}
+
+#[test]
+fn sysfs_module_enforces_atomic_noreplace_recovers_failed_sync_and_isolates_root_fd() {
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_private_dir(&sys_root);
+    std::fs::set_permissions(&sys_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let acls_can_name_test_uids = uid_is_mapped(64055) && uid_is_mapped(64099);
+
+    let mut cmd = Command::new("python3");
+    if !acls_can_name_test_uids {
+        cmd.env("QEMINGA_TEST_DISABLE_ACL", "1");
+    }
+    let py = cmd
+        .args([
+            "-I",
+            "-c",
+            r#"
+import ctypes, errno, importlib.util, os, stat, sys
+
+mod_path = sys.argv[1]
+root_path = sys.argv[2]
+assert os.path.isfile(mod_path), f"missing importable sysfs module: {mod_path}"
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", mod_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+euid = os.geteuid()
+egid = os.getegid()
+root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
+try:
+    # 1. Fixture-owned root_fd isolates walk from host '/' UID mapping (even when '/' reports 65534).
+    orig_fstat = mod.os.fstat
+    class FakeOverflowStat:
+        def __init__(self, st):
+            self._st = st
+            self.st_uid = 65534
+        def __getattr__(self, name):
+            return getattr(self._st, name)
+    real_root_fd = os.open("/", mod.READ_DIR_FLAGS)
+    try:
+        real_root_id = (os.fstat(real_root_fd).st_dev, os.fstat(real_root_fd).st_ino)
+    finally:
+        os.close(real_root_fd)
+    def fake_fstat_overflow_slash(fd):
+        st = orig_fstat(fd)
+        if (st.st_dev, st.st_ino) == real_root_id:
+            return FakeOverflowStat(st)
+        return st
+    mod.os.fstat = fake_fstat_overflow_slash
+    try:
+        # Production host-root walk MUST reject untrusted '/' (uid 65534).
+        try:
+            mod.walk_existing_prefix(os.path.join(root_path, "from-slash"), 64055, {egid}, {0, euid})
+            raise AssertionError("host-root walk must refuse untrusted '/'")
+        except OSError as exc:
+            assert exc.errno == errno.EACCES, f"expected EACCES on untrusted '/', got {exc}"
+        # Fixture-owned root_fd walk SUCCEEDS even when '/' reports 65534!
+        images_path = os.path.join(root_path, "isolated-images")
+        mod.prepare_images_root(images_path, 64055, egid, {egid}, root_fd=root_fd, root_path=root_path)
+        assert os.path.isdir(images_path)
+    finally:
+        mod.os.fstat = orig_fstat
+
+    # 2. Unsupported RENAME_NOREPLACE (EINVAL, ENOSYS, EOPNOTSUPP, and None):
+    #    MUST fail closed BEFORE publication, never invoke os.rename, clean up init staging dir,
+    #    and preserve both absent and existing empty destinations!
+    images_fd = os.open(images_path, mod.READ_DIR_FLAGS)
+    try:
+        orig_r2 = mod._RENAMEAT2
+        orig_rename = mod.os.rename
+        rename_called = []
+        def forbid_rename(*a, **kw):
+            rename_called.append((a, kw))
+            raise AssertionError("non-atomic os.rename fallback must NEVER be called")
+        mod.os.rename = forbid_rename
+        try:
+            for err_code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, None):
+                if err_code is None:
+                    mod._RENAMEAT2 = None
+                else:
+                    def make_fail(ec):
+                        def _fail(*_args):
+                            ctypes.set_errno(ec)
+                            return -1
+                        return _fail
+                    mod._RENAMEAT2 = make_fail(err_code)
+                absent_name = f"qeminga-e2e-201-{err_code or 0}-x86_64"
+                try:
+                    mod.create_component_in_fd(
+                        images_fd, images_path, absent_name, 64055, egid, {egid}, fail_if_exists=True
+                    )
+                    raise AssertionError(f"must refuse unsupported RENAME_NOREPLACE ({err_code})")
+                except OSError as exc:
+                    assert exc.errno in (errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL), exc
+                assert not os.path.exists(os.path.join(images_path, absent_name))
+
+                existing_name = f"qeminga-e2e-202-{err_code or 0}-x86_64"
+                existing_path = os.path.join(images_path, existing_name)
+                os.mkdir(existing_path, 0o700)
+                before_id = (os.lstat(existing_path).st_dev, os.lstat(existing_path).st_ino)
+                try:
+                    mod.create_component_in_fd(
+                        images_fd, images_path, existing_name, 64055, egid, {egid}, fail_if_exists=True
+                    )
+                    raise AssertionError(f"must refuse existing dest under unsupported RENAME_NOREPLACE ({err_code})")
+                except OSError as exc:
+                    assert exc.errno in (errno.EOPNOTSUPP, errno.ENOSYS, errno.EINVAL), exc
+                after_id = (os.lstat(existing_path).st_dev, os.lstat(existing_path).st_ino)
+                assert before_id == after_id, "existing empty directory inode must be preserved"
+                os.rmdir(existing_path)
+            assert not rename_called
+            leftovers = [n for n in os.listdir(images_path) if n.startswith(".qeminga-e2e-init.")]
+            assert not leftovers, f"unexpected staging leftovers: {leftovers}"
+        finally:
+            mod._RENAMEAT2 = orig_r2
+            mod.os.rename = orig_rename
+
+        # 3. Existing destination with real renameat2(RENAME_NOREPLACE): EEXIST + untouched inode.
+        other_run = "qeminga-e2e-203-1-x86_64"
+        other_path = os.path.join(images_path, other_run)
+        os.mkdir(other_path, 0o700)
+        other_before = (os.lstat(other_path).st_dev, os.lstat(other_path).st_ino)
+        try:
+            mod.create_component_in_fd(
+                images_fd, images_path, other_run, 64055, egid, {egid}, fail_if_exists=True
+            )
+            raise AssertionError("existing run dir must fail with EEXIST")
+        except OSError as exc:
+            assert exc.errno == errno.EEXIST, exc
+        assert (os.lstat(other_path).st_dev, os.lstat(other_path).st_ino) == other_before
+        os.rmdir(other_path)
+
+        # 4. Failed os.fsync(parent_fd) AFTER renameat2 publishes the run directory:
+        #    MUST return EIO, reclaim THIS invocation's still-empty directory, and let an
+        #    ordinary retry succeed cleanly (while still refusing an unrelated pre-existing dir
+        #    and never removing a directory whose inode changed before rollback).
+        retry_run = "qeminga-e2e-204-1-x86_64"
+        retry_path = os.path.join(images_path, retry_run)
+        orig_fsync = mod.os.fsync
+        saw_visible_at_sync = []
+        def fail_parent_fsync(fd):
+            if fd == images_fd:
+                saw_visible_at_sync.append(os.path.isdir(retry_path))
+                raise OSError(errno.EIO, "simulated parent directory fsync failure")
+            return orig_fsync(fd)
+        mod.os.fsync = fail_parent_fsync
+        try:
+            try:
+                mod.create_component_in_fd(
+                    images_fd, images_path, retry_run, 64055, egid, {egid}, fail_if_exists=True
+                )
+                raise AssertionError("expected EIO from parent fsync failure")
+            except OSError as exc:
+                assert exc.errno == errno.EIO, exc
+        finally:
+            mod.os.fsync = orig_fsync
+        assert saw_visible_at_sync == [True], f"expected directory visible at sync time, got {saw_visible_at_sync}"
+        assert not os.path.exists(retry_path), "failed parent fsync must reclaim this invocation's still-empty run dir"
+
+        # If another actor replaced retry_run with a different inode before rollback, rollback MUST NOT remove it!
+        replaced_run = "qeminga-e2e-205-1-x86_64"
+        replaced_path = os.path.join(images_path, replaced_run)
+        aside_path = os.path.join(images_path, ".replaced-aside")
+        def swap_and_fail_fsync(fd):
+            if fd == images_fd:
+                os.rename(replaced_path, aside_path)
+                os.mkdir(replaced_path, 0o700)
+                raise OSError(errno.EIO, "simulated sync failure after concurrent replacement")
+            return orig_fsync(fd)
+        mod.os.fsync = swap_and_fail_fsync
+        try:
+            try:
+                mod.create_component_in_fd(
+                    images_fd, images_path, replaced_run, 64055, egid, {egid}, fail_if_exists=True
+                )
+                raise AssertionError("expected EIO")
+            except OSError as exc:
+                assert exc.errno == errno.EIO, exc
+        finally:
+            mod.os.fsync = orig_fsync
+        assert os.path.isdir(replaced_path), "rollback must preserve directory whose inode changed"
+        os.rmdir(replaced_path)
+        os.rmdir(aside_path)
+
+        # Ordinary retry now succeeds cleanly!
+        rfd = mod.create_component_in_fd(
+            images_fd, images_path, retry_run, 64055, egid, {egid}, fail_if_exists=True
+        )
+        os.close(rfd)
+        assert os.path.isdir(retry_path)
+
+        # And a second attempt while retry_run exists STILL refuses with EEXIST and keeps it!
+        keep_id = (os.lstat(retry_path).st_dev, os.lstat(retry_path).st_ino)
+        try:
+            mod.create_component_in_fd(
+                images_fd, images_path, retry_run, 64055, egid, {egid}, fail_if_exists=True
+            )
+            raise AssertionError("retry_run owned by previous run must refuse with EEXIST")
+        except OSError as exc:
+            assert exc.errno == errno.EEXIST, exc
+        assert (os.lstat(retry_path).st_dev, os.lstat(retry_path).st_ino) == keep_id
+
+        # 5. cleanup_run_dir refuses untrusted-owner run dir AND cross-device mountpoints!
+        untrusted_run = "qeminga-e2e-206-1-x86_64"
+        untrusted_path = os.path.join(images_path, untrusted_run)
+        os.mkdir(untrusted_path, 0o700)
+        keep_marker = os.path.join(untrusted_path, "keep.txt")
+        with open(keep_marker, "w", encoding="utf-8") as fh:
+            fh.write("keep\n")
+        untrusted_id = (os.lstat(untrusted_path).st_dev, os.lstat(untrusted_path).st_ino)
+        def fake_untrusted_fstat(fd):
+            st = orig_fstat(fd)
+            if (st.st_dev, st.st_ino) == untrusted_id:
+                return FakeOverflowStat(st)
+            return st
+        mod.os.fstat = fake_untrusted_fstat
+        try:
+            try:
+                mod.cleanup_run_dir(images_path, untrusted_run, root_fd=root_fd, root_path=root_path)
+                raise AssertionError("cleanup_run_dir must refuse untrusted-owner run dir")
+            except OSError as exc:
+                assert exc.errno == errno.EACCES, exc
+        finally:
+            mod.os.fstat = orig_fstat
+        assert os.path.isfile(keep_marker), "untrusted run dir contents must survive refused cleanup"
+
+        # Cross-device mountpoint inside run dir MUST fail closed with EXDEV!
+        sub_mount = os.path.join(untrusted_path, "mnt-sub")
+        os.mkdir(sub_mount, 0o700)
+        sub_file = os.path.join(sub_mount, "mounted.txt")
+        with open(sub_file, "w", encoding="utf-8") as fh:
+            fh.write("mounted\n")
+        sub_id = (os.lstat(sub_mount).st_dev, os.lstat(sub_mount).st_ino)
+        class FakeCrossDevStat:
+            def __init__(self, st):
+                self._st = st
+                self.st_dev = st.st_dev + 1
+            def __getattr__(self, name):
+                return getattr(self._st, name)
+        def fake_crossdev_fstat(fd):
+            st = orig_fstat(fd)
+            if (st.st_dev, st.st_ino) == sub_id:
+                return FakeCrossDevStat(st)
+            return st
+        mod.os.fstat = fake_crossdev_fstat
+        try:
+            try:
+                mod.cleanup_run_dir(images_path, untrusted_run, root_fd=root_fd, root_path=root_path)
+                raise AssertionError("cleanup_run_dir must refuse cross-device subdirectory")
+            except OSError as exc:
+                assert exc.errno == errno.EXDEV, exc
+        finally:
+            mod.os.fstat = orig_fstat
+        assert os.path.isfile(sub_file), "cross-device mountpoint contents must survive refused cleanup"
+    finally:
+        os.close(images_fd)
+
+    # 6. CLI refuses QEMINGA_TEST_SYSFS_ROOT when euid == 0 (never bypass host-root walk as root).
+    orig_geteuid = mod.os.geteuid
+    mod.os.geteuid = lambda: 0
+    orig_env = os.environ.get("QEMINGA_TEST_SYSFS_ROOT")
+    os.environ["QEMINGA_TEST_SYSFS_ROOT"] = root_path
+    try:
+        try:
+            mod.resolve_cli_root()
+            raise AssertionError("root process MUST reject QEMINGA_TEST_SYSFS_ROOT")
+        except OSError as exc:
+            assert exc.errno == errno.EPERM, exc
+    finally:
+        mod.os.geteuid = orig_geteuid
+        if orig_env is None:
+            os.environ.pop("QEMINGA_TEST_SYSFS_ROOT", None)
+        else:
+            os.environ["QEMINGA_TEST_SYSFS_ROOT"] = orig_env
+finally:
+    os.close(root_fd)
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "sysfs module unit tests failed:\n{}",
+        text(&py)
+    );
+}
+
+#[test]
+fn private_fixture_helpers_create_0700_dirs_and_tools_even_under_umask_000() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    create_private_dir(&bin);
+    let tool = bin.join("tool");
+    write_exec(&tool, "#!/bin/sh\nexit 0\n");
+
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&bin).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&tool).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    // Confirm privileged_kvm_system_lane_kernel_verdicts requests 0700 at creation (not tempfile::tempdir()).
+    let src = std::fs::read_to_string(root().join("tests/libvirt_kvm.rs")).unwrap();
+    let priv_start = src
+        .find("fn privileged_kvm_system_lane_kernel_verdicts()")
+        .unwrap();
+    let priv_end = src[priv_start..]
+        .find("\n#[test]\n")
+        .map(|off| priv_start + off)
+        .unwrap_or(src.len());
+    let priv_body = &src[priv_start..priv_end];
+    assert!(
+        !priv_body.contains("tempfile::tempdir()")
+            && priv_body.contains("private_tempdir()")
+            && priv_body.contains("create_private_dir(&bin)"),
+        "privileged_kvm_system_lane_kernel_verdicts must create its fixture root and bin directory with 0700 permissions at creation"
     );
 }
 

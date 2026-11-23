@@ -82,8 +82,7 @@ fn require_jq() {
 }
 
 fn write_exec(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_file_mode(path, 0o700, body.as_bytes());
 }
 
 fn sha256_hex(path: &Path) -> String {
@@ -334,9 +333,9 @@ esac
 
 #[test]
 fn stale_check_and_cleanup_protect_unrelated_domains_and_unknown_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
     let bin = dir.path().join("bin");
-    std::fs::create_dir(&bin).unwrap();
+    create_dir_mode(&bin, 0o700);
     write_exec(&bin.join("virsh"), FAKE_VIRSH);
     let log = dir.path().join("virsh.log");
     let images = dir.path().join("images");
@@ -928,9 +927,38 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
     let upload_idx = smoke.find("actions/upload-artifact").unwrap();
     let upload_step = &smoke[smoke[..upload_idx].rfind("- name:").unwrap()..upload_idx];
     assert!(upload_step.contains("if: always()"), "{upload_step}");
+
+    // On an otherwise-green job path (no `if: always()`), explicitly require a
+    // validated run-bound passing `result.json` AFTER upload so replacing
+    // missing/invalid evidence with a failure record can never finish green.
+    let verify_idx = smoke
+        .find("libvirt-kvm-smoke.sh verify-pass")
+        .unwrap_or_else(|| {
+            panic!("missing success-path validated pass gate (verify-pass):\n{smoke}")
+        });
+    let verify_start = smoke[..verify_idx].rfind("- name:").unwrap();
+    let verify_step = &smoke[verify_start..];
     assert!(
-        cleanup_idx < fallback_idx && fallback_idx < summary_idx && summary_idx < upload_idx,
-        "cleanup -> fallback result -> summary -> upload ordering must hold"
+        !verify_step.contains("if: always()"),
+        "verify-pass gate must run only on the success path (not if: always()):\n{verify_step}"
+    );
+    assert!(verify_step.contains(r#"--out "$OUT""#), "{verify_step}");
+    assert!(verify_step.contains(r#"--arch "$ARCH""#), "{verify_step}");
+    assert!(
+        verify_step.contains(r#"--source-sha "$GITHUB_SHA""#),
+        "{verify_step}"
+    );
+    assert!(
+        verify_step.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#),
+        "{verify_step}"
+    );
+
+    assert!(
+        cleanup_idx < fallback_idx
+            && fallback_idx < summary_idx
+            && summary_idx < upload_idx
+            && upload_idx < verify_idx,
+        "cleanup -> fallback result -> summary -> upload -> verify-pass ordering must hold"
     );
 }
 
@@ -975,7 +1003,7 @@ exit "$rc""#,
     // Case 1: all four mandatory checks passed, but `out/result.json` is an
     // existing directory. `mv -f -T` must fail, clean up its temporary file,
     // leave the directory empty, and return nonzero even under `|| rc=1`.
-    let dir1 = tempfile::tempdir().unwrap();
+    let dir1 = private_tempdir();
     let out1 = dir1.path().join("out");
     std::fs::create_dir_all(out1.join("tests")).unwrap();
     for t in MANDATORY {
@@ -1005,14 +1033,24 @@ exit "$rc""#,
     );
 
     // Case 2: `mv` fails with an I/O error after all four checks passed.
-    let dir2 = tempfile::tempdir().unwrap();
+    let dir2 = private_tempdir();
+    assert_eq!(
+        std::fs::metadata(dir2.path()).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double root dir2 must be created 0700"
+    );
     let out2 = dir2.path().join("out");
     std::fs::create_dir_all(out2.join("tests")).unwrap();
     for t in MANDATORY {
         std::fs::write(out2.join("tests").join(t), "pass\n").unwrap();
     }
     let fake_bin = dir2.path().join("bin");
-    std::fs::create_dir(&fake_bin).unwrap();
+    create_dir_mode(&fake_bin, 0o700);
+    assert_eq!(
+        std::fs::metadata(&fake_bin).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double bin dir must be created 0700"
+    );
     write_exec(
         &fake_bin.join("mv"),
         "#!/bin/sh\necho 'mv: simulated rename failure' >&2\nexit 1\n",
@@ -1038,14 +1076,24 @@ exit "$rc""#,
     );
 
     // Case 3: `cat` fails after publishing when all four checks passed.
-    let dir3 = tempfile::tempdir().unwrap();
+    let dir3 = private_tempdir();
+    assert_eq!(
+        std::fs::metadata(dir3.path()).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double root dir3 must be created 0700"
+    );
     let out3 = dir3.path().join("out");
     std::fs::create_dir_all(out3.join("tests")).unwrap();
     for t in MANDATORY {
         std::fs::write(out3.join("tests").join(t), "pass\n").unwrap();
     }
     let fake_cat_bin = dir3.path().join("bin");
-    std::fs::create_dir(&fake_cat_bin).unwrap();
+    create_dir_mode(&fake_cat_bin, 0o700);
+    assert_eq!(
+        std::fs::metadata(&fake_cat_bin).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double cat bin dir must be created 0700"
+    );
     write_exec(
         &fake_cat_bin.join("cat"),
         "#!/bin/sh\necho 'cat: simulated read failure' >&2\nexit 1\n",
@@ -1136,14 +1184,15 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
             }
         };
 
-    // 2. Exercise `libvirt-kvm-smoke.sh ensure-result` directly (no Ruby
-    // required) across missing, corrupt, forged, foreign-run, and valid
-    // writer-produced records.
+    // 2. Exercise `libvirt-kvm-smoke.sh ensure-result` and `verify-pass`
+    // directly (no Ruby required) across missing, corrupt, concatenated,
+    // forged, foreign-run, and valid writer-produced records.
     let cases = [
         ("missing", candidate_digest.as_str(), false),
         ("empty", candidate_digest.as_str(), false),
         ("truncated", candidate_digest.as_str(), false),
         ("two_field_pass", candidate_digest.as_str(), false),
+        ("concatenated_pass", candidate_digest.as_str(), false),
         ("wrong_sha_pass", candidate_digest.as_str(), false),
         ("wrong_sha_fail", candidate_digest.as_str(), false),
         ("wrong_arch_pass", candidate_digest.as_str(), false),
@@ -1175,6 +1224,13 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
                     r#"{"suite":"libvirt-kvm-smoke-v1","result":"pass"}"#,
                 )
                 .unwrap();
+            }
+            "concatenated_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", true);
+                let valid = std::fs::read(out_dir.join("result.json")).unwrap();
+                let mut two = Vec::from(&b"{\"stale\":true}\n"[..]);
+                two.extend_from_slice(&valid);
+                std::fs::write(out_dir.join("result.json"), two).unwrap();
             }
             "wrong_sha_pass" => {
                 write_real_result(
@@ -1238,6 +1294,41 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
             _ => unreachable!(),
         }
 
+        // Plant an unrelated diagnostic file under `out/tests/` when the
+        // directory already exists: synthesizing a fallback result must NEVER
+        // delete caller-owned files under `tests/`.
+        let unrelated_path = out_dir.join("tests/keep-me.txt");
+        if out_dir.exists() {
+            std::fs::create_dir_all(out_dir.join("tests")).unwrap();
+            std::fs::write(&unrelated_path, b"do not delete\n").unwrap();
+        }
+
+        // Before fallback, `verify-pass` succeeds ONLY for `valid_pass`.
+        let pre_verify = lane(&[
+            "verify-pass",
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            expect,
+        ]);
+        if case == "valid_pass" {
+            assert!(
+                pre_verify.status.success(),
+                "{case}: verify-pass must accept valid run-bound pass: {}",
+                text(&pre_verify)
+            );
+        } else {
+            assert!(
+                !pre_verify.status.success(),
+                "{case}: verify-pass must reject non-pass / invalid record: {}",
+                text(&pre_verify)
+            );
+        }
+
         let before = std::fs::read(out_dir.join("result.json")).ok();
         let run = lane(&[
             "ensure-result",
@@ -1251,6 +1342,14 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
             expect,
         ]);
         assert!(run.status.success(), "{case}: {}", text(&run));
+        if before.is_some() {
+            assert_eq!(
+                std::fs::read(&unrelated_path).ok().as_deref(),
+                Some(&b"do not delete\n"[..]),
+                "{case}: ensure-result must preserve unrelated files under tests/"
+            );
+        }
+
         let after = std::fs::read(out_dir.join("result.json")).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&after)
             .unwrap_or_else(|e| panic!("{case}: invalid result.json: {e}: {}", text(&run)));
@@ -1284,6 +1383,26 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
             }
             assert_eq!(json["result"], "fail", "{case}");
         }
+
+        // After fallback, `verify-pass` STILL succeeds ONLY for `valid_pass`
+        // (so a synthesized failure record makes the success-path job go red).
+        let post_verify = lane(&[
+            "verify-pass",
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            expect,
+        ]);
+        assert_eq!(
+            post_verify.status.success(),
+            case == "valid_pass",
+            "{case}: post-fallback verify-pass status mismatch: {}",
+            text(&post_verify)
+        );
     }
 
     // 3. `ensure-result` also fails closed (and leaves no temp files) if
@@ -1591,18 +1710,20 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
 #[test]
 fn kvm_device_fixture_stays_private_under_permissive_umask() {
     let exe = std::env::current_exe().unwrap();
-    let out = Command::new("/bin/sh")
-        .args([
-            "-c",
-            r#"umask 000 && exec "$1" --exact run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device"#,
-            "sh",
-        ])
-        .arg(&exe)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "KVM device fixture must remain private under umask 000:\n{}",
-        text(&out)
-    );
+    for test_name in [
+        "run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device",
+        "write_result_propagates_publish_failure_in_exit_trap_context_and_cleans_temp",
+    ] {
+        let out = Command::new("/bin/sh")
+            .args(["-c", r#"umask 000 && exec "$1" --exact "$2""#, "sh"])
+            .arg(&exe)
+            .arg(test_name)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{test_name} must remain private under umask 000:\n{}",
+            text(&out)
+        );
+    }
 }

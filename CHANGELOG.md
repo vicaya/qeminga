@@ -153,19 +153,19 @@ semantic versioning.
   (`POLLIN | POLLHUP` without `POLLOUT`, `POLLERR`, `POLLNVAL`, or
   `POLLRDHUP`), `qeminga` abandons undelivered replies for the departed
   session while letting accepted commands finish, deregisters the old Tokio
-  reactor registration while keeping the underlying descriptor open
-  (preventing `VSERPORT_CHANGE (open=false)` from racing `libvirtd`), drains
-  unread stale driver bytes while disconnected (preserving a `0xFF`
-  `guest-sync-delimited` handshake and following bytes if the host connects
-  during the drain, and resetting the port if the 64 KiB cap is hit without
-  observing an empty buffer or `0xFF` boundary), polls readiness with
-  `ppoll(2)` under bounded backoff (`10 ms` doubling to `500 ms`), and opens
-  each connected session on a fresh reactor registration and fresh
-  `FrameDecoder` (avoiding sticky `EPOLLHUP` closed-readiness spins on idle
-  ports and keeping idle fast reconnects open under bounded empty-EOF
-  pacing). Hot-unplugged ports (bare `POLLHUP`), closed PTY/socket peers,
-  and other I/O errors still close and reopen with the `1 s` to `30 s`
-  reopen backoff.
+  reactor registration while retaining the underlying descriptor together
+  with its input-queue boundary state (preventing `VSERPORT_CHANGE
+  (open=false)` from racing `libvirtd`), drains unread stale driver bytes
+  while disconnected until EOF/`EAGAIN` proves an empty receive queue
+  (resetting the port via close-and-reopen whenever ambiguous drain bytes or
+  a reconnect occurs before a clean boundary is established), polls
+  readiness with `ppoll(2)` under bounded backoff (`10 ms` doubling to
+  `500 ms`), and opens each connected session on a fresh reactor
+  registration and fresh `FrameDecoder` (avoiding sticky `EPOLLHUP`
+  closed-readiness spins on idle ports and keeping idle fast reconnects open
+  under bounded empty-EOF pacing). Hot-unplugged ports (bare `POLLHUP`),
+  closed PTY/socket peers, and other I/O errors still close and reopen with
+  the `1 s` to `30 s` reopen backoff.
 - The thaw of a freeze operation this process completed drains the
   descriptors the operation published (its frozen targets and the
   `EBUSY` ones it retained) and nothing else, reading no mount table: a

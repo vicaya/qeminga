@@ -215,3 +215,11 @@ jobs:
           name: libvirt-kvm-hosted-x86_64
           path: ${{ env.OUT }}/
           if-no-files-found: error
+      # Runs only when every preceding step succeeded (no `if: always()`):
+      # turns the job red if `ensure-result` had to synthesize/replace invalid
+      # evidence or if the recorded verdict is not a validated run-bound pass.
+      - name: Require validated passing result.json
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh verify-pass --out "$OUT" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"

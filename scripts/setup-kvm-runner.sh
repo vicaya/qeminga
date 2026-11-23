@@ -676,7 +676,7 @@ cmd_fetch_runner() {
         rm -f "$tmp"
         die "SHA-256 mismatch for $url: got $got, expected $sha"
     fi
-    mv -f "$tmp" "$dest"
+    mv -T -f -- "$tmp" "$dest"
     trap - RETURN
     echo "verified actions/runner v${ver} (${arch}): sha256=${got}"
 }
@@ -945,7 +945,143 @@ verify_work_dir_safe() {
     done
 }
 
-safe_subdir "$IMAGES_DIR" || die "refusing unsafe IMAGES_DIR '$IMAGES_DIR'"
+# Perform STATE_DIR-anchored operations on $STATE_DIR/images using kernel
+# O_DIRECTORY | O_NOFOLLOW traversal from / down through every component so a
+# symlink planted at $STATE_DIR/images (or any ancestor / run entry) is refused
+# with ELOOP without ever touching the link target.
+images_ops() {
+    local op="$1"
+    shift
+    local py="/usr/bin/python3"
+    [ -x "$py" ] || die "/usr/bin/python3 is required for safe O_NOFOLLOW image cleanup"
+    env -i PATH=/usr/bin:/bin HOME=/nonexistent "$py" -I -S - "$op" "$STATE_DIR" "$@" <<'PY'
+import errno
+import os
+import re
+import stat
+import sys
+
+RUN_RE = re.compile(r"^qeminga-e2e-[0-9]+-[0-9]+-[a-z0-9_]+$")
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def open_chain_nofollow(abs_path):
+    parts = [p for p in abs_path.split("/") if p]
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in parts:
+            nxt = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def open_images_fd(state_dir):
+    state_fd = open_chain_nofollow(state_dir)
+    try:
+        try:
+            return os.open("images", DIR_FLAGS, dir_fd=state_fd)
+        except FileNotFoundError:
+            return None
+    finally:
+        os.close(state_fd)
+
+
+def rmtree_same_dev(parent_fd, name, root_dev):
+    st = os.lstat(name, dir_fd=parent_fd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.ENOTDIR, f"{name} is not a real directory")
+    if st.st_dev != root_dev:
+        raise OSError(errno.EXDEV, f"{name} crosses filesystem boundary")
+    dir_fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    try:
+        if (st.st_mode & 0o700) != 0o700:
+            os.fchmod(dir_fd, (st.st_mode & 0o7777) | 0o700)
+        for entry in os.listdir(dir_fd):
+            est = os.lstat(entry, dir_fd=dir_fd)
+            if stat.S_ISDIR(est.st_mode):
+                if est.st_dev != root_dev:
+                    raise OSError(errno.EXDEV, f"{entry} crosses filesystem boundary")
+                rmtree_same_dev(dir_fd, entry, root_dev)
+            else:
+                os.unlink(entry, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    os.rmdir(name, dir_fd=parent_fd)
+
+
+op = sys.argv[1]
+state_dir = sys.argv[2]
+
+try:
+    img_fd = open_images_fd(state_dir)
+except OSError as exc:
+    sys.stderr.write(
+        f"qeminga-runner-cleanup: refusing unsafe images directory under {state_dir}: {exc}\n"
+    )
+    sys.exit(1)
+
+if img_fd is None:
+    sys.exit(0)
+
+try:
+    img_st = os.fstat(img_fd)
+    if op == "verify":
+        sys.exit(0)
+    elif op == "list":
+        for entry in sorted(os.listdir(img_fd)):
+            if not RUN_RE.match(entry):
+                continue
+            try:
+                est = os.lstat(entry, dir_fd=img_fd)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(est.st_mode):
+                sys.stderr.write(
+                    f"qeminga-runner-cleanup: refusing symlinked run entry '{entry}' under images\n"
+                )
+                sys.exit(1)
+            print(entry)
+    elif op == "remove":
+        dom = sys.argv[3]
+        if not RUN_RE.match(dom):
+            sys.stderr.write(f"qeminga-runner-cleanup: refusing invalid run dir name '{dom}'\n")
+            sys.exit(1)
+        try:
+            est = os.lstat(dom, dir_fd=img_fd)
+        except FileNotFoundError:
+            sys.exit(0)
+        if stat.S_ISLNK(est.st_mode) or not stat.S_ISDIR(est.st_mode):
+            sys.stderr.write(
+                f"qeminga-runner-cleanup: refusing non-directory or symlinked run entry '{dom}'\n"
+            )
+            sys.exit(1)
+        rmtree_same_dev(img_fd, dom, img_st.st_dev)
+        print("removed")
+    else:
+        sys.stderr.write(f"qeminga-runner-cleanup: unknown images_ops op '{op}'\n")
+        sys.exit(1)
+except OSError as exc:
+    sys.stderr.write(f"qeminga-runner-cleanup: image cleanup failed ({op}): {exc}\n")
+    sys.exit(1)
+finally:
+    os.close(img_fd)
+PY
+}
+
+verify_images_dir_safe() {
+    safe_path_syntax "$STATE_DIR" || die "refusing unsafe STATE_DIR '$STATE_DIR'"
+    safe_subdir "$IMAGES_DIR" || die "refusing unsafe IMAGES_DIR '$IMAGES_DIR'"
+    [ "${IMAGES_DIR%/}" = "${STATE_DIR%/}/images" ] \
+        || die "refusing IMAGES_DIR '$IMAGES_DIR' not anchored directly at '${STATE_DIR%/}/images'"
+    no_symlink_components "$IMAGES_DIR" || die "refusing symlinked component in IMAGES_DIR '$IMAGES_DIR'"
+    images_ops verify || die "refusing unsafe images directory '$IMAGES_DIR'"
+}
+
+verify_images_dir_safe
 if [ "$DOMAINS_ONLY" -eq 0 ]; then
     verify_work_dir_safe
 fi
@@ -1001,9 +1137,12 @@ if command -v virsh >/dev/null 2>&1; then
                     continue
                 fi
             fi
-            if [ -d "${IMAGES_DIR:?}/${dom:?}" ]; then
-                rm -rf --one-file-system -- "${IMAGES_DIR:?}/${dom:?}"
-                log "removed ${IMAGES_DIR}/${dom}"
+            if rm_res="$(images_ops remove "$dom")"; then
+                if [ "$rm_res" = "removed" ]; then
+                    log "removed ${IMAGES_DIR}/${dom}"
+                fi
+            else
+                rc=1
             fi
         done <<<"$names"
     else
@@ -1012,32 +1151,33 @@ if command -v virsh >/dev/null 2>&1; then
     fi
 
     # Remove orphan qeminga-e2e-* run directories whose domain is confirmed absent.
-    if [ -d "$IMAGES_DIR" ]; then
-        shopt -s nullglob
-        for dir in "$IMAGES_DIR"/qeminga-e2e-*; do
-            [ -d "$dir" ] || continue
-            base="$(basename "$dir")"
-            [[ "$base" =~ ^qeminga-e2e-[0-9]+-[0-9]+-[a-z0-9_]+$ ]] || continue
-            st="$(domain_state "$base")" || { log "cannot confirm $base absent; keeping $dir"; rc=1; continue; }
+    if orphan_bases="$(images_ops list)"; then
+        while IFS= read -r base; do
+            [ -n "$base" ] || continue
+            st="$(domain_state "$base")" || { log "cannot confirm $base absent; keeping ${IMAGES_DIR}/${base}"; rc=1; continue; }
             if [ "$st" = absent ]; then
-                rm -rf --one-file-system -- "$dir"
-                log "removed orphan run dir $dir"
+                if rm_res="$(images_ops remove "$base")"; then
+                    [ "$rm_res" = "removed" ] && log "removed orphan run dir ${IMAGES_DIR}/${base}"
+                else
+                    rc=1
+                fi
             else
-                log "$base is '$st'; keeping $dir"
+                log "$base is '$st'; keeping ${IMAGES_DIR}/${base}"
                 rc=1
             fi
-        done
-        shopt -u nullglob
-    fi
-elif [ -d "$IMAGES_DIR" ]; then
-    shopt -s nullglob
-    for dir in "$IMAGES_DIR"/qeminga-e2e-*; do
-        [ -e "$dir" ] || continue
-        log "virsh is unavailable while $dir exists; keeping disks"
+        done <<<"$orphan_bases"
+    else
         rc=1
-        break
-    done
-    shopt -u nullglob
+    fi
+else
+    if orphan_bases="$(images_ops list)"; then
+        if [ -n "$orphan_bases" ]; then
+            log "virsh is unavailable while VM run directories remain under $IMAGES_DIR; keeping disks"
+            rc=1
+        fi
+    else
+        rc=1
+    fi
 fi
 
 if [ "$DOMAINS_ONLY" -eq 0 ]; then
@@ -1701,6 +1841,10 @@ REC_OWNED_STATE_DIR=""
 REC_OWNED_INSTALL_DIR=""
 REC_OWNED_HOOK_DIR=""
 REC_OWNED_UNIT=""
+REC_STAGED_UNIT=""
+REC_STAGED_INSTALL_DIR=""
+REC_STAGED_HOOK_DIR=""
+REC_STAGED_STATE_DIR=""
 
 MANAGED_USER_UID=""
 MANAGED_USER_GID=""
@@ -1754,19 +1898,102 @@ check_trusted_parent_dir() {
     done
 }
 
+# Serialize install, update, and uninstall invocations targeting the same
+# OPT_CONFIG_DIR using a stable root-owned flock outside the removable config
+# directory, acquired BEFORE reading install.env. Lock files are never unlinked
+# (so every process locks the same inode); FD 9 is closed in child runuser calls.
+acquire_install_lock() {
+    command -v flock >/dev/null 2>&1 || die "flock (util-linux) is required to serialize runner lifecycle operations"
+    command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required to compute the installation lock key"
+    local rt_root="${QEMINGA_RUNTIME_ROOT:-/run}"
+    rt_root="${rt_root%/}"
+    local lock_dir="${QEMINGA_LOCK_DIR:-${rt_root}/qeminga-runner.locks}"
+    lock_dir="${lock_dir%/}"
+    check_abs_path "lock directory" "$lock_dir"
+    [ ! -L "$lock_dir" ] || die "refusing symlinked lock directory '$lock_dir'"
+    check_trusted_parent_dir "$lock_dir"
+    if [ ! -e "$lock_dir" ]; then
+        (
+            umask 0077
+            mkdir -p -- "$lock_dir"
+        )
+    fi
+    [ ! -L "$lock_dir" ] && [ -d "$lock_dir" ] || die "lock directory '$lock_dir' is missing or unsafe"
+    check_trusted_parent_dir "${lock_dir}/lock"
+    chmod 0700 "$lock_dir"
+
+    local norm_cfg="${OPT_CONFIG_DIR%/}"
+    check_abs_path "config directory" "$norm_cfg"
+    local lock_key lock_file
+    lock_key="$(printf '%s' "$norm_cfg" | sha256sum | awk '{ print $1 }')"
+    lock_file="${lock_dir}/${lock_key}.lock"
+    [ ! -L "$lock_file" ] || die "refusing symlinked lock file '$lock_file'"
+    if [ -e "$lock_file" ] && [ ! -f "$lock_file" ]; then
+        die "lock path '$lock_file' exists and is not a regular file"
+    fi
+
+    local old_umask
+    old_umask="$(umask)"
+    umask 0077
+    exec 9>>"$lock_file"
+    umask "$old_umask"
+    local lock_owner
+    lock_owner="$(stat -c '%u' "$lock_file")" || die "cannot stat lock file '$lock_file'"
+    [ "$lock_owner" -eq 0 ] || die "refusing lock file '$lock_file' owned by uid $lock_owner (must be root)"
+    chmod 0600 "$lock_file"
+    flock -x 9
+}
+
+# Validate a STAGED_* directory path recorded in install.env. A staged removal
+# directory must live directly in the same trusted root-owned parent directory
+# as its corresponding managed target and carry the `.qeminga-removing.*` name.
+validate_staged_path() {
+    local label="$1" target="$2" staged_dir="$3"
+    check_abs_path "staged ${label} directory" "$staged_dir"
+    local exp_parent stage_parent stage_name
+    exp_parent="$(dirname "$target")"
+    stage_parent="$(dirname "$staged_dir")"
+    stage_name="$(basename "$staged_dir")"
+    [ "$stage_parent" = "$exp_parent" ] \
+        || die "refusing staged ${label} path '$staged_dir' outside expected parent '$exp_parent'"
+    [[ "$stage_name" =~ ^\.qeminga-removing\.[A-Za-z0-9_-]{6,}$ ]] \
+        || die "refusing unexpected staged ${label} directory name '$stage_name'"
+    check_trusted_parent_dir "$staged_dir"
+    [ ! -L "$staged_dir" ] || die "refusing symlinked staged ${label} directory '$staged_dir'"
+    if [ -e "$staged_dir" ]; then
+        [ -d "$staged_dir" ] || die "staged ${label} path '$staged_dir' is not a directory"
+        local owner
+        owner="$(stat -c '%u' "$staged_dir")" || die "cannot stat staged ${label} directory '$staged_dir'"
+        [ "$owner" -eq 0 ] || die "refusing staged ${label} directory '$staged_dir' owned by uid $owner (must be root)"
+    fi
+}
+
+staged_payload_exists() {
+    local label="$1" target="$2" staged_dir="$3"
+    [ -n "$staged_dir" ] || return 1
+    validate_staged_path "$label" "$target" "$staged_dir"
+    local base payload
+    base="$(basename "$target")"
+    payload="${staged_dir}/${base}"
+    [ -e "$payload" ] || [ -L "$payload" ]
+}
+
 # allow_existing:
 #   0      = fresh install (none of the four managed dirs may exist)
 #   1      = active install record (all four managed dirs may exist)
-#   2      = user-only record retained after uninstall (only CONFIG_DIR may exist,
+#   2      = user-only / user-pending record (only CONFIG_DIR may exist,
 #            and it may contain only install.env)
 #   record = interrupted install recovery (each dir may exist ONLY if its
 #            corresponding REC_OWNED_* flag is 1)
-#   owned  = uninstall mode (validate only dirs with REC_OWNED_* = 1; ignore
-#            unowned paths so foreign paths cannot block cleanup of owned dirs)
+#   owned  = uninstall mode (validate only dirs with REC_OWNED_* = 1 whose
+#            payload has not already been moved to a private staging dir;
+#            ignore unowned paths so foreign paths cannot block cleanup)
 check_dedicated_managed_dirs() {
     local allow_existing="$1"
     local dirs=("$OPT_INSTALL_DIR" "$OPT_STATE_DIR" "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR")
+    local labels=("runner" "state" "hook" "config")
     local owned=("${REC_OWNED_INSTALL_DIR:-0}" "${REC_OWNED_STATE_DIR:-0}" "${REC_OWNED_HOOK_DIR:-0}" "${REC_OWNED_CONFIG_DIR:-0}")
+    local staged=("${REC_STAGED_INSTALL_DIR:-}" "${REC_STAGED_STATE_DIR:-}" "${REC_STAGED_HOOK_DIR:-}" "")
     local i j a b
     for i in 0 1 2 3; do
         a="${dirs[$i]}"
@@ -1774,8 +2001,10 @@ check_dedicated_managed_dirs() {
         if is_reserved_system_dir "$a"; then
             die "refusing shared system directory '$a' as a managed runner directory"
         fi
-        if [ "$allow_existing" = "owned" ] && [ "${owned[$i]}" != "1" ]; then
-            continue
+        if [ "$allow_existing" = "owned" ]; then
+            if [ "${owned[$i]}" != "1" ] || staged_payload_exists "${labels[$i]}" "$a" "${staged[$i]}"; then
+                continue
+            fi
         fi
         [ ! -L "$a" ] || die "refusing symlinked managed directory '$a'"
         check_trusted_parent_dir "$a"
@@ -1796,7 +2025,7 @@ check_dedicated_managed_dirs() {
         local extra
         extra="$(find "$OPT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name 'install.env' -print -quit 2>/dev/null || true)"
         if [ -n "$extra" ]; then
-            die "refusing unexpected entry '$extra' in '$OPT_CONFIG_DIR' alongside user-only install.env"
+            die "refusing unexpected entry '$extra' in '$OPT_CONFIG_DIR' alongside ${REC_STATE:-user-only} install.env"
         fi
     fi
     for i in 0 1 2 3; do
@@ -1864,6 +2093,7 @@ read_install_record() {
     REC_LABELS="" REC_EPHEMERAL="" REC_ALLOW_AUTO_UPDATE="" REC_WORK_DIR=""
     REC_OWNED_CONFIG_DIR="" REC_OWNED_STATE_DIR="" REC_OWNED_INSTALL_DIR=""
     REC_OWNED_HOOK_DIR="" REC_OWNED_UNIT=""
+    REC_STAGED_UNIT="" REC_STAGED_INSTALL_DIR="" REC_STAGED_HOOK_DIR="" REC_STAGED_STATE_DIR=""
 
     local key val
     while IFS='=' read -r key val; do
@@ -1892,6 +2122,10 @@ read_install_record() {
             OWNED_INSTALL_DIR) REC_OWNED_INSTALL_DIR="$val" ;;
             OWNED_HOOK_DIR) REC_OWNED_HOOK_DIR="$val" ;;
             OWNED_UNIT) REC_OWNED_UNIT="$val" ;;
+            STAGED_UNIT) REC_STAGED_UNIT="$val" ;;
+            STAGED_INSTALL_DIR) REC_STAGED_INSTALL_DIR="$val" ;;
+            STAGED_HOOK_DIR) REC_STAGED_HOOK_DIR="$val" ;;
+            STAGED_STATE_DIR) REC_STAGED_STATE_DIR="$val" ;;
             *) die "unknown key '$key' in installation record '$rec'" ;;
         esac
     done <"$rec"
@@ -1899,11 +2133,37 @@ read_install_record() {
     [ "$REC_SCHEMA" = "1" ] || die "unsupported installation record schema '${REC_SCHEMA:-<empty>}' in '$rec'"
     REC_STATE="${REC_STATE:-installed}"
     case "$REC_STATE" in
-        installed | installing | partial-uninstall | user-only) ;;
+        installed | installing | partial-uninstall | user-only | user-pending) ;;
         *) die "unsupported installation record state '$REC_STATE' in '$rec'" ;;
     esac
     [ -n "$REC_USER" ] && [ -n "$REC_CONFIG_DIR" ] \
         || die "incomplete installation record '$rec'"
+
+    if [ "$REC_STATE" != "partial-uninstall" ]; then
+        if [ -n "$REC_STAGED_UNIT" ] || [ -n "$REC_STAGED_INSTALL_DIR" ] \
+            || [ -n "$REC_STAGED_HOOK_DIR" ] || [ -n "$REC_STAGED_STATE_DIR" ]; then
+            die "unexpected STAGED_* entry in $REC_STATE installation record '$rec'"
+        fi
+    fi
+
+    if [ "$REC_STATE" = "user-pending" ]; then
+        if [ -n "$REC_USER_UID" ]; then
+            [[ "$REC_USER_UID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_UID '$REC_USER_UID' in '$rec'"
+        fi
+        if [ -n "$REC_USER_GID" ]; then
+            [[ "$REC_USER_GID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_GID '$REC_USER_GID' in '$rec'"
+        fi
+        REC_USER_CREATED="${REC_USER_CREATED:-1}"
+        REC_OWNED_CONFIG_DIR="${REC_OWNED_CONFIG_DIR:-1}"
+        REC_OWNED_STATE_DIR="0"
+        REC_OWNED_INSTALL_DIR="0"
+        REC_OWNED_HOOK_DIR="0"
+        REC_OWNED_UNIT="0"
+        HAS_USER_RECORD=1
+        HAS_INSTALL_RECORD=0
+        return 0
+    fi
+
     [[ "$REC_USER_UID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_UID '$REC_USER_UID' in '$rec'"
     [[ "$REC_USER_GID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_GID '$REC_USER_GID' in '$rec'"
 
@@ -1977,7 +2237,7 @@ EOF
         rm -f "$tmp"
         die "failed to write installation record '$dest'"
     fi
-    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -T -f -- "$tmp" "$dest"; then
         rm -f "$tmp"
         die "failed to finalize installation record '$dest'"
     fi
@@ -2015,12 +2275,16 @@ OWNED_STATE_DIR=${REC_OWNED_STATE_DIR}
 OWNED_INSTALL_DIR=${REC_OWNED_INSTALL_DIR}
 OWNED_HOOK_DIR=${REC_OWNED_HOOK_DIR}
 OWNED_UNIT=${REC_OWNED_UNIT}
+STAGED_UNIT=${REC_STAGED_UNIT}
+STAGED_INSTALL_DIR=${REC_STAGED_INSTALL_DIR}
+STAGED_HOOK_DIR=${REC_STAGED_HOOK_DIR}
+STAGED_STATE_DIR=${REC_STAGED_STATE_DIR}
 EOF
     then
         rm -f "$tmp"
         die "failed to write uninstall record '$dest'"
     fi
-    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -T -f -- "$tmp" "$dest"; then
         rm -f "$tmp"
         die "failed to finalize uninstall record '$dest'"
     fi
@@ -2048,10 +2312,61 @@ EOF
         rm -f "$tmp"
         die "failed to write user-only record '$dest'"
     fi
-    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -T -f -- "$tmp" "$dest"; then
         rm -f "$tmp"
         die "failed to finalize user-only record '$dest'"
     fi
+}
+
+write_user_pending_record() {
+    local dest="$1" user="$2" cfg_dir="$3"
+    check_trusted_parent_dir "$dest"
+    [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
+    local tmp
+    tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
+    if ! cat >"$tmp" <<EOF
+# Managed by scripts/setup-kvm-runner.sh — durable pre-useradd bootstrap record.
+# Preserved if both initial install.env update and rollback userdel fail (e.g. ENOSPC).
+# Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
+RECORD_SCHEMA=1
+RECORD_STATE=user-pending
+USER=${user}
+USER_CREATED=1
+CONFIG_DIR=${cfg_dir}
+EOF
+    then
+        rm -f "$tmp"
+        die "failed to write pending bootstrap user record '$dest'"
+    fi
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -T -f -- "$tmp" "$dest"; then
+        rm -f "$tmp"
+        die "failed to finalize pending bootstrap user record '$dest'"
+    fi
+}
+
+# Verify a user-pending bootstrap account (no recorded UID/GID yet) is strictly
+# non-root and confined to primary group $OPT_USER and supplementary group kvm.
+verify_pending_user_safety() {
+    local mode="$1"
+    if ! id "$OPT_USER" >/dev/null 2>&1; then
+        return 0
+    fi
+    local cur_uid cur_gid pgroup groups g
+    cur_uid="$(id -u "$OPT_USER")"
+    cur_gid="$(id -g "$OPT_USER")"
+    pgroup="$(id -gn "$OPT_USER")"
+    if [ "$cur_uid" -eq 0 ] || [ "$cur_gid" -eq 0 ]; then
+        die "${mode}: pending service user '$OPT_USER' has root uid/gid (${cur_uid}:${cur_gid}); refusing to proceed"
+    fi
+    if [ "$pgroup" != "$OPT_USER" ]; then
+        die "${mode}: pending service user '$OPT_USER' primary group '$pgroup' does not match '$OPT_USER'; refusing to proceed"
+    fi
+    groups="$(id -nG "$OPT_USER")"
+    for g in $groups; do
+        if [ "$g" != "$OPT_USER" ] && [ "$g" != "kvm" ]; then
+            die "${mode}: pending service user '$OPT_USER' belongs to unexpected group '$g' (only '$OPT_USER' and 'kvm' are permitted); refusing to proceed"
+        fi
+    done
 }
 
 # Verify the live numeric UID and GID of OPT_USER match the root-owned record
@@ -2060,6 +2375,10 @@ EOF
 # inspect and recover safely.
 verify_recorded_user_identity() {
     local mode="$1"
+    if [ "$REC_STATE" = "user-pending" ]; then
+        verify_pending_user_safety "$mode"
+        return 0
+    fi
     if id "$OPT_USER" >/dev/null 2>&1; then
         local cur_uid cur_gid
         cur_uid="$(id -u "$OPT_USER")"
@@ -2087,9 +2406,9 @@ load_and_verify_install_record() {
     [ "$OPT_CONFIG_DIR" = "$REC_CONFIG_DIR" ] \
         || die "${mode}: --config-dir '$OPT_CONFIG_DIR' does not match installation record '$REC_CONFIG_DIR'"
 
-    if [ "$REC_STATE" = "user-only" ]; then
+    if [ "$REC_STATE" = "user-only" ] || [ "$REC_STATE" = "user-pending" ]; then
         if [ "$mode" = "update" ]; then
-            die "update: $rec_path records only a surviving service user '$REC_USER' (no active runner installation)"
+            die "update: $rec_path records only a surviving service user '$REC_USER' (state '$REC_STATE', no active runner installation)"
         fi
         OPT_USER="$REC_USER"
         OPT_CONFIG_DIR="$REC_CONFIG_DIR"
@@ -2099,6 +2418,11 @@ load_and_verify_install_record() {
         fi
         [ ! -L "$OPT_CONFIG_DIR" ] || die "refusing symlinked managed directory '$OPT_CONFIG_DIR'"
         check_trusted_parent_dir "$OPT_CONFIG_DIR"
+        local extra
+        extra="$(find "$OPT_CONFIG_DIR" -mindepth 1 -maxdepth 1 ! -name 'install.env' -print -quit 2>/dev/null || true)"
+        if [ -n "$extra" ]; then
+            die "${mode}: refusing unexpected entry '$extra' in '$OPT_CONFIG_DIR' alongside $REC_STATE install.env"
+        fi
         verify_recorded_user_identity "$mode"
         return 0
     fi
@@ -2148,6 +2472,7 @@ load_and_verify_install_record() {
 }
 
 _INSTALL_BOOTSTRAP_CFG=""
+_INSTALL_BOOTSTRAP_PENDING_REC=""
 _INSTALL_BOOTSTRAP_DIR=""
 _INSTALL_BOOTSTRAP_UNIT=""
 _INSTALL_BOOTSTRAP_USER=""
@@ -2167,11 +2492,26 @@ cleanup_install_exit() {
         _INSTALL_BOOTSTRAP_DIR=""
     fi
     if [ -n "${_INSTALL_BOOTSTRAP_USER:-}" ]; then
-        userdel "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || true
-        if getent group "$_INSTALL_BOOTSTRAP_USER" >/dev/null 2>&1; then
-            groupdel "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || true
+        if userdel "$_INSTALL_BOOTSTRAP_USER"; then
+            if getent group "$_INSTALL_BOOTSTRAP_USER" >/dev/null 2>&1; then
+                groupdel "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || true
+            fi
+            _INSTALL_BOOTSTRAP_USER=""
+        else
+            local surv_uid surv_gid
+            surv_uid="$(id -u "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || echo unknown)"
+            surv_gid="$(id -g "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || echo unknown)"
+            warn "bootstrap rollback failed: could not delete newly created service user '${_INSTALL_BOOTSTRAP_USER}' (uid=${surv_uid}, gid=${surv_gid}); preserving recovery record '${_INSTALL_BOOTSTRAP_PENDING_REC:-${_INSTALL_BOOTSTRAP_CFG}/install.env}' — once the host issue is resolved, run: sudo $0 uninstall --config-dir '${_INSTALL_BOOTSTRAP_CFG}' --purge-user"
+            # Preserve the durable user-pending record and config dir for recovery!
+            _INSTALL_BOOTSTRAP_PENDING_REC=""
+            _INSTALL_BOOTSTRAP_CFG=""
+            _INSTALL_BOOTSTRAP_USER=""
+            return 0
         fi
-        _INSTALL_BOOTSTRAP_USER=""
+    fi
+    if [ -n "${_INSTALL_BOOTSTRAP_PENDING_REC:-}" ]; then
+        rm -f "$_INSTALL_BOOTSTRAP_PENDING_REC"
+        _INSTALL_BOOTSTRAP_PENDING_REC=""
     fi
     if [ -n "${_INSTALL_BOOTSTRAP_CFG:-}" ]; then
         rmdir -- "$_INSTALL_BOOTSTRAP_CFG" 2>/dev/null || true
@@ -2192,8 +2532,10 @@ ensure_service_user() {
         gid="$(id -g "$OPT_USER")"
         pgroup="$(id -gn "$OPT_USER")"
         [ "$uid" -ne 0 ] || die "existing user $OPT_USER has uid 0"
-        [ "$uid" = "$REC_USER_UID" ] || die "user '$OPT_USER' uid $uid does not match recorded uid $REC_USER_UID; refusing to reuse"
-        [ "$gid" = "$REC_USER_GID" ] || die "user '$OPT_USER' gid $gid does not match recorded gid $REC_USER_GID; refusing to reuse"
+        if [ "$REC_STATE" != "user-pending" ]; then
+            [ "$uid" = "$REC_USER_UID" ] || die "user '$OPT_USER' uid $uid does not match recorded uid $REC_USER_UID; refusing to reuse"
+            [ "$gid" = "$REC_USER_GID" ] || die "user '$OPT_USER' gid $gid does not match recorded gid $REC_USER_GID; refusing to reuse"
+        fi
         [ "$pgroup" = "$OPT_USER" ] || die "user '$OPT_USER' primary group '$pgroup' does not match '$OPT_USER'; refusing to reuse"
         groups="$(id -nG "$OPT_USER")"
         for g in $groups; do
@@ -2288,6 +2630,7 @@ claim_managed_dir() {
         _INSTALL_BOOTSTRAP_DIR=""
         if [ "$owned_var" = "OWNED_CONFIG_DIR" ]; then
             _INSTALL_BOOTSTRAP_USER=""
+            _INSTALL_BOOTSTRAP_PENDING_REC=""
             _INSTALL_BOOTSTRAP_CFG=""
         fi
     else
@@ -2299,6 +2642,7 @@ claim_managed_dir() {
         if [ "$owned_var" = "OWNED_CONFIG_DIR" ]; then
             write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
             _INSTALL_BOOTSTRAP_USER=""
+            _INSTALL_BOOTSTRAP_PENDING_REC=""
             _INSTALL_BOOTSTRAP_CFG=""
         fi
     fi
@@ -2324,7 +2668,7 @@ init_state_subdirs() {
         "$OPT_STATE_DIR/.config" \
         "$OPT_STATE_DIR/.cache" \
         "$OPT_STATE_DIR/.local" \
-        "$OPT_STATE_DIR/.local/share"
+        "$OPT_STATE_DIR/.local/share" 9>&-
 }
 
 lock_runner_permissions() {
@@ -2390,7 +2734,7 @@ run_runner_config_with_token() {
         export ACTIONS_RUNNER_INPUT_TOKEN="$token"
         runuser -w ACTIONS_RUNNER_INPUT_TOKEN -u "$OPT_USER" -- env \
             "HOME=$OPT_STATE_DIR" \
-            "$OPT_INSTALL_DIR/config.sh" "$@"
+            "$OPT_INSTALL_DIR/config.sh" "$@" 9>&-
     )
 }
 
@@ -2504,9 +2848,13 @@ cmd_install() {
     local cg_ctrls="${QEMINGA_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}"
     [ -r "$cg_ctrls" ] || die "cgroup v2 unified hierarchy missing ($cg_ctrls); required for systemd IPAddressDeny= BPF firewall"
 
+    # Serialize overlapping lifecycle operations targeting the same OPT_CONFIG_DIR
+    # BEFORE reading install.env or inspecting/mutating live state.
+    acquire_install_lock
+
     # Load and validate existing installation record (if reinstalling, recovering
     # from an interrupted install, or reusing a managed user retained after
-    # uninstall) BEFORE mutating any live state, directories, or service status.
+    # uninstall/failed bootstrap rollback) BEFORE mutating any live state.
     OWNED_CONFIG_DIR=0
     OWNED_STATE_DIR=0
     OWNED_INSTALL_DIR=0
@@ -2517,12 +2865,15 @@ cmd_install() {
         read_install_record "$rec_path"
         [ "$REC_USER" = "$OPT_USER" ] || die "existing record at $rec_path is for user '$REC_USER', not '$OPT_USER'"
         [ "$REC_CONFIG_DIR" = "$OPT_CONFIG_DIR" ] || die "existing record at $rec_path manages config dir '$REC_CONFIG_DIR', not '$OPT_CONFIG_DIR'"
-        if [ "$REC_STATE" = "user-only" ]; then
+        if [ "$REC_STATE" = "user-only" ] || [ "$REC_STATE" = "user-pending" ]; then
+            if [ "$REC_STATE" = "user-pending" ]; then
+                verify_pending_user_safety install
+            fi
             OWNED_CONFIG_DIR=1
             check_dedicated_managed_dirs 2
             check_unit_not_occupied
         elif [ "$REC_STATE" = "partial-uninstall" ]; then
-            die "existing installation at $rec_path is in partial-uninstall state (stray VM state preserved); finish 'sudo $0 uninstall --config-dir $OPT_CONFIG_DIR' before reinstalling"
+            die "existing installation at $rec_path is in partial-uninstall state (stray VM state or pending removal preserved); finish 'sudo $0 uninstall --config-dir $OPT_CONFIG_DIR' before reinstalling"
         else
             [ "$REC_SERVICE" = "$OPT_SERVICE" ] || die "existing record at $rec_path is for service '$REC_SERVICE', not '$OPT_SERVICE'"
             [ "$REC_INSTALL_DIR" = "$OPT_INSTALL_DIR" ] || die "existing record at $rec_path manages install dir '$REC_INSTALL_DIR', not '$OPT_INSTALL_DIR'"
@@ -2607,15 +2958,19 @@ cmd_install() {
     if [ "$OWNED_UNIT" -eq 1 ] && systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
         was_active=1
         say "stopping existing ${OPT_SERVICE}.service"
-        systemctl stop "${OPT_SERVICE}.service"
+        systemctl stop "${OPT_SERVICE}.service" 9>&-
     fi
 
-    # Reserve a fresh config directory exclusively as root BEFORE creating the
-    # service account so a concurrent config-dir collision fails without
-    # orphaning an unrecorded user. If ensure_service_user or the first
-    # install.env write fails, cleanup_install_exit rolls back both the empty
-    # reserved config dir and any user created by this invocation.
+    # Reserve a fresh config directory exclusively as root and write a durable
+    # pre-useradd user-pending record BEFORE creating the service account so:
+    # - a concurrent config-dir collision fails without creating a user;
+    # - if post-useradd install.env update fails and userdel succeeds, both the
+    #   user and reserved config dir are cleanly rolled back;
+    # - if BOTH post-useradd install.env update AND rollback userdel fail (e.g.
+    #   full /etc), the durable user-pending record stays intact so the operator
+    #   can recover with `uninstall --purge-user` or retry `install`.
     _INSTALL_BOOTSTRAP_CFG=""
+    _INSTALL_BOOTSTRAP_PENDING_REC=""
     _INSTALL_BOOTSTRAP_DIR=""
     _INSTALL_BOOTSTRAP_UNIT=""
     _INSTALL_BOOTSTRAP_USER=""
@@ -2624,6 +2979,8 @@ cmd_install() {
     if [ "$OWNED_CONFIG_DIR" -ne 1 ]; then
         reserve_fresh_dir config "$OPT_CONFIG_DIR"
         _INSTALL_BOOTSTRAP_CFG="$OPT_CONFIG_DIR"
+        write_user_pending_record "$OPT_CONFIG_DIR/install.env" "$OPT_USER" "$OPT_CONFIG_DIR"
+        _INSTALL_BOOTSTRAP_PENDING_REC="$OPT_CONFIG_DIR/install.env"
         OWNED_CONFIG_DIR=1
     fi
 
@@ -2654,7 +3011,7 @@ cmd_install() {
 
     if [ "$OPT_SKIP_PACKAGES" -eq 0 ] && [ -x "$OPT_INSTALL_DIR/bin/installdependencies.sh" ]; then
         say "installing actions/runner runtime dependencies"
-        "$OPT_INSTALL_DIR/bin/installdependencies.sh" >/dev/null
+        "$OPT_INSTALL_DIR/bin/installdependencies.sh" >/dev/null 9>&-
     fi
 
     # Install root-owned hooks, egress firewall gate, main-process launcher, and policy.
@@ -2715,10 +3072,11 @@ cmd_install() {
 
     # Install and verify the hardened systemd unit. Stage the complete unit and
     # set its owner/mode on a temporary regular file in the trusted unit dir,
-    # then publish a fresh unit via hard link (`ln`, i.e. link(2)), which fails
-    # atomically with EEXIST on ANY existing directory entry — including a
-    # systemd mask symlink to /dev/null — without following symlinks or altering
-    # target permissions. Record OWNED_UNIT=1 only after publication succeeds.
+    # then publish a fresh unit via hard link (`ln -T`, i.e. link(2) with exact
+    # destination semantics), which fails atomically with EEXIST on ANY existing
+    # directory entry — including a systemd mask symlink to /dev/null or a
+    # directory — without following symlinks, linking into a directory, or
+    # altering target permissions. Record OWNED_UNIT=1 only after publication.
     local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
     unit_dir="${unit_dir%/}"
     check_abs_path "systemd unit dir" "$unit_dir"
@@ -2742,7 +3100,7 @@ cmd_install() {
         die "failed to stage hardened systemd unit in '$unit_dir'"
     fi
     if [ "$OWNED_UNIT" -ne 1 ]; then
-        if ! ln -- "$tmp_unit" "$unit_path" 2>/dev/null; then
+        if ! ln -T -- "$tmp_unit" "$unit_path" 2>/dev/null; then
             rm -f "$tmp_unit"
             die "refusing to overwrite unexpected existing systemd unit '$unit_path'"
         fi
@@ -2752,7 +3110,7 @@ cmd_install() {
         write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
         _INSTALL_BOOTSTRAP_UNIT=""
     else
-        if ! mv -f -- "$tmp_unit" "$unit_path"; then
+        if ! mv -T -f -- "$tmp_unit" "$unit_path"; then
             rm -f "$tmp_unit"
             die "failed to update owned systemd unit '$unit_path'"
         fi
@@ -2762,16 +3120,16 @@ cmd_install() {
         systemd-analyze verify --man=no "$unit_path" || die "systemd-analyze verify failed for $unit_path"
     fi
 
-    systemctl daemon-reload
+    systemctl daemon-reload 9>&-
     if [ "$OPT_NO_START" -eq 0 ]; then
         # Because the unit uses Type=notify (NotifyAccess=main), systemctl waits
         # until the launcher passes check-egress-firewall.sh and sends READY=1
         # (or exits non-zero immediately if the firewall gate rejects the host).
         if [ "$OPT_EPHEMERAL" -eq 1 ]; then
-            systemctl start "${OPT_SERVICE}.service"
+            systemctl start "${OPT_SERVICE}.service" 9>&-
             say "${OPT_SERVICE}.service started and passed egress firewall gate (ephemeral one-shot; not enabled across reboot)"
         else
-            systemctl enable --now "${OPT_SERVICE}.service"
+            systemctl enable --now "${OPT_SERVICE}.service" 9>&-
             say "${OPT_SERVICE}.service is enabled, started, and passed egress firewall gate"
         fi
     else
@@ -2829,6 +3187,7 @@ cmd_status() {
 cmd_update() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "update must run as root"
+    acquire_install_lock
 
     # Refuse to modify any service or directory without a valid root-owned
     # installation record matching CLI options and live user UID/GID.
@@ -2851,7 +3210,7 @@ cmd_update() {
     if systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
         was_active=1
         say "stopping ${OPT_SERVICE}.service"
-        systemctl stop "${OPT_SERVICE}.service"
+        systemctl stop "${OPT_SERVICE}.service" 9>&-
     fi
 
     # Remove old bin/ and externals/ so renamed assemblies do not linger across versions,
@@ -2865,7 +3224,7 @@ cmd_update() {
 
     if [ "$was_active" -eq 1 ] && [ "$OPT_NO_START" -eq 0 ]; then
         say "restarting ${OPT_SERVICE}.service"
-        systemctl start "${OPT_SERVICE}.service"
+        systemctl start "${OPT_SERVICE}.service" 9>&-
     fi
     echo "updated actions/runner in ${OPT_INSTALL_DIR} to v${OPT_RUNNER_VERSION} (${arch})"
 }
@@ -2873,6 +3232,8 @@ cmd_update() {
 # ---- uninstall ------------------------------------------------------------
 
 _UNINSTALL_TEMP_RT=""
+_UNINSTALL_TEMP_HOOK_DIR=""
+_UNINSTALL_EMPTY_STAGE=""
 
 # Terminate session libvirt daemons (libvirtd / virtqemud / virtlogd /
 # virtlockd / etc.) whose PID files live directly under $rt_dir/libvirt so no
@@ -2921,7 +3282,7 @@ stop_temp_session_libvirt_daemons() {
                 sleep 0.2
             done
         fi
-    ' _ "$rt_dir" "$force_kill" || true
+    ' _ "$rt_dir" "$force_kill" 9>&- || true
 }
 
 cleanup_uninstall_temp_rt() {
@@ -2932,16 +3293,210 @@ cleanup_uninstall_temp_rt() {
     rm -rf --one-file-system -- "$rt"
 }
 
+cleanup_uninstall_temp_hook() {
+    local hd="${_UNINSTALL_TEMP_HOOK_DIR:-}"
+    [ -n "$hd" ] || return 0
+    _UNINSTALL_TEMP_HOOK_DIR=""
+    rm -rf --one-file-system -- "$hd"
+}
+
+cleanup_uninstall_exit() {
+    cleanup_uninstall_temp_hook
+    cleanup_uninstall_temp_rt
+    if [ -n "${_UNINSTALL_EMPTY_STAGE:-}" ]; then
+        rmdir -- "$_UNINSTALL_EMPTY_STAGE" 2>/dev/null || true
+        _UNINSTALL_EMPTY_STAGE=""
+    fi
+}
+
+set_rec_owned_flag() {
+    local slot="$1" val="$2"
+    case "$slot" in
+        unit) REC_OWNED_UNIT="$val" ;;
+        install) REC_OWNED_INSTALL_DIR="$val" ;;
+        hook) REC_OWNED_HOOK_DIR="$val" ;;
+        state) REC_OWNED_STATE_DIR="$val" ;;
+        *) die "internal error: unknown uninstall slot '$slot'" ;;
+    esac
+}
+
+get_rec_owned_flag() {
+    case "$1" in
+        unit) printf '%s' "$REC_OWNED_UNIT" ;;
+        install) printf '%s' "$REC_OWNED_INSTALL_DIR" ;;
+        hook) printf '%s' "$REC_OWNED_HOOK_DIR" ;;
+        state) printf '%s' "$REC_OWNED_STATE_DIR" ;;
+        *) die "internal error: unknown uninstall slot '$1'" ;;
+    esac
+}
+
+set_rec_staged_path() {
+    local slot="$1" val="$2"
+    case "$slot" in
+        unit) REC_STAGED_UNIT="$val" ;;
+        install) REC_STAGED_INSTALL_DIR="$val" ;;
+        hook) REC_STAGED_HOOK_DIR="$val" ;;
+        state) REC_STAGED_STATE_DIR="$val" ;;
+        *) die "internal error: unknown uninstall slot '$slot'" ;;
+    esac
+}
+
+get_rec_staged_path() {
+    case "$1" in
+        unit) printf '%s' "$REC_STAGED_UNIT" ;;
+        install) printf '%s' "$REC_STAGED_INSTALL_DIR" ;;
+        hook) printf '%s' "$REC_STAGED_HOOK_DIR" ;;
+        state) printf '%s' "$REC_STAGED_STATE_DIR" ;;
+        *) die "internal error: unknown uninstall slot '$1'" ;;
+    esac
+}
+
+# Reconcile any STAGED_* removal container recorded by a previous interrupted
+# or failed uninstall BEFORE touching live public paths or purging OPT_USER.
+reconcile_staged_entry() {
+    local slot="$1" label="$2" target="$3"
+    local staged_dir owned_val payload
+    staged_dir="$(get_rec_staged_path "$slot")"
+    [ -n "$staged_dir" ] || return 0
+    validate_staged_path "$label" "$target" "$staged_dir"
+    owned_val="$(get_rec_owned_flag "$slot")"
+    payload="${staged_dir}/$(basename "$target")"
+
+    if [ "$owned_val" = "1" ]; then
+        if [ -e "$payload" ] || [ -L "$payload" ]; then
+            # Prior uninstall already moved target into staged_dir but stopped
+            # before persisting OWNED_*=0. Release public path ownership now so
+            # retry never touches an independent replacement at $target.
+            set_rec_owned_flag "$slot" "0"
+            write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+            if [ "$slot" = "unit" ] && command -v systemctl >/dev/null 2>&1; then
+                systemctl daemon-reload 9>&- || true
+            fi
+        else
+            # Prior uninstall stopped before moving target into staged_dir;
+            # clean up the empty staging dir and retain OWNED_*=1.
+            if [ -e "$staged_dir" ]; then
+                rm -rf --one-file-system -- "$staged_dir" \
+                    || die "failed to clean empty staged ${label} directory '$staged_dir'; preserving record at $OPT_CONFIG_DIR/install.env for retry"
+            fi
+            [ ! -e "$staged_dir" ] && [ ! -L "$staged_dir" ] \
+                || die "empty staged ${label} directory '$staged_dir' still exists after cleanup"
+            set_rec_staged_path "$slot" ""
+            write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+            return 0
+        fi
+    fi
+
+    if [ -e "$staged_dir" ] || [ -L "$staged_dir" ]; then
+        if ! rm -rf --one-file-system -- "$staged_dir"; then
+            die "failed to remove staged ${label} '$staged_dir'; preserving installation record at $OPT_CONFIG_DIR/install.env and service account '$OPT_USER' for retry"
+        fi
+    fi
+    if [ -e "$staged_dir" ] || [ -L "$staged_dir" ]; then
+        die "staged ${label} '$staged_dir' still exists after removal; preserving installation record at $OPT_CONFIG_DIR/install.env and service account '$OPT_USER' for retry"
+    fi
+    set_rec_staged_path "$slot" ""
+    write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+}
+
+reconcile_staged_removals() {
+    local unit_path="$1"
+    reconcile_staged_entry unit "systemd unit" "$unit_path"
+    reconcile_staged_entry install "runner directory" "$OPT_INSTALL_DIR"
+    reconcile_staged_entry hook "hook directory" "$OPT_HOOK_DIR"
+    reconcile_staged_entry state "state directory" "$OPT_STATE_DIR"
+}
+
+# Move an owned unit file or directory atomically into a private root-only 0700
+# staging directory on the same filesystem, record STAGED_* BEFORE moving,
+# release OWNED_*=0 (keeping STAGED_*) AFTER moving and BEFORE daemon-reload,
+# delete the private staging directory, and clear STAGED_* ONLY after deletion
+# is confirmed. If staging or deletion fails, OWNED_* or STAGED_* stays recorded
+# and cmd_uninstall exits non-zero without purging OPT_USER or OPT_CONFIG_DIR.
+stage_and_remove_resource() {
+    local slot="$1" label="$2" target="$3"
+    [ "$(get_rec_owned_flag "$slot")" = "1" ] || return 0
+
+    if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+        set_rec_owned_flag "$slot" "0"
+        write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+        if [ "$slot" = "unit" ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload 9>&- || true
+        fi
+        return 0
+    fi
+
+    if [ -L "$target" ]; then
+        if [ "$slot" = "unit" ]; then
+            warn "refusing to remove symlinked systemd unit path '$target'"
+            set_rec_owned_flag "$slot" "0"
+            write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl daemon-reload 9>&- || true
+            fi
+            return 0
+        fi
+        die "refusing to remove symlinked ${label} '$target'"
+    fi
+
+    check_trusted_parent_dir "$target"
+    local parent base stage_parent payload
+    parent="$(dirname "$target")"
+    base="$(basename "$target")"
+    stage_parent="$(umask 0077 && mktemp -d "${parent}/.qeminga-removing.XXXXXX")" \
+        || die "failed to create removal staging directory under '$parent' for ${label} '$target'; preserving installation record at $OPT_CONFIG_DIR/install.env for retry"
+    _UNINSTALL_EMPTY_STAGE="$stage_parent"
+    if ! chown -h root:root "$stage_parent" || ! chmod 0700 "$stage_parent"; then
+        rmdir -- "$stage_parent" 2>/dev/null || true
+        _UNINSTALL_EMPTY_STAGE=""
+        die "failed to secure removal staging directory '$stage_parent' for ${label} '$target'"
+    fi
+
+    set_rec_staged_path "$slot" "$stage_parent"
+    write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+    _UNINSTALL_EMPTY_STAGE=""
+
+    payload="${stage_parent}/${base}"
+    if ! mv -T -- "$target" "$payload"; then
+        rmdir -- "$stage_parent" 2>/dev/null || true
+        set_rec_staged_path "$slot" ""
+        write_uninstall_record "$OPT_CONFIG_DIR/install.env" || true
+        die "failed to stage removal of ${label} '$target'; ownership retained in $OPT_CONFIG_DIR/install.env for retry"
+    fi
+
+    set_rec_owned_flag "$slot" "0"
+    write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+    if [ "$slot" = "unit" ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 9>&- || true
+    fi
+
+    if ! rm -rf --one-file-system -- "$stage_parent"; then
+        die "failed to remove staged ${label} '$stage_parent'; preserving installation record at $OPT_CONFIG_DIR/install.env and service account '$OPT_USER' for retry"
+    fi
+    if [ -e "$stage_parent" ] || [ -L "$stage_parent" ]; then
+        die "staged ${label} '$stage_parent' still exists after removal; preserving installation record at $OPT_CONFIG_DIR/install.env and service account '$OPT_USER' for retry"
+    fi
+    set_rec_staged_path "$slot" ""
+    write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+}
+
 cmd_uninstall() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "uninstall must run as root"
+    acquire_install_lock
+
+    _UNINSTALL_TEMP_RT=""
+    _UNINSTALL_TEMP_HOOK_DIR=""
+    _UNINSTALL_EMPTY_STAGE=""
+    trap 'cleanup_uninstall_exit' EXIT
 
     # Refuse to run any cleanup, chown, token handoff, or deletion without a
     # valid root-owned installation record and matching live user UID/GID.
     load_and_verify_install_record uninstall
 
-    # Handle a retained user-only record from a prior uninstall without --purge-user.
-    if [ "$REC_STATE" = "user-only" ]; then
+    # Handle a retained user-only record (from uninstall without --purge-user)
+    # or a preserved user-pending record (from failed bootstrap userdel rollback).
+    if [ "$REC_STATE" = "user-only" ] || [ "$REC_STATE" = "user-pending" ]; then
         if [ "$OPT_PURGE_USER" -eq 1 ]; then
             if [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then
                 userdel "$OPT_USER" || die "could not delete user $OPT_USER; preserving ownership record at $OPT_CONFIG_DIR/install.env"
@@ -2953,10 +3508,13 @@ cmd_uninstall() {
             echo "purged user ${OPT_USER} and removed ${OPT_CONFIG_DIR}"
         elif ! id "$OPT_USER" >/dev/null 2>&1; then
             rm -rf --one-file-system -- "$OPT_CONFIG_DIR"
-            echo "removed stale user-only record in ${OPT_CONFIG_DIR}"
+            echo "removed stale ${REC_STATE} record in ${OPT_CONFIG_DIR}"
         else
-            echo "no runner installation remains in ${OPT_CONFIG_DIR}; managed user '${OPT_USER}' (uid=${REC_USER_UID}) is preserved (pass --purge-user to remove it)"
+            local live_uid
+            live_uid="${REC_USER_UID:-$(id -u "$OPT_USER" 2>/dev/null || echo unknown)}"
+            echo "no runner installation remains in ${OPT_CONFIG_DIR}; managed user '${OPT_USER}' (uid=${live_uid}) is preserved (pass --purge-user to remove it)"
         fi
+        trap - EXIT
         return 0
     fi
 
@@ -2965,18 +3523,24 @@ cmd_uninstall() {
     check_abs_path "systemd unit dir" "$unit_dir"
     local unit_path="${unit_dir}/${OPT_SERVICE}.service"
 
+    # Reconcile any previously staged removals BEFORE stopping services, running
+    # cleanup hooks, deregistering, or purging OPT_USER.
+    reconcile_staged_removals "$unit_path"
+
     # Only stop/disable the unit if this installation actually created/owns it.
     if [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
-        systemctl stop "${OPT_SERVICE}.service" 2>/dev/null || true
-        systemctl disable "${OPT_SERVICE}.service" 2>/dev/null || true
+        systemctl stop "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
+        systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
     fi
 
-    # Run the post-job cleanup hook as the runner user to destroy any stray
-    # qeminga-e2e-* session domains before removing owned state files.
+    # Run THIS installer's own domain-only cleanup logic (with a minimal
+    # generated STATE_DIR/IMAGES_DIR policy — never executing a stale hook from
+    # $OPT_HOOK_DIR and never referencing WORK_DIR/INSTALL_DIR) as the runner
+    # user to destroy any stray qeminga-e2e-* session domains before removing
+    # owned state files.
     local cleanup_rc=0
-    if [ "$REC_OWNED_STATE_DIR" = "1" ] && [ "$REC_OWNED_HOOK_DIR" = "1" ] \
-        && command -v runuser >/dev/null 2>&1 && id "$OPT_USER" >/dev/null 2>&1 \
-        && [ -x "$OPT_HOOK_DIR/hook-job-completed.sh" ] && [ -f "$OPT_CONFIG_DIR/policy.env" ]; then
+    if [ "$REC_OWNED_STATE_DIR" = "1" ] && [ -d "$OPT_STATE_DIR" ] \
+        && command -v runuser >/dev/null 2>&1 && id "$OPT_USER" >/dev/null 2>&1; then
         local runtime_root="${QEMINGA_RUNTIME_ROOT:-/run}"
         runtime_root="${runtime_root%/}"
         check_abs_path "runtime root" "$runtime_root"
@@ -2988,14 +3552,33 @@ cmd_uninstall() {
         if [ "$REC_OWNED_UNIT" = "1" ] && [ ! -L "$default_rt" ] && [ -d "$default_rt" ] && [ "$(stat -c '%u:%a' "$default_rt" 2>/dev/null || echo '')" = "${REC_USER_UID}:700" ]; then
             cleanup_rt="$default_rt"
         else
-            cleanup_rt="$(mktemp -d "${runtime_root}/qeminga-uninstall.XXXXXX")"
+            cleanup_rt="$(umask 0077 && mktemp -d "${runtime_root}/qeminga-uninstall.XXXXXX")"
             _UNINSTALL_TEMP_RT="$cleanup_rt"
-            trap 'cleanup_uninstall_temp_rt' EXIT
             chmod 0700 "$cleanup_rt"
-            chown -h "${OPT_USER}:${OPT_USER}" "$cleanup_rt"
+            chown -h "${REC_USER_UID}:${REC_USER_GID}" "$cleanup_rt"
             cleanup_rt_created=1
         fi
-        say "running cleanup hook to remove stray qeminga session domains"
+
+        local cleanup_hook_dir
+        cleanup_hook_dir="$(umask 0077 && mktemp -d "${runtime_root}/qeminga-uninstall-hook.XXXXXX")"
+        _UNINSTALL_TEMP_HOOK_DIR="$cleanup_hook_dir"
+        chown -h "0:${REC_USER_GID}" "$cleanup_hook_dir"
+        chmod 0750 "$cleanup_hook_dir"
+        write_job_completed_hook "$cleanup_hook_dir/hook-job-completed.sh"
+        chown -h root:root "$cleanup_hook_dir/hook-job-completed.sh"
+        chmod 0755 "$cleanup_hook_dir/hook-job-completed.sh"
+        (
+            umask 0027
+            cat >"$cleanup_hook_dir/policy.env" <<EOF
+STATE_DIR=${OPT_STATE_DIR}
+IMAGES_DIR=${OPT_STATE_DIR%/}/images
+LIBVIRT_CONNECT=qemu:///session
+EOF
+        )
+        chown -h "0:${REC_USER_GID}" "$cleanup_hook_dir/policy.env"
+        chmod 0640 "$cleanup_hook_dir/policy.env"
+
+        say "running domain-only cleanup hook to remove stray qeminga session domains"
         if ! runuser -u "$OPT_USER" -- env -u DBUS_SESSION_BUS_ADDRESS \
             "HOME=$OPT_STATE_DIR" \
             "XDG_RUNTIME_DIR=$cleanup_rt" \
@@ -3003,18 +3586,18 @@ cmd_uninstall() {
             "XDG_CACHE_HOME=$OPT_STATE_DIR/.cache" \
             "XDG_DATA_HOME=$OPT_STATE_DIR/.local/share" \
             "LIBVIRT_DEFAULT_URI=qemu:///session" \
-            "QEMINGA_RUNNER_POLICY=$OPT_CONFIG_DIR/policy.env" \
-            "$OPT_HOOK_DIR/hook-job-completed.sh" --domains-only; then
+            "QEMINGA_RUNNER_POLICY=$cleanup_hook_dir/policy.env" \
+            "$cleanup_hook_dir/hook-job-completed.sh" --domains-only 9>&-; then
             cleanup_rc=1
             warn "cleanup hook could not confirm all qeminga domains are gone; preserving $OPT_STATE_DIR/images"
         fi
+        cleanup_uninstall_temp_hook
         if [ "$cleanup_rt_created" -eq 1 ]; then
             cleanup_uninstall_temp_rt
-            trap - EXIT
         elif [ "$cleanup_rc" -eq 0 ]; then
             stop_temp_session_libvirt_daemons "$cleanup_rt" 0 || true
         fi
-    elif [ "$REC_OWNED_STATE_DIR" = "1" ] && [ -d "$OPT_STATE_DIR/images" ]; then
+    elif [ "$REC_OWNED_STATE_DIR" = "1" ] && [ ! -L "$OPT_STATE_DIR/images" ] && [ -d "$OPT_STATE_DIR/images" ]; then
         local leftover=""
         shopt -s nullglob
         for leftover in "$OPT_STATE_DIR/images"/qeminga-e2e-*; do
@@ -3043,41 +3626,23 @@ cmd_uninstall() {
         warn "skipping runner deregistration: $OPT_INSTALL_DIR is not owned by this installation (already removed or never created)"
     fi
 
-    # Persist each resource's release (RECORD_STATE=partial-uninstall with its
-    # OWNED_* flag cleared to 0) BEFORE unlinking/removing the resource and
-    # BEFORE daemon-reload, so a failed record write leaves the resource intact
-    # and an interrupted removal never lets a retry act on an independently
-    # created replacement service or directory.
-    if [ "$REC_OWNED_UNIT" = "1" ]; then
-        REC_OWNED_UNIT="0"
-        write_uninstall_record "$OPT_CONFIG_DIR/install.env"
-        if [ ! -L "$unit_path" ]; then
-            rm -f "$unit_path"
-        else
-            warn "refusing to remove symlinked systemd unit path '$unit_path'"
-        fi
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl daemon-reload || true
-        fi
-    fi
-
-    if [ "$REC_OWNED_INSTALL_DIR" = "1" ]; then
-        REC_OWNED_INSTALL_DIR="0"
-        write_uninstall_record "$OPT_CONFIG_DIR/install.env"
-        rm -rf --one-file-system -- "$OPT_INSTALL_DIR"
-    fi
+    # Stage each owned resource into a private root-only container on the same
+    # filesystem, release its OWNED_* flag only after moving it out of the
+    # public path, and clear STAGED_* only once deletion is confirmed.
+    stage_and_remove_resource unit "systemd unit" "$unit_path"
+    stage_and_remove_resource install "runner directory" "$OPT_INSTALL_DIR"
 
     if [ "$cleanup_rc" -eq 0 ]; then
-        if [ "$REC_OWNED_HOOK_DIR" = "1" ]; then
-            REC_OWNED_HOOK_DIR="0"
-            write_uninstall_record "$OPT_CONFIG_DIR/install.env"
-            rm -rf --one-file-system -- "$OPT_HOOK_DIR"
+        stage_and_remove_resource hook "hook directory" "$OPT_HOOK_DIR"
+        stage_and_remove_resource state "state directory" "$OPT_STATE_DIR"
+
+        if [ "$REC_OWNED_UNIT" != "0" ] || [ "$REC_OWNED_INSTALL_DIR" != "0" ] \
+            || [ "$REC_OWNED_HOOK_DIR" != "0" ] || [ "$REC_OWNED_STATE_DIR" != "0" ] \
+            || [ -n "$REC_STAGED_UNIT" ] || [ -n "$REC_STAGED_INSTALL_DIR" ] \
+            || [ -n "$REC_STAGED_HOOK_DIR" ] || [ -n "$REC_STAGED_STATE_DIR" ]; then
+            die "refusing to purge service user or remove ${OPT_CONFIG_DIR} while owned or staged resources remain in ${OPT_CONFIG_DIR}/install.env"
         fi
-        if [ "$REC_OWNED_STATE_DIR" = "1" ]; then
-            REC_OWNED_STATE_DIR="0"
-            write_uninstall_record "$OPT_CONFIG_DIR/install.env"
-            rm -rf --one-file-system -- "$OPT_STATE_DIR"
-        fi
+
         local user_purged=0
         if [ "$OPT_PURGE_USER" -eq 1 ] && [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then
             if userdel "$OPT_USER"; then
@@ -3103,6 +3668,7 @@ cmd_uninstall() {
             chown -h root:root "$OPT_CONFIG_DIR"
             chmod 0700 "$OPT_CONFIG_DIR"
         fi
+        trap - EXIT
         echo "uninstalled ${OPT_SERVICE}"
     else
         # Preserve images/, libvirt session .config/, hooks, and config in
@@ -3112,7 +3678,7 @@ cmd_uninstall() {
         if [ "$REC_OWNED_STATE_DIR" = "1" ]; then
             rm -rf --one-file-system -- \
                 "$OPT_STATE_DIR/work" "$OPT_STATE_DIR/image-cache" \
-                "$OPT_STATE_DIR/.cache" "$OPT_STATE_DIR/.local"
+                "$OPT_STATE_DIR/.cache" "$OPT_STATE_DIR/.local" || true
         fi
         die "partial uninstall of ${OPT_SERVICE}: preserved $OPT_STATE_DIR/images, $OPT_STATE_DIR/.config, $OPT_HOOK_DIR, and $OPT_CONFIG_DIR because libvirt domain cleanup did not confirm domains absent"
     fi

@@ -297,23 +297,35 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    checks `/dev/kvm` and stale `qeminga-e2e-*` domains. After every job,
    `hook-job-completed.sh` destroys/undefines any stray `qeminga-e2e-*`
    session domains (leaving unrelated domains alone and keeping disks if
-   state is unknown), restricts `WORK_DIR` to exact `$STATE_DIR/work` or a
-   single non-reserved child under `$INSTALL_DIR`, verifies no symlink
-   appears in any path component and that neither the lexical nor canonical
-   path overlaps `IMAGES_DIR`, `IMAGE_CACHE_DIR`, or `.config`, and scrubs
+   state is unknown), anchors image verification and recursive same-device
+   run-directory removal strictly to `$STATE_DIR/images` via kernel
+   `O_DIRECTORY | O_NOFOLLOW` traversal (so a symlink planted at
+   `$STATE_DIR/images` or any run entry fails closed without touching its
+   target), restricts `WORK_DIR` to exact `$STATE_DIR/work` or a single
+   non-reserved child under `$INSTALL_DIR`, verifies no symlink appears in
+   any path component and that neither the lexical nor canonical path
+   overlaps `IMAGES_DIR`, `IMAGE_CACHE_DIR`, or `.config`, and scrubs
    `WORK_DIR` with `find -P` while keeping the SHA-256-verified image cache.
 6. **Pinned, read-only runner binaries & safe update/reinstall/uninstall:**
    downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
    pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
-   extraction. Registration tokens are refused on the command line
-   (`--token` is rejected) and passed solely via the inherited
-   `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls inspect
-   existing `.runner` registrations before stopping the service (reusing
-   matching registrations, refusing incompatible ones, and restoring locked
-   permissions + restarting the service if reconfiguration fails).
-   Auto-updates are disabled by default (`--disableupdate`) so runner
-   binaries stay kernel-read-only; GitHub requires runner updates within
-   30 days of a new release — update cleanly with
+   extraction. `install`, `update`, and `uninstall` serialize overlapping
+   invocations for the same `--config-dir` with an exclusive root-owned
+   `flock` under `/run/qeminga-runner.locks` before reading `install.env`.
+   Fresh installs write a durable `RECORD_STATE=user-pending` record before
+   `useradd` (rolling it back when `userdel` succeeds, or preserving it for
+   `uninstall --purge-user` recovery if both record update and rollback
+   `userdel` fail) and publish fresh systemd units with `ln -T` (updating
+   owned units with `mv -T -f`) so an existing file, mask symlink, or
+   directory destination fails closed. Registration tokens are refused on
+   the command line (`--token` is rejected) and passed solely via the
+   inherited `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls
+   inspect existing `.runner` registrations before stopping the service
+   (reusing matching registrations, refusing incompatible ones, and
+   restoring locked permissions + restarting the service if reconfiguration
+   fails). Auto-updates are disabled by default (`--disableupdate`) so
+   runner binaries stay kernel-read-only; GitHub requires runner updates
+   within 30 days of a new release — update cleanly with
    `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
    root-owned `install.env` in `installed` state, verifies live numeric
    UID/GID, and refuses mismatched flags, or opt in to GitHub self-updates
@@ -322,14 +334,17 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
    (uninstall shares the same record and live numeric UID/GID checks BEFORE
    any `runuser`, `chown`, service stop, or token handoff — leaving
-   `install.env` intact on mismatch — runs `hook-job-completed.sh
-   --domains-only` over a private temporary runtime dir once `OWNED_UNIT=0`
-   so released JIT workspaces and replacement services are never touched,
-   refuses to act on unowned units or paths, persists each cleared
-   `OWNED_*` flag in `RECORD_STATE=partial-uninstall` before unlinking its
-   resource or reloading systemd so retries never touch independently
-   created replacement services or directories even if `--token-file` is
-   passed, preserves `$STATE_DIR/images` if session domain cleanup cannot
+   `install.env` intact on mismatch — stages and runs the current
+   installer's own domain-only cleanup logic with a minimal
+   `STATE_DIR`/`IMAGES_DIR` policy over a private temporary runtime dir
+   once `OWNED_UNIT=0` so outdated hooks on disk, released JIT workspaces,
+   and replacement services are never touched, moves each owned unit or
+   directory into a private root-only `0700` `.qeminga-removing.*` staging
+   container recorded in `STAGED_*` before clearing `OWNED_*=0` and
+   reloading systemd — refusing to purge the service account or remove
+   `install.env` until every staged container is confirmed deleted so
+   failed deletions stay recoverable on retry without touching replacement
+   paths — preserves `$STATE_DIR/images` if session domain cleanup cannot
    confirm domains are gone, and when run without `--purge-user` retains a
    minimal `RECORD_STATE=user-only` UID/GID record in
    `/etc/qeminga-runner/install.env` so a later default reinstall or

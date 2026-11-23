@@ -358,38 +358,53 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    the command line (`--token` is rejected) and passed solely via the
    inherited `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls
    require non-empty recorded `VOL_*` fingerprints for every owned
-   directory and owned systemd unit (directing legacy empty records to
-   `migrate-record --confirm-volumes` before downloading, stopping the
-   service, or mutating files), check owned directories/unit for active
-   mounts upfront, inspect existing `.runner` registrations before
-   stopping the service (reusing matching registrations and refusing
-   incompatible ones), and for an existing owned `installed` runner
-   download, stage, validate, prepare dependencies for the replacement
-   bundle, and snapshot pre-reinstall managed `policy.env`, `jitconfig`,
-   hooks, launcher, and systemd unit (bytes, modes, and ownership) into
-   the verified backup container BEFORE stopping the service or changing
-   `install.env` out of `installed`, sharing `update`'s recoverable
-   transactional replacement and restoring both binaries and pre-reinstall
-   policy/unit (with `systemctl daemon-reload`) before restarting the
-   previous release if publication, reconfiguration, or service startup
-   fails. Auto-updates are disabled by default (`--disableupdate`) so
-   runner binaries stay kernel-read-only; GitHub requires runner updates
-   within 30 days of a new release — update cleanly with
-   `sudo scripts/setup-kvm-runner.sh update` (which requires a valid
-   root-owned `install.env` in `installed` state — or retries an
+   directory and owned systemd unit (directing legacy empty records and
+   preceding phased journals to `migrate-record --confirm-volumes` before
+   downloading, stopping the service, or mutating files), check owned
+   directories/unit for active mounts upfront, and inspect existing
+   `.runner` registrations before stopping the service: matching persistent
+   registrations are reused, incompatible ones are refused, provisioning
+   `--jitconfig-file` refuses any leftover `.runner`/`.credentials`/
+   `.credentials_rsaparams`/`.path`, and in-place persistent re-enrollment
+   (`config.sh --replace`) over an already-`installed` runner lacking a
+   matching `.runner` (including when the runner directory itself was
+   deleted on the recorded volume) is refused — run
+   `sudo scripts/setup-kvm-runner.sh uninstall --config-dir <dir>` (with
+   `--token-file` if deregistering) before re-enrolling so remote GitHub
+   registration state is never mutated without rollback. For an existing
+   owned `installed` runner, reinstall downloads, stages, validates, and
+   prepares dependencies for the replacement bundle, durably journals
+   `UPDATE_PHASE=preparing` with the verified stage and backup directory
+   identities BEFORE copying pre-reinstall `policy.env`, `jitconfig`,
+   hooks, launcher, and systemd unit (bytes, modes, and ownership) into the
+   verified backup container (so a crash mid-snapshot is cleanly prunable
+   by retrying `install`, `update`, or `uninstall` without touching
+   originals), advances to `UPDATE_PHASE=publishing`, and shares `update`'s
+   recoverable transactional replacement — restoring both binaries and
+   snapshotted config/policy/unit (retaining `cfg_old/` and
+   `config-manifest.json` until `UPDATE_PHASE=restored` is durably saved,
+   with `systemctl daemon-reload`) before restarting the previous release
+   if publication or service startup fails. Auto-updates are disabled by
+   default (`--disableupdate`) so runner binaries stay kernel-read-only;
+   GitHub requires runner updates within 30 days of a new release — update
+   cleanly with `sudo scripts/setup-kvm-runner.sh update` (which requires a
+   valid root-owned `install.env` in `installed` state — or retries an
    interrupted `updating` record — with non-empty recorded
-   `VOL_INSTALL_DIR` and `VOL_UNIT`, directing legacy empty records and
-   legacy pre-phase `updating` records to `migrate-record --confirm-volumes`
-   before download or service stop; verifies live numeric UID/GID,
-   `INSTALL_ID` marker, recorded backing volumes, and absence of nested
-   mounts both before and after download; stages, sanitizes, and validates
-   the complete bundle in a private `0700` sibling before stopping the
-   service; records `UPDATE_PHASE=publishing`, the original
-   `UPDATE_WAS_ACTIVE`, and both `.qeminga-extract.*` stage and
-   `.qeminga-update-backup.*` backup paths with reboot/remount-surviving
-   directory identities binding parent/target inodes, persistent volume
-   fingerprint, and a root-owned `0600` `.qeminga-tx-id` marker in
-   `install.env`; publishes `manifest.json` atomically via
+   `VOL_INSTALL_DIR` and `VOL_UNIT`, directing legacy empty records,
+   legacy pre-phase `updating` records, and preceding `376eed2`-format
+   phased journals to `migrate-record --confirm-volumes` before download or
+   service stop; verifies live numeric UID/GID, `INSTALL_ID` marker,
+   recorded backing volumes, absence of nested mounts, and a working
+   `systemctl` client / confirmed service state for any owned unit both
+   before and after download; stages, sanitizes, and validates the complete
+   bundle in a private `0700` sibling before stopping the service; records
+   `UPDATE_PHASE=publishing`, the original `UPDATE_WAS_ACTIVE`, and both
+   `.qeminga-extract.*` stage and `.qeminga-update-backup.*` backup paths
+   with reboot/remount-surviving directory identities binding parent/target
+   inodes, persistent volume fingerprint, and a root-owned `0600`
+   `.qeminga-tx-id` marker in `install.env` (preserving recorded containers
+   in exit traps if post-rename directory `fsync` fails or the journal
+   cannot be read); publishes `manifest.json` atomically via
    `manifest.json.tmp` + `fsync` + `rename`, moves live entries into the
    verified backup container and `fsync`s the backup before placing
    replacements, and `fsync`s all published package files and directories
@@ -397,17 +412,21 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    and service activation so a startup failure rolls back and restarts the
    previous release; durably records `UPDATE_PHASE=committed` after
    startup succeeds — or after permission locking with `--no-start` —
-   BEFORE pruning the backup; and on retrying an `updating` record either
-   finishes pruning a `committed` backup without rolling back, or stops
-   any active owned replacement service first, reclaims the recorded
-   stage, restores the verified `publishing` backup (retaining the
-   verified backup container on disk until `UPDATE_PHASE=restored` is
-   durably saved, and only then pruning it idempotently), re-locks
-   permissions, reloads systemd, and preserves `UPDATE_WAS_ACTIVE`; and
-   refuses mismatched flags, or opt in to GitHub self-updates with
-   `--allow-auto-update`). Operators upgrading legacy empty/4-field or
-   verified root-only `blkid` UUID `VOL_*` records, pre-marker managed
-   accounts, or pre-phase `updating` journals can run
+   BEFORE pruning the backup (enforcing `euid`/`0700` ownership and syncing
+   the emptied container before unlinking `.qeminga-tx-id` last); and on
+   retrying an `updating` record prunes an interrupted `preparing`
+   stage/snapshot without touching live files, finishes pruning a
+   `committed` backup without rolling back, or stops any active owned
+   replacement service first, reclaims the recorded stage, restores the
+   verified `publishing` backup (retaining the verified backup container
+   and config blobs on disk until `UPDATE_PHASE=restored` is durably saved,
+   and only then pruning it idempotently), re-locks permissions, reloads
+   systemd, and preserves `UPDATE_WAS_ACTIVE`; and refuses mismatched
+   flags, or opt in to GitHub self-updates with `--allow-auto-update`).
+   Operators upgrading legacy empty/4-field or verified root-only `blkid`
+   UUID `VOL_*` records, pre-marker managed accounts, pre-phase `updating`
+   journals, or preceding `376eed2`-format phased journals (using 7-field
+   `p_dev/p_ino/p_mnt/t_dev/t_ino/t_mnt/vol` identities) can run
    `sudo scripts/setup-kvm-runner.sh migrate-record --confirm-volumes`
    and/or `--confirm-account-marker` after confirming the host storage and
    account (`migrate-record` refuses `user-pending` records, failed
@@ -417,28 +436,37 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `UPDATE_PHASE=restored` when `UPDATE_BACKUP_DIR` is empty or stamps
    `.qeminga-tx-id` and `UPDATE_PHASE=publishing` + `UPDATE_BACKUP_ID`
    after verifying a root-owned `0700` same-volume backup container;
-   checks moved `STAGED_*` payloads before vacated public paths during
-   interrupted `partial-uninstall` recovery across all four slots — and
-   when a released `OWNED_*=0` slot's `STAGED_*` directory was already
-   deleted before clearing `STAGED_*`, verifies its recorded legacy volume
-   fingerprint against the trusted parent directory after confirming no
-   mount exists at or under the absent path; persists any newly generated
-   `INSTALL_ID` to `install.env` before invoking `usermod` so interrupted
-   attempts stay idempotent on retry; and refreshes `STATE_VOL`/
-   `INSTALL_VOL` in `policy.env`). Remove only resources owned by the
-   recorded installation with
+   atomically verifies preceding `376eed2` `publishing`/`committed`/
+   `restored` stage and backup containers on the same open directory
+   descriptor and stamps `.qeminga-tx-id` while preserving `UPDATE_PHASE` —
+   or, for a `376eed2` `committed` journal whose backup was already pruned
+   before `RECORD_STATE=installed` was written, verifies the recorded
+   parent inode and backing volume and finalizes the completed transaction
+   as `installed`; checks moved `STAGED_*` payloads before vacated public
+   paths during interrupted `partial-uninstall` recovery across all four
+   slots — and when a released `OWNED_*=0` slot's `STAGED_*` directory was
+   already deleted before clearing `STAGED_*`, verifies its recorded legacy
+   volume fingerprint against the trusted parent directory after confirming
+   no mount exists at or under the absent path; persists any newly
+   generated `INSTALL_ID` to `install.env` before invoking `usermod` so
+   interrupted attempts stay idempotent on retry; and refreshes
+   `STATE_VOL`/`INSTALL_VOL` in `policy.env`). Remove only resources owned
+   by the recorded installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
-   (which also stops any active owned replacement service before restoring
-   a `publishing` backup, reclaims any recorded `UPDATE_STAGE_DIR`,
-   reconciles `UPDATE_BACKUP_DIR` by `UPDATE_PHASE` and verified identity
-   retaining the backup container until `UPDATE_PHASE=restored` is saved
-   before pruning, directs legacy pre-phase `updating` records to
-   `migrate-record --confirm-volumes`, and shares the same
-   volume, and mount checks BEFORE any `runuser`, `chown`, service stop, or
-   token handoff — leaving `install.env` intact on mismatch — stages and
-   runs the current installer's own domain-only cleanup logic with a
-   minimal `STATE_DIR`/`IMAGES_DIR`/`STATE_VOL` policy over a private
-   temporary runtime dir once `OWNED_UNIT=0`, fails closed in the fallback
+   (which requires a working `systemctl` client and confirmed deactivation
+   of any owned unit before restoring a `publishing` backup OR running
+   ordinary guest cleanup/deregistration/removal — preserving `install.env`
+   for retry if stopping fails or service state is indeterminate — prunes
+   interrupted `preparing` stages/backups without touching originals,
+   reclaims any recorded `UPDATE_STAGE_DIR`, reconciles `UPDATE_BACKUP_DIR`
+   by `UPDATE_PHASE` and verified identity retaining the backup container
+   until `UPDATE_PHASE=restored` is saved before pruning, directs legacy
+   pre-phase and preceding `376eed2` phased `updating` records to
+   `migrate-record --confirm-volumes`, and shares the same user, volume,
+   and mount checks BEFORE any `runuser`, `chown`, service stop, or token
+   handoff — leaving `install.env` intact on mismatch — stages and runs the
+   current installer's own domain-only cleanup logic with a minimal
+   `STATE_DIR`/`IMAGES_DIR`/`STATE_VOL` policy over a private temporary runtime dir once `OWNED_UNIT=0`, fails closed in the fallback
    path when `runuser` or the service account is unavailable and
    `$STATE_DIR/images` cannot be verified clean without following symlinks
    or crossing a mount, verifies each owned or staged path's recorded

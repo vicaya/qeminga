@@ -2716,6 +2716,14 @@ def scan_dir_same_mount(parent_fd, name, root_dev, root_mnt_id, cur_path, mountp
         os.close(dir_fd)
 
 
+def scan_open_dir_same_mount(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints):
+    for entry in os.listdir(dir_fd):
+        child_path = f"{cur_path}/{entry}"
+        est = assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path, mountpoints)
+        if stat.S_ISDIR(est.st_mode):
+            scan_dir_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path, mountpoints)
+
+
 def check_no_mounts(abs_path, mountpoints):
     norm = norm_abs(abs_path)
     assert_no_mount_at_or_under(norm, mountpoints)
@@ -2733,11 +2741,7 @@ def check_no_mounts(abs_path, mountpoints):
                 r_mnt = fd_mnt_id(rfd)
                 if rst.st_dev != pst.st_dev or r_mnt != p_mnt:
                     raise OSError(errno.EXDEV, f"'{norm}' crosses mount boundary")
-                for entry in os.listdir(rfd):
-                    child_path = f"{norm}/{entry}"
-                    est = assert_entry_same_mount(rfd, entry, rst.st_dev, r_mnt, child_path, mountpoints)
-                    if stat.S_ISDIR(est.st_mode):
-                        scan_dir_same_mount(rfd, entry, rst.st_dev, r_mnt, child_path, mountpoints)
+                scan_open_dir_same_mount(rfd, rst.st_dev, r_mnt, norm, mountpoints)
             finally:
                 os.close(rfd)
     finally:
@@ -4382,6 +4386,9 @@ try:
         pfd = open_chain_rdir(dst_parent)
         try:
             p_mnt = fd_mnt_id(pfd)
+            fail_target = os.environ.get("QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC", "")
+            fail_base, fail_sep, fail_needle = fail_target.partition(":")
+            staged_matches_needle = not fail_sep
             sfd = os.open(src_base, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=pfd)
             try:
                 sst = os.fstat(sfd)
@@ -4389,6 +4396,9 @@ try:
                     raise OSError(errno.EINVAL, f"unsafe staging file '{src}'")
                 if fd_mnt_id(sfd) != p_mnt:
                     raise OSError(errno.EXDEV, f"staging file '{src}' crosses mount boundary")
+                if fail_sep and fail_base in ("1", dst_base):
+                    staged_data = os.read(sfd, 65536).decode("utf-8", errors="ignore")
+                    staged_matches_needle = fail_needle in staged_data
                 os.fsync(sfd)
             finally:
                 os.close(sfd)
@@ -4408,8 +4418,7 @@ try:
                     os.close(dfd)
             os.rename(src_base, dst_base, src_dir_fd=pfd, dst_dir_fd=pfd)
             try:
-                fail_target = os.environ.get("QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC", "")
-                if fail_target and (fail_target == "1" or fail_target == dst_base):
+                if fail_target and fail_base in ("1", dst_base) and staged_matches_needle:
                     raise OSError(errno.EIO, f"simulated post-rename parent dir fsync failure for '{dst}'")
                 os.fsync(pfd)
             except OSError as exc:
@@ -4924,16 +4933,21 @@ try:
                 os.close(tfd)
         finally:
             os.close(pfd)
-    elif op == "verify-legacy-path-identity":
+    elif op in ("verify-legacy-path-identity", "upgrade-legacy-path-identity"):
+        stamp_tx = op == "upgrade-legacy-path-identity"
         target = norm_abs(sys.argv[2])
         ident = parse_legacy_path_identity(sys.argv[3], target)
         expected_vol = sys.argv[4] if len(sys.argv) > 4 else ""
         allow_missing = (sys.argv[5] == "1") if len(sys.argv) > 5 else False
         entries = parse_mountinfo()
         mountpoints = visible_mountpoints(entries)
+        assert_no_mount_at_or_under(target, mountpoints)
         parent = os.path.dirname(target) or "/"
         base = os.path.basename(target)
-        pfd = open_chain_opath(parent)
+        if stamp_tx:
+            pfd, p_sync = open_chain_rdir_or_opath(parent)
+        else:
+            pfd, p_sync = open_chain_opath(parent), False
         try:
             pst = os.fstat(pfd)
             p_mnt = fd_mnt_id(pfd)
@@ -4955,10 +4969,11 @@ try:
                 tfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
             except FileNotFoundError:
                 if allow_missing:
+                    if stamp_tx:
+                        print("ABSENT")
                     sys.exit(0)
                 raise
             try:
-                check_no_mounts(target, mountpoints)
                 tst = os.fstat(tfd)
                 t_mnt = fd_mnt_id(tfd)
                 if tst.st_dev != pst.st_dev or t_mnt != p_mnt:
@@ -4973,6 +4988,7 @@ try:
                         errno.EXDEV,
                         f"legacy identity directory inode mismatch for '{target}'",
                     )
+                scan_open_dir_same_mount(tfd, tst.st_dev, t_mnt, target, mountpoints)
                 t_vol = volume_id_of_fd(tfd, target, entries)
                 t_vol_ok = t_vol == ident["vol"]
                 if not t_vol_ok and is_legacy_four_field_vol(ident["vol"]):
@@ -4982,12 +4998,18 @@ try:
                         errno.EXDEV,
                         f"legacy identity backing volume mismatch for '{target}'",
                     )
+                if stamp_tx:
+                    tx = ensure_tx_marker(tfd, t_mnt, target, create=True)
+                    if p_sync:
+                        os.fsync(pfd)
+                    print(format_path_identity(pst, tst, tx, t_vol))
             finally:
                 os.close(tfd)
         finally:
             os.close(pfd)
     elif op == "path-identity":
         target = norm_abs(sys.argv[2])
+        expected_vol = sys.argv[3] if len(sys.argv) > 3 else ""
         entries = parse_mountinfo()
         mountpoints = visible_mountpoints(entries)
         assert_no_mount_at_or_under(target, mountpoints)
@@ -5010,8 +5032,8 @@ try:
                         f"private directory '{target}' must be owned by current user with mode 0700",
                     )
                 t_vol = volume_id_of_fd(tfd, target, entries)
-                if t_vol != p_vol:
-                    raise OSError(errno.EXDEV, f"'{target}' backing volume differs from parent '{parent}'")
+                if t_vol != p_vol or (expected_vol and t_vol != expected_vol):
+                    raise OSError(errno.EXDEV, f"'{target}' backing volume differs from expected volume '{expected_vol or p_vol}'")
                 tx = ensure_tx_marker(tfd, t_mnt, target, create=True)
                 if p_sync:
                     os.fsync(pfd)
@@ -6121,12 +6143,16 @@ require_recorded_volume() {
         || die "${mode}: installation record '$OPT_CONFIG_DIR/install.env' is missing ${key} for owned ${label}; verify the mounted storage and run 'sudo $0 migrate-record --config-dir $OPT_CONFIG_DIR --confirm-volumes' before proceeding"
 }
 
-# Query an owned systemd unit's active state without `--quiet` so manager/D-Bus
-# connection failures (empty stdout, non-zero exit) and unrecognized states are
-# treated as indeterminate (fail-closed) rather than silently treated as stopped.
+# Query an owned systemd unit's active state without `--quiet` so a missing
+# `systemctl` client, manager/D-Bus connection failures (empty stdout, non-zero
+# exit), and unrecognized states are treated as indeterminate (fail-closed)
+# rather than silently treated as stopped.
 # Prints "running" (active/reloading/refreshing/activating), "deactivating", or
 # "stopped" (inactive/failed with expected exit code 3 or 4).
 query_owned_service_state() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
     local svc_state rc=0
     svc_state="$(systemctl is-active "${OPT_SERVICE}.service" 2>/dev/null)" || rc=$?
     svc_state="${svc_state%%$'\n'*}"
@@ -6153,10 +6179,11 @@ query_owned_service_state() {
 }
 
 # Verify an owned systemd service is in a confirmed stopped state BEFORE
-# mutating live runner binaries, managed config, or unit files (both forward
-# update/reinstall and rollback/recovery). Sets _SERVICE_WAS_ACTIVE=1 if the
-# unit was active/reloading/refreshing/activating prior to stopping. Fails
-# closed (returns 1) on manager errors, unrecognized states, stop failure, or
+# mutating live runner binaries, managed config, or unit files (forward
+# update/reinstall, ordinary uninstall, and rollback/recovery). Sets
+# _SERVICE_WAS_ACTIVE=1 if the unit was active/reloading/refreshing/activating
+# prior to stopping. Fails closed (returns 1) when `systemctl` is unavailable
+# for an owned unit, on manager errors, unrecognized states, stop failure, or
 # if the unit does not reach a confirmed stopped state after stop.
 _SERVICE_WAS_ACTIVE=0
 ensure_owned_service_stopped() {
@@ -6166,7 +6193,8 @@ ensure_owned_service_stopped() {
         return 0
     fi
     if ! command -v systemctl >/dev/null 2>&1; then
-        return 0
+        warn "${mode}: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; refusing to modify live runner files"
+        return 1
     fi
     local state
     if ! state="$(query_owned_service_state)"; then
@@ -6196,10 +6224,30 @@ ensure_owned_service_stopped_for_restore() {
     ensure_owned_service_stopped "$1"
 }
 
-_record_references_entry() {
+# Three-outcome journal check shared by `cleanup_install_exit` and
+# `cleanup_update_exit`:
+#   0 -> journal is readable and contains exact line "${key}=${val}"
+#   1 -> confirmed absent (fresh install with no journal path, or readable
+#        journal lacks the entry)
+#   2 -> indeterminate / read error (missing, symlinked, or unreadable journal
+#        or `grep` error >= 2): callers MUST preserve on-disk recovery data
+#        without pruning or rolling back.
+_inspect_record_entry() {
     local rec="$1" key="$2" val="$3"
-    [ -n "$rec" ] && [ -n "$val" ] && [ -f "$rec" ] && [ ! -L "$rec" ] || return 1
-    grep -Fqx -- "${key}=${val}" "$rec" 2>/dev/null
+    if [ -z "$rec" ]; then
+        return 1
+    fi
+    if [ -z "$val" ] || [ -L "$rec" ] || [ ! -f "$rec" ] || [ ! -r "$rec" ]; then
+        return 2
+    fi
+    local rc=0
+    grep -Fqx -- "${key}=${val}" "$rec" 2>/dev/null || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        return 0
+    elif [ "$rc" -eq 1 ]; then
+        return 1
+    fi
+    return 2
 }
 
 # Shared rollback helper for both `update` and transactional `install`
@@ -6252,11 +6300,9 @@ _rollback_runner_package_tx() {
                     fi
                 fi
                 if [ "$restore_ok" -eq 1 ] && { [ "${REC_OWNED_UNIT:-0}" = "1" ] || [ "${OWNED_UNIT:-0}" = "1" ]; }; then
-                    if command -v systemctl >/dev/null 2>&1; then
-                        if ! systemctl daemon-reload 9>&-; then
-                            warn "rollback restored previous runner unit/files but systemctl daemon-reload failed; preserving updating record for retry"
-                            restore_ok=0
-                        fi
+                    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl daemon-reload 9>&-; then
+                        warn "rollback restored previous runner unit/files but systemctl daemon-reload failed or systemctl is unavailable; preserving updating record for retry"
+                        restore_ok=0
                     fi
                 fi
             else
@@ -6270,9 +6316,9 @@ _rollback_runner_package_tx() {
     fi
     if [ "$restore_ok" -eq 1 ]; then
         local service_ok=1
-        if [ "$was_active" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+        if [ "$was_active" -eq 1 ]; then
             warn "restarting previously active ${OPT_SERVICE}.service after failed package replacement"
-            if ! systemctl start "${OPT_SERVICE}.service" 9>&-; then
+            if ! command -v systemctl >/dev/null 2>&1 || ! systemctl start "${OPT_SERVICE}.service" 9>&-; then
                 warn "failed to restart ${OPT_SERVICE}.service during rollback; preserving updating record so retry remembers the service was active"
                 service_ok=0
             fi
@@ -6324,8 +6370,16 @@ cleanup_install_exit() {
     fi
     if [ "${_INSTALL_REINSTALL_PREPARING:-0}" -eq 1 ]; then
         _INSTALL_REINSTALL_PREPARING=0
-        if _record_references_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_PHASE" "publishing"; then
+        local prep_rc=0
+        _inspect_record_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_PHASE" "publishing" || prep_rc=$?
+        if [ "$prep_rc" -eq 0 ]; then
             warn "preserving reinstall stage and backup because UPDATE_PHASE=publishing is already visible at '$_INSTALL_REINSTALL_RECORD_PATH'"
+            _INSTALL_BOOTSTRAP_STAGE=""
+            _INSTALL_BOOTSTRAP_STAGE_ID=""
+            _INSTALL_REINSTALL_BACKUP_DIR=""
+            _INSTALL_REINSTALL_BACKUP_ID=""
+        elif [ "$prep_rc" -ne 1 ]; then
+            warn "unable to read journal '$_INSTALL_REINSTALL_RECORD_PATH' during preparing cleanup; preserving stage and backup for manual recovery"
             _INSTALL_BOOTSTRAP_STAGE=""
             _INSTALL_BOOTSTRAP_STAGE_ID=""
             _INSTALL_REINSTALL_BACKUP_DIR=""
@@ -6365,8 +6419,14 @@ cleanup_install_exit() {
     fi
     if [ "${_INSTALL_REINSTALL_ROLLBACK:-0}" -eq 1 ]; then
         _INSTALL_REINSTALL_ROLLBACK=0
-        if _record_references_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_PHASE" "committed"; then
+        local rb_rc=0
+        _inspect_record_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_PHASE" "committed" || rb_rc=$?
+        if [ "$rb_rc" -eq 0 ]; then
             warn "preserving backup '$_INSTALL_REINSTALL_BACKUP_DIR' without rollback because UPDATE_PHASE=committed is already visible at '$_INSTALL_REINSTALL_RECORD_PATH'"
+            _INSTALL_BOOTSTRAP_STAGE=""
+            _INSTALL_BOOTSTRAP_STAGE_ID=""
+        elif [ "$rb_rc" -ne 1 ]; then
+            warn "unable to read journal '$_INSTALL_REINSTALL_RECORD_PATH' during reinstall exit cleanup; preserving stage and backup without rollback for manual recovery"
             _INSTALL_BOOTSTRAP_STAGE=""
             _INSTALL_BOOTSTRAP_STAGE_ID=""
         else
@@ -6402,8 +6462,12 @@ cleanup_install_exit() {
         _INSTALL_REINSTALL_BACKUP_ID=""
     else
         if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
-            if _record_references_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_STAGE_DIR" "$_INSTALL_BOOTSTRAP_STAGE"; then
+            local st_rc=0
+            _inspect_record_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_STAGE_DIR" "$_INSTALL_BOOTSTRAP_STAGE" || st_rc=$?
+            if [ "$st_rc" -eq 0 ]; then
                 warn "preserving recorded staging directory '$_INSTALL_BOOTSTRAP_STAGE' referenced by '$_INSTALL_REINSTALL_RECORD_PATH'"
+            elif [ "$st_rc" -ne 1 ]; then
+                warn "unable to read journal '$_INSTALL_REINSTALL_RECORD_PATH'; preserving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual recovery"
             elif [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
                 if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
                     warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
@@ -6415,8 +6479,12 @@ cleanup_install_exit() {
             _INSTALL_BOOTSTRAP_STAGE_ID=""
         fi
         if [ "${_INSTALL_REINSTALL_COMMITTED:-0}" -eq 0 ] && [ -n "${_INSTALL_REINSTALL_BACKUP_DIR:-}" ]; then
-            if _record_references_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_BACKUP_DIR" "$_INSTALL_REINSTALL_BACKUP_DIR"; then
+            local bk_rc=0
+            _inspect_record_entry "$_INSTALL_REINSTALL_RECORD_PATH" "UPDATE_BACKUP_DIR" "$_INSTALL_REINSTALL_BACKUP_DIR" || bk_rc=$?
+            if [ "$bk_rc" -eq 0 ]; then
                 warn "preserving recorded reinstall backup directory '$_INSTALL_REINSTALL_BACKUP_DIR' referenced by '$_INSTALL_REINSTALL_RECORD_PATH'"
+            elif [ "$bk_rc" -ne 1 ]; then
+                warn "unable to read journal '$_INSTALL_REINSTALL_RECORD_PATH'; preserving reinstall backup directory '$_INSTALL_REINSTALL_BACKUP_DIR' for manual recovery"
             elif [ -n "${_INSTALL_REINSTALL_BACKUP_ID:-}" ]; then
                 if ! fs_ops safe-rmtree-id "$_INSTALL_REINSTALL_BACKUP_DIR" "$_INSTALL_REINSTALL_BACKUP_ID"; then
                     warn "leaving uncommitted reinstall backup directory '$_INSTALL_REINSTALL_BACKUP_DIR' for manual inspection because its identity or backing volume changed"
@@ -7004,11 +7072,11 @@ cmd_install() {
     fi
 
     # Refuse in-place re-enrollment (`config.sh --replace`) over an already-installed
-    # runner lacking a matching persistent `.runner` registration: remote GitHub
-    # registration cannot be safely rolled back if the replacement fails startup.
+    # runner lacking a matching persistent `.runner` registration (even if the entire
+    # runner directory was deleted on the recorded volume): remote GitHub registration
+    # cannot be safely rolled back if the replacement fails startup.
     if [ "$HAS_INSTALL_RECORD" -eq 1 ] && [ "$REC_STATE" = "installed" ] \
         && [ "$OWNED_CONFIG_DIR" -eq 1 ] && [ "$OWNED_INSTALL_DIR" -eq 1 ] \
-        && [ -d "$OPT_INSTALL_DIR" ] \
         && [ -z "$OPT_JITCONFIG_FILE" ] && [ "$reg_mode" = "configure" ]; then
         die "existing installation at $rec_path has no matching persistent .runner registration; in-place reinstall cannot safely roll back a new remote GitHub registration (--replace) — run 'sudo $0 uninstall --config-dir $OPT_CONFIG_DIR' (with --token-file if deregistering) before re-enrolling"
     fi
@@ -7100,10 +7168,10 @@ cmd_install() {
     if [ "$is_reinstall_installed" -eq 1 ]; then
         require_recorded_volume install VOL_INSTALL_DIR "${VOL_INSTALL_DIR:-}" "runner directory"
         local reinstall_install_vol="$VOL_INSTALL_DIR"
-        if [ "$OWNED_UNIT" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+        if [ "$OWNED_UNIT" -eq 1 ]; then
             local pre_svc_state
             if ! pre_svc_state="$(query_owned_service_state)"; then
-                die "install: unable to confirm systemd state for ${OPT_SERVICE}.service (manager error or unrecognized state); refusing to modify live runner files"
+                die "install: unable to confirm systemd state for ${OPT_SERVICE}.service (systemctl unavailable, manager error, or unrecognized state); refusing to modify live runner files"
             fi
             if [ "$pre_svc_state" = "running" ]; then
                 was_active=1
@@ -7141,10 +7209,10 @@ cmd_install() {
         rm -f "$tarball"
         _INSTALL_BOOTSTRAP_TARBALL=""
 
-        if [ "$OWNED_UNIT" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+        if [ "$OWNED_UNIT" -eq 1 ]; then
             local post_dl_svc_state
             if ! post_dl_svc_state="$(query_owned_service_state)"; then
-                die "install: unable to confirm systemd state for ${OPT_SERVICE}.service after download (manager error or unrecognized state); refusing to modify live runner files"
+                die "install: unable to confirm systemd state for ${OPT_SERVICE}.service after download (systemctl unavailable, manager error, or unrecognized state); refusing to modify live runner files"
             fi
             if [ "$post_dl_svc_state" = "running" ]; then
                 was_active=1
@@ -7482,8 +7550,14 @@ cleanup_update_exit() {
     fi
     if [ "${_UPDATE_ROLLBACK_ACTIVE:-0}" -eq 1 ]; then
         _UPDATE_ROLLBACK_ACTIVE=0
-        if _record_references_entry "$_UPDATE_RECORD_PATH" "UPDATE_PHASE" "committed"; then
+        local rb_rc=0
+        _inspect_record_entry "$_UPDATE_RECORD_PATH" "UPDATE_PHASE" "committed" || rb_rc=$?
+        if [ "$rb_rc" -eq 0 ]; then
             warn "preserving backup '$_UPDATE_BACKUP_DIR' without rollback because UPDATE_PHASE=committed is already visible at '$_UPDATE_RECORD_PATH'"
+            _UPDATE_TMP_STAGE=""
+            _UPDATE_TMP_STAGE_ID=""
+        elif [ "$rb_rc" -ne 1 ]; then
+            warn "unable to read journal '$_UPDATE_RECORD_PATH' during update exit cleanup; preserving stage and backup without rollback for manual recovery"
             _UPDATE_TMP_STAGE=""
             _UPDATE_TMP_STAGE_ID=""
         else
@@ -7510,8 +7584,12 @@ cleanup_update_exit() {
         _UPDATE_BACKUP_ID=""
     else
         if [ -n "${_UPDATE_TMP_STAGE:-}" ]; then
-            if _record_references_entry "$_UPDATE_RECORD_PATH" "UPDATE_STAGE_DIR" "$_UPDATE_TMP_STAGE"; then
+            local st_rc=0
+            _inspect_record_entry "$_UPDATE_RECORD_PATH" "UPDATE_STAGE_DIR" "$_UPDATE_TMP_STAGE" || st_rc=$?
+            if [ "$st_rc" -eq 0 ]; then
                 warn "preserving recorded update staging directory '$_UPDATE_TMP_STAGE' referenced by '$_UPDATE_RECORD_PATH'"
+            elif [ "$st_rc" -ne 1 ]; then
+                warn "unable to read journal '$_UPDATE_RECORD_PATH'; preserving update staging directory '$_UPDATE_TMP_STAGE' for manual recovery"
             elif [ -n "${_UPDATE_TMP_STAGE_ID:-}" ]; then
                 if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
                     warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection because its identity or backing volume changed"
@@ -7523,8 +7601,12 @@ cleanup_update_exit() {
             _UPDATE_TMP_STAGE_ID=""
         fi
         if [ "${_UPDATE_COMMITTED:-0}" -eq 0 ] && [ -n "${_UPDATE_BACKUP_DIR:-}" ]; then
-            if _record_references_entry "$_UPDATE_RECORD_PATH" "UPDATE_BACKUP_DIR" "$_UPDATE_BACKUP_DIR"; then
+            local bk_rc=0
+            _inspect_record_entry "$_UPDATE_RECORD_PATH" "UPDATE_BACKUP_DIR" "$_UPDATE_BACKUP_DIR" || bk_rc=$?
+            if [ "$bk_rc" -eq 0 ]; then
                 warn "preserving recorded update backup directory '$_UPDATE_BACKUP_DIR' referenced by '$_UPDATE_RECORD_PATH'"
+            elif [ "$bk_rc" -ne 1 ]; then
+                warn "unable to read journal '$_UPDATE_RECORD_PATH'; preserving update backup directory '$_UPDATE_BACKUP_DIR' for manual recovery"
             elif [ -n "${_UPDATE_BACKUP_ID:-}" ]; then
                 if ! fs_ops safe-rmtree-id "$_UPDATE_BACKUP_DIR" "$_UPDATE_BACKUP_ID"; then
                     warn "leaving uncommitted update backup directory '$_UPDATE_BACKUP_DIR' for manual inspection because its identity or backing volume changed"
@@ -7663,7 +7745,9 @@ cmd_update() {
             REC_UPDATE_BACKUP_ID=""
             write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
             lock_runner_permissions
-            if [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+            if [ "$REC_OWNED_UNIT" = "1" ]; then
+                command -v systemctl >/dev/null 2>&1 \
+                    || die "update: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; preserving updating record for retry"
                 systemctl daemon-reload 9>&-
             fi
             _UPDATE_ROLLBACK_ACTIVE=1
@@ -7680,17 +7764,19 @@ cmd_update() {
                 write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
             fi
             lock_runner_permissions
-            if [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+            if [ "$REC_OWNED_UNIT" = "1" ]; then
+                command -v systemctl >/dev/null 2>&1 \
+                    || die "update: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; preserving updating record for retry"
                 systemctl daemon-reload 9>&-
             fi
             _UPDATE_ROLLBACK_ACTIVE=1
         fi
     fi
 
-    if [ "$REC_STATE" != "updating" ] && [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ "$REC_STATE" != "updating" ] && [ "$REC_OWNED_UNIT" = "1" ]; then
         local pre_upd_svc_state
         if ! pre_upd_svc_state="$(query_owned_service_state)"; then
-            die "update: unable to confirm systemd state for ${OPT_SERVICE}.service (manager error or unrecognized state); refusing to modify live runner files"
+            die "update: unable to confirm systemd state for ${OPT_SERVICE}.service (systemctl unavailable, manager error, or unrecognized state); refusing to modify live runner files"
         fi
         if [ "$pre_upd_svc_state" = "running" ]; then
             was_active=1
@@ -7736,10 +7822,10 @@ cmd_update() {
     rm -f "$tarball"
     _UPDATE_TMP_TARBALL=""
 
-    if [ "$REC_STATE" != "updating" ] && [ "$REC_OWNED_UNIT" = "1" ] && command -v systemctl >/dev/null 2>&1; then
+    if [ "$REC_STATE" != "updating" ] && [ "$REC_OWNED_UNIT" = "1" ]; then
         local post_dl_upd_state
         if ! post_dl_upd_state="$(query_owned_service_state)"; then
-            die "update: unable to confirm systemd state for ${OPT_SERVICE}.service after download (manager error or unrecognized state); refusing to modify live runner files"
+            die "update: unable to confirm systemd state for ${OPT_SERVICE}.service after download (systemctl unavailable, manager error, or unrecognized state); refusing to modify live runner files"
         fi
         if [ "$post_dl_upd_state" = "running" ]; then
             was_active=1
@@ -7997,6 +8083,10 @@ cmd_migrate_record() {
                 || die "migrate-record: refusing legacy UPDATE_BACKUP_DIR '$REC_UPDATE_BACKUP_DIR' (must be root-owned mode 0700 on runner volume with no nested mounts)"
         fi
         if [ "${REC_LEGACY_PHASED_IDS:-0}" -eq 1 ]; then
+            local bk_allow_missing="0"
+            if [ "$REC_UPDATE_PHASE" = "restored" ] || [ "$REC_UPDATE_PHASE" = "committed" ]; then
+                bk_allow_missing="1"
+            fi
             if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
                 fs_ops verify-legacy-path-identity "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$new_vol_install" "1" \
@@ -8004,10 +8094,11 @@ cmd_migrate_record() {
             fi
             if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
                 validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-                local bk_allow_missing="0"
-                [ "$REC_UPDATE_PHASE" = "restored" ] && bk_allow_missing="1"
                 fs_ops verify-legacy-path-identity "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$new_vol_install" "$bk_allow_missing" \
                     || die "migrate-record: refusing preceding phased UPDATE_BACKUP_DIR '$REC_UPDATE_BACKUP_DIR' (recorded inode, permissions, or backing volume mismatch)"
+                if [ "$REC_UPDATE_PHASE" = "committed" ] && [ ! -e "$REC_UPDATE_BACKUP_DIR" ] && [ -n "$REC_UPDATE_STAGE_DIR" ] && [ -e "$REC_UPDATE_STAGE_DIR" ]; then
+                    die "migrate-record: refusing preceding committed journal where backup '$REC_UPDATE_BACKUP_DIR' is absent but stage '$REC_UPDATE_STAGE_DIR' still exists; inspect runner state before upgrading"
+                fi
             fi
         fi
     fi
@@ -8020,27 +8111,60 @@ cmd_migrate_record() {
             REC_UPDATE_PHASE="restored"
             REC_UPDATE_BACKUP_ID=""
         else
-            REC_UPDATE_BACKUP_ID="$(fs_ops path-identity "$REC_UPDATE_BACKUP_DIR")" \
+            REC_UPDATE_BACKUP_ID="$(fs_ops path-identity "$REC_UPDATE_BACKUP_DIR" "$new_vol_install")" \
                 || die "migrate-record: failed to stamp transaction identity marker in legacy backup '$REC_UPDATE_BACKUP_DIR'"
             REC_UPDATE_PHASE="publishing"
         fi
     elif [ "$OPT_CONFIRM_VOLUMES" -eq 1 ] && [ "${REC_LEGACY_PHASED_IDS:-0}" -eq 1 ]; then
+        local legacy_id_re='^p_dev:[0-9]+;p_ino:[0-9]+;p_mnt:[0-9]+;t_dev:[0-9]+;t_ino:[0-9]+;t_mnt:[0-9]+;vol:[A-Za-z0-9._/%:,+-]+$'
+        local bk_allow_missing="0"
+        if [ "$REC_UPDATE_PHASE" = "restored" ] || [ "$REC_UPDATE_PHASE" = "committed" ]; then
+            bk_allow_missing="1"
+        fi
         if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-            if [ -d "$REC_UPDATE_STAGE_DIR" ]; then
-                REC_UPDATE_STAGE_ID="$(fs_ops path-identity "$REC_UPDATE_STAGE_DIR")" \
-                    || die "migrate-record: failed to stamp transaction identity marker in preceding stage '$REC_UPDATE_STAGE_DIR'"
-            else
+            if [[ "$REC_UPDATE_STAGE_ID" =~ $legacy_id_re ]]; then
+                local upgraded_stage
+                upgraded_stage="$(fs_ops upgrade-legacy-path-identity "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$new_vol_install" "1")" \
+                    || die "migrate-record: failed to atomically verify and stamp preceding stage '$REC_UPDATE_STAGE_DIR'"
+                if [ "$upgraded_stage" = "ABSENT" ]; then
+                    REC_UPDATE_STAGE_DIR=""
+                    REC_UPDATE_STAGE_ID=""
+                else
+                    REC_UPDATE_STAGE_ID="$upgraded_stage"
+                fi
+            elif [ ! -e "$REC_UPDATE_STAGE_DIR" ]; then
                 REC_UPDATE_STAGE_DIR=""
                 REC_UPDATE_STAGE_ID=""
             fi
         fi
         if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-            if [ -d "$REC_UPDATE_BACKUP_DIR" ]; then
-                REC_UPDATE_BACKUP_ID="$(fs_ops path-identity "$REC_UPDATE_BACKUP_DIR")" \
-                    || die "migrate-record: failed to stamp transaction identity marker in preceding backup '$REC_UPDATE_BACKUP_DIR'"
-            else
+            if [[ "$REC_UPDATE_BACKUP_ID" =~ $legacy_id_re ]]; then
+                local upgraded_backup
+                upgraded_backup="$(fs_ops upgrade-legacy-path-identity "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$new_vol_install" "$bk_allow_missing")" \
+                    || die "migrate-record: failed to atomically verify and stamp preceding backup '$REC_UPDATE_BACKUP_DIR'"
+                if [ "$upgraded_backup" = "ABSENT" ]; then
+                    REC_UPDATE_BACKUP_DIR=""
+                    REC_UPDATE_BACKUP_ID=""
+                    if [ "$REC_UPDATE_PHASE" = "committed" ]; then
+                        [ -z "$REC_UPDATE_STAGE_DIR" ] \
+                            || die "migrate-record: cannot finalize preceding committed journal while stage '$REC_UPDATE_STAGE_DIR' still exists"
+                        REC_STATE="installed"
+                        REC_UPDATE_PHASE=""
+                        REC_UPDATE_WAS_ACTIVE=""
+                        say "finalized preceding committed update journal (backup already pruned) as installed in $rec_path"
+                    fi
+                else
+                    REC_UPDATE_BACKUP_ID="$upgraded_backup"
+                fi
+            elif [ ! -e "$REC_UPDATE_BACKUP_DIR" ] && [ "$bk_allow_missing" = "1" ]; then
                 REC_UPDATE_BACKUP_DIR=""
                 REC_UPDATE_BACKUP_ID=""
+                if [ "$REC_UPDATE_PHASE" = "committed" ] && [ -z "$REC_UPDATE_STAGE_DIR" ]; then
+                    REC_STATE="installed"
+                    REC_UPDATE_PHASE=""
+                    REC_UPDATE_WAS_ACTIVE=""
+                    say "finalized preceding committed update journal (backup already pruned) as installed in $rec_path"
+                fi
             fi
         fi
     fi
@@ -8473,13 +8597,14 @@ cmd_uninstall() {
     fi
 
     # Only stop/disable the unit if this installation actually created/owns it
-    # and its recorded backing volume matches.
+    # and its recorded backing volume matches. Require confirmed deactivation
+    # before running guest domain cleanup, deregistration, or resource removal
+    # so live runner processes or jobs are never torn down underneath them.
     if [ "$REC_OWNED_UNIT" = "1" ]; then
         verify_resource_volume unit "systemd unit" "$unit_path"
-        if command -v systemctl >/dev/null 2>&1; then
-            systemctl stop "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
-            systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
-        fi
+        ensure_owned_service_stopped uninstall \
+            || die "uninstall: refusing to clean up or remove runner resources without confirming ${OPT_SERVICE}.service is stopped; preserving $OPT_CONFIG_DIR/install.env for retry"
+        systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
     fi
 
     # Run THIS installer's own domain-only cleanup logic (with a minimal

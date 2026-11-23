@@ -23136,7 +23136,9 @@ fn restored_journal_retains_unpruned_stage_and_inspect_is_readonly_and_fail_clos
     assert!(id_out.status.success(), "{}", text(&id_out));
     let stage_a_id = String::from_utf8(id_out.stdout).unwrap().trim().to_string();
 
-    // Simulate post-marker-unlink crash window: `.qeminga-tx-id` unlinked, dir empty.
+    // Empty directory with matching inode but missing `.qeminga-tx-id` (indistinguishable
+    // from an ext4 immediate inode reuse after removal): MUST return `ambiguous` (NEVER
+    // `match` or `mismatch`) without stamping `.qeminga-tx-id`!
     std::fs::remove_file(stage_a.join(".qeminga-tx-id")).unwrap();
     let insp_empty = Command::new("bash")
         .args([
@@ -23151,10 +23153,91 @@ fn restored_journal_retains_unpruned_stage_and_inspect_is_readonly_and_fail_clos
         .unwrap();
     assert!(
         insp_empty.status.success()
-            && String::from_utf8_lossy(&insp_empty.stdout).trim() == "match"
+            && String::from_utf8_lossy(&insp_empty.stdout).trim() == "ambiguous"
             && !stage_a.join(".qeminga-tx-id").exists(),
-        "inspect-path-identity must recognize empty post-marker-unlink dir as `match` without stamping it: {}",
+        "inspect-path-identity must classify markerless empty dir (reused-inode ambiguity) as `ambiguous` without stamping it: {}",
         text(&insp_empty)
+    );
+
+    // Mount obscuring the stage directory (both mountpoint table entry and same-fs bind
+    // mount differing only by kernel mnt_id, plus volume change): MUST exit non-zero
+    // (indeterminate, NEVER `mismatch`) so rollback preserves the journal reference!
+    let insp_mount_py = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r##"
+import io, os, sys
+script_text = open(sys.argv[1], "r", encoding="utf-8").read()
+fs_section = script_text.split("fs_ops() {\n", 1)[1].split("\nPY\n", 1)[0]
+py_body = fs_section.split("<<'PY'\n", 1)[1].split("\nop = sys.argv[1]", 1)[0]
+op_body = fs_section.split("\nop = sys.argv[1]", 1)[1]
+target, expected_id = sys.argv[2], sys.argv[3]
+
+def run_with_hook(hook):
+    ns = {"__name__": "__main__"}
+    buf, err = io.StringIO(), io.StringIO()
+    old_argv, old_out, old_err = sys.argv[:], sys.stdout, sys.stderr
+    try:
+        exec(py_body, ns)
+        hook(ns)
+        sys.argv = ["fs_ops", "inspect-path-identity", target, expected_id]
+        sys.stdout, sys.stderr = buf, err
+        rc = 0
+        try:
+            exec("op = sys.argv[1]" + op_body, ns)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+        except OSError as exc:
+            rc = 1
+            err.write(str(exc))
+        return rc, buf.getvalue().strip(), err.getvalue().strip()
+    finally:
+        sys.argv, sys.stdout, sys.stderr = old_argv, old_out, old_err
+
+# Case A: target appears in mountpoints (covering mount hides the real underlying stage).
+def hook_mountpoint(ns):
+    orig = ns["visible_mountpoints"]
+    ns["visible_mountpoints"] = lambda entries: orig(entries) | {os.path.normpath(target)}
+
+rc, out, err = run_with_hook(hook_mountpoint)
+assert rc != 0 and out != "mismatch", f"mountpoint covering stage MUST be indeterminate (non-zero), got rc={rc} out={out!r} err={err!r}"
+
+# Case B: same-filesystem bind mount (same st_dev, different mnt_id) with a DIFFERENT visible inode!
+def hook_bind_mount(ns):
+    orig_mnt = ns["fd_mnt_id"]
+    calls = {"n": 0}
+    def fake_mnt(fd):
+        calls["n"] += 1
+        base = orig_mnt(fd)
+        return base if calls["n"] == 1 else base + 777
+    ns["fd_mnt_id"] = fake_mnt
+
+rc, out, err = run_with_hook(hook_bind_mount)
+assert rc != 0 and out != "mismatch", f"bind-mounted stage (mnt_id diff) MUST be indeterminate (non-zero), got rc={rc} out={out!r} err={err!r}"
+
+# Case C: backing volume differs on target descriptor.
+def hook_vol_diff(ns):
+    orig_vol = ns["volume_id_of_fd"]
+    def fake_vol(fd, path, entries):
+        if os.path.normpath(path) == os.path.normpath(target):
+            return "fsid:deadbeef"
+        return orig_vol(fd, path, entries)
+    ns["volume_id_of_fd"] = fake_vol
+
+rc, out, err = run_with_hook(hook_vol_diff)
+assert rc != 0 and out != "mismatch", f"volume-obscured stage MUST be indeterminate (non-zero), got rc={rc} out={out!r} err={err!r}"
+"##,
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_mount_py.status.success(),
+        "inspect-path-identity mount/volume obscuration checks failed:\n{}",
+        text(&insp_mount_py)
     );
 
     // Unreadable matching-inode dir (EACCES) MUST fail closed (non-zero, not mismatch/absent).
@@ -23476,4 +23559,101 @@ esac
             "{case_label}: retry must honor preserved UPDATE_WAS_ACTIVE=1 and restart service"
         );
     }
+
+    // Part 4: Rollback caller with an ambiguous markerless empty directory (reused-inode case):
+    //   `_rollback_runner_package_tx` MUST neither remove that directory via `safe-rmtree-id`
+    //   nor clear `UPDATE_STAGE_DIR` / mark `installed`!
+    let amb_stage = inst_parent.join(".qeminga-extract.ambig1");
+    let amb_backup = inst_parent.join(".qeminga-update-backup.ambig1");
+    std::fs::create_dir(&amb_stage).unwrap();
+    std::fs::create_dir(&amb_backup).unwrap();
+    std::fs::set_permissions(&amb_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&amb_backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let amb_sid = String::from_utf8(
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops path-identity "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                amb_stage.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let amb_bid = String::from_utf8(
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops path-identity "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                amb_backup.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // Remove `.qeminga-tx-id` to simulate an empty dir with the same inode and no marker.
+    std::fs::remove_file(amb_stage.join(".qeminga-tx-id")).unwrap();
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    let rb_amb = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_SERVICE="qeminga-restored-stage-box"
+read_install_record "$OPT_CONFIG_DIR/install.env"
+_rollback_runner_package_tx \
+    "$OPT_CONFIG_DIR/install.env" \
+    "$REC_VOL_INSTALL_DIR" \
+    "$4" "$5" "" "1" "" "" "" "" "" \
+    "$6" "$7"
+"#,
+            "_",
+            script().to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            inst.to_str().unwrap(),
+            amb_backup.to_str().unwrap(),
+            &amb_bid,
+            amb_stage.to_str().unwrap(),
+            &amb_sid,
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("FAKE_STATE_FILE", &state_file)
+        .env("FAKE_EXPECTED_FRAG", &unit_file)
+        .env("QEMINGA_RUNTIME_ROOT", &rt_root)
+        .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
+        .output()
+        .unwrap();
+    assert!(rb_amb.status.success(), "{}", text(&rb_amb));
+    let rec_amb = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        amb_stage.is_dir()
+            && !amb_stage.join(".qeminga-tx-id").exists()
+            && rec_amb.contains("RECORD_STATE=updating\n")
+            && rec_amb.contains("UPDATE_PHASE=restored\n")
+            && rec_amb.contains(&format!("UPDATE_STAGE_DIR={}\n", amb_stage.display()))
+            && rec_amb.contains(&format!("UPDATE_STAGE_ID={amb_sid}\n"))
+            && rec_amb.contains("UPDATE_WAS_ACTIVE=1\n"),
+        "rollback MUST leave ambiguous markerless empty dir untouched and retain UPDATE_STAGE_DIR/ID in restored journal:\n{rec_amb}"
+    );
 }

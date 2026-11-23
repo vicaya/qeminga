@@ -221,22 +221,26 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    world-writable modes), refuses to adopt unrelated pre-existing accounts
    (or accounts in any group beyond `{qeminga-runner, kvm}`), unmanaged
    pre-existing directories, or existing systemd units (including vendor
-   units) without a matching unit ownership record. It claims each new
-   top-level managed directory (and fresh unit file) exclusively so a
-   concurrent creation after preflight fails atomically without mutating
-   foreign files, and records the provisioned UID/GID, dedicated
-   non-overlapping paths, and per-resource acquisition markers
-   (`OWNED_CONFIG_DIR`, `OWNED_STATE_DIR`, `OWNED_INSTALL_DIR`,
-   `OWNED_HOOK_DIR`, `OWNED_UNIT`) in root-owned
-   `/etc/qeminga-runner/install.env` (`0600`) immediately upon creation
-   and before initializing contents (`RECORD_STATE=installing`, finalized to
-   `installed` only after startup readiness succeeds unless `--no-start`
-   is set), so an interrupted first install (including a failure while
-   initializing state subdirectories) stays recoverable without ever
-   claiming a unit name or directory created independently afterwards,
-   stops an existing runner service only when owned by this installation,
-   and creates runtime state subdirectories (`work/`, `images/`,
-   `image-cache/`, etc.) as the unprivileged runner user rather than root.
+   units) without a matching unit ownership record. It reserves a fresh
+   config directory exclusively as root before creating the service account
+   (rolling back both the empty directory and newly created account if the
+   initial record cannot be written), claims each remaining top-level
+   managed directory exclusively via `mkdir` and publishes fresh systemd
+   units via hard link (`link(2)`) so concurrent creations or systemd mask
+   symlinks (`/dev/null`) fail atomically without mutating foreign files,
+   and records the provisioned UID/GID, dedicated non-overlapping paths,
+   and per-resource acquisition markers (`OWNED_CONFIG_DIR`,
+   `OWNED_STATE_DIR`, `OWNED_INSTALL_DIR`, `OWNED_HOOK_DIR`, `OWNED_UNIT`)
+   in root-owned `/etc/qeminga-runner/install.env` (`0600`) immediately
+   upon creation and before initializing contents
+   (`RECORD_STATE=installing`, finalized to `installed` only after startup
+   readiness succeeds unless `--no-start` is set), so an interrupted first
+   install (including a failure while initializing state subdirectories)
+   stays recoverable without ever claiming a unit name or directory created
+   independently afterwards, stops an existing runner service only when
+   owned by this installation, and creates runtime state subdirectories
+   (`work/`, `images/`, `image-cache/`, etc.) as the unprivileged runner
+   user rather than root.
 2. **Unprivileged `qemu:///session` isolation:** installs only minimal
    session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
    `libvirt-clients`, `qemu-system-x86` or `qemu-system-arm` +
@@ -318,13 +322,16 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
    (uninstall shares the same record and live numeric UID/GID checks BEFORE
    any `runuser`, `chown`, service stop, or token handoff — leaving
-   `install.env` intact on mismatch — refuses to touch unowned units or
-   paths, clears each `OWNED_*` flag in `RECORD_STATE=partial-uninstall` as
-   resources are removed so retries never touch independently created
-   replacement services or directories even if `--token-file` is passed,
-   preserves `$STATE_DIR/images` if session domain cleanup cannot confirm
-   domains are gone, and when run without `--purge-user` retains a minimal
-   `RECORD_STATE=user-only` UID/GID record in
+   `install.env` intact on mismatch — runs `hook-job-completed.sh
+   --domains-only` over a private temporary runtime dir once `OWNED_UNIT=0`
+   so released JIT workspaces and replacement services are never touched,
+   refuses to act on unowned units or paths, persists each cleared
+   `OWNED_*` flag in `RECORD_STATE=partial-uninstall` before unlinking its
+   resource or reloading systemd so retries never touch independently
+   created replacement services or directories even if `--token-file` is
+   passed, preserves `$STATE_DIR/images` if session domain cleanup cannot
+   confirm domains are gone, and when run without `--purge-user` retains a
+   minimal `RECORD_STATE=user-only` UID/GID record in
    `/etc/qeminga-runner/install.env` so a later default reinstall or
    `uninstall --purge-user` recognizes the surviving managed account).
 

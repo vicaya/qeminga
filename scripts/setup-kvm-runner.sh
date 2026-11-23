@@ -841,6 +841,13 @@ POLICY="${QEMINGA_RUNNER_POLICY:-/etc/qeminga-runner/policy.env}"
 log() { echo "qeminga-runner-cleanup: $*"; }
 die() { echo "qeminga-runner-cleanup: $*" >&2; exit 1; }
 
+DOMAINS_ONLY=0
+if [ "${1:-}" = "--domains-only" ]; then
+    DOMAINS_ONLY=1
+    shift
+fi
+[ $# -eq 0 ] || die "unexpected argument '$1'"
+
 if [ ! -f "$POLICY" ] || [ ! -r "$POLICY" ]; then
     die "missing or unreadable policy file $POLICY"
 fi
@@ -939,7 +946,9 @@ verify_work_dir_safe() {
 }
 
 safe_subdir "$IMAGES_DIR" || die "refusing unsafe IMAGES_DIR '$IMAGES_DIR'"
-verify_work_dir_safe
+if [ "$DOMAINS_ONLY" -eq 0 ]; then
+    verify_work_dir_safe
+fi
 [ "$LIBVIRT_CONNECT" = "qemu:///session" ] || die "refusing unexpected LIBVIRT_CONNECT '$LIBVIRT_CONNECT'"
 
 v() { timeout 30 virsh "--connect=$LIBVIRT_CONNECT" "$@"; }
@@ -1031,12 +1040,14 @@ elif [ -d "$IMAGES_DIR" ]; then
     shopt -u nullglob
 fi
 
-# Re-verify WORK_DIR has no symlinks or protected-state overlap right before
-# scrubbing, and use find -P so symlinks are never traversed.
-verify_work_dir_safe
-if [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ]; then
-    find -P "$WORK_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
-    log "scrubbed work directory $WORK_DIR"
+if [ "$DOMAINS_ONLY" -eq 0 ]; then
+    # Re-verify WORK_DIR has no symlinks or protected-state overlap right before
+    # scrubbing, and use find -P so symlinks are never traversed.
+    verify_work_dir_safe
+    if [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ]; then
+        find -P "$WORK_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+        log "scrubbed work directory $WORK_DIR"
+    fi
 fi
 
 exit "$rc"
@@ -1935,7 +1946,7 @@ write_install_record() {
     [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
     local tmp
     tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
-    cat >"$tmp" <<EOF
+    if ! cat >"$tmp" <<EOF
 # Managed by scripts/setup-kvm-runner.sh — root-owned installation record.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
 RECORD_SCHEMA=1
@@ -1962,9 +1973,14 @@ OWNED_INSTALL_DIR=${OWNED_INSTALL_DIR}
 OWNED_HOOK_DIR=${OWNED_HOOK_DIR}
 OWNED_UNIT=${OWNED_UNIT}
 EOF
-    chown -h root:root "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$dest"
+    then
+        rm -f "$tmp"
+        die "failed to write installation record '$dest'"
+    fi
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+        rm -f "$tmp"
+        die "failed to finalize installation record '$dest'"
+    fi
 }
 
 write_uninstall_record() {
@@ -1973,7 +1989,7 @@ write_uninstall_record() {
     [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
     local tmp
     tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
-    cat >"$tmp" <<EOF
+    if ! cat >"$tmp" <<EOF
 # Managed by scripts/setup-kvm-runner.sh — root-owned installation record.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
 RECORD_SCHEMA=1
@@ -2000,9 +2016,14 @@ OWNED_INSTALL_DIR=${REC_OWNED_INSTALL_DIR}
 OWNED_HOOK_DIR=${REC_OWNED_HOOK_DIR}
 OWNED_UNIT=${REC_OWNED_UNIT}
 EOF
-    chown -h root:root "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$dest"
+    then
+        rm -f "$tmp"
+        die "failed to write uninstall record '$dest'"
+    fi
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+        rm -f "$tmp"
+        die "failed to finalize uninstall record '$dest'"
+    fi
 }
 
 write_user_only_record() {
@@ -2011,7 +2032,7 @@ write_user_only_record() {
     [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
     local tmp
     tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
-    cat >"$tmp" <<EOF
+    if ! cat >"$tmp" <<EOF
 # Managed by scripts/setup-kvm-runner.sh — retained minimal UID/GID ownership
 # record for a managed service user that survived uninstall without --purge-user.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
@@ -2023,9 +2044,14 @@ USER_GID=${gid}
 USER_CREATED=${created}
 CONFIG_DIR=${cfg_dir}
 EOF
-    chown -h root:root "$tmp"
-    chmod 0600 "$tmp"
-    mv -f "$tmp" "$dest"
+    then
+        rm -f "$tmp"
+        die "failed to write user-only record '$dest'"
+    fi
+    if ! chown -h root:root "$tmp" || ! chmod 0600 "$tmp" || ! mv -f "$tmp" "$dest"; then
+        rm -f "$tmp"
+        die "failed to finalize user-only record '$dest'"
+    fi
 }
 
 # Verify the live numeric UID and GID of OPT_USER match the root-owned record
@@ -2121,6 +2147,38 @@ load_and_verify_install_record() {
     verify_recorded_user_identity "$mode"
 }
 
+_INSTALL_BOOTSTRAP_CFG=""
+_INSTALL_BOOTSTRAP_DIR=""
+_INSTALL_BOOTSTRAP_UNIT=""
+_INSTALL_BOOTSTRAP_USER=""
+_INSTALL_BOOTSTRAP_TARBALL=""
+
+cleanup_install_exit() {
+    if [ -n "${_INSTALL_BOOTSTRAP_TARBALL:-}" ]; then
+        rm -f "$_INSTALL_BOOTSTRAP_TARBALL"
+        _INSTALL_BOOTSTRAP_TARBALL=""
+    fi
+    if [ -n "${_INSTALL_BOOTSTRAP_UNIT:-}" ]; then
+        rm -f "$_INSTALL_BOOTSTRAP_UNIT"
+        _INSTALL_BOOTSTRAP_UNIT=""
+    fi
+    if [ -n "${_INSTALL_BOOTSTRAP_DIR:-}" ]; then
+        rmdir -- "$_INSTALL_BOOTSTRAP_DIR" 2>/dev/null || true
+        _INSTALL_BOOTSTRAP_DIR=""
+    fi
+    if [ -n "${_INSTALL_BOOTSTRAP_USER:-}" ]; then
+        userdel "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || true
+        if getent group "$_INSTALL_BOOTSTRAP_USER" >/dev/null 2>&1; then
+            groupdel "$_INSTALL_BOOTSTRAP_USER" 2>/dev/null || true
+        fi
+        _INSTALL_BOOTSTRAP_USER=""
+    fi
+    if [ -n "${_INSTALL_BOOTSTRAP_CFG:-}" ]; then
+        rmdir -- "$_INSTALL_BOOTSTRAP_CFG" 2>/dev/null || true
+        _INSTALL_BOOTSTRAP_CFG=""
+    fi
+}
+
 ensure_service_user() {
     say "configuring dedicated locked service user ${OPT_USER}"
     getent group kvm >/dev/null 2>&1 || die "group 'kvm' does not exist (is KVM enabled on this host?)"
@@ -2153,6 +2211,7 @@ ensure_service_user() {
             --no-create-home \
             --shell /usr/sbin/nologin \
             "$OPT_USER"
+        _INSTALL_BOOTSTRAP_USER="$OPT_USER"
         passwd -l "$OPT_USER" >/dev/null 2>&1 || true
         usermod -G kvm "$OPT_USER"
         MANAGED_USER_UID="$(id -u "$OPT_USER")"
@@ -2161,20 +2220,43 @@ ensure_service_user() {
     fi
 }
 
+# Atomically create a fresh top-level managed directory (mode 0700 root:root)
+# via `mkdir` without `-p`, failing on EEXIST so a concurrent creation after
+# preflight can never be adopted or mutated.
+reserve_fresh_dir() {
+    local label="$1" dir="$2"
+    check_abs_path "${label} directory" "$dir"
+    if is_reserved_system_dir "$dir"; then
+        die "refusing shared system directory '$dir' as a managed runner directory"
+    fi
+    [ ! -L "$dir" ] || die "refusing symlinked ${label} directory: $dir"
+    check_trusted_parent_dir "$dir"
+    local parent
+    parent="$(dirname "$dir")"
+    if [ ! -e "$parent" ]; then
+        install -d -m 0755 -o root -g root "$parent"
+        check_trusted_parent_dir "$dir"
+    fi
+    (
+        umask 0077
+        mkdir -- "$dir"
+    ) || die "refusing to adopt existing unmanaged ${label} directory '$dir' (already exists)"
+}
+
 # Acquire or validate one of the four top-level managed directories:
 #   claim_managed_dir <label> <owned_var> <dir> <mode> <owner> <group> <runner_name>
 #
-# - When <owned_var> is 0 (unowned), claims <dir> exclusively via `mkdir`
-#   (without `-p`), failing atomically on EEXIST if another process created
-#   <dir> after preflight — leaving any foreign directory's ownership, mode,
-#   and contents untouched.
+# - When <owned_var> is 0 (unowned), claims <dir> exclusively via
+#   reserve_fresh_dir (atomic EEXIST refusal) leaving any foreign directory's
+#   ownership, mode, and contents untouched.
 # - Sets <owned_var>=1 and persists install.env (state=installing) BEFORE
 #   adjusting permissions or initializing any child files/subdirectories, so
 #   an interruption during chmod/chown/runuser/extraction leaves <dir>
 #   recorded as owned and recoverable by ordinary retry or uninstall.
-# - When <owned_var> is 1 (already owned per verified install.env), validates
-#   <dir> as a non-symlink directory under trusted root-owned ancestors (or
-#   recreates it exclusively if absent) and applies owner/group/mode.
+# - When <owned_var> is 1 (already owned per verified install.env or reserved
+#   earlier in this invocation), validates <dir> as a non-symlink directory
+#   under trusted root-owned ancestors (or recreates it exclusively if absent)
+#   and applies owner/group/mode.
 claim_managed_dir() {
     local label="$1" owned_var="$2" dir="$3" mode="$4" owner="$5" group="$6" runner_name="$7"
     local is_owned=0
@@ -2194,17 +2276,8 @@ claim_managed_dir() {
     check_trusted_parent_dir "$dir"
 
     if [ "$is_owned" -ne 1 ]; then
-        local parent
-        parent="$(dirname "$dir")"
-        if [ ! -e "$parent" ]; then
-            install -d -m 0755 -o root -g root "$parent"
-            check_trusted_parent_dir "$dir"
-        fi
-        # Exclusive leaf creation: fails atomically on EEXIST (no TOCTOU adoption).
-        (
-            umask 0077
-            mkdir -- "$dir"
-        ) || die "refusing to adopt existing unmanaged ${label} directory '$dir' (already exists)"
+        reserve_fresh_dir "$label" "$dir"
+        _INSTALL_BOOTSTRAP_DIR="$dir"
         case "$owned_var" in
             OWNED_CONFIG_DIR) OWNED_CONFIG_DIR=1 ;;
             OWNED_STATE_DIR) OWNED_STATE_DIR=1 ;;
@@ -2212,23 +2285,21 @@ claim_managed_dir() {
             OWNED_HOOK_DIR) OWNED_HOOK_DIR=1 ;;
         esac
         write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
+        _INSTALL_BOOTSTRAP_DIR=""
+        if [ "$owned_var" = "OWNED_CONFIG_DIR" ]; then
+            _INSTALL_BOOTSTRAP_USER=""
+            _INSTALL_BOOTSTRAP_CFG=""
+        fi
     else
         if [ -e "$dir" ]; then
             [ -d "$dir" ] || die "${label} path '$dir' exists and is not a directory"
         else
-            local parent
-            parent="$(dirname "$dir")"
-            if [ ! -e "$parent" ]; then
-                install -d -m 0755 -o root -g root "$parent"
-                check_trusted_parent_dir "$dir"
-            fi
-            (
-                umask 0077
-                mkdir -- "$dir"
-            ) || die "failed to recreate owned ${label} directory '$dir'"
+            reserve_fresh_dir "$label" "$dir"
         fi
         if [ "$owned_var" = "OWNED_CONFIG_DIR" ]; then
             write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
+            _INSTALL_BOOTSTRAP_USER=""
+            _INSTALL_BOOTSTRAP_CFG=""
         fi
     fi
 
@@ -2539,12 +2610,29 @@ cmd_install() {
         systemctl stop "${OPT_SERVICE}.service"
     fi
 
+    # Reserve a fresh config directory exclusively as root BEFORE creating the
+    # service account so a concurrent config-dir collision fails without
+    # orphaning an unrecorded user. If ensure_service_user or the first
+    # install.env write fails, cleanup_install_exit rolls back both the empty
+    # reserved config dir and any user created by this invocation.
+    _INSTALL_BOOTSTRAP_CFG=""
+    _INSTALL_BOOTSTRAP_DIR=""
+    _INSTALL_BOOTSTRAP_UNIT=""
+    _INSTALL_BOOTSTRAP_USER=""
+    _INSTALL_BOOTSTRAP_TARBALL=""
+    trap 'cleanup_install_exit' EXIT
+    if [ "$OWNED_CONFIG_DIR" -ne 1 ]; then
+        reserve_fresh_dir config "$OPT_CONFIG_DIR"
+        _INSTALL_BOOTSTRAP_CFG="$OPT_CONFIG_DIR"
+        OWNED_CONFIG_DIR=1
+    fi
+
     ensure_service_user
 
-    # Claim each new top-level directory exclusively (atomic EEXIST refusal)
-    # and persist ownership in install.env BEFORE adjusting permissions or
-    # initializing contents so any interruption stays recoverable and never
-    # adopts a directory created independently after preflight.
+    # Establish install.env (disarming bootstrap rollback) and claim each
+    # remaining top-level directory exclusively (atomic EEXIST refusal) before
+    # adjusting permissions or initializing contents so any interruption stays
+    # recoverable and never adopts a directory created after preflight.
     claim_managed_dir config OWNED_CONFIG_DIR "$OPT_CONFIG_DIR" 0750 root "$OPT_USER" "$runner_name"
     claim_managed_dir state OWNED_STATE_DIR "$OPT_STATE_DIR" 0700 "$OPT_USER" "$OPT_USER" "$runner_name"
     init_state_subdirs
@@ -2552,7 +2640,7 @@ cmd_install() {
     # Download, SHA-256 verify, and extract actions/runner.
     local tarball fetch_args=()
     tarball="$(mktemp /tmp/qeminga-actions-runner.XXXXXX.tar.gz)"
-    trap 'rm -f "${tarball:-}"' EXIT
+    _INSTALL_BOOTSTRAP_TARBALL="$tarball"
     fetch_args=(--arch "$arch" --dest "$tarball" --version "$OPT_RUNNER_VERSION")
     if [ -n "$OPT_RUNNER_SHA256" ]; then fetch_args+=(--sha256 "$OPT_RUNNER_SHA256"); fi
     if [ -n "$OPT_URL" ]; then fetch_args+=(--url "$OPT_URL"); fi
@@ -2562,7 +2650,7 @@ cmd_install() {
     rm -rf --one-file-system -- "${OPT_INSTALL_DIR:?}/bin" "${OPT_INSTALL_DIR:?}/externals"
     tar --no-same-owner -xzf "$tarball" -C "$OPT_INSTALL_DIR"
     rm -f "$tarball"
-    trap - EXIT
+    _INSTALL_BOOTSTRAP_TARBALL=""
 
     if [ "$OPT_SKIP_PACKAGES" -eq 0 ] && [ -x "$OPT_INSTALL_DIR/bin/installdependencies.sh" ]; then
         say "installing actions/runner runtime dependencies"
@@ -2625,8 +2713,12 @@ cmd_install() {
 
     lock_runner_permissions
 
-    # Install and verify the hardened systemd unit (re-checking occupancy and
-    # claiming the unit file exclusively before writing when not yet owned).
+    # Install and verify the hardened systemd unit. Stage the complete unit and
+    # set its owner/mode on a temporary regular file in the trusted unit dir,
+    # then publish a fresh unit via hard link (`ln`, i.e. link(2)), which fails
+    # atomically with EEXIST on ANY existing directory entry — including a
+    # systemd mask symlink to /dev/null — without following symlinks or altering
+    # target permissions. Record OWNED_UNIT=1 only after publication succeeds.
     local unit_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
     unit_dir="${unit_dir%/}"
     check_abs_path "systemd unit dir" "$unit_dir"
@@ -2635,22 +2727,36 @@ cmd_install() {
     [ ! -L "$unit_path" ] || die "refusing symlinked systemd unit path: $unit_path"
     if [ "$OWNED_UNIT" -ne 1 ]; then
         check_unit_not_occupied
-        if [ ! -e "$unit_dir" ]; then
-            install -d -m 0755 -o root -g root "$unit_dir"
-            check_trusted_parent_dir "$unit_path"
-        fi
-        (
-            umask 0022
-            set -C
-            : >"$unit_path"
-        ) || die "refusing to overwrite unexpected existing systemd unit '$unit_path'"
-        OWNED_UNIT=1
-        write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
+    fi
+    if [ ! -e "$unit_dir" ]; then
+        install -d -m 0755 -o root -g root "$unit_dir"
+        check_trusted_parent_dir "$unit_path"
     fi
     say "installing hardened systemd unit ${unit_path}"
-    render_unit_text "$arch" | awk 'NF || prev_nf { print } { prev_nf = NF }' >"$unit_path"
-    chmod 0644 "$unit_path"
-    chown -h root:root "$unit_path"
+    local tmp_unit
+    tmp_unit="$(mktemp "${unit_dir}/.${OPT_SERVICE}.service.XXXXXX")"
+    if ! render_unit_text "$arch" | awk 'NF || prev_nf { print } { prev_nf = NF }' >"$tmp_unit" \
+        || ! chown -h root:root "$tmp_unit" \
+        || ! chmod 0644 "$tmp_unit"; then
+        rm -f "$tmp_unit"
+        die "failed to stage hardened systemd unit in '$unit_dir'"
+    fi
+    if [ "$OWNED_UNIT" -ne 1 ]; then
+        if ! ln -- "$tmp_unit" "$unit_path" 2>/dev/null; then
+            rm -f "$tmp_unit"
+            die "refusing to overwrite unexpected existing systemd unit '$unit_path'"
+        fi
+        rm -f "$tmp_unit"
+        _INSTALL_BOOTSTRAP_UNIT="$unit_path"
+        OWNED_UNIT=1
+        write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installing"
+        _INSTALL_BOOTSTRAP_UNIT=""
+    else
+        if ! mv -f -- "$tmp_unit" "$unit_path"; then
+            rm -f "$tmp_unit"
+            die "failed to update owned systemd unit '$unit_path'"
+        fi
+    fi
 
     if command -v systemd-analyze >/dev/null 2>&1; then
         systemd-analyze verify --man=no "$unit_path" || die "systemd-analyze verify failed for $unit_path"
@@ -2675,6 +2781,7 @@ cmd_install() {
     # Finalize installation record state only after unit verification & startup
     # readiness (unless --no-start) succeed.
     write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name" "installed"
+    trap - EXIT
 
     echo
     echo "qeminga KVM runner installed:"
@@ -2878,7 +2985,7 @@ cmd_uninstall() {
 
         local default_rt="${runtime_root}/${OPT_SERVICE}"
         local cleanup_rt="" cleanup_rt_created=0
-        if [ ! -L "$default_rt" ] && [ -d "$default_rt" ] && [ "$(stat -c '%u:%a' "$default_rt" 2>/dev/null || echo '')" = "${REC_USER_UID}:700" ]; then
+        if [ "$REC_OWNED_UNIT" = "1" ] && [ ! -L "$default_rt" ] && [ -d "$default_rt" ] && [ "$(stat -c '%u:%a' "$default_rt" 2>/dev/null || echo '')" = "${REC_USER_UID}:700" ]; then
             cleanup_rt="$default_rt"
         else
             cleanup_rt="$(mktemp -d "${runtime_root}/qeminga-uninstall.XXXXXX")"
@@ -2897,7 +3004,7 @@ cmd_uninstall() {
             "XDG_DATA_HOME=$OPT_STATE_DIR/.local/share" \
             "LIBVIRT_DEFAULT_URI=qemu:///session" \
             "QEMINGA_RUNNER_POLICY=$OPT_CONFIG_DIR/policy.env" \
-            "$OPT_HOOK_DIR/hook-job-completed.sh"; then
+            "$OPT_HOOK_DIR/hook-job-completed.sh" --domains-only; then
             cleanup_rc=1
             warn "cleanup hook could not confirm all qeminga domains are gone; preserving $OPT_STATE_DIR/images"
         fi
@@ -2936,10 +3043,14 @@ cmd_uninstall() {
         warn "skipping runner deregistration: $OPT_INSTALL_DIR is not owned by this installation (already removed or never created)"
     fi
 
-    # Release each resource's ownership flag in install.env (RECORD_STATE=partial-uninstall)
-    # immediately upon removal so a partial uninstall or interrupted teardown can never
-    # act on an independently created replacement unit or directory on retry.
+    # Persist each resource's release (RECORD_STATE=partial-uninstall with its
+    # OWNED_* flag cleared to 0) BEFORE unlinking/removing the resource and
+    # BEFORE daemon-reload, so a failed record write leaves the resource intact
+    # and an interrupted removal never lets a retry act on an independently
+    # created replacement service or directory.
     if [ "$REC_OWNED_UNIT" = "1" ]; then
+        REC_OWNED_UNIT="0"
+        write_uninstall_record "$OPT_CONFIG_DIR/install.env"
         if [ ! -L "$unit_path" ]; then
             rm -f "$unit_path"
         else
@@ -2948,26 +3059,24 @@ cmd_uninstall() {
         if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload || true
         fi
-        REC_OWNED_UNIT="0"
-        write_uninstall_record "$OPT_CONFIG_DIR/install.env"
     fi
 
     if [ "$REC_OWNED_INSTALL_DIR" = "1" ]; then
-        rm -rf --one-file-system -- "$OPT_INSTALL_DIR"
         REC_OWNED_INSTALL_DIR="0"
         write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+        rm -rf --one-file-system -- "$OPT_INSTALL_DIR"
     fi
 
     if [ "$cleanup_rc" -eq 0 ]; then
         if [ "$REC_OWNED_HOOK_DIR" = "1" ]; then
-            rm -rf --one-file-system -- "$OPT_HOOK_DIR"
             REC_OWNED_HOOK_DIR="0"
             write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+            rm -rf --one-file-system -- "$OPT_HOOK_DIR"
         fi
         if [ "$REC_OWNED_STATE_DIR" = "1" ]; then
-            rm -rf --one-file-system -- "$OPT_STATE_DIR"
             REC_OWNED_STATE_DIR="0"
             write_uninstall_record "$OPT_CONFIG_DIR/install.env"
+            rm -rf --one-file-system -- "$OPT_STATE_DIR"
         fi
         local user_purged=0
         if [ "$OPT_PURGE_USER" -eq 1 ] && [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then

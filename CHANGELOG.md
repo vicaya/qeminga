@@ -143,21 +143,29 @@ semantic versioning.
 ### Fixed
 
 - Virtio-serial startup and host-disconnect race under fast KVM guests
-  (`src/channel.rs`, `src/kernel/async_fd.rs`, design §5.7, §5.10): when
-  Linux `virtio_console` reports an open port whose host side is not yet
-  connected or has disconnected (`POLLIN | POLLHUP` without `POLLOUT`,
-  `POLLERR`, `POLLNVAL`, or `POLLRDHUP`), `qeminga` abandons undelivered
-  replies for the departed session while letting accepted commands finish,
-  deregisters the old Tokio reactor registration while keeping the
-  underlying descriptor open (preventing `VSERPORT_CHANGE (open=false)`
-  from racing `libvirtd`), drains unread stale driver bytes while
-  disconnected, polls readiness with `ppoll(2)` under bounded backoff
-  (`10 ms` doubling to `500 ms`), and opens each connected session on a
-  fresh reactor registration and fresh `FrameDecoder` (avoiding sticky
-  `EPOLLHUP` closed-readiness spins on idle ports and keeping idle fast
-  reconnects open under bounded empty-EOF pacing). Hot-unplugged ports
-  (bare `POLLHUP`), closed PTY/socket peers, and other I/O errors still
-  close and reopen with the `1 s` to `30 s` reopen backoff.
+  (`src/channel.rs`, `src/kernel/async_fd.rs`, design §5.7, §5.10): once the
+  reactor latches hangup closed readiness (`WRITE_CLOSED` on writes, or
+  `READ_CLOSED` on a non-closed virtio port), the old registration ends the
+  departed session *before* calling `write(2)` or `read(2)` so undelivered
+  replies cannot leak to a reconnected peer and the new peer's first request
+  cannot join onto an old partial frame; when Linux `virtio_console` reports
+  an open port whose host side is not yet connected or has disconnected
+  (`POLLIN | POLLHUP` without `POLLOUT`, `POLLERR`, `POLLNVAL`, or
+  `POLLRDHUP`), `qeminga` abandons undelivered replies for the departed
+  session while letting accepted commands finish, deregisters the old Tokio
+  reactor registration while keeping the underlying descriptor open
+  (preventing `VSERPORT_CHANGE (open=false)` from racing `libvirtd`), drains
+  unread stale driver bytes while disconnected (preserving a `0xFF`
+  `guest-sync-delimited` handshake and following bytes if the host connects
+  during the drain, and resetting the port if the 64 KiB cap is hit without
+  observing an empty buffer or `0xFF` boundary), polls readiness with
+  `ppoll(2)` under bounded backoff (`10 ms` doubling to `500 ms`), and opens
+  each connected session on a fresh reactor registration and fresh
+  `FrameDecoder` (avoiding sticky `EPOLLHUP` closed-readiness spins on idle
+  ports and keeping idle fast reconnects open under bounded empty-EOF
+  pacing). Hot-unplugged ports (bare `POLLHUP`), closed PTY/socket peers,
+  and other I/O errors still close and reopen with the `1 s` to `30 s`
+  reopen backoff.
 - The thaw of a freeze operation this process completed drains the
   descriptors the operation published (its frozen targets and the
   `EBUSY` ones it retained) and nothing else, reading no mount table: a

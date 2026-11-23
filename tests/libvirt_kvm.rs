@@ -871,6 +871,19 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         );
     }
 
+    // Output directory must live under runner.temp (outside the checkout) so
+    // pre-existing files in the workspace cannot leak into early-failure evidence.
+    assert!(
+        smoke.contains(
+            "OUT: ${{ runner.temp }}/libvirt-kvm-hosted-${{ github.run_id }}-${{ github.run_attempt }}"
+        ),
+        "OUT must use a fresh per-run directory under runner.temp:\n{smoke}"
+    );
+    assert!(
+        !smoke.contains("OUT: ${{ github.workspace }}"),
+        "OUT must not live under github.workspace:\n{smoke}"
+    );
+
     // Cleanup, fallback failure-result generation (for early exits before `run` installs its
     // EXIT trap), summary, and artifact upload all run under `if: always()` in order.
     let cleanup_idx = smoke.find("libvirt-kvm-smoke.sh cleanup").unwrap();
@@ -878,25 +891,26 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
     assert!(cleanup_step.contains("if: always()"), "{cleanup_step}");
 
     let fallback_idx = smoke
-        .find("libvirt-kvm-smoke.sh result")
+        .find("libvirt-kvm-smoke.sh ensure-result")
         .unwrap_or_else(|| {
-            panic!("missing early-failure structured result.json fallback step:\n{smoke}")
+            panic!("missing early-failure structured result.json ensure-result step:\n{smoke}")
         });
     let fallback_start = smoke[..fallback_idx].rfind("- name:").unwrap();
     let summary_idx = smoke.find("- name: Result summary").unwrap();
     let fallback_step = &smoke[fallback_start..summary_idx];
     assert!(fallback_step.contains("if: always()"), "{fallback_step}");
+    assert!(fallback_step.contains(r#"--out "$OUT""#), "{fallback_step}");
     assert!(
-        fallback_step.contains("jq -e"),
-        "fallback must validate existing and replacement result.json with jq:\n{fallback_step}"
-    );
-    assert!(
-        fallback_step.contains("--accelerator unknown"),
+        fallback_step.contains(r#"--arch "$ARCH""#),
         "{fallback_step}"
     );
     assert!(
-        fallback_step.contains(&format!("--binary-sha256 {}", "0".repeat(64))),
-        "fallback must use the unverified-digest sentinel:\n{fallback_step}"
+        fallback_step.contains(r#"--source-sha "$GITHUB_SHA""#),
+        "{fallback_step}"
+    );
+    assert!(
+        fallback_step.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#),
+        "fallback must bind any preserved pass record to the candidate digest:\n{fallback_step}"
     );
 
     let upload_idx = smoke.find("actions/upload-artifact").unwrap();
@@ -909,12 +923,139 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
 }
 
 #[test]
+fn write_result_propagates_publish_failure_in_exit_trap_context_and_cleans_temp() {
+    require_jq();
+    let digest = "a".repeat(64);
+    let script_path = script();
+
+    // Helper: invoke `write_result ... || rc=1` in a subshell where bash
+    // disables `errexit` inside `write_result`, matching `cmd_run`'s EXIT trap.
+    let run_trap_context = |out_dir: &Path, bin_override: Option<&Path>| {
+        let mut cmd = Command::new("bash");
+        cmd.args([
+            "--noprofile",
+            "--norc",
+            "-euo",
+            "pipefail",
+            "-c",
+            r#"body="$(sed -e 's|\${BASH_SOURCE\[0\]}|"$SCRIPT_PATH"|g' -e '/^# ---- dispatch/q' "$SCRIPT_PATH")"
+eval "$body"
+rc=0
+write_result "$1" x86_64 "$2" "$3" kvm || rc=1
+exit "$rc""#,
+            "bash",
+        ])
+        .arg(out_dir)
+        .arg(SHA)
+        .arg(&digest)
+        .env("SCRIPT_PATH", &script_path);
+        if let Some(bin) = bin_override {
+            let path = format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            );
+            cmd.env("PATH", path);
+        }
+        cmd.output().unwrap()
+    };
+
+    // Case 1: all four mandatory checks passed, but `out/result.json` is an
+    // existing directory. `mv -f -T` must fail, clean up its temporary file,
+    // leave the directory empty, and return nonzero even under `|| rc=1`.
+    let dir1 = tempfile::tempdir().unwrap();
+    let out1 = dir1.path().join("out");
+    std::fs::create_dir_all(out1.join("tests")).unwrap();
+    for t in MANDATORY {
+        std::fs::write(out1.join("tests").join(t), "pass\n").unwrap();
+    }
+    let blocking_dir = out1.join("result.json");
+    std::fs::create_dir(&blocking_dir).unwrap();
+    let res1 = run_trap_context(&out1, None);
+    assert!(
+        !res1.status.success(),
+        "directory at result.json must fail write_result even when all checks pass: {}",
+        text(&res1)
+    );
+    let leftovers1: Vec<String> = std::fs::read_dir(&out1)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".result.json.tmp"))
+        .collect();
+    assert!(
+        leftovers1.is_empty(),
+        "temp file must be cleaned up on mv failure: {leftovers1:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(&blocking_dir).unwrap().count(),
+        0,
+        "mv -T must never move temp file inside an existing result.json directory"
+    );
+
+    // Case 2: `mv` fails with an I/O error after all four checks passed.
+    let dir2 = tempfile::tempdir().unwrap();
+    let out2 = dir2.path().join("out");
+    std::fs::create_dir_all(out2.join("tests")).unwrap();
+    for t in MANDATORY {
+        std::fs::write(out2.join("tests").join(t), "pass\n").unwrap();
+    }
+    let fake_bin = dir2.path().join("bin");
+    std::fs::create_dir(&fake_bin).unwrap();
+    write_exec(
+        &fake_bin.join("mv"),
+        "#!/bin/sh\necho 'mv: simulated rename failure' >&2\nexit 1\n",
+    );
+    let res2 = run_trap_context(&out2, Some(&fake_bin));
+    assert!(
+        !res2.status.success(),
+        "failing mv must fail write_result in || rc=1 trap context: {}",
+        text(&res2)
+    );
+    let leftovers2: Vec<String> = std::fs::read_dir(&out2)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".result.json.tmp"))
+        .collect();
+    assert!(
+        leftovers2.is_empty(),
+        "temp file must be cleaned up after mv error: {leftovers2:?}"
+    );
+    assert!(
+        !out2.join("result.json").exists(),
+        "result.json must not exist after failed mv"
+    );
+
+    // Case 3: `cat` fails after publishing when all four checks passed.
+    let dir3 = tempfile::tempdir().unwrap();
+    let out3 = dir3.path().join("out");
+    std::fs::create_dir_all(out3.join("tests")).unwrap();
+    for t in MANDATORY {
+        std::fs::write(out3.join("tests").join(t), "pass\n").unwrap();
+    }
+    let fake_cat_bin = dir3.path().join("bin");
+    std::fs::create_dir(&fake_cat_bin).unwrap();
+    write_exec(
+        &fake_cat_bin.join("cat"),
+        "#!/bin/sh\necho 'cat: simulated read failure' >&2\nexit 1\n",
+    );
+    let res3 = run_trap_context(&out3, Some(&fake_cat_bin));
+    assert!(
+        !res3.status.success(),
+        "failing cat must fail write_result in || rc=1 trap context: {}",
+        text(&res3)
+    );
+}
+
+#[test]
 fn early_failure_fallback_writes_structured_fail_result_json() {
     require_jq();
     let sentinel = "0".repeat(64);
+    let candidate_digest = "a".repeat(64);
+    let other_digest = "b".repeat(64);
+    let other_sha = SHA.replace('0', "f");
 
     // 1. Direct `result` subcommand exits non-zero (fail-closed) and publishes
-    // result.json atomically via a temporary file + rename, leaving no temp files.
+    // result.json atomically via a temporary file + `mv -f -T`, leaving no temp files.
     let direct_dir = tempfile::tempdir().unwrap();
     let direct_out = direct_dir.path().join("out");
     std::fs::create_dir(&direct_out).unwrap();
@@ -946,59 +1087,176 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
     let wr_end = script_src[wr_start..].find("\ncmd_result()").unwrap() + wr_start;
     let write_result_fn = &script_src[wr_start..wr_end];
     assert!(
-        write_result_fn.contains("mv -f ") && !write_result_fn.contains(r#">"$out/result.json""#),
-        "write_result must publish atomically via temp file + mv -f:\n{write_result_fn}"
+        write_result_fn.contains("mv -f -T ")
+            && !write_result_fn.contains(r#">"$out/result.json""#),
+        "write_result must publish atomically via temp file + mv -f -T:\n{write_result_fn}"
     );
 
-    // 2. Execute the exact fallback step script from `.github/workflows/libvirt-kvm-hosted.yml`
-    // against missing, empty, truncated, and valid-pass `result.json` inputs.
-    let wf_path = root().join(".github/workflows/libvirt-kvm-hosted.yml");
-    let extract = Command::new("ruby")
-        .args([
-            "-ryaml",
-            "-e",
-            r#"wf = YAML.load_file(ARGV[0]); step = wf["jobs"]["smoke"]["steps"].find { |s| s["name"].to_s.include?("Record structured failure") }; abort("missing step") unless step; print step["run"]"#,
-            wf_path.to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(extract.status.success(), "{}", text(&extract));
-    let fallback_script = String::from_utf8(extract.stdout).unwrap();
+    // Helper: produce an authentic writer-generated `result.json` using the
+    // script's own `result` subcommand.
+    let write_real_result =
+        |out: &Path, arch: &str, sha: &str, digest: &str, accel: &str, pass_all: bool| {
+            std::fs::create_dir_all(out.join("tests")).unwrap();
+            for t in MANDATORY {
+                std::fs::write(
+                    out.join("tests").join(t),
+                    if pass_all { "pass\n" } else { "fail\n" },
+                )
+                .unwrap();
+            }
+            let r = lane(&[
+                "result",
+                "--out",
+                out.to_str().unwrap(),
+                "--arch",
+                arch,
+                "--source-sha",
+                sha,
+                "--binary-sha256",
+                digest,
+                "--accelerator",
+                accel,
+            ]);
+            if pass_all && accel == "kvm" {
+                assert!(r.status.success(), "{}", text(&r));
+            } else {
+                assert!(!r.status.success(), "{}", text(&r));
+            }
+        };
 
-    for case in ["missing", "empty", "truncated", "valid_pass"] {
+    // 2. Exercise `libvirt-kvm-smoke.sh ensure-result` directly (no Ruby
+    // required) across missing, corrupt, forged, foreign-run, and valid
+    // writer-produced records.
+    let cases = [
+        ("missing", candidate_digest.as_str(), false),
+        ("empty", candidate_digest.as_str(), false),
+        ("truncated", candidate_digest.as_str(), false),
+        ("two_field_pass", candidate_digest.as_str(), false),
+        ("wrong_sha_pass", candidate_digest.as_str(), false),
+        ("wrong_sha_fail", candidate_digest.as_str(), false),
+        ("wrong_arch_pass", candidate_digest.as_str(), false),
+        ("wrong_digest_pass", candidate_digest.as_str(), false),
+        ("empty_expect_pass", "", false),
+        ("forged_tcg_pass", candidate_digest.as_str(), false),
+        ("forged_partial_pass", candidate_digest.as_str(), false),
+        ("valid_pass", candidate_digest.as_str(), true),
+        ("valid_fail", candidate_digest.as_str(), true),
+    ];
+
+    for (case, expect, preserve) in cases {
         let dir = tempfile::tempdir().unwrap();
         let out_dir = dir.path().join("out");
-        if case != "missing" {
-            std::fs::create_dir(&out_dir).unwrap();
-        }
         match case {
             "missing" => {}
-            "empty" => std::fs::write(out_dir.join("result.json"), b"").unwrap(),
-            "truncated" => {
-                std::fs::write(out_dir.join("result.json"), b"{\"schema\": 1, \"suite\":").unwrap()
+            "empty" => {
+                std::fs::create_dir(&out_dir).unwrap();
+                std::fs::write(out_dir.join("result.json"), b"").unwrap();
             }
-            "valid_pass" => std::fs::write(
-                out_dir.join("result.json"),
-                r#"{"schema":1,"suite":"libvirt-kvm-smoke-v1","result":"pass","virtualization":{"accelerator":"kvm"}}"#,
-            )
-            .unwrap(),
+            "truncated" => {
+                std::fs::create_dir(&out_dir).unwrap();
+                std::fs::write(out_dir.join("result.json"), b"{\"schema\": 1, \"suite\":").unwrap();
+            }
+            "two_field_pass" => {
+                std::fs::create_dir(&out_dir).unwrap();
+                std::fs::write(
+                    out_dir.join("result.json"),
+                    r#"{"suite":"libvirt-kvm-smoke-v1","result":"pass"}"#,
+                )
+                .unwrap();
+            }
+            "wrong_sha_pass" => {
+                write_real_result(
+                    &out_dir,
+                    "x86_64",
+                    &other_sha,
+                    &candidate_digest,
+                    "kvm",
+                    true,
+                );
+            }
+            "wrong_sha_fail" => {
+                write_real_result(
+                    &out_dir,
+                    "x86_64",
+                    &other_sha,
+                    &candidate_digest,
+                    "kvm",
+                    false,
+                );
+            }
+            "wrong_arch_pass" => {
+                write_real_result(&out_dir, "aarch64", SHA, &candidate_digest, "kvm", true);
+            }
+            "wrong_digest_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &other_digest, "kvm", true);
+            }
+            "empty_expect_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", true);
+            }
+            "forged_tcg_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", true);
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
+                        .unwrap();
+                doc["virtualization"]["accelerator"] = serde_json::json!("tcg");
+                std::fs::write(
+                    out_dir.join("result.json"),
+                    serde_json::to_vec(&doc).unwrap(),
+                )
+                .unwrap();
+            }
+            "forged_partial_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", true);
+                let mut doc: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
+                        .unwrap();
+                doc["tests"]["agent_shutdown"] = serde_json::json!("not_run");
+                std::fs::write(
+                    out_dir.join("result.json"),
+                    serde_json::to_vec(&doc).unwrap(),
+                )
+                .unwrap();
+            }
+            "valid_pass" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", true);
+            }
+            "valid_fail" => {
+                write_real_result(&out_dir, "x86_64", SHA, &candidate_digest, "kvm", false);
+            }
             _ => unreachable!(),
         }
-        let run = Command::new("bash")
-            .args(["-euo", "pipefail", "-c", &fallback_script])
-            .current_dir(root())
-            .env("OUT", &out_dir)
-            .env("ARCH", "x86_64")
-            .env("GITHUB_SHA", SHA)
-            .output()
-            .unwrap();
+
+        let before = std::fs::read(out_dir.join("result.json")).ok();
+        let run = lane(&[
+            "ensure-result",
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            expect,
+        ]);
         assert!(run.status.success(), "{case}: {}", text(&run));
-        let json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
-                .unwrap_or_else(|e| panic!("{case}: invalid result.json: {e}: {}", text(&run)));
-        if case == "valid_pass" {
-            assert_eq!(json["result"], "pass", "{case}: must preserve valid pass");
-            assert_eq!(json["virtualization"]["accelerator"], "kvm", "{case}");
+        let after = std::fs::read(out_dir.join("result.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&after)
+            .unwrap_or_else(|e| panic!("{case}: invalid result.json: {e}: {}", text(&run)));
+        if preserve {
+            assert_eq!(
+                Some(after),
+                before,
+                "{case}: valid run-bound record must be preserved untouched"
+            );
+            if case == "valid_pass" {
+                assert_eq!(json["result"], "pass", "{case}");
+                assert_eq!(json["candidate_binary_sha256"], candidate_digest, "{case}");
+                assert_eq!(json["virtualization"]["accelerator"], "kvm", "{case}");
+            } else {
+                assert_eq!(json["result"], "fail", "{case}");
+                assert_eq!(json["candidate_binary_sha256"], candidate_digest, "{case}");
+                assert_eq!(json["tests"]["production_install"], "fail", "{case}");
+            }
         } else {
             assert_eq!(json["schema"], 1, "{case}");
             assert_eq!(json["suite"], "libvirt-kvm-smoke-v1", "{case}");
@@ -1015,6 +1273,34 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
             assert_eq!(json["result"], "fail", "{case}");
         }
     }
+
+    // 3. `ensure-result` also fails closed (and leaves no temp files) if
+    // publication itself is blocked (e.g. a directory at `result.json`).
+    let blocked = tempfile::tempdir().unwrap();
+    let blocked_out = blocked.path().join("out");
+    std::fs::create_dir_all(blocked_out.join("result.json")).unwrap();
+    let res = lane(&[
+        "ensure-result",
+        "--out",
+        blocked_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &candidate_digest,
+    ]);
+    assert!(
+        !res.status.success(),
+        "ensure-result must fail closed when result.json cannot be published: {}",
+        text(&res)
+    );
+    assert_eq!(
+        std::fs::read_dir(blocked_out.join("result.json"))
+            .unwrap()
+            .count(),
+        0
+    );
 }
 
 /// Runs `libvirt-kvm-smoke.sh` guaranteed unprivileged (dropping to uid/gid
@@ -1039,9 +1325,41 @@ fn lane_unprivileged(args: &[&str], env: &[(&str, &str)], path_override: Option<
     cmd.output().unwrap()
 }
 
+/// Creates a temporary directory with `0700` permissions at creation time
+/// (independent of process `umask`) so there is never a world-writable window
+/// before narrowing permissions under root or under permissive umasks.
+fn private_tempdir() -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap()
+}
+
+/// Creates a directory with explicit Unix `mode` at creation time (masked only
+/// by `umask`, never widening beyond `mode`, so `0700` stays `0700` even under
+/// `umask 000`).
+fn create_dir_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(mode).create(path).unwrap();
+}
+
+/// Creates a new file with explicit Unix `mode` at creation time and writes
+/// `bytes`, never creating a world-writable file even under `umask 000`.
+fn write_file_mode(path: &Path, mode: u32, bytes: &[u8]) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(mode)
+        .open(path)
+        .unwrap();
+    f.write_all(bytes).unwrap();
+}
+
 /// Gives the dropped test subprocess (uid/gid 65534 when the test runner is
 /// root) private ownership of `path` with `mode`; leaves unprivileged runs at
-/// their default user-private permissions.
+/// their creation-time private permissions.
 fn grant_child_private(path: &Path, mode: u32, as_root: bool) {
     if as_root {
         std::os::unix::fs::chown(path, Some(65534), Some(65534)).unwrap();
@@ -1057,10 +1375,15 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
         return;
     }
     let as_root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = private_tempdir();
+    assert_eq!(
+        std::fs::metadata(dir.path()).unwrap().mode() & 0o777,
+        0o700,
+        "temp parent must be created with 0700 permissions even under permissive umask"
+    );
     if as_root {
-        // Traversal-only for non-root; parent stays root-owned and never
-        // world-writable during setup.
+        // Grant traversal-only to the dropped child only AFTER the directory
+        // exists as 0700; parent stays root-owned and never world-writable.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
     }
     assert_eq!(
@@ -1072,8 +1395,9 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
     // Build a real, valid candidate directory and matching digest so the test
     // cannot accidentally pass because of a missing candidate.
     let bin_file = dir.path().join("built-qeminga");
-    std::fs::write(&bin_file, b"valid fake candidate\n").unwrap();
+    write_file_mode(&bin_file, 0o600, b"valid fake candidate\n");
     let cand_dir = dir.path().join("candidate");
+    create_dir_mode(&cand_dir, 0o755);
     let m = lane(&[
         "manifest",
         "--out",
@@ -1105,27 +1429,32 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
 
     let missing = dir.path().join("no-such-kvm");
     let regular = dir.path().join("regular-file-kvm");
-    std::fs::write(&regular, b"").unwrap();
+    write_file_mode(&regular, 0o600, b"");
+    assert_eq!(
+        std::fs::metadata(&regular).unwrap().mode() & 0o777,
+        0o600,
+        "regular fixture file must be created 0600"
+    );
     grant_child_private(&regular, 0o600, as_root);
 
     let images_dir = dir.path().join("images");
-    std::fs::create_dir(&images_dir).unwrap();
-    grant_child_private(&images_dir, 0o700, as_root);
+    create_dir_mode(&images_dir, 0o700);
     assert_eq!(
-        std::fs::metadata(&images_dir).unwrap().mode() & 0o002,
-        0,
-        "images dir must never be world-writable"
+        std::fs::metadata(&images_dir).unwrap().mode() & 0o777,
+        0o700,
+        "images dir must be created 0700"
     );
+    grant_child_private(&images_dir, 0o700, as_root);
 
     for (label, kvm_path) in [("missing", &missing), ("regular", &regular)] {
         let out_dir = dir.path().join(format!("out-{label}"));
-        std::fs::create_dir(&out_dir).unwrap();
-        grant_child_private(&out_dir, 0o700, as_root);
+        create_dir_mode(&out_dir, 0o700);
         assert_eq!(
-            std::fs::metadata(&out_dir).unwrap().mode() & 0o002,
-            0,
-            "out dir must never be world-writable"
+            std::fs::metadata(&out_dir).unwrap().mode() & 0o777,
+            0o700,
+            "out dir must be created 0700"
         );
+        grant_child_private(&out_dir, 0o700, as_root);
         let output = lane_unprivileged(
             &[
                 "run",
@@ -1190,10 +1519,7 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
     // guard and reaches the subsequent tool check (stopping at `missing tool: virsh` under a
     // PATH that omits `virsh`), proving the assertions above only pass because of the guard.
     let minimal_bin = dir.path().join("minimal-bin");
-    std::fs::create_dir(&minimal_bin).unwrap();
-    if as_root {
-        std::fs::set_permissions(&minimal_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    create_dir_mode(&minimal_bin, 0o755);
     for tool in [
         "dirname", "basename", "uname", "id", "mkdir", "rm", "cat", "tr", "jq", "printf", "cut",
         "cp", "mv",
@@ -1207,7 +1533,12 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
         }
     }
     let ctrl_out = dir.path().join("out-control");
-    std::fs::create_dir(&ctrl_out).unwrap();
+    create_dir_mode(&ctrl_out, 0o700);
+    assert_eq!(
+        std::fs::metadata(&ctrl_out).unwrap().mode() & 0o777,
+        0o700,
+        "ctrl out dir must be created 0700"
+    );
     grant_child_private(&ctrl_out, 0o700, as_root);
     let ctrl = lane_unprivileged(
         &[
@@ -1242,5 +1573,24 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
     assert!(
         ctrl_text.contains("missing tool: virsh"),
         "control run should reach the next preflight stage (missing tool: virsh):\n{ctrl_text}"
+    );
+}
+
+#[test]
+fn kvm_device_fixture_stays_private_under_permissive_umask() {
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new("/bin/sh")
+        .args([
+            "-c",
+            r#"umask 000 && exec "$1" --exact run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device"#,
+            "sh",
+        ])
+        .arg(&exe)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "KVM device fixture must remain private under umask 000:\n{}",
+        text(&out)
     );
 }

@@ -56,7 +56,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
 use crate::dispatch::Dispatcher;
-use crate::framing::{DecodeEvent, FrameDecoder};
+use crate::framing::{DecodeEvent, FrameDecoder, SENTINEL};
 use crate::kernel::async_fd::OwnedAsyncFd;
 use crate::state::FreezeState;
 
@@ -187,17 +187,31 @@ impl Channel {
     }
 }
 
-/// Shared read/write view of a [`Channel`] so [`serve`] can inspect the
-/// underlying descriptor during a session without `tokio::io::split`.
+/// Shared write (and unchecked read) view of a [`Channel`] so [`serve`] can
+/// inspect the underlying descriptor during a session without `tokio::io::split`.
 struct ChannelRef<'a>(&'a Channel);
 
-impl AsyncRead for ChannelRef<'_> {
+/// Shared read view of a [`Channel`] that checks the peer probe before issuing
+/// `read(2)` when Tokio has already latched `READ_CLOSED`, ending a virtio
+/// session cleanly without consuming a reconnected peer's first request (§5.7).
+struct ChannelReadRef<'a, P>(&'a Channel, &'a P);
+
+impl<P> AsyncRead for ChannelReadRef<'_, P>
+where
+    P: Fn(BorrowedFd<'_>) -> HostState + Send + Sync,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut TaskContext<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let n = ready!(self.0.fd.poll_read(cx, buf.initialize_unfilled()))?;
+        let n = ready!(
+            self.0
+                .fd
+                .poll_read_checked(cx, buf.initialize_unfilled(), || (self.1)(
+                    self.0.fd.as_fd()
+                ) != HostState::Closed,)
+        )?;
         buf.advance(n);
         Poll::Ready(Ok(()))
     }
@@ -627,7 +641,7 @@ where
     W: AsyncWrite + Unpin,
     H: Handle,
 {
-    run_session_inner(reader, writer, handler, decoder, cancel, || false).await
+    run_session_inner(reader, writer, handler, decoder, cancel, &[], || false).await
 }
 
 async fn run_session_inner<R, W, H, F>(
@@ -636,6 +650,7 @@ async fn run_session_inner<R, W, H, F>(
     handler: &H,
     decoder: &mut FrameDecoder,
     cancel: &mut Cancel,
+    prefetch: &[u8],
     abandon_on_eof: F,
 ) -> SessionReport
 where
@@ -652,6 +667,13 @@ where
     // Every frame decoded, in request order, until its reply has left
     // for the outbox.
     let mut slots: VecDeque<Slot<'_>> = VecDeque::new();
+    if !prefetch.is_empty() {
+        received += prefetch.len() as u64;
+        for event in decoder.push(prefetch) {
+            let kind = handler.classify(&event);
+            slots.push_back(Slot::Waiting(kind, event));
+        }
+    }
     let mut outbox = Outbox::new();
     // The input ended: finish what was received, then report why.
     let mut input_end: Option<SessionEnd> = None;
@@ -785,18 +807,21 @@ pub fn cancel_pair() -> (watch::Sender<bool>, Cancel) {
     watch::channel(false)
 }
 
-/// Opens the channel, retrying non-terminal failures with bounded
-/// exponential backoff until it succeeds or `cancel` fires. Returns
-/// `Ok(None)` when cancelled.
-pub async fn open_with_retry(
+/// Shared retry loop for [`open_with_retry`] and [`open_fd_with_retry`]:
+/// retries non-terminal failures with bounded exponential backoff until
+/// `attempt` succeeds or `cancel` fires.
+async fn retry_open<T, F>(
     path: &Path,
-    open: &OpenFn,
+    mut attempt: F,
     cancel: &mut Cancel,
-) -> Result<Option<Channel>, OpenError> {
+) -> Result<Option<T>, OpenError>
+where
+    F: FnMut(&Path) -> Result<T, OpenError>,
+{
     let mut delay = INITIAL_BACKOFF;
     loop {
-        match Channel::open_with(path, open.as_ref()) {
-            Ok(channel) => return Ok(Some(channel)),
+        match attempt(path) {
+            Ok(value) => return Ok(Some(value)),
             Err(err) if err.is_terminal() => return Err(err),
             Err(err) => {
                 tracing::warn!(event = "channel_open_retry", error = %err, delay_secs = delay.as_secs(), "cannot open channel; retrying");
@@ -817,38 +842,33 @@ pub async fn open_with_retry(
     }
 }
 
+/// Opens the channel, retrying non-terminal failures with bounded
+/// exponential backoff until it succeeds or `cancel` fires. Returns
+/// `Ok(None)` when cancelled.
+pub async fn open_with_retry(
+    path: &Path,
+    open: &OpenFn,
+    cancel: &mut Cancel,
+) -> Result<Option<Channel>, OpenError> {
+    retry_open(path, |p| Channel::open_with(p, open.as_ref()), cancel).await
+}
+
 /// Opens the raw channel descriptor without registering it with Tokio yet,
-/// retrying non-terminal failures with bounded exponential backoff until it
-/// succeeds or `cancel` fires. Keeping the descriptor unregistered until the
-/// host connects avoids latching Mio/Tokio's sticky `READ_CLOSED`/`WRITE_CLOSED`
-/// bits on an initial virtio-serial `EPOLLHUP` (§5.7).
+/// sharing [`open_with_retry`]'s retry and cancellation loop. Keeping the
+/// descriptor unregistered until the host connects avoids latching Mio/Tokio's
+/// sticky `READ_CLOSED`/`WRITE_CLOSED` bits on an initial virtio-serial
+/// `EPOLLHUP` (§5.7).
 async fn open_fd_with_retry(
     path: &Path,
     open: &OpenFn,
     cancel: &mut Cancel,
 ) -> Result<Option<OwnedFd>, OpenError> {
-    let mut delay = INITIAL_BACKOFF;
-    loop {
-        match open(path).map_err(|err| OpenError::from_io(path, err)) {
-            Ok(fd) => return Ok(Some(fd)),
-            Err(err) if err.is_terminal() => return Err(err),
-            Err(err) => {
-                tracing::warn!(event = "channel_open_retry", error = %err, delay_secs = delay.as_secs(), "cannot open channel; retrying");
-            }
-        }
-        tokio::select! {
-            () = tokio::time::sleep(delay) => {}
-            changed = cancel.changed() => {
-                if changed.is_err() || *cancel.borrow() {
-                    return Ok(None);
-                }
-            }
-        }
-        if *cancel.borrow() {
-            return Ok(None);
-        }
-        delay = (delay * 2).min(MAX_BACKOFF);
-    }
+    retry_open(
+        path,
+        |p| open(p).map_err(|err| OpenError::from_io(p, err)),
+        cancel,
+    )
+    .await
 }
 
 /// The daemon's channel loop: open (with retry), run a session with a
@@ -933,11 +953,33 @@ enum HostState {
 }
 
 /// Outcome of waiting for the host side of an open virtio-serial port.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum HostWait {
-    Ready,
+    /// Host is ready; carries any bytes read across a disconnected→ready
+    /// transition so the next session's decoder does not lose the handshake.
+    Ready(Vec<u8>),
+    /// Port hot-unplugged, errored, or required a transport reset because an
+    /// overfull stale input buffer could not be observed empty before reconnect.
     Closed,
     Cancelled,
+}
+
+/// Outcome of draining unread bytes from a host-disconnected virtio-serial port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DrainOutcome {
+    /// Host stayed disconnected and the port's read buffer emptied (EOF / EAGAIN).
+    Drained,
+    /// Host stayed disconnected, but [`MAX_DRAIN_BYTES`] was reached before the
+    /// buffer emptied.
+    Incomplete,
+    /// Host transitioned to [`HostState::Ready`] across a read; `prefetch`
+    /// holds the bytes from that read (trimmed to the first `0xFF` sentinel if
+    /// present) so a newly connected peer's handshake and following requests
+    /// are preserved.
+    BecameReady { prefetch: Vec<u8> },
+    /// Descriptor hot-unplugged, errored, or hit [`MAX_DRAIN_BYTES`] on a
+    /// `Ready` transition without observing an empty buffer or `0xFF` boundary.
+    Closed,
 }
 
 /// Linux `POLLRDHUP` (stream socket peer closed or shut down writing); `nix`
@@ -1002,10 +1044,15 @@ fn is_host_disconnect_end(end: &SessionEnd) -> bool {
 /// Discards unread bytes buffered in a non-blocking, host-disconnected
 /// virtio-serial port so a partial frame left by a previous host cannot prefix
 /// the next connection's first request (§5.7). Callers must have just observed
-/// [`HostState::VirtioHostDisconnected`] and ensured `O_NONBLOCK` on `fd`;
-/// `probe` is re-checked before any subsequent read so newly connected host
-/// traffic is never consumed.
-fn drain_disconnected_input<P>(fd: BorrowedFd<'_>, probe: &P) -> HostState
+/// [`HostState::VirtioHostDisconnected`] and ensured `O_NONBLOCK` on `fd`.
+///
+/// After each non-empty read, `probe` is re-checked *before* discarding the
+/// chunk: if the host became [`HostState::Ready`] across the read, any `0xFF`
+/// `guest-sync-delimited` boundary (and everything after it) — or the full
+/// chunk when the stale buffer had not hit [`MAX_DRAIN_BYTES`] — is returned in
+/// [`DrainOutcome::BecameReady`] so the new session preserves the first request
+/// instead of silently discarding it.
+fn drain_disconnected_input<P>(fd: BorrowedFd<'_>, probe: &P) -> DrainOutcome
 where
     P: Fn(BorrowedFd<'_>) -> HostState + Send + Sync,
 {
@@ -1021,30 +1068,59 @@ where
                         "discarded unread bytes from disconnected channel"
                     );
                 }
-                return HostState::VirtioHostDisconnected;
+                return DrainOutcome::Drained;
             }
             Ok(n) => {
-                discarded += n;
-                if discarded >= MAX_DRAIN_BYTES {
-                    tracing::debug!(
-                        event = "channel_stale_input_discarded",
-                        bytes = discarded,
-                        "discarded unread bytes from disconnected channel"
-                    );
-                    return probe(fd);
-                }
-                let state = probe(fd);
-                if state != HostState::VirtioHostDisconnected {
-                    tracing::debug!(
-                        event = "channel_stale_input_discarded",
-                        bytes = discarded,
-                        "discarded unread bytes from disconnected channel"
-                    );
-                    return state;
+                let chunk = &buf[..n];
+                match probe(fd) {
+                    HostState::Closed => return DrainOutcome::Closed,
+                    HostState::Ready => {
+                        if let Some(pos) = chunk.iter().position(|&b| b == SENTINEL) {
+                            discarded += pos;
+                            if discarded > 0 {
+                                tracing::debug!(
+                                    event = "channel_stale_input_discarded",
+                                    bytes = discarded,
+                                    "discarded stale prefix before 0xFF sync sentinel"
+                                );
+                            }
+                            return DrainOutcome::BecameReady {
+                                prefetch: chunk[pos..].to_vec(),
+                            };
+                        }
+                        if discarded + n >= MAX_DRAIN_BYTES {
+                            // Overfull stale buffer hit the cap without seeing
+                            // EOF/EAGAIN or a 0xFF resync boundary: force a
+                            // transport reset (close & reopen) so kernel
+                            // release discards any remaining stale bytes.
+                            return DrainOutcome::Closed;
+                        }
+                        if discarded > 0 {
+                            tracing::debug!(
+                                event = "channel_stale_input_discarded",
+                                bytes = discarded,
+                                "discarded unread bytes from disconnected channel"
+                            );
+                        }
+                        return DrainOutcome::BecameReady {
+                            prefetch: chunk.to_vec(),
+                        };
+                    }
+                    HostState::VirtioHostDisconnected => {
+                        discarded += n;
+                        if discarded >= MAX_DRAIN_BYTES {
+                            tracing::debug!(
+                                event = "channel_stale_input_discarded",
+                                bytes = discarded,
+                                "discarded unread bytes from disconnected channel; buffer still non-empty"
+                            );
+                            return DrainOutcome::Incomplete;
+                        }
+                    }
                 }
             }
             Err(Errno::EINTR) => continue,
-            Err(_) => return HostState::Closed,
+            Err(_) => return DrainOutcome::Closed,
         }
     }
 }
@@ -1074,8 +1150,9 @@ async fn sleep_or_cancel<H: Handle>(
 }
 
 /// Polls a non-blocking, unregistered virtio-serial descriptor until the host
-/// connects, the port hot-unplugs, or a stop is allowed. Drains any stale
-/// unread input buffered in the driver on each observed disconnect (§5.7).
+/// connects, the port hot-unplugs (or requires a transport reset), or a stop is
+/// allowed. Drains any stale unread input buffered in the driver on each
+/// observed disconnect (§5.7).
 async fn wait_for_virtio_host<H, P>(
     fd: BorrowedFd<'_>,
     probe: &P,
@@ -1083,6 +1160,7 @@ async fn wait_for_virtio_host<H, P>(
     cancel: &mut Cancel,
     cancel_live: &mut bool,
     wait: Backoff,
+    mut stale_incomplete: bool,
 ) -> HostWait
 where
     H: Handle,
@@ -1107,13 +1185,27 @@ where
             return HostWait::Cancelled;
         }
         match probe(fd) {
-            HostState::Ready => return HostWait::Ready,
+            HostState::Ready => {
+                // If an earlier drain hit MAX_DRAIN_BYTES without observing an
+                // empty buffer, force a transport reset (close & reopen) rather
+                // than admitting a new session onto un-emptied stale bytes.
+                if stale_incomplete {
+                    return HostWait::Closed;
+                }
+                return HostWait::Ready(Vec::new());
+            }
             HostState::Closed => return HostWait::Closed,
             HostState::VirtioHostDisconnected => {
                 match drain_disconnected_input(fd, probe) {
-                    HostState::Ready => return HostWait::Ready,
-                    HostState::Closed => return HostWait::Closed,
-                    HostState::VirtioHostDisconnected => {}
+                    DrainOutcome::Drained => stale_incomplete = false,
+                    DrainOutcome::Incomplete => stale_incomplete = true,
+                    DrainOutcome::BecameReady { prefetch } => {
+                        if stale_incomplete && prefetch.first() != Some(&SENTINEL) {
+                            return HostWait::Closed;
+                        }
+                        return HostWait::Ready(prefetch);
+                    }
+                    DrainOutcome::Closed => return HostWait::Closed,
                 }
                 if slept {
                     delay = (delay * 2).clamp(wait.initial, wait.max);
@@ -1204,13 +1296,14 @@ where
             );
             continue;
         }
+        let mut prefetch = Vec::new();
         if probe(fd.as_fd()) == HostState::VirtioHostDisconnected {
-            let after_drain = drain_disconnected_input(fd.as_fd(), &probe);
-            match after_drain {
-                HostState::Ready => {
+            match drain_disconnected_input(fd.as_fd(), &probe) {
+                DrainOutcome::BecameReady { prefetch: bytes } => {
+                    prefetch = bytes;
                     empty_eof_delay = Duration::ZERO;
                 }
-                HostState::Closed => {
+                DrainOutcome::Closed => {
                     reopen_delay =
                         (reopen_delay * 2).clamp(timers.reopen.initial, timers.reopen.max);
                     empty_eof_delay = Duration::ZERO;
@@ -1219,11 +1312,12 @@ where
                         reason = "eof",
                         received = 0u64,
                         reopen_in_ms = reopen_delay.as_millis() as u64,
-                        "channel closed while draining disconnected input; reopening"
+                        "channel reset while draining disconnected input; reopening"
                     );
                     continue;
                 }
-                HostState::VirtioHostDisconnected => {
+                outcome @ (DrainOutcome::Drained | DrainOutcome::Incomplete) => {
+                    let stale_incomplete = matches!(outcome, DrainOutcome::Incomplete);
                     tracing::info!(
                         event = "channel_waiting_for_host",
                         path = %path.display(),
@@ -1236,10 +1330,12 @@ where
                         &mut cancel,
                         &mut cancel_live,
                         timers.host_wait,
+                        stale_incomplete,
                     )
                     .await
                     {
-                        HostWait::Ready => {
+                        HostWait::Ready(bytes) => {
+                            prefetch = bytes;
                             empty_eof_delay = Duration::ZERO;
                         }
                         HostWait::Cancelled => return Ok(()),
@@ -1276,11 +1372,12 @@ where
         tracing::info!(event = "channel_open", path = %path.display(), "channel open");
         let mut decoder = FrameDecoder::new();
         let report = run_session_inner(
-            ChannelRef(&channel),
+            ChannelReadRef(&channel, &probe),
             ChannelRef(&channel),
             handler,
             &mut decoder,
             &mut cancel,
+            &prefetch,
             || probe(channel.fd.as_fd()) != HostState::Closed,
         )
         .await;
@@ -1294,18 +1391,16 @@ where
         if is_host_disconnect_end(&report.end) {
             match probe(fd.as_fd()) {
                 HostState::VirtioHostDisconnected => {
-                    if drain_disconnected_input(fd.as_fd(), &probe) != HostState::Closed {
-                        tracing::warn!(
-                            event = "channel_closed",
-                            reason = %report.end,
-                            received = report.received,
-                            "host disconnected; keeping channel open while waiting for host"
-                        );
-                        pending_fd = Some(fd);
-                        reopen_delay = Duration::ZERO;
-                        empty_eof_delay = Duration::ZERO;
-                        continue;
-                    }
+                    tracing::warn!(
+                        event = "channel_closed",
+                        reason = %report.end,
+                        received = report.received,
+                        "host disconnected; keeping channel open while waiting for host"
+                    );
+                    pending_fd = Some(fd);
+                    reopen_delay = Duration::ZERO;
+                    empty_eof_delay = Duration::ZERO;
+                    continue;
                 }
                 HostState::Ready => {
                     tracing::warn!(
@@ -2807,9 +2902,10 @@ mod tests {
             &mut cancel,
             &mut cancel_live,
             wait,
+            false,
         )
         .await;
-        assert_eq!(outcome, HostWait::Ready);
+        assert_eq!(outcome, HostWait::Ready(Vec::new()));
         assert_eq!(polls.load(Ordering::SeqCst), 4);
         // 4 sleeps before 4 probes: 10 ms + 20 ms + 40 ms + 50 ms (clamped) = 120 ms.
         assert_eq!(start.elapsed(), Duration::from_millis(120));
@@ -2831,6 +2927,7 @@ mod tests {
             &mut cancel,
             &mut cancel_live,
             wait,
+            false,
         )
         .await;
         assert_eq!(outcome, HostWait::Closed);
@@ -2855,6 +2952,7 @@ mod tests {
             &mut cancel,
             &mut cancel_live,
             long_wait,
+            false,
         )
         .await;
         stopper.await.unwrap();
@@ -2886,6 +2984,7 @@ mod tests {
             &mut cancel,
             &mut cancel_live,
             wait,
+            false,
         )
         .await;
         driver.await.unwrap();
@@ -3603,5 +3702,447 @@ mod tests {
 
         tx.send(true).unwrap();
         server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_ends_session_on_latched_hangup_without_joining_new_peer_request_to_old_partial_frame()
+     {
+        bounded(async {
+            // Part A (read side): fill MAX_QUEUED slots + leave a partial frame
+            // in Session 1's decoder via one atomic FIFO write so `can_read` is
+            // false; drop writer1 so epoll latches READ_CLOSED while `can_read`
+            // is false; reconnect writer2 AND write its first request BEFORE
+            // releasing the blocking command. Session 1 must finish its 8
+            // accepted commands and end WITHOUT reading writer2's request into
+            // Session 1's partial decoder; Session 2 reads `new-peer\n` cleanly.
+            struct HoldNoReply {
+                release: tokio::sync::Notify,
+                seen: Mutex<Vec<Vec<u8>>>,
+                running: AtomicUsize,
+            }
+            impl Handle for HoldNoReply {
+                async fn handle(&self, event: DecodeEvent) -> Option<Vec<u8>> {
+                    let DecodeEvent::Frame { bytes, .. } = event else {
+                        return None;
+                    };
+                    self.running.fetch_add(1, Ordering::SeqCst);
+                    if bytes == b"hold-1" {
+                        self.release.notified().await;
+                    }
+                    self.seen.lock().unwrap().push(bytes);
+                    self.running.fetch_sub(1, Ordering::SeqCst);
+                    None
+                }
+            }
+
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("fast-reconnect-read.fifo");
+            nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+            let reader = open(
+                &fifo,
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open_fn: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            let handler = Arc::new(HoldNoReply {
+                release: tokio::sync::Notify::new(),
+                seen: Mutex::new(Vec::new()),
+                running: AtomicUsize::new(0),
+            });
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open_fn,
+                    h.as_ref(),
+                    cancel,
+                    Some(reader),
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    |fd| {
+                        use nix::poll::{PollFd, ppoll};
+                        use nix::sys::time::TimeSpec;
+                        let mut fds = [PollFd::new(fd, PollFlags::POLLIN)];
+                        let revents = match ppoll(&mut fds, Some(TimeSpec::new(0, 0)), None) {
+                            Ok(0) => PollFlags::empty(),
+                            Ok(_) => fds[0].revents().unwrap_or(PollFlags::POLLERR),
+                            Err(_) => PollFlags::POLLERR,
+                        };
+                        if revents.contains(PollFlags::POLLHUP) {
+                            HostState::VirtioHostDisconnected
+                        } else {
+                            HostState::Ready
+                        }
+                    },
+                )
+                .await
+            });
+
+            // 8 complete frames (= MAX_QUEUED, pausing `can_read`) + 1 partial frame.
+            nix::unistd::write(
+                &writer1,
+                b"hold-1\nq1\nq2\nq3\nq4\nq5\nq6\nq7\npartial-stale",
+            )
+            .unwrap();
+            while handler.running.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            // Drop writer1 while `can_read` is false so epoll latches READ_CLOSED.
+            drop(writer1);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Reconnect writer2 and send its first request BEFORE `hold-1` finishes.
+            let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+            nix::unistd::write(&writer2, b"new-peer\n").unwrap();
+
+            // Release `hold-1`: all 8 Session 1 commands finish, Session 1 ends
+            // without reading `new-peer\n` into the old decoder, and Session 2
+            // reads `new-peer\n` cleanly on a fresh registration + decoder.
+            handler.release.notify_waiters();
+            while handler.seen.lock().unwrap().len() < 9 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let seen = handler.seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 9);
+            assert_eq!(
+                seen[8],
+                b"new-peer",
+                "new peer's first request must not join onto the old decoder's partial frame: {:?}",
+                String::from_utf8_lossy(&seen[8])
+            );
+            assert_eq!(opened.load(Ordering::SeqCst), 0);
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+
+            // Part B (write side): a session whose writer registration already
+            // latched WRITE_CLOSED (via real FIFO EPOLLERR) must NOT deliver an
+            // old reply even after a replacement reader opens ready to accept it.
+            let wfifo = dir.path().join("fast-reconnect-write.fifo");
+            nix::unistd::mkfifo(&wfifo, Mode::S_IRWXU).unwrap();
+            let r1 = open(
+                &wfifo,
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let w_fd = open(
+                &wfifo,
+                OFlag::O_WRONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let w_chan = Channel::from_fd(w_fd).unwrap();
+            // Fill the FIFO so `w_chan` parks on epoll; dropping `r1` then
+            // delivers real EPOLLERR latching WRITE_CLOSED.
+            let filler = [b'x'; 4096];
+            loop {
+                let mut w_ref = ChannelRef(&w_chan);
+                if tokio::time::timeout(
+                    Duration::from_millis(20),
+                    tokio::io::AsyncWriteExt::write(&mut w_ref, &filler),
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+            drop(r1);
+            // Let Tokio's reactor observe the real kernel EPOLLERR and latch
+            // WRITE_CLOSED in the background without any prior write failing.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            // Reconnect r2 and drain the pipe so write(2) WOULD succeed if called.
+            let r2 = open(
+                &wfifo,
+                OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .unwrap();
+            let mut drain = [0u8; 4096];
+            while nix::unistd::read(&r2, &mut drain).is_ok_and(|n| n > 0) {}
+
+            // Run a session with `w_chan` as writer and an accepted command
+            // whose reply becomes ready: `outbox.drain` must fail with
+            // BrokenPipe before calling write(2), leaking ZERO bytes to r2
+            // even while `w_chan` remains open.
+            let (mut peer_in, sess_in) = duplex(256);
+            let counting = CountingHandler::new();
+            let (_ctx, mut cancel_rx) = cancel_pair();
+            let mut dec = FrameDecoder::new();
+            let c = counting.clone();
+            let sess = tokio::spawn(async move {
+                let report = run_session_until(
+                    sess_in,
+                    ChannelRef(&w_chan),
+                    c.as_ref(),
+                    &mut dec,
+                    &mut cancel_rx,
+                )
+                .await;
+                (report, w_chan)
+            });
+            peer_in.write_all(b"quick-old\n").await.unwrap();
+            let (report, w_chan) = sess.await.unwrap();
+            assert!(
+                matches!(report.end, SessionEnd::WriteError(ref e) if e.kind() == io::ErrorKind::BrokenPipe),
+                "{}",
+                report.end
+            );
+            assert_eq!(counting.started(), ["quick-old"]);
+            let mut leaked = [0u8; 32];
+            assert_eq!(
+                nix::unistd::read(&r2, &mut leaked),
+                Err(Errno::EAGAIN),
+                "old reply must not leak to the reconnected peer"
+            );
+            // Refreshing the registration allows a new session to write to r2.
+            let fresh_w = Channel::from_fd(w_chan.into_fd()).unwrap();
+            let mut fresh_ref = ChannelRef(&fresh_w);
+            fresh_ref.write_all(b"fresh-reply\n").await.unwrap();
+            let n = nix::unistd::read(&r2, &mut leaked).unwrap();
+            assert_eq!(&leaked[..n], b"fresh-reply\n");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_preserves_sync_delimited_handshake_when_host_connects_during_drain() {
+        bounded(async {
+            // Case A: host connects between the disconnected probe (call 0) and
+            // the first read inside `drain_disconnected_input`, delivering
+            // stale bytes followed by a 0xFF `guest-sync-delimited` handshake
+            // and a follow-up request. The stale prefix is discarded, and both
+            // the 0xFF-delimited handshake and the follow-up request are served
+            // without reopening.
+            let (ours, peer) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            nix::unistd::write(&peer, b"stale-prefix\xffsync-delimited\nfollow-up\n").unwrap();
+
+            let first = Arc::new(Mutex::new(Some(ours)));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                first
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            let probes = Arc::new(AtomicUsize::new(0));
+            let p = probes.clone();
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                    None,
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| {
+                        if p.fetch_add(1, Ordering::SeqCst) == 0 {
+                            HostState::VirtioHostDisconnected
+                        } else {
+                            HostState::Ready
+                        }
+                    },
+                )
+                .await
+            });
+            let mut peer = Channel::from_fd(peer).unwrap();
+            let expected = b"\xffSYNC-DELIMITED\nFOLLOW-UP\n";
+            let mut got = Vec::new();
+            let mut buf = [0u8; 64];
+            while got.len() < expected.len() {
+                let n = peer.read(&mut buf).await.unwrap();
+                assert!(
+                    n > 0,
+                    "peer closed early; got {:?}",
+                    String::from_utf8_lossy(&got)
+                );
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got, expected);
+            assert_eq!(opened.load(Ordering::SeqCst), 1);
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+
+            // Case B: a plain first request (no 0xFF) arriving across the same
+            // disconnected->Ready transition is also preserved rather than lost.
+            let (ours2, peer2) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            nix::unistd::write(&peer2, b"plain-first\n").unwrap();
+            let probes2 = Arc::new(AtomicUsize::new(0));
+            let p2 = probes2.clone();
+            let opened2 = Arc::new(AtomicUsize::new(0));
+            let o2 = opened2.clone();
+            let open2: OpenFn = Arc::new(move |_| {
+                o2.fetch_add(1, Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            let handler2 = Arc::new(FakeDispatcher::default());
+            let (tx2, cancel2) = cancel_pair();
+            let h2 = handler2.clone();
+            let server2 = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open2,
+                    h2.as_ref(),
+                    cancel2,
+                    Some(ours2),
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| {
+                        if p2.fetch_add(1, Ordering::SeqCst) == 0 {
+                            HostState::VirtioHostDisconnected
+                        } else {
+                            HostState::Ready
+                        }
+                    },
+                )
+                .await
+            });
+            let mut peer2 = Channel::from_fd(peer2).unwrap();
+            let n = peer2.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"PLAIN-FIRST\n");
+            assert_eq!(opened2.load(Ordering::SeqCst), 0);
+            tx2.send(true).unwrap();
+            server2.await.unwrap().unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn serve_resets_port_when_host_connects_before_overfull_stale_buffer_drains() {
+        bounded(async {
+            // Buffer more than MAX_DRAIN_BYTES (64 KiB) of stale data in fd #1
+            // while disconnected, then transition `probe` to Ready right as the
+            // 64 KiB cap is hit (so the old input buffer was NEVER observed
+            // empty). `serve` must not admit a session onto an un-emptied stale
+            // buffer: it performs a transport reset (closes fd #1, opens fd #2).
+            let (ours1, peer1) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            set_nonblocking(peer1.as_fd()).unwrap();
+            let stale = vec![b'x'; MAX_DRAIN_BYTES + READ_CHUNK];
+            let mut written = 0;
+            while written < stale.len() {
+                written += nix::unistd::write(&peer1, &stale[written..]).unwrap();
+            }
+
+            let (ours2, peer2) = nix::sys::socket::socketpair(
+                nix::sys::socket::AddressFamily::Unix,
+                nix::sys::socket::SockType::Stream,
+                None,
+                nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            )
+            .unwrap();
+            let fds = Arc::new(Mutex::new(VecDeque::from([ours1, ours2])));
+            let opened = Arc::new(AtomicUsize::new(0));
+            let o = opened.clone();
+            let open: OpenFn = Arc::new(move |_| {
+                o.fetch_add(1, Ordering::SeqCst);
+                fds.lock()
+                    .unwrap()
+                    .pop_front()
+                    .ok_or_else(|| io::Error::from_raw_os_error(nix::libc::ENOENT))
+            });
+            // Stay VirtioHostDisconnected through the first drain pass (16 ×
+            // 4 KiB chunks = 64 KiB -> 16 probes), then flip Ready while 4 KiB
+            // of stale data is still sitting unread in fd #1.
+            let probes = Arc::new(AtomicUsize::new(0));
+            let p = probes.clone();
+            let handler = Arc::new(FakeDispatcher::default());
+            let (tx, cancel) = cancel_pair();
+            let h = handler.clone();
+            let server = tokio::spawn(async move {
+                serve_inner_with_probe(
+                    Path::new("/dev/virtio-ports/fake"),
+                    open,
+                    h.as_ref(),
+                    cancel,
+                    None,
+                    ServeTimers {
+                        reopen: TEST_BACKOFF,
+                        host_wait: Backoff {
+                            initial: Duration::from_millis(5),
+                            max: Duration::from_millis(20),
+                        },
+                    },
+                    move |_| {
+                        if p.fetch_add(1, Ordering::SeqCst) < 16 {
+                            HostState::VirtioHostDisconnected
+                        } else {
+                            HostState::Ready
+                        }
+                    },
+                )
+                .await
+            });
+
+            // fd #1 must be closed (transport reset) rather than serving stale
+            // bytes; closing a Linux Unix stream socket with unread receive
+            // bytes signals EOF or ConnectionReset to `peer1`.
+            let mut peer1 = Channel::from_fd(peer1).unwrap();
+            let mut buf = [0u8; 32];
+            let peer1_res = peer1.read(&mut buf).await;
+            assert!(
+                matches!(peer1_res, Ok(0))
+                    || matches!(&peer1_res, Err(e) if e.kind() == io::ErrorKind::ConnectionReset),
+                "fd #1 must be closed on un-emptied >64 KiB stale buffer, got {peer1_res:?}"
+            );
+
+            // fd #2 opens cleanly and serves normal requests.
+            let mut peer2 = Channel::from_fd(peer2).unwrap();
+            peer2.write_all(b"clean\n").await.unwrap();
+            let n = peer2.read(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"CLEAN\n");
+            assert_eq!(opened.load(Ordering::SeqCst), 2);
+
+            tx.send(true).unwrap();
+            server.await.unwrap().unwrap();
+        })
+        .await;
     }
 }

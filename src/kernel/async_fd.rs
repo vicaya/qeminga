@@ -62,9 +62,28 @@ impl OwnedAsyncFd {
     /// rather than spinning so the caller can re-register a fresh
     /// [`OwnedAsyncFd`].
     pub fn poll_read(&self, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
+        self.poll_read_checked(cx, buf, || false)
+    }
+
+    /// Reads into `buf` once the descriptor is readable; `Pending` until
+    /// then. If the reactor has already latched `READ_CLOSED` (`EPOLLHUP` /
+    /// `EPOLLRDHUP`) and `stop_on_hangup()` returns `true`, returns `Ok(0)`
+    /// **before** calling `read(2)` so bytes sent by a newly reconnected peer
+    /// remain intact for the next session's fresh registration and decoder.
+    /// When `read(2)` would block after `READ_CLOSED` is latched, also returns
+    /// `Ok(0)` rather than spinning on Tokio's sticky closed readiness.
+    pub fn poll_read_checked(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+        mut stop_on_hangup: impl FnMut() -> bool,
+    ) -> Poll<io::Result<usize>> {
         loop {
             let mut guard = ready!(self.inner.poll_read_ready(cx))?;
             let read_closed = guard.ready().is_read_closed();
+            if read_closed && stop_on_hangup() {
+                return Poll::Ready(Ok(0));
+            }
             match guard
                 .try_io(|inner| nix::unistd::read(inner.get_ref(), buf).map_err(io::Error::from))
             {
@@ -76,22 +95,20 @@ impl OwnedAsyncFd {
     }
 
     /// Writes from `data` once the descriptor is writable; `Pending` until
-    /// then. A write that would block clears the readiness and waits again,
-    /// except when Tokio has already latched `WRITE_CLOSED` (for example a
-    /// non-blocking `virtio_console` write returning `EAGAIN` while the
-    /// host is disconnected): in that case it reports `BrokenPipe` rather
-    /// than spinning.
+    /// then. If Tokio has already latched `WRITE_CLOSED` (`EPOLLHUP` /
+    /// `EPOLLERR`), returns `BrokenPipe` **before** calling `write(2)` so an
+    /// undelivered reply from a departed virtio-serial session can neither
+    /// spin on `EAGAIN` nor leak into a newly reconnected peer.
     pub fn poll_write(&self, cx: &mut Context<'_>, data: &[u8]) -> Poll<io::Result<usize>> {
         loop {
             let mut guard = ready!(self.inner.poll_write_ready(cx))?;
-            let write_closed = guard.ready().is_write_closed();
+            if guard.ready().is_write_closed() {
+                return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+            }
             match guard
                 .try_io(|inner| nix::unistd::write(inner.get_ref(), data).map_err(io::Error::from))
             {
                 Ok(result) => return Poll::Ready(result),
-                Err(_would_block) if write_closed => {
-                    return Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)));
-                }
                 Err(_would_block) => continue,
             }
         }
@@ -267,5 +284,150 @@ mod tests {
         .expect("fresh registration wakes on new writer data")
         .unwrap();
         assert_eq!(&buf[..n], b"second\n");
+    }
+
+    #[tokio::test]
+    async fn poll_write_refuses_io_after_real_epollerr_even_when_new_reader_is_ready() {
+        use nix::errno::Errno;
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::Mode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("write-hup.fifo");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+
+        let reader1 = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer_fd = open(
+            &fifo,
+            OFlag::O_WRONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let old = OwnedAsyncFd::register(writer_fd).unwrap();
+
+        // Fill the FIFO pipe buffer until `poll_write` clears initial WRITABLE
+        // and parks on epoll; closing `reader1` then delivers a real kernel
+        // EPOLLERR, latching Mio/Tokio's sticky WRITE_CLOSED bit on `old`.
+        let chunk = [b'a'; 4096];
+        loop {
+            let res = tokio::time::timeout(
+                Duration::from_millis(20),
+                poll_fn(|cx| old.poll_write(cx, &chunk)),
+            )
+            .await;
+            if res.is_err() {
+                break;
+            }
+            res.unwrap().unwrap();
+        }
+
+        drop(reader1);
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| old.poll_write(cx, b"x")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+
+        // Reconnect a ready reader2 (draining any old buffered bytes so the
+        // FIFO is writable again): `old.poll_write` MUST refuse to call
+        // write(2) because WRITE_CLOSED is latched, leaking ZERO bytes to r2.
+        let reader2 = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let mut drain = [0u8; 4096];
+        while nix::unistd::read(&reader2, &mut drain).is_ok_and(|n| n > 0) {}
+
+        let refused = tokio::time::timeout(
+            Duration::from_secs(5),
+            poll_fn(|cx| old.poll_write(cx, b"stale-reply\n")),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::BrokenPipe,
+            "latched WRITE_CLOSED must refuse write before calling write(2)"
+        );
+        let mut got = [0u8; 32];
+        assert_eq!(
+            nix::unistd::read(&reader2, &mut got),
+            Err(Errno::EAGAIN),
+            "no stale reply bytes may leak to the new reader"
+        );
+
+        // Refreshing the registration via `into_fd` + `register` allows the new
+        // session to write normally.
+        let fresh = OwnedAsyncFd::register(old.into_fd()).unwrap();
+        let n = poll_fn(|cx| fresh.poll_write(cx, b"fresh-reply\n"))
+            .await
+            .unwrap();
+        assert_eq!(n, b"fresh-reply\n".len());
+        let n = nix::unistd::read(&reader2, &mut got).unwrap();
+        assert_eq!(&got[..n], b"fresh-reply\n");
+    }
+
+    #[tokio::test]
+    async fn poll_read_checked_refuses_read_on_latched_read_closed_when_stop_on_hangup_holds() {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::Mode;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("read-hup.fifo");
+        nix::unistd::mkfifo(&fifo, Mode::S_IRWXU).unwrap();
+
+        let reader = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        let old = OwnedAsyncFd::register(reader).unwrap();
+
+        let mut buf = [0u8; 32];
+        let parked = tokio::time::timeout(
+            Duration::from_millis(20),
+            poll_fn(|cx| old.poll_read(cx, &mut buf)),
+        )
+        .await;
+        assert!(parked.is_err());
+
+        drop(writer1);
+        assert_eq!(
+            poll_fn(|cx| old.poll_read(cx, &mut buf)).await.unwrap(),
+            0,
+            "EPOLLHUP latches READ_CLOSED"
+        );
+
+        // Writer 2 reconnects and ALREADY sends its first request before the
+        // old registration polls again: `poll_read_checked(..., || true)` must
+        // return Ok(0) WITHOUT consuming writer2's request!
+        let writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        nix::unistd::write(&writer2, b"new-request\n").unwrap();
+
+        let n = poll_fn(|cx| old.poll_read_checked(cx, &mut buf, || true))
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 0,
+            "latched READ_CLOSED must return EOF before calling read(2)"
+        );
+
+        // Fresh registration receives writer2's complete first request intact.
+        let fresh = OwnedAsyncFd::register(old.into_fd()).unwrap();
+        let n = poll_fn(|cx| fresh.poll_read(cx, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"new-request\n");
     }
 }

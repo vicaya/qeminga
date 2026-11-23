@@ -28,6 +28,8 @@
 #       [--image-cache DIR]
 #   libvirt-kvm-smoke.sh result --out DIR --arch ARCH --source-sha SHA
 #       --binary-sha256 HEX --accelerator ACCEL
+#   libvirt-kvm-smoke.sh ensure-result --out DIR --arch ARCH --source-sha SHA
+#       [--expect-sha256 HEX]
 #   libvirt-kvm-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
 #       [--out DIR]
 #
@@ -295,7 +297,10 @@ cmd_cleanup() {
 
 write_result() {
     local out="$1" arch="$2" sha="$3" digest="$4" accel="$5"
-    local tests='{}' overall=pass t status
+    local tests='{}' overall=pass t status machine image image_sha
+    machine="$(machine_of "$arch")" || return 1
+    image="$(image_file_of "$arch")" || return 1
+    image_sha="$(image_sha_of "$arch")" || return 1
     for t in $MANDATORY_TESTS; do
         if [ -f "$out/tests/$t" ]; then
             case "$(tr -d '[:space:]' <"$out/tests/$t")" in
@@ -306,17 +311,17 @@ write_result() {
             status=not_run
         fi
         [ "$status" = pass ] || overall=fail
-        tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")"
+        tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")" || return 1
     done
     [ "$accel" = kvm ] || overall=fail
     local tmp="$out/.result.json.tmp.$$"
-    rm -f "$tmp"
+    rm -f "$tmp" || return 1
     if ! jq -n \
         --arg suite "$SUITE" --arg repo "$SOURCE_REPOSITORY" --arg sha "$sha" \
         --arg arch "$arch" --arg digest "$digest" --arg accel "$accel" \
-        --arg machine "$(machine_of "$arch")" \
-        --arg image "$(image_file_of "$arch")" --arg image_release "$IMAGE_RELEASE" \
-        --arg image_sha "$(image_sha_of "$arch")" \
+        --arg machine "$machine" \
+        --arg image "$image" --arg image_release "$IMAGE_RELEASE" \
+        --arg image_sha "$image_sha" \
         --argjson tests "$tests" --arg result "$overall" \
         '{schema: 1, suite: $suite, source_repository: $repo, source_sha: $sha,
           architecture: $arch, candidate_binary_sha256: $digest,
@@ -326,8 +331,11 @@ write_result() {
         rm -f "$tmp"
         return 1
     fi
-    mv -f "$tmp" "$out/result.json"
-    cat "$out/result.json"
+    if ! mv -f -T "$tmp" "$out/result.json"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    cat "$out/result.json" || return 1
     [ "$overall" = pass ]
 }
 
@@ -338,7 +346,77 @@ cmd_result() {
     digest="$(need binary_sha256)"; accel="$(need accelerator)"
     check_arch "$arch"; check_sha "$sha"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "bad digest '$digest'"
-    write_result "$out" "$arch" "$sha" "$digest" "$accel"
+    write_result "$out" "$arch" "$sha" "$digest" "$accel" || return 1
+}
+
+# Validates that `$file` is a complete `libvirt-kvm-smoke-v1` record bound to
+# this run's architecture and commit SHA. A `"pass"` record additionally must
+# prove the expected candidate digest, KVM acceleration, and all mandatory
+# checks passing.
+valid_result_json() {
+    local file="$1" arch="$2" sha="$3" expect="$4"
+    [ -f "$file" ] && [ -s "$file" ] || return 1
+    local machine image image_sha
+    machine="$(machine_of "$arch")" || return 1
+    image="$(image_file_of "$arch")" || return 1
+    image_sha="$(image_sha_of "$arch")" || return 1
+    jq -e \
+        --arg suite "$SUITE" \
+        --arg repo "$SOURCE_REPOSITORY" \
+        --arg sha "$sha" \
+        --arg arch "$arch" \
+        --arg expect "$expect" \
+        --arg machine "$machine" \
+        --arg image "$image" \
+        --arg image_release "$IMAGE_RELEASE" \
+        --arg image_sha "$image_sha" \
+        --arg mandatory "$MANDATORY_TESTS" \
+        'type == "object"
+         and .schema == 1
+         and .suite == $suite
+         and .source_repository == $repo
+         and .source_sha == $sha
+         and .architecture == $arch
+         and (.candidate_binary_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
+         and (.virtualization | type == "object"
+              and .hypervisor == "qemu"
+              and .machine == $machine
+              and (.accelerator | type == "string" and length > 0))
+         and (.guest | type == "object"
+              and .image == $image
+              and .image_release == $image_release
+              and .image_sha256 == $image_sha)
+         and (.tests | type == "object")
+         and ((.tests) as $t | ($mandatory | split(" ")) as $req |
+              ($req | all(. as $k | ($t[$k] == "pass" or $t[$k] == "fail" or $t[$k] == "not_run")))
+              and (
+                (.result == "fail")
+                or (
+                  .result == "pass"
+                  and ($expect | test("^[0-9a-f]{64}$"))
+                  and .candidate_binary_sha256 == $expect
+                  and .virtualization.accelerator == "kvm"
+                  and ($req | all(. as $k | $t[$k] == "pass"))
+                )
+              ))' "$file" >/dev/null 2>&1
+}
+
+cmd_ensure_result() {
+    parse_opts "$@"
+    local out arch sha expect
+    out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
+    expect="${opt_expect_sha256:-}"
+    check_arch "$arch"; check_sha "$sha"
+    if [ -n "$expect" ]; then
+        [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
+    fi
+    if valid_result_json "$out/result.json" "$arch" "$sha" "$expect"; then
+        return 0
+    fi
+    mkdir -p "$out"
+    rm -rf -- "$out/tests"
+    write_result "$out" "$arch" "$sha" "$NO_DIGEST" unknown || true
+    valid_result_json "$out/result.json" "$arch" "$sha" "$expect"
 }
 
 # ---- the lane -------------------------------------------------------------
@@ -563,6 +641,7 @@ case "$sub" in
     fetch-image) cmd_fetch_image "$@" ;;
     run) cmd_run "$@" ;;
     result) cmd_result "$@" ;;
+    ensure-result) cmd_ensure_result "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
     -h | --help) usage ;;
     *) die "unknown subcommand '$sub'" ;;

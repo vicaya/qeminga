@@ -120,7 +120,7 @@ jobs:
     env:
       ARCH: x86_64
       QEMINGA_E2E_CONNECT: qemu:///session
-      OUT: ${{ github.workspace }}/libvirt-kvm-out
+      OUT: ${{ runner.temp }}/libvirt-kvm-hosted-${{ github.run_id }}-${{ github.run_attempt }}
       IMAGE_CACHE: ${{ github.workspace }}/libvirt-kvm-image-cache
     steps:
       - uses: actions/checkout@v4
@@ -184,25 +184,15 @@ jobs:
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
       # If an early step (such as the /dev/kvm check or package installation)
       # failed before `libvirt-kvm-smoke.sh run` installed its EXIT trap — or an
-      # interrupted write left an empty or truncated file — write a structured
-      # `libvirt-kvm-smoke-v1` failure record so the summary and evidence
-      # artifact always carry valid JSON identifying the failed run.
+      # interrupted write left a missing, corrupt, or foreign file — ensure a
+      # valid run-bound `libvirt-kvm-smoke-v1` record exists so the summary and
+      # evidence artifact always carry valid JSON identifying this run.
       - name: Record structured failure if run did not produce result.json
         if: always()
         run: |
-          valid_result() {
-            [ -s "$OUT/result.json" ] && jq -e \
-              'type == "object" and .suite == "libvirt-kvm-smoke-v1" and (.result == "pass" or .result == "fail")' \
-              "$OUT/result.json" >/dev/null 2>&1
-          }
-          if ! valid_result; then
-            mkdir -p "$OUT"
-            scripts/ci/libvirt-kvm-smoke.sh result --out "$OUT" \
-              --arch "$ARCH" --source-sha "$GITHUB_SHA" \
-              --binary-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
-              --accelerator unknown || true
-            valid_result
-          fi
+          scripts/ci/libvirt-kvm-smoke.sh ensure-result --out "$OUT" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
       - name: Result summary
         if: always()
         run: |

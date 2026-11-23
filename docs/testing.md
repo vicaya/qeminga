@@ -220,7 +220,7 @@ the host with `render-unit` and `render-hooks`.
 2. **Unprivileged `qemu:///session` isolation:** installs only minimal
    session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
    `libvirt-clients`, `qemu-system-x86` or `qemu-system-arm` +
-   `qemu-efi-aarch64`, `qemu-utils`, `genisoimage`, `jq`, `curl`,
+   `qemu-efi-aarch64`, `qemu-utils`, `genisoimage`, `git`, `jq`, `curl`,
    `python3`); no `libvirt-daemon-system`, no host bridge, no `docker`, and
    no access to the donor's own `qemu:///system` VMs.
 3. **Kernel-enforced systemd sandbox:** `NoNewPrivileges=yes`, empty

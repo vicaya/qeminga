@@ -1337,8 +1337,17 @@ cmd_preflight() {
         fail=1
     fi
 
+    if command -v libvirtd >/dev/null 2>&1; then
+        echo "  ok: tool libvirtd"
+    elif command -v virtqemud >/dev/null 2>&1; then
+        echo "  ok: tool virtqemud"
+    else
+        echo "  FAIL: missing tool 'libvirtd' (or 'virtqemud') (install will install packages on Ubuntu/Debian/Fedora)"
+        fail=1
+    fi
+
     local tool
-    for tool in virsh libvirtd "qemu-system-$arch" qemu-img genisoimage jq curl sha256sum tar python3; do
+    for tool in virsh "qemu-system-$arch" qemu-img genisoimage git jq curl sha256sum tar python3; do
         if command -v "$tool" >/dev/null 2>&1; then
             echo "  ok: tool $tool"
         else
@@ -1418,7 +1427,7 @@ install_packages() {
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             libvirt-daemon libvirt-daemon-driver-qemu libvirt-clients \
-            qemu-utils genisoimage jq curl ca-certificates python3 "${arch_pkgs[@]}"
+            qemu-utils genisoimage git jq curl ca-certificates python3 "${arch_pkgs[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         local arch_pkgs=()
         case "$arch" in
@@ -1427,9 +1436,9 @@ install_packages() {
         esac
         dnf install -y -q \
             libvirt-daemon-driver-qemu libvirt-client \
-            qemu-img genisoimage jq curl ca-certificates python3 "${arch_pkgs[@]}"
+            qemu-img genisoimage git jq curl ca-certificates python3 "${arch_pkgs[@]}"
     else
-        die "neither apt-get nor dnf found; install libvirt-daemon, qemu-system-${arch}, qemu-img, genisoimage, jq, curl, python3 manually and rerun with --skip-packages"
+        die "neither apt-get nor dnf found; install libvirt-daemon, qemu-system-${arch}, qemu-img, genisoimage, git, jq, curl, python3 manually and rerun with --skip-packages"
     fi
 }
 

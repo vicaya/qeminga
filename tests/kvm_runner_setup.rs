@@ -1037,6 +1037,7 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
             "libvirtd",
             "qemu-img",
             "genisoimage",
+            "git",
             "jq",
             "curl",
             "sha256sum",
@@ -2989,4 +2990,123 @@ exit 1
         vm_disk4.exists() && cfg4.join("install.env").exists(),
         "VM disk and install.env must remain preserved on partial uninstall"
     );
+}
+
+#[test]
+fn preflight_and_install_packages_require_git_and_support_modular_virtqemud() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // 1. Controlled PATH containing all basic utilities and virtualization tools
+    //    EXCEPT git: preflight MUST fail reporting missing 'git'.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    for util in ["awk", "df", "dirname", "grep", "sed", "tr", "cut", "head"] {
+        let out = Command::new("which").arg(util).output().unwrap();
+        assert!(out.status.success(), "host lacks {util}");
+        let real = String::from_utf8(out.stdout).unwrap();
+        std::os::unix::fs::symlink(real.trim(), bin.join(util)).unwrap();
+    }
+    write_exec(
+        &bin.join("uname"),
+        "#!/bin/sh\nif [ \"$1\" = -m ]; then echo x86_64; else echo Linux; fi\n",
+    );
+    write_exec(&bin.join("virsh"), FAKE_VIRSH);
+    for tool in [
+        "virtqemud",
+        "qemu-system-x86_64",
+        "qemu-img",
+        "genisoimage",
+        "jq",
+        "curl",
+        "sha256sum",
+        "tar",
+        "systemctl",
+        "python3",
+    ] {
+        write_exec(&bin.join(tool), "#!/bin/sh\nexit 0\n");
+    }
+
+    let resolv = dir.path().join("resolv.conf");
+    std::fs::write(&resolv, "nameserver 127.0.0.53\n").unwrap();
+    let cgroup_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cgroup_ctrls, "cpu memory pids\n").unwrap();
+    let log = dir.path().join("virsh.log");
+
+    let run_preflight_isolated = || {
+        Command::new("/bin/bash")
+            .arg(script())
+            .args(["preflight", "--state-dir", dir.path().to_str().unwrap()])
+            .env("PATH", &bin)
+            .env("FAKE_LOG", &log)
+            .env("QEMINGA_KVM_DEVICE", "/dev/null")
+            .env("QEMINGA_RESOLV_CONF", &resolv)
+            .env("QEMINGA_CGROUP_CONTROLLERS", &cgroup_ctrls)
+            .env("QEMINGA_MIN_DISK_GIB", "0")
+            .env("QEMINGA_MIN_RAM_MIB", "0")
+            .output()
+            .unwrap()
+    };
+
+    let no_git = run_preflight_isolated();
+    assert!(
+        !no_git.status.success(),
+        "preflight must fail when git is missing: {}",
+        text(&no_git)
+    );
+    assert!(
+        text(&no_git).contains("missing tool 'git'"),
+        "preflight output must name missing git: {}",
+        text(&no_git)
+    );
+
+    // Adding git makes preflight pass (also proving modular virtqemud is accepted
+    // when monolithic libvirtd is absent, as on Fedora).
+    write_exec(&bin.join("git"), "#!/bin/sh\nexit 0\n");
+    let with_git = run_preflight_isolated();
+    assert!(
+        with_git.status.success(),
+        "preflight with git and virtqemud must succeed: {}",
+        text(&with_git)
+    );
+
+    // 2. install_packages includes git in both apt-get and dnf branches for both arches.
+    for (pm, arch) in [
+        ("apt-get", "x86_64"),
+        ("apt-get", "aarch64"),
+        ("dnf", "x86_64"),
+        ("dnf", "aarch64"),
+    ] {
+        let pm_bin = dir.path().join(format!("pm-{pm}-{arch}"));
+        std::fs::create_dir_all(&pm_bin).unwrap();
+        let pm_log = dir.path().join(format!("pm-{pm}-{arch}.log"));
+        write_exec(
+            &pm_bin.join(pm),
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_PM_LOG:?}\"\nexit 0\n",
+        );
+        let out = Command::new("/bin/bash")
+            .args([
+                "-c",
+                r#"source "$1"; install_packages "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                arch,
+            ])
+            .env("PATH", &pm_bin)
+            .env("FAKE_PM_LOG", &pm_log)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "install_packages ({pm}, {arch}) failed: {}",
+            text(&out)
+        );
+        let logged = std::fs::read_to_string(&pm_log).unwrap();
+        let has_git_token = logged
+            .lines()
+            .any(|line| line.split_whitespace().any(|tok| tok == "git"));
+        assert!(
+            has_git_token,
+            "install_packages ({pm}, {arch}) must install git package: {logged}"
+        );
+    }
 }

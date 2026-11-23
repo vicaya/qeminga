@@ -268,7 +268,7 @@ collect_diagnostics() {
         fi
         return 0
     fi
-    mkdir -p "$out"
+    sys_fs_ops prepare-session-evidence-dir "$out" 2>/dev/null || return 0
     if [ "$domain_owned" = "1" ]; then
         v dumpxml "${domain_ref:-$name}" >"$out/domain.xml" 2>/dev/null || true
         if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
@@ -299,6 +299,9 @@ cmd_cleanup() {
         if [ -n "$out" ]; then
             sys_fs_ops prepare-evidence-dir "$out" || exit 1
         fi
+    elif [ -n "$out" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+        sys_fs_ops prepare-session-evidence-dir "$out" || exit 1
     fi
     dir="$IMAGES/$name"
     if ! command -v virsh >/dev/null 2>&1; then
@@ -309,7 +312,7 @@ cmd_cleanup() {
             if [ "$CONNECT_URI" = "qemu:///system" ]; then
                 printf '%s\n' "$note" | sys_fs_ops publish-evidence-stdin "$out" "cleanup.txt"
             else
-                mkdir -p "$out" && echo "$note" >"$out/cleanup.txt"
+                printf '%s\n' "$note" | sys_fs_ops publish-session-evidence-stdin "$out" "cleanup.txt"
             fi
         fi
         return 0
@@ -415,16 +418,30 @@ write_result() {
     machine="$(machine_of "$arch")" || return 1
     image="$(image_file_of "$arch")" || return 1
     image_sha="$(image_sha_of "$arch")" || return 1
+    local read_op
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        read_op="read-evidence-stdout"
+    else
+        read_op="read-session-evidence-stdout"
+    fi
     for t in $MANDATORY_TESTS; do
         if [ "$all_not_run" = 1 ]; then
             status=not_run
-        elif [ ! -L "$out/tests/$t" ] && [ -f "$out/tests/$t" ]; then
-            case "$(tr -d '[:space:]' <"$out/tests/$t")" in
-                pass) status=pass ;;
-                *) status=fail ;;
-            esac
         else
-            status=not_run
+            local marker_raw="" marker_rc=0
+            if marker_raw="$(sys_fs_ops "$read_op" --quiet-missing "$out" "$t" "tests")"; then
+                case "$(printf '%s' "$marker_raw" | tr -d '[:space:]')" in
+                    pass) status=pass ;;
+                    *) status=fail ;;
+                esac
+            else
+                marker_rc=$?
+                case "$marker_rc" in
+                    2) status=not_run ;;
+                    4) status=fail ;;
+                    *) return 1 ;;
+                esac
+            fi
         fi
         [ "$status" = pass ] || overall=fail
         tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")" || return 1
@@ -446,6 +463,7 @@ write_result() {
         printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json" || return 1
         printf '%s\n' "$result_json" || return 1
     else
+        sys_fs_ops verify-session-evidence-dir "$out" || return 1
         local tmp
         tmp="$(mktemp -- "$out/.result.json.tmp.XXXXXX")" || return 1
         if ! chmod 0600 -- "$tmp"; then
@@ -472,25 +490,31 @@ cmd_result() {
     digest="$(need binary_sha256)"; accel="$(need accelerator)"
     check_arch "$arch"; check_sha "$sha"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "bad digest '$digest'"
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        command -v python3 >/dev/null || die "missing tool: python3"
-    fi
+    command -v python3 >/dev/null || die "missing tool: python3"
     write_result "$out" "$arch" "$sha" "$digest" "$accel" || return 1
 }
 
 # Validates that `$out/result.json` contains exactly one JSON object forming a
 # complete `libvirt-kvm-smoke-v1` record bound to this run's architecture and
-# commit SHA. In `qemu:///system` mode, reads through `sys_fs_ops` after
-# verifying the evidence directory and a regular single-link file. A `"pass"`
-# record additionally must prove the expected candidate digest, KVM
-# acceleration, and all mandatory checks passing. When `$require_pass` is `1`,
-# only a validated `"pass"` record is accepted.
+# commit SHA. Reads through `sys_fs_ops` after verifying the evidence directory
+# (trusted in `qemu:///system`, caller-controlled in `qemu:///session`) and a
+# regular single-link file. A `"pass"` record additionally must prove the
+# expected candidate digest, KVM acceleration, and all mandatory checks
+# passing. When `$require_pass` is `1`, only a validated `"pass"` record is
+# accepted.
+#
+# Exit status:
+#   0: valid run-bound record (and passing when `$require_pass` is `1`)
+#   1: confirmed missing, malformed/mismatched JSON, or unsafe file inside a
+#      verified directory (replaceable by `ensure-result`)
+#   2: untrusted output directory or indeterminate operational read/validator
+#      failure (`ensure-result` must preserve any existing bytes and fail)
 valid_result_json() {
     local out="$1" arch="$2" sha="$3" expect="$4" require_pass="${5:-0}"
     local machine image image_sha
-    machine="$(machine_of "$arch")" || return 1
-    image="$(image_file_of "$arch")" || return 1
-    image_sha="$(image_sha_of "$arch")" || return 1
+    machine="$(machine_of "$arch")" || return 2
+    image="$(image_file_of "$arch")" || return 2
+    image_sha="$(image_sha_of "$arch")" || return 2
     local -a jq_args=(
         -s -e
         --arg suite "$SUITE"
@@ -535,19 +559,39 @@ valid_result_json() {
                 ))
          ))'
     )
+    local read_op
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        if [ "$require_pass" = 1 ]; then
-            sys_fs_ops read-evidence-stdout "$out" "result.json" \
-                | jq "${jq_args[@]}" >/dev/null 2>&1
-        else
-            sys_fs_ops read-evidence-stdout "$out" "result.json" 2>/dev/null \
-                | jq "${jq_args[@]}" >/dev/null 2>&1
-        fi
+        read_op="read-evidence-stdout"
     else
-        local file="$out/result.json"
-        [ ! -L "$file" ] && [ -f "$file" ] && [ -s "$file" ] || return 1
-        jq "${jq_args[@]}" "$file" >/dev/null 2>&1
+        read_op="read-session-evidence-stdout"
     fi
+    local -a read_cmd=("$read_op")
+    if [ "$require_pass" != 1 ]; then
+        read_cmd+=(--quiet-missing)
+    fi
+    read_cmd+=("$out" "result.json")
+    local -a pstatus=()
+    if sys_fs_ops "${read_cmd[@]}" | jq "${jq_args[@]}" >/dev/null 2>&1; then
+        return 0
+    else
+        pstatus=("${PIPESTATUS[@]}")
+    fi
+    local read_rc="${pstatus[0]:-1}" jq_rc="${pstatus[1]:-1}"
+    case "$read_rc" in
+        0)
+            case "$jq_rc" in
+                0) return 0 ;;
+                1 | 5) return 1 ;;
+                *) return 2 ;;
+            esac
+            ;;
+        2 | 4)
+            return 1
+            ;;
+        *)
+            return 2
+            ;;
+    esac
 }
 
 cmd_ensure_result() {
@@ -559,16 +603,18 @@ cmd_ensure_result() {
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     fi
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        command -v python3 >/dev/null || die "missing tool: python3"
-    fi
-    if valid_result_json "$out" "$arch" "$sha" "$expect" 0; then
+    command -v python3 >/dev/null || die "missing tool: python3"
+    local check_rc=0
+    valid_result_json "$out" "$arch" "$sha" "$expect" 0 || check_rc=$?
+    if [ "$check_rc" -eq 0 ]; then
         return 0
+    elif [ "$check_rc" -ne 1 ]; then
+        die "cannot verify existing result.json at $out/result.json; preserving any existing evidence"
     fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         sys_fs_ops prepare-evidence-dir "$out" || return 1
     else
-        mkdir -p "$out"
+        sys_fs_ops prepare-session-evidence-dir "$out" || return 1
     fi
     write_result "$out" "$arch" "$sha" "$NO_DIGEST" unknown 1 || true
     valid_result_json "$out" "$arch" "$sha" "$expect" 0
@@ -581,9 +627,7 @@ cmd_verify_pass() {
     expect="${opt_expect_sha256:-}"
     check_arch "$arch"; check_sha "$sha"
     [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        command -v python3 >/dev/null || die "missing tool: python3"
-    fi
+    command -v python3 >/dev/null || die "missing tool: python3"
     valid_result_json "$out" "$arch" "$sha" "$expect" 1 \
         || die "no validated passing result.json at $out/result.json for $arch @ $sha (candidate $expect)"
 }
@@ -594,8 +638,7 @@ mark() {
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         printf '%s\n' "$2" | sys_fs_ops publish-evidence-stdin "$OUT" "$1" "tests"
     else
-        mkdir -p "$OUT/tests"
-        echo "$2" >"$OUT/tests/$1"
+        printf '%s\n' "$2" | sys_fs_ops publish-session-evidence-stdin "$OUT" "$1" "tests"
     fi
     echo "-- $1: $2"
 }
@@ -894,13 +937,12 @@ cmd_run() {
     check_number QEMINGA_E2E_BOOT_TIMEOUT_SECS "$boot_timeout"
     check_number QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS "$shutdown_timeout"
 
+    command -v python3 >/dev/null || die "missing tool: python3"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         [ "$(id -u)" -eq 0 ] || die "qemu:///system requires root"
-        command -v python3 >/dev/null || die "missing tool: python3"
         sys_fs_ops prepare-evidence-dir "$OUT" init-run || exit 1
     else
-        mkdir -p "$OUT/tests"
-        rm -f "$OUT"/tests/* "$OUT/result.json"
+        sys_fs_ops prepare-session-evidence-dir "$OUT" init-run || exit 1
     fi
     RUN_ARCH="$arch" RUN_SHA="$sha" RUN_DIGEST="$NO_DIGEST" RUN_ACCEL=unknown
     RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"

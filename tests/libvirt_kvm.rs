@@ -4943,17 +4943,23 @@ exit "$rc""#,
         cmd.output().unwrap()
     };
 
+    let make_passing_out = |base: &Path| {
+        let out = base.join("out");
+        create_dir_mode(&out, 0o700);
+        create_dir_mode(&out.join("tests"), 0o700);
+        for t in MANDATORY {
+            write_file_mode(&out.join("tests").join(t), 0o600, b"pass\n");
+        }
+        out
+    };
+
     // Case 1: all four mandatory checks passed, but `out/result.json` is an
     // existing directory. `mv -f -T` must fail, clean up its temporary file,
     // leave the directory empty, and return nonzero even under `|| rc=1`.
     let dir1 = private_tempdir();
-    let out1 = dir1.path().join("out");
-    std::fs::create_dir_all(out1.join("tests")).unwrap();
-    for t in MANDATORY {
-        std::fs::write(out1.join("tests").join(t), "pass\n").unwrap();
-    }
+    let out1 = make_passing_out(dir1.path());
     let blocking_dir = out1.join("result.json");
-    std::fs::create_dir(&blocking_dir).unwrap();
+    create_dir_mode(&blocking_dir, 0o700);
     let res1 = run_trap_context(&out1, None);
     assert!(
         !res1.status.success(),
@@ -4982,11 +4988,7 @@ exit "$rc""#,
         0o700,
         "executable test-double root dir2 must be created 0700"
     );
-    let out2 = dir2.path().join("out");
-    std::fs::create_dir_all(out2.join("tests")).unwrap();
-    for t in MANDATORY {
-        std::fs::write(out2.join("tests").join(t), "pass\n").unwrap();
-    }
+    let out2 = make_passing_out(dir2.path());
     let fake_bin = dir2.path().join("bin");
     create_dir_mode(&fake_bin, 0o700);
     assert_eq!(
@@ -5025,11 +5027,7 @@ exit "$rc""#,
         0o700,
         "executable test-double root dir3 must be created 0700"
     );
-    let out3 = dir3.path().join("out");
-    std::fs::create_dir_all(out3.join("tests")).unwrap();
-    for t in MANDATORY {
-        std::fs::write(out3.join("tests").join(t), "pass\n").unwrap();
-    }
+    let out3 = make_passing_out(dir3.path());
     let fake_cat_bin = dir3.path().join("bin");
     create_dir_mode(&fake_cat_bin, 0o700);
     assert_eq!(
@@ -5055,11 +5053,7 @@ exit "$rc""#,
         0o700,
         "executable test-double root dir4 must be created 0700"
     );
-    let out4 = dir4.path().join("out");
-    std::fs::create_dir_all(out4.join("tests")).unwrap();
-    for t in MANDATORY {
-        std::fs::write(out4.join("tests").join(t), "pass\n").unwrap();
-    }
+    let out4 = make_passing_out(dir4.path());
     let fake_chmod_bin = dir4.path().join("bin");
     create_dir_mode(&fake_chmod_bin, 0o700);
     write_exec(
@@ -5093,11 +5087,7 @@ exit "$rc""#,
         0o700,
         "executable test-double root dir5 must be created 0700"
     );
-    let out5 = dir5.path().join("out");
-    std::fs::create_dir_all(out5.join("tests")).unwrap();
-    for t in MANDATORY {
-        std::fs::write(out5.join("tests").join(t), "pass\n").unwrap();
-    }
+    let out5 = make_passing_out(dir5.path());
     let fake_mktemp_bin = dir5.path().join("bin");
     create_dir_mode(&fake_mktemp_bin, 0o700);
     write_exec(
@@ -5668,7 +5658,7 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
     create_dir_mode(&minimal_bin, 0o755);
     for tool in [
         "dirname", "basename", "uname", "id", "mkdir", "rm", "cat", "tr", "jq", "printf", "cut",
-        "cp", "mv", "mktemp", "chmod",
+        "cp", "mv", "mktemp", "chmod", "python3",
     ] {
         if let Some(real) = ["/usr/bin", "/bin"]
             .iter()
@@ -5733,13 +5723,23 @@ fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() 
         write_file_mode(&out_dir.join("tests").join(t), 0o600, b"pass\n");
     }
     let digest = "a".repeat(64);
+    let as_root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+
+    let run_umask_000 = |args: &[&str], envs: &[(&str, &str)]| -> Output {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
+            .arg(script())
+            .args(args);
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    };
 
     // 1. Ordinary session `result` under `umask 000` must publish `result.json`
     //    with explicit `0600` permissions (never `0666`) and leave no temp files.
-    let res = Command::new("/bin/sh")
-        .args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
-        .arg(script())
-        .args([
+    let res = run_umask_000(
+        &[
             "result",
             "--out",
             out_dir.to_str().unwrap(),
@@ -5751,9 +5751,9 @@ fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() 
             &digest,
             "--accelerator",
             "kvm",
-        ])
-        .output()
-        .unwrap();
+        ],
+        &[],
+    );
     assert!(res.status.success(), "{}", text(&res));
     let result_path = out_dir.join("result.json");
     assert_eq!(
@@ -5795,10 +5795,8 @@ fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() 
         text(&sym_verify)
     );
 
-    let sym_ensure = Command::new("/bin/sh")
-        .args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
-        .arg(script())
-        .args([
+    let sym_ensure = run_umask_000(
+        &[
             "ensure-result",
             "--out",
             sym_out.to_str().unwrap(),
@@ -5808,9 +5806,9 @@ fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() 
             SHA,
             "--expect-sha256",
             &digest,
-        ])
-        .output()
-        .unwrap();
+        ],
+        &[],
+    );
     assert!(sym_ensure.status.success(), "{}", text(&sym_ensure));
     let sym_lmeta = std::fs::symlink_metadata(sym_out.join("result.json")).unwrap();
     assert!(
@@ -5830,6 +5828,215 @@ fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() 
     let replaced: serde_json::Value =
         serde_json::from_slice(&std::fs::read(sym_out.join("result.json")).unwrap()).unwrap();
     assert_eq!(replaced["result"], "fail");
+
+    // 3. Missing `--out` under `ensure-result` with `umask 000`: every newly created
+    //    output directory component must be private `0700` (never `0777`) and
+    //    `result.json` must be `0600`.
+    let missing_parent = dir.path().join("new-session-parent");
+    let missing_out = missing_parent.join("nested-out");
+    let missing_ensure = run_umask_000(
+        &[
+            "ensure-result",
+            "--out",
+            missing_out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &[],
+    );
+    assert!(
+        missing_ensure.status.success(),
+        "ensure-result with missing --out under umask 000 must succeed: {}",
+        text(&missing_ensure)
+    );
+    for created_dir in [&missing_parent, &missing_out] {
+        assert_eq!(
+            std::fs::metadata(created_dir).unwrap().mode() & 0o777,
+            0o700,
+            "session ensure-result must create {} as private 0700 even under umask 000",
+            created_dir.display()
+        );
+    }
+    assert_eq!(
+        std::fs::metadata(missing_out.join("result.json"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600,
+        "newly created session result.json must be mode 0600 under umask 000"
+    );
+
+    // 4. Existing shared-writable (`0777`) session destination or shared-writable
+    //    parent MUST be refused by `verify-pass`, `ensure-result`, and `result`.
+    let shared_dir = dir.path().join("shared-session-0777");
+    create_dir_mode(&shared_dir, 0o700);
+    std::fs::set_permissions(&shared_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    write_file_mode(&shared_dir.join("result.json"), 0o600, &valid_pass_bytes);
+
+    let shared_verify = lane(&[
+        "verify-pass",
+        "--out",
+        shared_dir.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_verify.status.success(),
+        "session verify-pass must refuse shared-writable 0777 output dir: {}",
+        text(&shared_verify)
+    );
+    let shared_ensure = lane(&[
+        "ensure-result",
+        "--out",
+        shared_dir.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_ensure.status.success(),
+        "session ensure-result must refuse shared-writable 0777 output dir: {}",
+        text(&shared_ensure)
+    );
+    let shared_result = lane(&[
+        "result",
+        "--out",
+        shared_dir.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--binary-sha256",
+        &digest,
+        "--accelerator",
+        "kvm",
+    ]);
+    assert!(
+        !shared_result.status.success(),
+        "session result must refuse shared-writable 0777 output dir: {}",
+        text(&shared_result)
+    );
+    let shared_missing_child = shared_dir.join("must-not-create");
+    let shared_child_ensure = lane(&[
+        "ensure-result",
+        "--out",
+        shared_missing_child.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_child_ensure.status.success() && !shared_missing_child.exists(),
+        "session ensure-result must refuse missing dir under 0777 parent without creating it: {}",
+        text(&shared_child_ensure)
+    );
+
+    // 5. `cmd_run` under `umask 000` must initialize `$OUT` and `$OUT/tests` as `0700`
+    //    (never `0777`) and refuse an existing `0777` `$OUT` before creating `tests/`.
+    let arch = std::env::consts::ARCH;
+    if !as_root && (arch == "x86_64" || arch == "aarch64") {
+        let run_out_missing = dir.path().join("run-missing-out");
+        let missing_kvm = dir.path().join("no-kvm");
+        let run_res = run_umask_000(
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                dir.path().to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "44",
+                "--run-attempt",
+                "1",
+                "--out",
+                run_out_missing.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_KVM_DEVICE", missing_kvm.to_str().unwrap()),
+                (
+                    "QEMINGA_E2E_IMAGES",
+                    dir.path().join("imgs").to_str().unwrap(),
+                ),
+            ],
+        );
+        assert!(!run_res.status.success(), "{}", text(&run_res));
+        assert_eq!(
+            std::fs::metadata(&run_out_missing).unwrap().mode() & 0o777,
+            0o700,
+            "session run must create $OUT as 0700 under umask 000"
+        );
+        assert_eq!(
+            std::fs::metadata(run_out_missing.join("tests"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700,
+            "session run must create $OUT/tests as 0700 under umask 000"
+        );
+        assert_eq!(
+            std::fs::metadata(run_out_missing.join("result.json"))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o600,
+            "session run must publish result.json as 0600 under umask 000"
+        );
+
+        let shared_run_out = dir.path().join("shared-run-out");
+        create_dir_mode(&shared_run_out, 0o700);
+        std::fs::set_permissions(&shared_run_out, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let bad_run = run_umask_000(
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                dir.path().to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "45",
+                "--run-attempt",
+                "1",
+                "--out",
+                shared_run_out.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_KVM_DEVICE", missing_kvm.to_str().unwrap()),
+                (
+                    "QEMINGA_E2E_IMAGES",
+                    dir.path().join("imgs").to_str().unwrap(),
+                ),
+            ],
+        );
+        assert!(
+            !bad_run.status.success()
+                && !shared_run_out.join("tests").exists()
+                && !shared_run_out.join("result.json").exists(),
+            "session run must refuse existing 0777 $OUT before initializing tests/ or result.json: {}",
+            text(&bad_run)
+        );
+    }
 }
 
 #[test]
@@ -5871,6 +6078,32 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
         }
         lane_env(args, &envs, None)
     };
+    let verify_pass = |out: &Path| -> Output {
+        run_sys(&[
+            "verify-pass",
+            "--out",
+            out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ])
+    };
+    let ensure_result = |out: &Path| -> Output {
+        run_sys(&[
+            "ensure-result",
+            "--out",
+            out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ])
+    };
 
     // Build a genuine passing `result.json` using the script's own `result` subcommand
     // inside a private verified directory.
@@ -5898,33 +6131,13 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
 
     // 1. Positive control: private verified directory + regular single-link `result.json`
     //    is accepted by BOTH `verify-pass` and `ensure-result` (preserving exact bytes).
-    let ok_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        priv_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let ok_verify = verify_pass(&priv_out);
     assert!(
         ok_verify.status.success(),
         "private valid result must pass verify-pass: {}",
         text(&ok_verify)
     );
-    let ok_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        priv_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let ok_ensure = ensure_result(&priv_out);
     assert!(
         ok_ensure.status.success(),
         "private valid result must pass ensure-result: {}",
@@ -5945,33 +6158,13 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
     create_dir_mode(&shared_out, 0o755);
     write_file_mode(&shared_out.join("result.json"), 0o644, &valid_pass_bytes);
 
-    let shared_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        shared_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let shared_verify = verify_pass(&shared_out);
     assert!(
         !shared_verify.status.success(),
         "system verify-pass must reject valid result under shared-writable parent: {}",
         text(&shared_verify)
     );
-    let shared_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        shared_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let shared_ensure = ensure_result(&shared_out);
     assert!(
         !shared_ensure.status.success(),
         "system ensure-result must fail closed on valid result under shared-writable parent: {}",
@@ -5979,19 +6172,9 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
     );
 
     // 3. Missing output directory under a shared-writable parent: `ensure-result`
-    //    MUST fail closed via `prepare-evidence-dir` BEFORE creating the directory.
+    //    MUST fail closed BEFORE creating the directory.
     let shared_missing = shared_parent.join("missing-out");
-    let shared_missing_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        shared_missing.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let shared_missing_ensure = ensure_result(&shared_missing);
     assert!(
         !shared_missing_ensure.status.success(),
         "system ensure-result must reject missing out dir under shared-writable parent: {}",
@@ -6004,8 +6187,7 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
 
     // 4. Symlinked `result.json` inside a private verified directory pointing to an
     //    unrelated passing record: `verify-pass` rejects it, and `ensure-result`
-    //    rejects it and atomically replaces it with a `fail` record without modifying
-    //    the symlink target.
+    //    atomically replaces it with a `fail` record without modifying the symlink target.
     let victim_dir = sys_root.join("victims");
     create_dir_mode(&victim_dir, 0o700);
     let sym_victim = victim_dir.join("symlink-pass.json");
@@ -6015,33 +6197,13 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
     create_dir_mode(&sym_out, 0o755);
     std::os::unix::fs::symlink(&sym_victim, sym_out.join("result.json")).unwrap();
 
-    let sym_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        sym_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let sym_verify = verify_pass(&sym_out);
     assert!(
         !sym_verify.status.success(),
         "system verify-pass must reject symlinked result.json: {}",
         text(&sym_verify)
     );
-    let sym_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        sym_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let sym_ensure = ensure_result(&sym_out);
     assert!(
         sym_ensure.status.success(),
         "system ensure-result must replace symlinked result.json with a fail record: {}",
@@ -6064,18 +6226,7 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
         serde_json::from_slice(&std::fs::read(sym_out.join("result.json")).unwrap()).unwrap();
     assert_eq!(sym_doc["result"], "fail");
     assert_eq!(sym_doc["candidate_binary_sha256"], sentinel);
-    let sym_post_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        sym_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
-    assert!(!sym_post_verify.status.success());
+    assert!(!verify_pass(&sym_out).status.success());
 
     // 5. Hard-linked `result.json` (`nlink == 2`) inside a private verified directory:
     //    `verify-pass` rejects it, and `ensure-result` atomically replaces it with a
@@ -6087,33 +6238,13 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
     std::fs::hard_link(&hard_victim, hard_out.join("result.json")).unwrap();
     assert_eq!(std::fs::metadata(&hard_victim).unwrap().nlink(), 2);
 
-    let hard_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        hard_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let hard_verify = verify_pass(&hard_out);
     assert!(
         !hard_verify.status.success(),
         "system verify-pass must reject hard-linked result.json (nlink == 2): {}",
         text(&hard_verify)
     );
-    let hard_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        hard_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let hard_ensure = ensure_result(&hard_out);
     assert!(
         hard_ensure.status.success(),
         "system ensure-result must replace hard-linked result.json with a fail record: {}",
@@ -6141,33 +6272,13 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
         std::fs::Permissions::from_mode(0o666),
     )
     .unwrap();
-    let writable_verify = run_sys(&[
-        "verify-pass",
-        "--out",
-        writable_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let writable_verify = verify_pass(&writable_out);
     assert!(
         !writable_verify.status.success(),
         "system verify-pass must reject world-writable result.json: {}",
         text(&writable_verify)
     );
-    let writable_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        writable_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let writable_ensure = ensure_result(&writable_out);
     assert!(
         writable_ensure.status.success(),
         "system ensure-result must replace world-writable result.json: {}",
@@ -6187,17 +6298,7 @@ fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_link
     // 7. Missing output directory under a trusted private parent: `ensure-result`
     //    creates it via `prepare-evidence-dir` and publishes a valid `fail` record.
     let new_priv_out = sys_root.join("private-new/nested-out");
-    let new_ensure = run_sys(&[
-        "ensure-result",
-        "--out",
-        new_priv_out.to_str().unwrap(),
-        "--arch",
-        "x86_64",
-        "--source-sha",
-        SHA,
-        "--expect-sha256",
-        &digest,
-    ]);
+    let new_ensure = ensure_result(&new_priv_out);
     assert!(
         new_ensure.status.success(),
         "system ensure-result must create missing trusted dir via prepare-evidence-dir: {}",
@@ -6303,4 +6404,562 @@ finally:
         !root().join("scripts/ci/__pycache__").exists(),
         "Python test invocations must pass -B and never leave scripts/ci/__pycache__ behind"
     );
+}
+
+#[test]
+fn system_mode_result_verifies_test_markers_before_certifying_pass() {
+    require_jq();
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_dir_mode(&sys_root, 0o755);
+    let as_root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+    let digest = "a".repeat(64);
+
+    let run_sys = |args: &[&str]| -> Output {
+        let mut envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", "qemu:///system")];
+        if !as_root {
+            envs.push(("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()));
+        }
+        lane_env(args, &envs, None)
+    };
+    let run_result = |out: &Path| -> Output {
+        run_sys(&[
+            "result",
+            "--out",
+            out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--binary-sha256",
+            &digest,
+            "--accelerator",
+            "kvm",
+        ])
+    };
+    let verify_pass = |out: &Path| -> Output {
+        run_sys(&[
+            "verify-pass",
+            "--out",
+            out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ])
+    };
+
+    // 1. Positive control: verified `tests/` dir and four regular single-link `0644`
+    //    `"pass\n"` markers certify a passing result accepted by `verify-pass`.
+    let clean_out = sys_root.join("clean-markers");
+    create_dir_mode(&clean_out, 0o755);
+    create_dir_mode(&clean_out.join("tests"), 0o755);
+    for t in MANDATORY {
+        write_file_mode(&clean_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    let clean_res = run_result(&clean_out);
+    assert!(clean_res.status.success(), "{}", text(&clean_res));
+    assert!(verify_pass(&clean_out).status.success());
+
+    // 2. Symlinked `tests/` directory pointing to external passing markers must NOT
+    //    certify a passing verdict.
+    let ext_tests = sys_root.join("external-tests");
+    create_dir_mode(&ext_tests, 0o755);
+    for t in MANDATORY {
+        write_file_mode(&ext_tests.join(t), 0o644, b"pass\n");
+    }
+    let sym_tests_out = sys_root.join("symlinked-tests-dir");
+    create_dir_mode(&sym_tests_out, 0o755);
+    std::os::unix::fs::symlink(&ext_tests, sym_tests_out.join("tests")).unwrap();
+    let sym_tests_res = run_result(&sym_tests_out);
+    assert!(
+        !sym_tests_res.status.success(),
+        "symlinked tests/ directory must prevent a passing verdict: {}",
+        text(&sym_tests_res)
+    );
+    let sym_tests_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sym_tests_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(sym_tests_doc["result"], "fail");
+    assert!(!verify_pass(&sym_tests_out).status.success());
+
+    // 3. Shared-writable (`0777`) `tests/` directory must prevent a passing verdict.
+    let writable_tests_out = sys_root.join("writable-tests-dir");
+    create_dir_mode(&writable_tests_out, 0o755);
+    create_dir_mode(&writable_tests_out.join("tests"), 0o700);
+    std::fs::set_permissions(
+        writable_tests_out.join("tests"),
+        std::fs::Permissions::from_mode(0o777),
+    )
+    .unwrap();
+    for t in MANDATORY {
+        write_file_mode(&writable_tests_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    let writable_tests_res = run_result(&writable_tests_out);
+    assert!(
+        !writable_tests_res.status.success(),
+        "shared-writable 0777 tests/ dir must prevent a passing verdict: {}",
+        text(&writable_tests_res)
+    );
+    assert!(!verify_pass(&writable_tests_out).status.success());
+
+    // 4. Hard-linked (`nlink == 2`) marker inside a verified `tests/` directory must
+    //    be treated as `fail` and prevent a passing verdict.
+    let hard_marker_src = sys_root.join("external-pass-marker");
+    write_file_mode(&hard_marker_src, 0o644, b"pass\n");
+    let hard_marker_out = sys_root.join("hardlinked-marker");
+    create_dir_mode(&hard_marker_out, 0o755);
+    create_dir_mode(&hard_marker_out.join("tests"), 0o755);
+    for t in &MANDATORY[..3] {
+        write_file_mode(&hard_marker_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    std::fs::hard_link(
+        &hard_marker_src,
+        hard_marker_out.join("tests").join(MANDATORY[3]),
+    )
+    .unwrap();
+    let hard_marker_res = run_result(&hard_marker_out);
+    assert!(
+        !hard_marker_res.status.success(),
+        "hard-linked marker must prevent a passing verdict: {}",
+        text(&hard_marker_res)
+    );
+    let hard_marker_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hard_marker_out.join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(hard_marker_doc["result"], "fail");
+    assert_eq!(hard_marker_doc["tests"][MANDATORY[3]], "fail");
+    assert!(!verify_pass(&hard_marker_out).status.success());
+
+    // 5. World-writable (`0666`) marker must be treated as `fail` and prevent pass.
+    let writable_marker_out = sys_root.join("writable-marker");
+    create_dir_mode(&writable_marker_out, 0o755);
+    create_dir_mode(&writable_marker_out.join("tests"), 0o755);
+    for t in MANDATORY {
+        write_file_mode(&writable_marker_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    std::fs::set_permissions(
+        writable_marker_out.join("tests").join(MANDATORY[0]),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let writable_marker_res = run_result(&writable_marker_out);
+    assert!(
+        !writable_marker_res.status.success(),
+        "world-writable marker must prevent a passing verdict: {}",
+        text(&writable_marker_res)
+    );
+    let writable_marker_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(writable_marker_out.join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(writable_marker_doc["result"], "fail");
+    assert_eq!(writable_marker_doc["tests"][MANDATORY[0]], "fail");
+    assert!(!verify_pass(&writable_marker_out).status.success());
+
+    // 6. Oversized marker (> 64 bytes) must be refused and prevent a passing verdict.
+    let oversized_out = sys_root.join("oversized-marker");
+    create_dir_mode(&oversized_out, 0o755);
+    create_dir_mode(&oversized_out.join("tests"), 0o755);
+    for t in &MANDATORY[1..] {
+        write_file_mode(&oversized_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    let mut padded = vec![b' '; 128];
+    padded.extend_from_slice(b"pass\n");
+    write_file_mode(
+        &oversized_out.join("tests").join(MANDATORY[0]),
+        0o644,
+        &padded,
+    );
+    let oversized_res = run_result(&oversized_out);
+    assert!(
+        !oversized_res.status.success(),
+        "oversized test marker must prevent a passing verdict: {}",
+        text(&oversized_res)
+    );
+    let oversized_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(oversized_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(oversized_doc["result"], "fail");
+    assert_eq!(oversized_doc["tests"][MANDATORY[0]], "fail");
+    assert!(!verify_pass(&oversized_out).status.success());
+
+    // 7. Python unit invariants for `read_evidence_bytes(..., subdir="tests")`:
+    //    allowlist, cross-mount `tests/` & marker (`EXDEV`), untrusted owner (`EACCES`),
+    //    bounded status size (`EFBIG`), and NUL-byte rejection (`EINVAL`).
+    let py = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import errno, importlib.util, os, sys
+
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+root_path = sys.argv[2]
+clean_out = sys.argv[3]
+root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
+try:
+    # Disallowed marker name rejected with EINVAL.
+    for bad in ("unknown_check", "../result.json"):
+        try:
+            mod.read_evidence_bytes(clean_out, bad, subdir="tests", root_fd=root_fd, root_path=root_path)
+            raise AssertionError(f"must reject unexpected test marker {bad}")
+        except OSError as exc:
+            assert exc.errno == errno.EINVAL, exc
+
+    # Cross-mount `tests/` directory rejected with EXDEV.
+    tdir = os.path.join(clean_out, "tests")
+    tid = (os.lstat(tdir).st_dev, os.lstat(tdir).st_ino)
+    orig_mnt_id = mod.fd_mnt_id
+    def fake_tests_mnt(fd):
+        st = os.fstat(fd)
+        mid = orig_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == tid:
+            return mid + 31
+        return mid
+    mod.fd_mnt_id = fake_tests_mnt
+    try:
+        try:
+            mod.read_evidence_bytes(clean_out, "production_install", subdir="tests", root_fd=root_fd, root_path=root_path)
+            raise AssertionError("must reject bind-mounted tests/ subdir")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.fd_mnt_id = orig_mnt_id
+
+    # Cross-mount marker file rejected with EXDEV.
+    mpath = os.path.join(tdir, "production_install")
+    mid_pair = (os.lstat(mpath).st_dev, os.lstat(mpath).st_ino)
+    def fake_marker_mnt(fd):
+        st = os.fstat(fd)
+        mid = orig_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == mid_pair:
+            return mid + 32
+        return mid
+    mod.fd_mnt_id = fake_marker_mnt
+    try:
+        try:
+            mod.read_evidence_bytes(clean_out, "production_install", subdir="tests", root_fd=root_fd, root_path=root_path)
+            raise AssertionError("must reject bind-mounted test marker")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.fd_mnt_id = orig_mnt_id
+
+    # Untrusted owner marker rejected with EACCES.
+    orig_fstat = mod.os.fstat
+    class UntrustedStat:
+        def __init__(self, st):
+            self._st = st
+            self.st_uid = 64099
+        def __getattr__(self, name):
+            return getattr(self._st, name)
+    def fake_untrusted(fd):
+        st = orig_fstat(fd)
+        if (st.st_dev, st.st_ino) == mid_pair:
+            return UntrustedStat(st)
+        return st
+    mod.os.fstat = fake_untrusted
+    try:
+        try:
+            mod.read_evidence_bytes(clean_out, "production_install", subdir="tests", root_fd=root_fd, root_path=root_path)
+            raise AssertionError("must reject untrusted-owner test marker")
+        except OSError as exc:
+            assert exc.errno == errno.EACCES, exc
+    finally:
+        mod.os.fstat = orig_fstat
+
+    # Positive control succeeds.
+    assert mod.read_evidence_bytes(clean_out, "production_install", subdir="tests", root_fd=root_fd, root_path=root_path) == b"pass\n"
+finally:
+    os.close(root_fd)
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+            clean_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "read_evidence_bytes(subdir='tests') invariants failed:\n{}",
+        text(&py)
+    );
+    assert!(!root().join("scripts/ci/__pycache__").exists());
+}
+
+#[test]
+fn ensure_result_preserves_existing_report_on_indeterminate_read_failure() {
+    require_jq();
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_dir_mode(&sys_root, 0o755);
+    let as_root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+    let digest = "a".repeat(64);
+
+    // Exercise BOTH qemu:///system and qemu:///session modes: build a valid existing
+    // failing report with 3 passing checks and 1 failed check, then inject:
+    //  - A temporary operational read failure (python3 reader exits 1) -> ensure-result
+    //    MUST return nonzero (retryable) and preserve all 4 original check statuses!
+    //  - An operational validator failure (jq exits 2) -> ensure-result MUST return
+    //    nonzero and preserve all 4 original check statuses!
+    //  - A subsequent clean retry -> ensure-result MUST succeed (0) and keep the
+    //    original 3-pass + 1-fail bytes untouched!
+    //  - Normal truncated/corrupt JSON -> ensure-result MUST still succeed and replace
+    //    with the all-not_run failure record!
+    let real_python3 = ["/usr/bin/python3", "/bin/python3"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap();
+    let real_jq = ["/usr/bin/jq", "/bin/jq"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .copied()
+        .unwrap();
+
+    let fail_read_bin = dir.path().join("fail-read-bin");
+    create_dir_mode(&fail_read_bin, 0o700);
+    write_exec(
+        &fail_read_bin.join("python3"),
+        &format!(
+            "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    read-evidence-stdout|read-session-evidence-stdout)\n      echo 'libvirt-kvm-smoke: simulated transient EIO while reading result.json' >&2\n      exit 1\n      ;;\n  esac\ndone\nexec {real_python3} \"$@\"\n"
+        ),
+    );
+
+    let fail_jq_bin = dir.path().join("fail-jq-bin");
+    create_dir_mode(&fail_jq_bin, 0o700);
+    write_exec(
+        &fail_jq_bin.join("jq"),
+        &format!("#!/bin/sh\necho 'jq: simulated operational error' >&2\nexit 2\n# {real_jq}\n"),
+    );
+
+    for mode in ["qemu:///system", "qemu:///session"] {
+        let out_dir = sys_root.join(format!("indeterminate-{}", mode.replace([':', '/'], "_")));
+        let dir_mode = if mode == "qemu:///system" {
+            0o755
+        } else {
+            0o700
+        };
+        let file_mode = if mode == "qemu:///system" {
+            0o644
+        } else {
+            0o600
+        };
+        create_dir_mode(&out_dir, dir_mode);
+        create_dir_mode(&out_dir.join("tests"), dir_mode);
+        for t in &MANDATORY[..3] {
+            write_file_mode(&out_dir.join("tests").join(t), file_mode, b"pass\n");
+        }
+        write_file_mode(
+            &out_dir.join("tests").join(MANDATORY[3]),
+            file_mode,
+            b"fail\n",
+        );
+
+        let mut envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", mode)];
+        if !as_root {
+            envs.push(("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()));
+        }
+
+        // Generate authentic 3-pass + 1-fail report.
+        let gen_fail = lane_env(
+            &[
+                "result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--binary-sha256",
+                &digest,
+                "--accelerator",
+                "kvm",
+            ],
+            &envs,
+            None,
+        );
+        assert!(!gen_fail.status.success(), "{}", text(&gen_fail));
+        let original_bytes = std::fs::read(out_dir.join("result.json")).unwrap();
+        let orig_doc: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+        assert_eq!(orig_doc["result"], "fail");
+        assert_eq!(orig_doc["tests"][MANDATORY[0]], "pass");
+        assert_eq!(orig_doc["tests"][MANDATORY[1]], "pass");
+        assert_eq!(orig_doc["tests"][MANDATORY[2]], "pass");
+        assert_eq!(orig_doc["tests"][MANDATORY[3]], "fail");
+
+        // 1. Injected transient read error (exit 1) MUST fail closed & preserve bytes.
+        let io_err = lane_env(
+            &[
+                "ensure-result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            Some(&fail_read_bin),
+        );
+        assert!(
+            !io_err.status.success(),
+            "{mode}: ensure-result must return retryable nonzero on transient read failure: {}",
+            text(&io_err)
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("result.json")).unwrap(),
+            original_bytes,
+            "{mode}: ensure-result MUST preserve existing 3-pass/1-fail report on transient read failure"
+        );
+
+        // 2. Injected operational `jq` error (exit 2) MUST fail closed & preserve bytes.
+        let jq_err = lane_env(
+            &[
+                "ensure-result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            Some(&fail_jq_bin),
+        );
+        assert!(
+            !jq_err.status.success(),
+            "{mode}: ensure-result must return retryable nonzero on jq operational error: {}",
+            text(&jq_err)
+        );
+        assert_eq!(
+            std::fs::read(out_dir.join("result.json")).unwrap(),
+            original_bytes,
+            "{mode}: ensure-result MUST preserve existing report on jq operational error"
+        );
+
+        // 3. Clean retry succeeds and still preserves the original 3-pass/1-fail report.
+        let retry_ok = lane_env(
+            &[
+                "ensure-result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(retry_ok.status.success(), "{mode}: {}", text(&retry_ok));
+        assert_eq!(
+            std::fs::read(out_dir.join("result.json")).unwrap(),
+            original_bytes,
+            "{mode}: retry after transient failure must preserve original report"
+        );
+
+        // 4. Confirmed invalid JSON still falls back and replaces with all-not_run.
+        std::fs::write(
+            out_dir.join("result.json"),
+            b"{\"schema\": 1, \"truncated\":",
+        )
+        .unwrap();
+        let fallback_ok = lane_env(
+            &[
+                "ensure-result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            fallback_ok.status.success(),
+            "{mode}: {}",
+            text(&fallback_ok)
+        );
+        let fb_doc: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap()).unwrap();
+        assert_eq!(fb_doc["result"], "fail");
+        for t in MANDATORY {
+            assert_eq!(fb_doc["tests"][t], "not_run", "{mode}/{t}");
+        }
+    }
+
+    // 5. Verify `libvirt_kvm_sysfs.main` exit-code classification directly:
+    //    0 = ok, 1 = indeterminate I/O error (EIO during os.read), 2 = missing (ENOENT),
+    //    3 = unsafe dir (shared 0777), 4 = unsafe file (symlink).
+    let py = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import errno, importlib.util, os, sys
+
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+root_path = sys.argv[2]
+os.environ["QEMINGA_TEST_SYSFS_ROOT"] = root_path
+
+ok_dir = os.path.join(root_path, "cls-ok")
+os.mkdir(ok_dir, 0o755)
+rfile = os.path.join(ok_dir, "result.json")
+with open(rfile, "wb") as fh:
+    fh.write(b"{}\n")
+os.chmod(rfile, 0o644)
+
+# Missing file -> exit 2
+assert mod.main(["read-evidence-stdout", os.path.join(root_path, "absent-dir"), "result.json"]) == 2
+
+# Shared-writable dir -> exit 3
+bad_dir = os.path.join(root_path, "cls-0777")
+os.mkdir(bad_dir, 0o700)
+os.chmod(bad_dir, 0o777)
+assert mod.main(["read-evidence-stdout", bad_dir, "result.json"]) == 3
+
+# Symlinked file in verified dir -> exit 4
+sym_dir = os.path.join(root_path, "cls-sym")
+os.mkdir(sym_dir, 0o755)
+os.symlink(rfile, os.path.join(sym_dir, "result.json"))
+assert mod.main(["read-evidence-stdout", sym_dir, "result.json"]) == 4
+
+# Transient EIO during os.read -> exit 1 (indeterminate)
+orig_read = mod.os.read
+def fail_eio(_fd, _n):
+    raise OSError(errno.EIO, "simulated disk I/O error")
+mod.os.read = fail_eio
+try:
+    assert mod.main(["read-evidence-stdout", ok_dir, "result.json"]) == 1
+finally:
+    mod.os.read = orig_read
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "libvirt_kvm_sysfs exit-code classification failed:\n{}",
+        text(&py)
+    );
+    assert!(!root().join("scripts/ci/__pycache__").exists());
 }

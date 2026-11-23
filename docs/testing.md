@@ -143,10 +143,14 @@ runners on every code-changing push to `main`, pull request, and
   `scripts/ci/libvirt-kvm-smoke.sh`'s own `preflight` check after package
   installation detect any permissions regression. If an early step exits before
   `libvirt-kvm-smoke.sh run` installs its `EXIT` trap, an `if: always()` step
-  invokes `scripts/ci/libvirt-kvm-smoke.sh result` before the summary and
-  evidence upload to write a structured `libvirt-kvm-smoke-v1` failure
+  invokes `scripts/ci/libvirt-kvm-smoke.sh ensure-result` before the summary
+  and evidence upload — preserving any already-written valid run-bound report
+  and otherwise writing a structured `libvirt-kvm-smoke-v1` failure
   `result.json` (`accelerator: "unknown"`, unexecuted checks `"not_run"`,
-  unverified-digest sentinel).
+  unverified-digest sentinel). On the success path after evidence upload,
+  `scripts/ci/libvirt-kvm-smoke.sh verify-pass` requires a validated passing
+  `result.json` matching the run's architecture, source SHA, and candidate
+  digest.
 - **Unprivileged `qemu:///session` reuse:** the `candidate` job builds
   `cargo build --release --locked --features seccomp` on `ubuntu-24.04`
   and reports the binary's SHA-256 as a job output; the `smoke` job has

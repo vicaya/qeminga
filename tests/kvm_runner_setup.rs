@@ -2134,6 +2134,8 @@ exec "$@"
     )
     .unwrap();
 
+    let rt_root = dir.path().join("run");
+    std::fs::create_dir_all(&rt_root).unwrap();
     let fail_uninst = run_setup_env(
         &[
             "uninstall",
@@ -2148,7 +2150,7 @@ exec "$@"
             "--config-dir",
             cfg3.to_str().unwrap(),
         ],
-        &[],
+        &[("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap())],
         Some(&bin),
     );
     assert!(
@@ -2466,4 +2468,419 @@ fn jit_workspace_validation_and_post_job_cleanup() {
             text(&out)
         );
     }
+}
+
+#[test]
+fn uninstall_provides_private_runtime_dir_for_cleanup_after_stopping_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    let rt_root = dir.path().join("run");
+    let service_rt = rt_root.join("qeminga-test-rt");
+    let inst = dir.path().join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    for d in [&bin, &rt_root, &service_rt, &inst, &state, &hooks, &cfg] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let userdel_log = dir.path().join("userdel.log");
+    let rt_seen_log = dir.path().join("rt_seen.log");
+    let daemon_pids_log = dir.path().join("daemon.pids");
+
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+if [ "$1" = "-u" ] && [ -z "${2:-}" ]; then echo 0; exit 0; fi
+if [ "$1" = "-u" ] && [ "$2" = "qeminga-runner" ]; then echo 995; exit 0; fi
+exit 0
+"#,
+    );
+    // Simulate systemd removing RuntimeDirectory= when the service stops.
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ "$1" = "stop" ] && [ "${FAKE_KEEP_SERVICE_RT:-0}" != "1" ]; then
+    rm -rf "${FAKE_SERVICE_RT:?}"
+fi
+exit 0
+"#,
+    );
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    // Fail userdel if any simulated libvirt daemon PID is still alive, matching
+    // real userdel ("user is currently used by process").
+    write_exec(
+        &bin.join("userdel"),
+        r#"#!/bin/sh
+if [ -f "${FAKE_DAEMON_PIDS_LOG:-}" ]; then
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if kill -0 "$p" 2>/dev/null; then
+            echo "userdel: user $1 is currently used by process $p" >&2
+            exit 8
+        fi
+    done <"${FAKE_DAEMON_PIDS_LOG}"
+fi
+printf '%s\n' "$*" >> "${FAKE_USERDEL_LOG:?}"
+exit 0
+"#,
+    );
+    write_exec(&bin.join("groupdel"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
+    if [ -n "${FAKE_LIVE_RT_PATH:-}" ] && [ "$3" = "$FAKE_LIVE_RT_PATH" ]; then
+        echo "${FAKE_LIVE_RT_STAT:-995:700}"
+        exit 0
+    fi
+    echo "0:755"
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+
+    let write_install_env = |cfg_dir: &Path,
+                             service: &str,
+                             inst_dir: &Path,
+                             state_dir: &Path,
+                             hook_dir: &Path| {
+        std::fs::write(
+            cfg_dir.join("policy.env"),
+            "ALLOWED_REPOSITORY=vicaya/qeminga-kvm-controller\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg_dir.join("install.env"),
+            format!(
+                "RECORD_SCHEMA=1\nSERVICE={service}\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nINSTALL_DIR={}\nSTATE_DIR={}\nHOOK_DIR={}\nCONFIG_DIR={}\nTARGET_URL={REPO_URL}\nRUNNER_GROUP=\nRUNNER_NAME=test\nLABELS=qeminga-kvm\nEPHEMERAL=0\nALLOW_AUTO_UPDATE=0\nWORK_DIR={}/work\n",
+                inst_dir.display(),
+                state_dir.display(),
+                hook_dir.display(),
+                cfg_dir.display(),
+                state_dir.display(),
+            ),
+        )
+        .unwrap();
+    };
+
+    // 1. Ordinary uninstall after systemctl stop removes RuntimeDirectory=:
+    //    must provision a private mode-0700 XDG_RUNTIME_DIR, isolate XDG env
+    //    vars from the invoking root shell, terminate both monolithic and
+    //    auxiliary session libvirt daemons before userdel, and remove the temp dir.
+    write_exec(
+        &hooks.join("hook-job-completed.sh"),
+        r#"#!/bin/sh
+set -eu
+[ -n "${XDG_RUNTIME_DIR:-}" ] || { echo "missing XDG_RUNTIME_DIR" >&2; exit 1; }
+[ -d "$XDG_RUNTIME_DIR" ] || { echo "XDG_RUNTIME_DIR does not exist: $XDG_RUNTIME_DIR" >&2; exit 1; }
+mode="$(/usr/bin/stat -c '%a' "$XDG_RUNTIME_DIR")"
+[ "$mode" = "700" ] || { echo "XDG_RUNTIME_DIR mode $mode != 700" >&2; exit 1; }
+[ "${XDG_CONFIG_HOME:-}" = "${HOME}/.config" ] || { echo "unexpected XDG_CONFIG_HOME=${XDG_CONFIG_HOME:-}" >&2; exit 1; }
+[ "${XDG_CACHE_HOME:-}" = "${HOME}/.cache" ] || { echo "unexpected XDG_CACHE_HOME=${XDG_CACHE_HOME:-}" >&2; exit 1; }
+[ "${XDG_DATA_HOME:-}" = "${HOME}/.local/share" ] || { echo "unexpected XDG_DATA_HOME=${XDG_DATA_HOME:-}" >&2; exit 1; }
+[ "${LIBVIRT_DEFAULT_URI:-}" = "qemu:///session" ] || { echo "unexpected LIBVIRT_DEFAULT_URI=${LIBVIRT_DEFAULT_URI:-}" >&2; exit 1; }
+[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] || { echo "caller DBUS_SESSION_BUS_ADDRESS leaked" >&2; exit 1; }
+mkdir -p "$XDG_RUNTIME_DIR/libvirt"
+printf '%s\n' "$XDG_RUNTIME_DIR" > "${FAKE_RT_SEEN_LOG:?}"
+: > "${FAKE_DAEMON_PIDS_LOG:?}"
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid1=$!
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid2=$!
+printf '%s\n' "$pid1" > "$XDG_RUNTIME_DIR/libvirt/libvirtd.pid"
+printf '%s\n' "$pid2" > "$XDG_RUNTIME_DIR/libvirt/virtlogd.pid"
+printf '%s\n%s\n' "$pid1" "$pid2" > "${FAKE_DAEMON_PIDS_LOG:?}"
+exit 0
+"#,
+    );
+    write_install_env(&cfg, "qeminga-test-rt", &inst, &state, &hooks);
+
+    let out = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-test-rt",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &[
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("FAKE_SERVICE_RT", service_rt.to_str().unwrap()),
+            ("FAKE_USERDEL_LOG", userdel_log.to_str().unwrap()),
+            ("FAKE_RT_SEEN_LOG", rt_seen_log.to_str().unwrap()),
+            ("FAKE_DAEMON_PIDS_LOG", daemon_pids_log.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", "/root/.config"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/0/bus"),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        out.status.success(),
+        "ordinary uninstall after systemctl stop removed RuntimeDirectory= must succeed: {}",
+        text(&out)
+    );
+
+    let seen_rt = std::fs::read_to_string(&rt_seen_log).unwrap();
+    let seen_rt = seen_rt.trim();
+    assert!(
+        seen_rt.starts_with(rt_root.to_str().unwrap()) && seen_rt != service_rt.to_str().unwrap(),
+        "cleanup XDG_RUNTIME_DIR should be a fresh temp dir under runtime root: {seen_rt}"
+    );
+    assert!(
+        !Path::new(seen_rt).exists(),
+        "temporary cleanup runtime directory must be removed after uninstall: {seen_rt}"
+    );
+    assert!(
+        !inst.exists() && !state.exists() && !hooks.exists() && !cfg.exists(),
+        "managed directories must be removed on clean uninstall"
+    );
+    let ud = std::fs::read_to_string(&userdel_log).unwrap();
+    assert!(
+        ud.contains("qeminga-runner"),
+        "--purge-user must complete cleanly and remove qeminga-runner: {ud}"
+    );
+
+    // 2. When /run/<service> is still present with owner=REC_USER_UID and mode=0700,
+    //    uninstall reuses it (to talk to any still-running session daemon), stops its
+    //    modular virtqemud daemon after clean domain cleanup, and succeeds with --purge-user.
+    let case2 = dir.path().join("reuse-live-rt");
+    let inst2 = case2.join("runner");
+    let state2 = case2.join("state");
+    let hooks2 = case2.join("hooks");
+    let cfg2 = case2.join("cfg");
+    let live_rt = rt_root.join("qeminga-live-rt");
+    for d in [&inst2, &state2, &hooks2, &cfg2, &live_rt] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::set_permissions(&live_rt, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_install_env(&cfg2, "qeminga-live-rt", &inst2, &state2, &hooks2);
+    let rt_seen2 = case2.join("rt_seen.log");
+    let pids2 = case2.join("daemon.pids");
+    let userdel2 = case2.join("userdel.log");
+    write_exec(
+        &hooks2.join("hook-job-completed.sh"),
+        r#"#!/bin/sh
+set -eu
+mkdir -p "$XDG_RUNTIME_DIR/libvirt"
+printf '%s\n' "$XDG_RUNTIME_DIR" > "${FAKE_RT_SEEN_LOG:?}"
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid=$!
+printf '%s\n' "$pid" > "$XDG_RUNTIME_DIR/libvirt/virtqemud.pid"
+printf '%s\n' "$pid" > "${FAKE_DAEMON_PIDS_LOG:?}"
+exit 0
+"#,
+    );
+    let out2 = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-live-rt",
+            "--install-dir",
+            inst2.to_str().unwrap(),
+            "--state-dir",
+            state2.to_str().unwrap(),
+            "--hook-dir",
+            hooks2.to_str().unwrap(),
+            "--config-dir",
+            cfg2.to_str().unwrap(),
+            "--purge-user",
+        ],
+        &[
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("FAKE_KEEP_SERVICE_RT", "1"),
+            ("FAKE_LIVE_RT_PATH", live_rt.to_str().unwrap()),
+            ("FAKE_LIVE_RT_STAT", "995:700"),
+            ("FAKE_USERDEL_LOG", userdel2.to_str().unwrap()),
+            ("FAKE_RT_SEEN_LOG", rt_seen2.to_str().unwrap()),
+            ("FAKE_DAEMON_PIDS_LOG", pids2.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        out2.status.success(),
+        "uninstall reusing live private RuntimeDirectory must succeed: {}",
+        text(&out2)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rt_seen2).unwrap().trim(),
+        live_rt.to_str().unwrap(),
+        "must reuse live private RuntimeDirectory owned by recorded UID"
+    );
+    assert!(
+        std::fs::read_to_string(&userdel2)
+            .unwrap()
+            .contains("qeminga-runner"),
+        "userdel must succeed after stopping virtqemud in live RuntimeDirectory"
+    );
+
+    // 3. Untrusted /run/<service> (wrong mode 0755) must NOT be reused; uninstall
+    //    must create a fresh private mode-0700 temp runtime dir instead.
+    let case3 = dir.path().join("bad-mode-rt");
+    let inst3 = case3.join("runner");
+    let state3 = case3.join("state");
+    let hooks3 = case3.join("hooks");
+    let cfg3 = case3.join("cfg");
+    let bad_rt = rt_root.join("qeminga-bad-rt");
+    for d in [&inst3, &state3, &hooks3, &cfg3, &bad_rt] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_install_env(&cfg3, "qeminga-bad-rt", &inst3, &state3, &hooks3);
+    let rt_seen3 = case3.join("rt_seen.log");
+    write_exec(
+        &hooks3.join("hook-job-completed.sh"),
+        r#"#!/bin/sh
+set -eu
+mode="$(/usr/bin/stat -c '%a' "$XDG_RUNTIME_DIR")"
+[ "$mode" = "700" ] || { echo "expected mode 700, got $mode" >&2; exit 1; }
+printf '%s\n' "$XDG_RUNTIME_DIR" > "${FAKE_RT_SEEN_LOG:?}"
+exit 0
+"#,
+    );
+    let out3 = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-bad-rt",
+            "--install-dir",
+            inst3.to_str().unwrap(),
+            "--state-dir",
+            state3.to_str().unwrap(),
+            "--hook-dir",
+            hooks3.to_str().unwrap(),
+            "--config-dir",
+            cfg3.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("FAKE_KEEP_SERVICE_RT", "1"),
+            ("FAKE_LIVE_RT_PATH", bad_rt.to_str().unwrap()),
+            ("FAKE_LIVE_RT_STAT", "995:755"),
+            ("FAKE_RT_SEEN_LOG", rt_seen3.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        out3.status.success(),
+        "uninstall with untrusted /run/<service> mode must fall back to fresh temp dir: {}",
+        text(&out3)
+    );
+    let seen_rt3 = std::fs::read_to_string(&rt_seen3).unwrap();
+    let seen_rt3 = seen_rt3.trim();
+    assert_ne!(
+        seen_rt3,
+        bad_rt.to_str().unwrap(),
+        "must not reuse /run/<service> with non-0700 mode"
+    );
+    assert!(
+        !Path::new(seen_rt3).exists(),
+        "fallback temp runtime dir must be removed after uninstall"
+    );
+
+    // 4. On partial uninstall (cleanup hook fails after starting a temp libvirtd),
+    //    temp runtime dir and temp daemon must still be cleaned up while images/ and
+    //    config/ remain preserved.
+    let case4 = dir.path().join("partial-cleanup-rt");
+    let inst4 = case4.join("runner");
+    let state4 = case4.join("state");
+    let hooks4 = case4.join("hooks");
+    let cfg4 = case4.join("cfg");
+    let vm_disk4 = state4.join("images/qeminga-e2e-77-1-x86_64/root.qcow2");
+    std::fs::create_dir_all(vm_disk4.parent().unwrap()).unwrap();
+    for d in [&inst4, &hooks4, &cfg4] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(&vm_disk4, b"active-disk").unwrap();
+    write_install_env(&cfg4, "qeminga-partial-rt", &inst4, &state4, &hooks4);
+    let rt_seen4 = case4.join("rt_seen.log");
+    let pids4 = case4.join("daemon.pids");
+    write_exec(
+        &hooks4.join("hook-job-completed.sh"),
+        r#"#!/bin/sh
+set -eu
+mkdir -p "$XDG_RUNTIME_DIR/libvirt"
+printf '%s\n' "$XDG_RUNTIME_DIR" > "${FAKE_RT_SEEN_LOG:?}"
+sleep 30 </dev/null >/dev/null 2>&1 &
+pid=$!
+printf '%s\n' "$pid" > "$XDG_RUNTIME_DIR/libvirt/libvirtd.pid"
+printf '%s\n' "$pid" > "${FAKE_DAEMON_PIDS_LOG:?}"
+exit 1
+"#,
+    );
+    let out4 = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-partial-rt",
+            "--install-dir",
+            inst4.to_str().unwrap(),
+            "--state-dir",
+            state4.to_str().unwrap(),
+            "--hook-dir",
+            hooks4.to_str().unwrap(),
+            "--config-dir",
+            cfg4.to_str().unwrap(),
+        ],
+        &[
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            (
+                "FAKE_SERVICE_RT",
+                rt_root.join("qeminga-partial-rt").to_str().unwrap(),
+            ),
+            ("FAKE_RT_SEEN_LOG", rt_seen4.to_str().unwrap()),
+            ("FAKE_DAEMON_PIDS_LOG", pids4.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !out4.status.success(),
+        "partial uninstall must fail non-zero when hook fails: {}",
+        text(&out4)
+    );
+    let seen_rt4 = std::fs::read_to_string(&rt_seen4).unwrap();
+    let seen_rt4 = seen_rt4.trim();
+    assert!(
+        !Path::new(seen_rt4).exists(),
+        "temp runtime dir must still be removed on partial uninstall: {seen_rt4}"
+    );
+    let pid4: i32 = std::fs::read_to_string(&pids4)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let alive4 = Command::new("kill")
+        .args(["-0", &pid4.to_string()])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(
+        !alive4,
+        "temp session libvirtd (pid {pid4}) must still be terminated on partial uninstall"
+    );
+    assert!(
+        vm_disk4.exists() && cfg4.join("install.env").exists(),
+        "VM disk and install.env must remain preserved on partial uninstall"
+    );
 }

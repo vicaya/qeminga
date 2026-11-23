@@ -2081,6 +2081,66 @@ cmd_update() {
 
 # ---- uninstall ------------------------------------------------------------
 
+_UNINSTALL_TEMP_RT=""
+
+# Terminate session libvirt daemons (libvirtd / virtqemud / virtlogd /
+# virtlockd / etc.) whose PID files live directly under $rt_dir/libvirt so no
+# temporary or idle daemon remains running as OPT_USER (which would cause
+# `userdel` during --purge-user to fail with "user is currently used by
+# process"). PID-file reading and signaling run strictly as OPT_USER so root
+# never opens user-writable files and the kernel enforces UID ownership.
+# Pass force_kill=1 for a temporary uninstall runtime dir we created ourselves
+# so a stuck daemon is killed before removing the directory.
+stop_temp_session_libvirt_daemons() {
+    local rt_dir="$1"
+    local force_kill="${2:-0}"
+    [ ! -L "$rt_dir" ] && [ -d "$rt_dir" ] || return 0
+    [ ! -L "$rt_dir/libvirt" ] && [ -d "$rt_dir/libvirt" ] || return 0
+    runuser -u "$OPT_USER" -- sh -c '
+        rt_dir="$1"
+        force_kill="$2"
+        pids=""
+        for pidf in "$rt_dir"/libvirt/libvirtd.pid "$rt_dir"/libvirt/virt*d.pid; do
+            [ ! -L "$pidf" ] && [ -f "$pidf" ] && [ -r "$pidf" ] || continue
+            pid="$(head -c 32 "$pidf" 2>/dev/null | tr -d "[:space:]")"
+            case "$pid" in
+                ""|*[!0-9]*|0*) continue ;;
+            esac
+            [ "$pid" = "$$" ] && continue
+            pids="$pids $pid"
+        done
+        [ -n "$pids" ] || exit 0
+        for p in $pids; do kill -TERM "$p" 2>/dev/null || true; done
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            alive=0
+            for p in $pids; do
+                if kill -0 "$p" 2>/dev/null; then alive=1; break; fi
+            done
+            [ "$alive" -eq 0 ] && exit 0
+            sleep 0.2
+        done
+        if [ "$force_kill" = "1" ]; then
+            for p in $pids; do kill -KILL "$p" 2>/dev/null || true; done
+            for _ in 1 2 3 4 5; do
+                alive=0
+                for p in $pids; do
+                    if kill -0 "$p" 2>/dev/null; then alive=1; break; fi
+                done
+                [ "$alive" -eq 0 ] && exit 0
+                sleep 0.2
+            done
+        fi
+    ' _ "$rt_dir" "$force_kill" || true
+}
+
+cleanup_uninstall_temp_rt() {
+    local rt="${_UNINSTALL_TEMP_RT:-}"
+    [ -n "$rt" ] || return 0
+    _UNINSTALL_TEMP_RT=""
+    stop_temp_session_libvirt_daemons "$rt" 1 || true
+    rm -rf --one-file-system -- "$rt"
+}
+
 cmd_uninstall() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "uninstall must run as root"
@@ -2123,18 +2183,49 @@ cmd_uninstall() {
     fi
 
     # Run the post-job cleanup hook as the runner user to destroy any stray
-    # qeminga-e2e-* session domains before removing state files. Preserve the
-    # images directory if domain cleanup cannot confirm domains are gone.
+    # qeminga-e2e-* session domains before removing state files. Systemd removes
+    # RuntimeDirectory= on service stop by default, so provision a temporary
+    # private mode-0700 XDG_RUNTIME_DIR when absent so session virsh/libvirtd
+    # can open its socket, then tear down any session libvirt daemon before
+    # removing the directory or purging the user.
     local cleanup_rc=0
     if command -v runuser >/dev/null 2>&1 && id "$OPT_USER" >/dev/null 2>&1 && [ -x "$OPT_HOOK_DIR/hook-job-completed.sh" ] && [ -f "$OPT_CONFIG_DIR/policy.env" ]; then
+        local runtime_root="${QEMINGA_RUNTIME_ROOT:-/run}"
+        runtime_root="${runtime_root%/}"
+        check_abs_path "runtime root" "$runtime_root"
+        [ ! -L "$runtime_root" ] && [ -d "$runtime_root" ] || die "runtime root directory '$runtime_root' is missing or unsafe"
+        check_trusted_parent_dir "${runtime_root}/qeminga-uninstall"
+
+        local default_rt="${runtime_root}/${OPT_SERVICE}"
+        local cleanup_rt="" cleanup_rt_created=0
+        if [ ! -L "$default_rt" ] && [ -d "$default_rt" ] && [ "$(stat -c '%u:%a' "$default_rt" 2>/dev/null || echo '')" = "${REC_USER_UID}:700" ]; then
+            cleanup_rt="$default_rt"
+        else
+            cleanup_rt="$(mktemp -d "${runtime_root}/qeminga-uninstall.XXXXXX")"
+            _UNINSTALL_TEMP_RT="$cleanup_rt"
+            trap 'cleanup_uninstall_temp_rt' EXIT
+            chmod 0700 "$cleanup_rt"
+            chown -h "${OPT_USER}:${OPT_USER}" "$cleanup_rt"
+            cleanup_rt_created=1
+        fi
         say "running cleanup hook to remove stray qeminga session domains"
-        if ! runuser -u "$OPT_USER" -- env \
+        if ! runuser -u "$OPT_USER" -- env -u DBUS_SESSION_BUS_ADDRESS \
             "HOME=$OPT_STATE_DIR" \
-            "XDG_RUNTIME_DIR=/run/${OPT_SERVICE}" \
+            "XDG_RUNTIME_DIR=$cleanup_rt" \
+            "XDG_CONFIG_HOME=$OPT_STATE_DIR/.config" \
+            "XDG_CACHE_HOME=$OPT_STATE_DIR/.cache" \
+            "XDG_DATA_HOME=$OPT_STATE_DIR/.local/share" \
+            "LIBVIRT_DEFAULT_URI=qemu:///session" \
             "QEMINGA_RUNNER_POLICY=$OPT_CONFIG_DIR/policy.env" \
             "$OPT_HOOK_DIR/hook-job-completed.sh"; then
             cleanup_rc=1
             warn "cleanup hook could not confirm all qeminga domains are gone; preserving $OPT_STATE_DIR/images"
+        fi
+        if [ "$cleanup_rt_created" -eq 1 ]; then
+            cleanup_uninstall_temp_rt
+            trap - EXIT
+        elif [ "$cleanup_rc" -eq 0 ]; then
+            stop_temp_session_libvirt_daemons "$cleanup_rt" 0 || true
         fi
     elif [ -d "$OPT_STATE_DIR/images" ]; then
         local leftover=""

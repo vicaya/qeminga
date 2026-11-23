@@ -6675,24 +6675,31 @@ _rollback_runner_package_tx() {
                     was_active=1
                 fi
                 if fs_ops restore-runner-backup "$OPT_INSTALL_DIR" "$expected_vol" "$backup_dir" "$backup_id" "$work_child" "0" "$cfg_dir" "$hook_dir" "$hook_vol" "$unit_path" "$unit_vol"; then
-                    if [ -n "$stage_dir" ]; then
-                        if [ -n "$stage_id" ] && fs_ops safe-rmtree-id "$stage_dir" "$stage_id"; then
-                            stage_dir=""
-                            stage_id=""
-                        else
-                            warn "rollback restored previous runner files but staging directory '$stage_dir' could not be removed; preserving publishing record with stage and backup references for retry"
-                            restore_ok=0
-                        fi
-                    fi
-                    local rec_saved=0
-                    if [ "$restore_ok" -eq 1 ]; then
-                        rec_saved=1
-                        if [ -n "$rec_path" ]; then
-                            if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "$backup_dir" "$backup_id" "$was_active" ); then
-                                warn "rollback restored previous runner files but failed to persist UPDATE_PHASE=restored to '$rec_path'; retaining verified backup container '$backup_dir' for retry"
-                                rec_saved=0
+                    if [ -n "$sync_stage_dir" ]; then
+                        local cur_stage_id=""
+                        cur_stage_id="$(fs_ops path-identity "$sync_stage_dir" 2>/dev/null || true)"
+                        if [ "$cur_stage_id" = "$sync_stage_id" ]; then
+                            if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id"; then
+                                sync_stage_dir=""
+                                sync_stage_id=""
+                            else
+                                warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
                                 restore_ok=0
                             fi
+                        else
+                            # Recorded stage directory is already absent or replaced by an
+                            # unrelated directory left for manual inspection; do not block
+                            # finalizing rollback of the restored runner on it.
+                            sync_stage_dir=""
+                            sync_stage_id=""
+                        fi
+                    fi
+                    local rec_saved=1
+                    if [ -n "$rec_path" ]; then
+                        if ! ( write_update_record "$rec_path" "updating" "restored" "$sync_stage_dir" "$sync_stage_id" "$backup_dir" "$backup_id" "$was_active" ); then
+                            warn "rollback restored previous runner files but failed to persist UPDATE_PHASE=restored to '$rec_path'; retaining verified backup container '$backup_dir' for retry"
+                            rec_saved=0
+                            restore_ok=0
                         fi
                     fi
                     if [ "$rec_saved" -eq 1 ]; then
@@ -6700,7 +6707,7 @@ _rollback_runner_package_tx() {
                             warn "rollback restored previous runner files and saved UPDATE_PHASE=restored, but failed to prune '$backup_dir'; preserving record for inspection"
                             restore_ok=0
                         elif [ -n "$rec_path" ]; then
-                            if ! ( write_update_record "$rec_path" "updating" "restored" "" "" "" "" "$was_active" ); then
+                            if ! ( write_update_record "$rec_path" "updating" "restored" "$sync_stage_dir" "$sync_stage_id" "" "" "$was_active" ); then
                                 warn "rollback pruned '$backup_dir' but failed to clear UPDATE_BACKUP_DIR in '$rec_path'; preserving restored record for retry"
                                 restore_ok=0
                             fi

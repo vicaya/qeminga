@@ -18726,8 +18726,12 @@ esac
         "in-place reinstall when entire owned runner directory is missing must refuse re-enrollment: {missing_dir_msg}"
     );
     assert!(
-        missing_dir_msg.contains("uninstall") && missing_dir_msg.contains(".runner"),
-        "refusal on missing runner dir must direct operator to uninstall before re-enrolling: {missing_dir_msg}"
+        missing_dir_msg.contains("uninstall")
+            && missing_dir_msg.contains(".runner")
+            && missing_dir_msg.contains("Settings -> Actions -> Runners")
+            && missing_dir_msg.contains("reg-box")
+            && missing_dir_msg.contains(REPO_URL),
+        "refusal on missing runner dir must direct operator to uninstall local state and remove runner in GitHub Settings -> Actions -> Runners: {missing_dir_msg}"
     );
     assert!(
         !cfg_invoked.exists() && !inst.exists(),
@@ -18737,6 +18741,47 @@ esac
         std::fs::read_to_string(cfg.join("install.env")).unwrap(),
         orig_record,
         "original install.env record must survive intact when re-enrollment is refused on missing dir"
+    );
+
+    // 4. Following the instruction with `uninstall --token-file` while the owned runner directory
+    //    is gone cannot run local `config.sh remove`; it MUST warn with the recorded runner name,
+    //    recorded target URL, and manual GitHub Settings -> Actions -> Runners instructions
+    //    before discarding the local record.
+    let uninst_missing_dir = run_setup_env(
+        &[
+            "uninstall",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    let uninst_missing_msg = text(&uninst_missing_dir);
+    assert!(
+        uninst_missing_dir.status.success(),
+        "uninstall with missing runner dir should clear local state: {uninst_missing_msg}"
+    );
+    assert!(
+        uninst_missing_msg.contains("Settings -> Actions -> Runners")
+            && uninst_missing_msg.contains("reg-box")
+            && uninst_missing_msg.contains(REPO_URL),
+        "uninstall --token-file without executable config.sh MUST direct operator to remove recorded runner 'reg-box' for '{REPO_URL}' in GitHub Settings -> Actions -> Runners: {uninst_missing_msg}"
+    );
+    let post_uninst_rec = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        !units.join("qeminga-reg-box.service").exists()
+            && post_uninst_rec.contains("RECORD_STATE=user-only\n")
+            && !post_uninst_rec.contains("RUNNER_NAME="),
+        "uninstall with missing runner dir should remove local unit and clear runner record after warning:\n{post_uninst_rec}"
     );
 }
 
@@ -19181,7 +19226,59 @@ exec /usr/bin/grep "$@"
         text(&upd_comm_grep_err)
     );
 
-    // Retry update cleans up the committed backup cleanly.
+    // (b1) Keep the config-directory fsync failure active across BOTH `update` and `uninstall`
+    //      retries while `UPDATE_PHASE=committed` is in memory: a persistent config-dir sync error
+    //      MUST preserve the backup on EVERY retry (never pruning before the phase is durably synced)!
+    let comm_retry_sync_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=committed",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !comm_retry_sync_fail.status.success() && bk_comm_err.is_dir(),
+        "retry update on UPDATE_PHASE=committed MUST preserve backup while config-dir fsync still fails: {}",
+        text(&comm_retry_sync_fail)
+    );
+    let comm_uninst_sync_fail = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=committed",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !comm_uninst_sync_fail.status.success() && bk_comm_err.is_dir(),
+        "retry uninstall on UPDATE_PHASE=committed MUST preserve backup while config-dir fsync still fails: {}",
+        text(&comm_uninst_sync_fail)
+    );
+
+    // Retry update once config-dir fsync succeeds cleans up the committed backup cleanly.
     let comm_retry = run_setup_env(
         &[
             "update",
@@ -19205,6 +19302,154 @@ exec /usr/bin/grep "$@"
         comm_retry.status.success() && !bk_comm_err.exists() && inst.join("bin/v1-marker").exists(),
         "retry after committed journal read-error preservation must succeed: {}",
         text(&comm_retry)
+    );
+
+    // (b2) `UPDATE_PHASE=restored` with a post-rename config-dir fsync failure:
+    //      Crash mid-publish, then run `update` with `QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC`
+    //      matching `UPDATE_PHASE=restored` -> restores live files and retains backup.
+    //      Keeping the config-dir sync error active across BOTH `update` and `uninstall` retries
+    //      MUST preserve the backup on EVERY retry until config-dir sync succeeds!
+    let crash_for_rest = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_TEST_CRASH_PUBLISH_AFTER", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert_eq!(
+        crash_for_rest.status.code(),
+        Some(99),
+        "{}",
+        text(&crash_for_rest)
+    );
+
+    let rest_sync_fail_1 = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=restored",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(!rest_sync_fail_1.status.success());
+    let rec_rest_err = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_rest_err.contains("UPDATE_PHASE=restored\n"),
+        "expected restored journal on disk:\n{rec_rest_err}"
+    );
+    let bk_rest_err = PathBuf::from(
+        rec_rest_err
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+    assert!(
+        bk_rest_err.is_dir(),
+        "restored backup must be retained on first sync failure"
+    );
+
+    let rest_retry_upd_fail = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=restored",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !rest_retry_upd_fail.status.success() && bk_rest_err.is_dir(),
+        "retry update on UPDATE_PHASE=restored MUST preserve backup while config-dir fsync still fails: {}",
+        text(&rest_retry_upd_fail)
+    );
+    let rest_retry_uninst_fail = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            (
+                "QEMINGA_TEST_FAIL_REPLACE_DIR_FSYNC",
+                "install.env:UPDATE_PHASE=restored",
+            ),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !rest_retry_uninst_fail.status.success() && bk_rest_err.is_dir(),
+        "retry uninstall on UPDATE_PHASE=restored MUST preserve backup while config-dir fsync still fails: {}",
+        text(&rest_retry_uninst_fail)
+    );
+
+    let rest_retry_ok = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        rest_retry_ok.status.success()
+            && !bk_rest_err.exists()
+            && inst.join("bin/v1-marker").exists(),
+        "retry update on UPDATE_PHASE=restored must succeed once config-dir fsync recovers: {}",
+        text(&rest_retry_ok)
     );
 
     // (c) Reinstall preparing/publishing journal + post-rename dir fsync failure + grep exit 2:
@@ -19904,8 +20149,126 @@ esac
         text(&uninst_nosc)
     );
 
-    // 7. Ordinary `uninstall` MUST confirm the owned service actually stopped BEFORE
+    // 6c. `UPDATE_PHASE=restored` recovery MUST verify/stop the owned service BEFORE calling
+    //     `lock_runner_permissions` (never changing live dir permissions under a missing client or
+    //     already-running restored listener) and MUST retain restart intent!
+    let rec_before_rest = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let rec_restored_active = rec_before_rest.replace(
+        "RECORD_STATE=installed\n",
+        "RECORD_STATE=updating\nUPDATE_PHASE=restored\nUPDATE_STAGE_DIR=\nUPDATE_STAGE_ID=\nUPDATE_BACKUP_DIR=\nUPDATE_BACKUP_ID=\nUPDATE_WAS_ACTIVE=1\n",
+    );
+    std::fs::write(cfg.join("install.env"), &rec_restored_active).unwrap();
+    std::fs::set_permissions(&inst, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // 6c-i. Missing `systemctl` client during `UPDATE_PHASE=restored`: MUST fail closed AND leave
+    //       live runner directory permissions untouched (still 0700, NOT changed to 0755)!
+    let rest_nosc = run_no_sc(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap())],
+    );
+    let inst_mode_after_nosc = std::fs::metadata(&inst).unwrap().permissions().mode() & 0o777;
+    assert!(
+        !rest_nosc.status.success(),
+        "restored recovery MUST fail closed when systemctl is unavailable: {}",
+        text(&rest_nosc)
+    );
+    assert_eq!(
+        inst_mode_after_nosc,
+        0o700,
+        "restored recovery with missing systemctl MUST NOT mutate live runner dir mode before checking systemctl (got {:o}): {}",
+        inst_mode_after_nosc,
+        text(&rest_nosc)
+    );
+
+    // 6c-ii. Already-running restored service (`state_file=active`, e.g. rollback restarted the
+    //        old runner before failing its final `installed` write): `update` MUST stop the
+    //        service BEFORE `lock_runner_permissions` changes `inst` from 0700 to 0755, complete
+    //        the update, and restart the service (`active`) retaining restart intent!
+    let stop_seen_mode = dir.path().join("stop-seen-inst-mode");
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+if [ -n "${FAKE_SC_LOG:-}" ]; then printf '%s\n' "$*" >> "$FAKE_SC_LOG"; fi
+st="$(cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo inactive)"
+case "$1" in
+    show) echo "not-found"; exit 0 ;;
+    is-active)
+        case "$st" in
+            active | reloading) echo "$st"; exit 0 ;;
+            activating | deactivating | inactive | failed) echo "$st"; exit 3 ;;
+            *) exit 1 ;;
+        esac
+        ;;
+    stop)
+        if [ -n "${FAKE_CHECK_INST_DIR:-}" ] && [ -n "${FAKE_STOP_MODE_OUT:-}" ] && [ ! -e "$FAKE_STOP_MODE_OUT" ]; then
+            stat -c '%a' "$FAKE_CHECK_INST_DIR" > "$FAKE_STOP_MODE_OUT"
+        fi
+        echo "inactive" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    start | enable)
+        echo "active" > "${FAKE_STATE_FILE:?}"
+        exit 0
+        ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    std::fs::write(&state_file, "active\n").unwrap();
+    let _ = std::fs::remove_file(&sc_log);
+    let rest_running_upd = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_SC_LOG", sc_log.to_str().unwrap()),
+            ("FAKE_CHECK_INST_DIR", inst.to_str().unwrap()),
+            ("FAKE_STOP_MODE_OUT", stop_seen_mode.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        rest_running_upd.status.success(),
+        "restored recovery on an already-running unit must stop, update, and restart cleanly: {}",
+        text(&rest_running_upd)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&stop_seen_mode)
+            .unwrap_or_default()
+            .trim(),
+        "700",
+        "restored recovery MUST stop the already-running owned service BEFORE lock_runner_permissions changes mode from 700 to 755 (sc_log:\n{})",
+        std::fs::read_to_string(&sc_log).unwrap_or_default()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "active",
+        "restored recovery MUST retain restart intent and restart the owned service"
+    );
+
+    // 7. Ordinary `uninstall` MUST confirm the owned service actually stopped AND disabled BEFORE
     //    running domain cleanup (`virsh`) or removing binaries/state/unit/install.env!
+    let wants_dir = units.join("multi-user.target.wants");
+    std::fs::create_dir_all(&wants_dir).unwrap();
+    let wants_link = wants_dir.join("qeminga-svcstate-box.service");
+    std::os::unix::fs::symlink(units.join("qeminga-svcstate-box.service"), &wants_link).unwrap();
+
     let virsh_log = dir.path().join("uninstall-virsh.log");
     write_exec(
         &bin.join("virsh"),
@@ -19941,6 +20304,24 @@ case "$1" in
         fi
         exit 0
         ;;
+    disable)
+        if [ "${FAKE_DISABLE_FAIL:-0}" = "1" ]; then
+            echo "Failed to disable unit: Read-only file system" >&2
+            exit 1
+        fi
+        if [ "${FAKE_DISABLE_NOOP:-0}" != "1" ] && [ -n "${FAKE_WANTS_LINK:-}" ]; then
+            rm -f "$FAKE_WANTS_LINK"
+        fi
+        exit 0
+        ;;
+    is-enabled)
+        if [ -n "${FAKE_WANTS_LINK:-}" ] && { [ -e "$FAKE_WANTS_LINK" ] || [ -L "$FAKE_WANTS_LINK" ]; }; then
+            echo "enabled"
+            exit 0
+        fi
+        echo "disabled"
+        exit 1
+        ;;
     *) exit 0 ;;
 esac
 "#,
@@ -19952,6 +20333,7 @@ esac
         &[
             ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
             ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_WANTS_LINK", wants_link.to_str().unwrap()),
             ("FAKE_STOP_FAIL", "1"),
             ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
             ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
@@ -19979,6 +20361,7 @@ esac
         &[
             ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
             ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_WANTS_LINK", wants_link.to_str().unwrap()),
             ("FAKE_STOP_STAYS_ACTIVE", "1"),
             ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
             ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
@@ -19996,12 +20379,72 @@ esac
         text(&uninst_still_active)
     );
 
-    // 7c. Once `systemctl stop` transitions service to `inactive`, retry `uninstall` succeeds!
+    // 7c. `systemctl stop` succeeds, but `systemctl disable` fails leaving
+    //     `multi-user.target.wants/<unit>.service`: MUST fail closed, preserving unit file,
+    //     enablement link, and `install.env` (`OWNED_UNIT=1`) for retry!
+    let uninst_disable_fail = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_WANTS_LINK", wants_link.to_str().unwrap()),
+            ("FAKE_DISABLE_FAIL", "1"),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !uninst_disable_fail.status.success(),
+        "uninstall MUST fail closed when systemctl disable fails on enabled unit: {}",
+        text(&uninst_disable_fail)
+    );
+    assert!(
+        !virsh_log.exists()
+            && units.join("qeminga-svcstate-box.service").is_file()
+            && wants_link.symlink_metadata().is_ok()
+            && std::fs::read_to_string(cfg.join("install.env"))
+                .unwrap()
+                .contains("OWNED_UNIT=1\n"),
+        "failed disable MUST retain OWNED_UNIT=1, unit file, and install.env without leaving a dangling wants link"
+    );
+
+    // 7d. Even if `systemctl disable` exits 0 without removing the `.wants` symlink, uninstall
+    //     MUST still fail closed and retain ownership!
+    let uninst_disable_noop = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_WANTS_LINK", wants_link.to_str().unwrap()),
+            ("FAKE_DISABLE_NOOP", "1"),
+            ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !uninst_disable_noop.status.success()
+            && !virsh_log.exists()
+            && units.join("qeminga-svcstate-box.service").is_file()
+            && wants_link.symlink_metadata().is_ok()
+            && cfg.join("install.env").is_file(),
+        "uninstall MUST fail closed if enablement symlink still exists after systemctl disable: {}",
+        text(&uninst_disable_noop)
+    );
+
+    // 7e. Once `systemctl disable` removes the enablement link and confirms disabled, retry
+    //     `uninstall` succeeds cleanly!
     let uninst_ok = run_setup_env(
         &["uninstall", "--config-dir", cfg.to_str().unwrap()],
         &[
             ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
             ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_WANTS_LINK", wants_link.to_str().unwrap()),
             ("FAKE_VIRSH_LOG", virsh_log.to_str().unwrap()),
             ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
             ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
@@ -20012,8 +20455,9 @@ esac
     assert!(
         uninst_ok.status.success()
             && !inst.exists()
-            && !units.join("qeminga-svcstate-box.service").exists(),
-        "uninstall retry after service stops must succeed cleanly: {}",
+            && !units.join("qeminga-svcstate-box.service").exists()
+            && wants_link.symlink_metadata().is_err(),
+        "uninstall retry after service stops and disables must succeed cleanly: {}",
         text(&uninst_ok)
     );
 }
@@ -20836,6 +21280,139 @@ os.chmod(target, 0o700)
 rc_sub, _, err_sub = exec_fs_op(["upgrade-legacy-path-identity", target, legacy_id, vol, "0"])
 assert rc_sub != 0, "substituted 0700 directory with different inode must be rejected"
 assert not os.path.exists(os.path.join(target, ".qeminga-tx-id")), "substituted directory must NOT be stamped"
+
+# 3. Interrupted marker creation before first write (simulating SIGKILL/power loss where cleanup
+#    does not run): final `.qeminga-tx-id` MUST NEVER be created empty before writing, and retry
+#    MUST clean any leftover private temp marker and succeed!
+target_w = os.path.join(root, ".qeminga-update-backup.writecrash")
+os.makedirs(target_w, mode=0o700)
+os.chmod(target_w, 0o700)
+tst_w = os.lstat(target_w)
+legacy_id_w = f"p_dev:{pst.st_dev};p_ino:{pst.st_ino};p_mnt:1;t_dev:{tst_w.st_dev};t_ino:{tst_w.st_ino};t_mnt:1;vol:{vol}"
+def fail_first_write_sigkill_hook(ns):
+    orig_os = ns["os"]
+    class SpyOs:
+        def __getattr__(self, name):
+            return getattr(orig_os, name)
+        def write(self, fd, data):
+            raise OSError(5, "simulated crash before first marker write")
+        def unlink(self, path, *args, **kwargs):
+            # Simulate abrupt SIGKILL where finally-block unlink never executes.
+            return None
+    ns["os"] = SpyOs()
+
+rc_wc, _, err_wc = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_w, legacy_id_w, vol, "0"],
+    hook=fail_first_write_sigkill_hook,
+)
+assert rc_wc != 0, "interrupted write must fail"
+assert not os.path.exists(os.path.join(target_w, ".qeminga-tx-id")), (
+    f"final .qeminga-tx-id must NEVER be created empty before writing; entries={os.listdir(target_w)}"
+)
+rc_wretry, new_id_w, err_wretry = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_w, legacy_id_w, vol, "0"]
+)
+assert rc_wretry == 0, f"retry after interrupted marker write must succeed: rc={rc_wretry} err={err_wretry}"
+assert os.listdir(target_w) == [".qeminga-tx-id"], (
+    f"retry must leave only .qeminga-tx-id with no stale temp markers: {os.listdir(target_w)}"
+)
+assert f"p_ino:{pst.st_ino};t_ino:{tst_w.st_ino};tx:" in new_id_w, new_id_w
+
+# 4. Interrupted marker creation right after os.link before unlinking the temp sibling
+#    (leaving `.qeminga-tx-id` and `.qeminga-tx-id.tmp.*` hardlinked with st_nlink == 2):
+#    retry MUST unlink the verified stale temp sibling, restore st_nlink == 1, and return the
+#    exact same token!
+target_l = os.path.join(root, ".qeminga-update-backup.linkcrash")
+os.makedirs(target_l, mode=0o700)
+os.chmod(target_l, 0o700)
+tst_l = os.lstat(target_l)
+legacy_id_l = f"p_dev:{pst.st_dev};p_ino:{pst.st_ino};p_mnt:1;t_dev:{tst_l.st_dev};t_ino:{tst_l.st_ino};t_mnt:1;vol:{vol}"
+def fail_temp_unlink_hook(ns):
+    orig_os = ns["os"]
+    class SpyOs:
+        def __getattr__(self, name):
+            return getattr(orig_os, name)
+        def unlink(self, path, *args, **kwargs):
+            if str(path).startswith(".qeminga-tx-id.tmp."):
+                raise OSError(5, "simulated crash before temp marker unlink")
+            return orig_os.unlink(path, *args, **kwargs)
+    ns["os"] = SpyOs()
+
+rc_lc, _, _ = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_l, legacy_id_l, vol, "0"],
+    hook=fail_temp_unlink_hook,
+)
+assert rc_lc != 0, "simulated post-link unlink crash must fail"
+assert os.path.isfile(os.path.join(target_l, ".qeminga-tx-id")), "linked marker should be present"
+published_tok_l = open(os.path.join(target_l, ".qeminga-tx-id"), encoding="ascii").read().strip()
+assert os.lstat(os.path.join(target_l, ".qeminga-tx-id")).st_nlink == 2, (
+    f"expected st_nlink==2 before recovery, entries={os.listdir(target_l)}"
+)
+rc_lretry, new_id_l, err_lretry = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_l, legacy_id_l, vol, "0"]
+)
+assert rc_lretry == 0, f"retry after post-link crash must succeed: rc={rc_lretry} err={err_lretry}"
+assert os.listdir(target_l) == [".qeminga-tx-id"], f"stale temp must be cleaned: {os.listdir(target_l)}"
+assert os.lstat(os.path.join(target_l, ".qeminga-tx-id")).st_nlink == 1
+assert f";tx:{published_tok_l};" in new_id_l, f"retry must return the published token {published_tok_l}, got {new_id_l}"
+
+# 5. Failed container-directory `os.fsync(tfd)` after complete marker publication:
+#    retry on the reuse path MUST sync `tfd` (and marker `mfd`) again rather than silently
+#    returning an unsynced token!
+target_f = os.path.join(root, ".qeminga-update-backup.fsyncfail")
+os.makedirs(target_f, mode=0o700)
+os.chmod(target_f, 0o700)
+tst_f = os.lstat(target_f)
+legacy_id_f = f"p_dev:{pst.st_dev};p_ino:{pst.st_ino};p_mnt:1;t_dev:{tst_f.st_dev};t_ino:{tst_f.st_ino};t_mnt:1;vol:{vol}"
+fail_container_fsync = [True]
+container_fsync_attempts = [0]
+synced_inos_on_ok = []
+def container_fsync_hook(ns):
+    orig_os = ns["os"]
+    class SpyOs:
+        def __getattr__(self, name):
+            return getattr(orig_os, name)
+        def fsync(self, fd):
+            st = orig_os.fstat(fd)
+            if st.st_ino == tst_f.st_ino:
+                container_fsync_attempts[0] += 1
+                if fail_container_fsync[0]:
+                    raise OSError(5, "simulated container dir fsync failure")
+            synced_inos_on_ok.append(st.st_ino)
+            return orig_os.fsync(fd)
+    ns["os"] = SpyOs()
+
+rc_f1, _, _ = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_f, legacy_id_f, vol, "0"],
+    hook=container_fsync_hook,
+)
+assert rc_f1 != 0, "first call must fail when container-dir fsync fails"
+assert os.path.isfile(os.path.join(target_f, ".qeminga-tx-id")), "marker was published before container fsync"
+assert container_fsync_attempts[0] == 1
+
+# Second call (reuse path) with container-dir fsync STILL failing -> MUST STILL fail!
+rc_f2, out_f2, _ = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_f, legacy_id_f, vol, "0"],
+    hook=container_fsync_hook,
+)
+assert rc_f2 != 0 and not out_f2, (
+    f"reuse path MUST propagate persistent container-dir fsync failure instead of returning '{out_f2}'"
+)
+assert container_fsync_attempts[0] >= 2, "reuse path must attempt container-dir fsync"
+
+# Third call (reuse path) once container-dir fsync succeeds -> MUST sync both marker and container!
+fail_container_fsync[0] = False
+synced_inos_on_ok.clear()
+mst_f = os.lstat(os.path.join(target_f, ".qeminga-tx-id"))
+rc_f3, new_id_f, err_f3 = exec_fs_op(
+    ["upgrade-legacy-path-identity", target_f, legacy_id_f, vol, "0"],
+    hook=container_fsync_hook,
+)
+assert rc_f3 == 0, f"retry once container fsync recovers must succeed: rc={rc_f3} err={err_f3}"
+assert tst_f.st_ino in synced_inos_on_ok, "reuse path MUST fsync verified container directory tfd"
+assert mst_f.st_ino in synced_inos_on_ok, "reuse path MUST fsync verified marker file mfd"
+tok_f = open(os.path.join(target_f, ".qeminga-tx-id"), encoding="ascii").read().strip()
+assert f";tx:{tok_f};" in new_id_f, new_id_f
 "##,
             script().to_str().unwrap(),
             py_root.to_str().unwrap(),

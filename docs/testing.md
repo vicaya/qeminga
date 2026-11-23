@@ -370,8 +370,13 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    matching `.runner` (including when the runner directory itself was
    deleted on the recorded volume) is refused — run
    `sudo scripts/setup-kvm-runner.sh uninstall --config-dir <dir>` (with
-   `--token-file` if deregistering) before re-enrolling so remote GitHub
-   registration state is never mutated without rollback. For an existing
+   `--token-file` when an executable local `config.sh` is still present to
+   run `config.sh remove`; if the runner directory or `config.sh` is gone,
+   `uninstall` clears local state and reports the recorded runner name and
+   target so you can remove the registration manually in the repository or
+   organization's **Settings → Actions → Runners** on GitHub) before
+   re-enrolling so remote GitHub registration state is never mutated without
+   rollback. For an existing
    owned `installed` runner, reinstall downloads, stages, validates, and
    prepares dependencies for the replacement bundle, durably journals
    `UPDATE_PHASE=preparing` with the verified stage and backup directory
@@ -402,9 +407,10 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `.qeminga-extract.*` stage and `.qeminga-update-backup.*` backup paths
    with reboot/remount-surviving directory identities binding parent/target
    inodes, persistent volume fingerprint, and a root-owned `0600`
-   `.qeminga-tx-id` marker in `install.env` (preserving recorded containers
-   in exit traps if post-rename directory `fsync` fails or the journal
-   cannot be read); publishes `manifest.json` atomically via
+   `.qeminga-tx-id` marker published atomically via temp file + `fsync` +
+   `link` in `install.env` (preserving recorded containers in exit traps if
+   post-rename directory `fsync` fails or the journal cannot be read);
+   publishes `manifest.json` atomically via
    `manifest.json.tmp` + `fsync` + `rename`, moves live entries into the
    verified backup container and `fsync`s the backup before placing
    replacements, and `fsync`s all published package files and directories
@@ -414,15 +420,19 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    startup succeeds — or after permission locking with `--no-start` —
    BEFORE pruning the backup (enforcing `euid`/`0700` ownership and syncing
    the emptied container before unlinking `.qeminga-tx-id` last); and on
-   retrying an `updating` record prunes an interrupted `preparing`
-   stage/snapshot without touching live files, finishes pruning a
-   `committed` backup without rolling back, or stops any active owned
-   replacement service first, reclaims the recorded stage, restores the
-   verified `publishing` backup (retaining the verified backup container
-   and config blobs on disk until `UPDATE_PHASE=restored` is durably saved,
-   and only then pruning it idempotently), re-locks permissions, reloads
-   systemd, and preserves `UPDATE_WAS_ACTIVE`; and refuses mismatched
-   flags, or opt in to GitHub self-updates with `--allow-auto-update`).
+   retrying an `updating` record durably re-saves `preparing`, `committed`,
+   or `restored` phases before pruning any backup (preserving backups across
+   persistent config-directory sync errors), prunes an interrupted
+   `preparing` stage/snapshot without touching live files, finishes pruning
+   a `committed` backup without rolling back, or confirms any active owned
+   service is stopped first (in both `publishing` and `restored` recovery,
+   before re-locking permissions and while retaining restart intent),
+   reclaims the recorded stage, restores the verified `publishing` backup
+   (retaining the verified backup container and config blobs on disk until
+   `UPDATE_PHASE=restored` is durably saved, and only then pruning it
+   idempotently), re-locks permissions, reloads systemd, and preserves
+   `UPDATE_WAS_ACTIVE`; and refuses mismatched flags, or opt in to GitHub
+   self-updates with `--allow-auto-update`).
    Operators upgrading legacy empty/4-field or verified root-only `blkid`
    UUID `VOL_*` records, pre-marker managed accounts, pre-phase `updating`
    journals, or preceding `376eed2`-format phased journals (using 7-field
@@ -433,12 +443,14 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    `getent passwd` lookups, mismatched legacy or strong UUID/fsid volumes,
    absent owned paths, and any non-empty GECOS including comma-separated
    contact metadata; upgrades legacy pre-phase `updating` records to
-   `UPDATE_PHASE=restored` when `UPDATE_BACKUP_DIR` is empty or stamps
-   `.qeminga-tx-id` and `UPDATE_PHASE=publishing` + `UPDATE_BACKUP_ID`
-   after verifying a root-owned `0700` same-volume backup container;
+   `UPDATE_PHASE=restored` when `UPDATE_BACKUP_DIR` is empty or atomically
+   publishes and container-`fsync`s `.qeminga-tx-id` and
+   `UPDATE_PHASE=publishing` + `UPDATE_BACKUP_ID` after verifying a
+   root-owned `0700` same-volume backup container;
    atomically verifies preceding `376eed2` `publishing`/`committed`/
    `restored` stage and backup containers on the same open directory
-   descriptor and stamps `.qeminga-tx-id` while preserving `UPDATE_PHASE` —
+   descriptor and atomically publishes/syncs `.qeminga-tx-id` (including
+   container `fsync` on reuse retries) while preserving `UPDATE_PHASE` —
    or, for a `376eed2` `committed` journal whose backup was already pruned
    before `RECORD_STATE=installed` was written, verifies the recorded
    parent inode and backing volume and finalizes the completed transaction
@@ -454,13 +466,20 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    by the recorded installation with
    `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
    (which requires a working `systemctl` client and confirmed deactivation
-   of any owned unit before restoring a `publishing` backup OR running
-   ordinary guest cleanup/deregistration/removal — preserving `install.env`
-   for retry if stopping fails or service state is indeterminate — prunes
+   and enablement removal — verifying `systemctl disable`, `is-enabled`, and
+   absence of `.wants`/`.requires`/`.upholds` links before releasing
+   `OWNED_UNIT=1` — of any owned unit before restoring a `publishing` backup
+   OR running ordinary guest cleanup/deregistration/removal — preserving
+   `install.env` for retry if stopping or disabling fails or service state
+   is indeterminate — durably re-saves recovered `preparing`/`committed`/
+   `restored` phases before pruning any backup, prunes
    interrupted `preparing` stages/backups without touching originals,
    reclaims any recorded `UPDATE_STAGE_DIR`, reconciles `UPDATE_BACKUP_DIR`
    by `UPDATE_PHASE` and verified identity retaining the backup container
-   until `UPDATE_PHASE=restored` is saved before pruning, directs legacy
+   until `UPDATE_PHASE=restored` is saved before pruning, emits a manual
+   **Settings → Actions → Runners** diagnostic naming the recorded runner
+   and target before discarding local state whenever executable `config.sh`
+   is unavailable for deregistration, directs legacy
    pre-phase and preceding `376eed2` phased `updating` records to
    `migrate-record --confirm-volumes`, and shares the same user, volume,
    and mount checks BEFORE any `runuser`, `chown`, service stop, or token

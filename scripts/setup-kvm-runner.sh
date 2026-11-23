@@ -2415,6 +2415,7 @@ READ_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 CUSTOM_MOUNTINFO = bool(os.environ.get("QEMINGA_MOUNTINFO"))
 TX_MARKER_NAME = ".qeminga-tx-id"
 TX_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+TX_MARKER_TMP_RE = re.compile(r"^\.qeminga-tx-id\.tmp\.[0-9a-f]{16}$")
 MANAGED_CFG_FILES = ("policy.env", "jitconfig")
 MANAGED_HOOK_FILES = (
     "hook-job-started.sh",
@@ -4043,7 +4044,7 @@ def open_verified_private_sibling(pfd, ref_dev, ref_mnt, sibling_path, sibling_b
         raise
 
 
-def read_tx_marker(tfd, t_mnt, target):
+def read_tx_marker(tfd, t_mnt, target, sync_file=False):
     try:
         mfd = os.open(TX_MARKER_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=tfd)
     except FileNotFoundError:
@@ -4065,6 +4066,8 @@ def read_tx_marker(tfd, t_mnt, target):
         tok = raw.decode("ascii", errors="strict").strip()
         if not TX_TOKEN_RE.fullmatch(tok):
             raise OSError(errno.EINVAL, f"malformed transaction marker '{target}/{TX_MARKER_NAME}'")
+        if sync_file:
+            os.fsync(mfd)
         return tok
     except UnicodeDecodeError as exc:
         raise OSError(errno.EINVAL, f"malformed transaction marker '{target}/{TX_MARKER_NAME}'") from exc
@@ -4072,9 +4075,62 @@ def read_tx_marker(tfd, t_mnt, target):
         os.close(mfd)
 
 
+def cleanup_stale_tx_marker_temps(tfd, t_mnt, target):
+    # Reclaim verified private `.qeminga-tx-id.tmp.<16hex>` temp files left
+    # behind by an interrupted write or a crash between os.link and os.unlink.
+    tx_key = None
+    try:
+        mfd = os.open(TX_MARKER_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=tfd)
+    except FileNotFoundError:
+        mfd = None
+    if mfd is not None:
+        try:
+            mst = os.fstat(mfd)
+            if (
+                stat.S_ISREG(mst.st_mode)
+                and fd_mnt_id(mfd) == t_mnt
+                and mst.st_uid == os.geteuid()
+                and (mst.st_mode & 0o777) == 0o600
+            ):
+                tx_key = (mst.st_dev, mst.st_ino)
+        finally:
+            os.close(mfd)
+    cleaned = False
+    for name in os.listdir(tfd):
+        if not TX_MARKER_TMP_RE.fullmatch(name):
+            continue
+        tmp_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=tfd)
+        try:
+            tst = os.fstat(tmp_fd)
+            if not stat.S_ISREG(tst.st_mode):
+                raise OSError(errno.EINVAL, f"unsafe transaction marker temp '{target}/{name}'")
+            if fd_mnt_id(tmp_fd) != t_mnt:
+                raise OSError(errno.EXDEV, f"transaction marker temp '{target}/{name}' crosses mount boundary")
+            if tst.st_uid != os.geteuid() or (tst.st_mode & 0o777) != 0o600:
+                raise OSError(
+                    errno.EACCES,
+                    f"transaction marker temp '{target}/{name}' must be owned by current user with mode 0600",
+                )
+            if tst.st_nlink == 1:
+                pass
+            elif tst.st_nlink == 2 and tx_key is not None and (tst.st_dev, tst.st_ino) == tx_key:
+                pass
+            else:
+                raise OSError(errno.EINVAL, f"unsafe transaction marker temp '{target}/{name}'")
+        finally:
+            os.close(tmp_fd)
+        os.unlink(name, dir_fd=tfd)
+        cleaned = True
+    if cleaned:
+        os.fsync(tfd)
+
+
 def ensure_tx_marker(tfd, t_mnt, target, create=True):
-    existing = read_tx_marker(tfd, t_mnt, target)
+    if create:
+        cleanup_stale_tx_marker_temps(tfd, t_mnt, target)
+    existing = read_tx_marker(tfd, t_mnt, target, sync_file=True)
     if existing:
+        os.fsync(tfd)
         return existing
     if not create:
         raise OSError(
@@ -4082,25 +4138,42 @@ def ensure_tx_marker(tfd, t_mnt, target, create=True):
             f"refusing '{target}': missing transaction identity marker '{TX_MARKER_NAME}' (leaving for inspection)",
         )
     tok = os.urandom(16).hex()
-    mfd = os.open(TX_MARKER_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=tfd)
+    tmp_name = f"{TX_MARKER_NAME}.tmp.{os.urandom(8).hex()}"
+    mfd = os.open(tmp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=tfd)
+    tmp_present = True
     try:
-        if os.geteuid() == 0:
-            os.fchown(mfd, 0, 0)
-        os.fchmod(mfd, 0o600)
-        data = (tok + "\n").encode("ascii")
-        view = memoryview(data)
-        while view:
-            written = os.write(mfd, view)
-            view = view[written:]
-        os.fsync(mfd)
-    except Exception:
-        os.close(mfd)
         try:
-            os.unlink(TX_MARKER_NAME, dir_fd=tfd)
-        except OSError:
-            pass
-        raise
-    os.close(mfd)
+            if os.geteuid() == 0:
+                os.fchown(mfd, 0, 0)
+            os.fchmod(mfd, 0o600)
+            data = (tok + "\n").encode("ascii")
+            view = memoryview(data)
+            while view:
+                written = os.write(mfd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, f"short write creating transaction marker '{target}/{TX_MARKER_NAME}'")
+                view = view[written:]
+            os.fsync(mfd)
+        finally:
+            os.close(mfd)
+        try:
+            os.link(tmp_name, TX_MARKER_NAME, src_dir_fd=tfd, dst_dir_fd=tfd)
+        except FileExistsError:
+            os.unlink(tmp_name, dir_fd=tfd)
+            tmp_present = False
+            existing = read_tx_marker(tfd, t_mnt, target, sync_file=True)
+            if not existing:
+                raise OSError(errno.EIO, f"transaction marker '{target}/{TX_MARKER_NAME}' vanished during creation")
+            os.fsync(tfd)
+            return existing
+        os.unlink(tmp_name, dir_fd=tfd)
+        tmp_present = False
+    finally:
+        if tmp_present:
+            try:
+                os.unlink(tmp_name, dir_fd=tfd)
+            except OSError:
+                pass
     os.fsync(tfd)
     return tok
 
@@ -6233,6 +6306,93 @@ ensure_owned_service_stopped_for_restore() {
     ensure_owned_service_stopped "$1"
 }
 
+# Print any remaining systemd enablement symlinks (*.wants, *.requires,
+# *.upholds) for `${OPT_SERVICE}.service` under the configured unit directories.
+find_unit_enablement_links() {
+    local unit="${OPT_SERVICE}.service"
+    local primary_dir="${QEMINGA_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+    primary_dir="${primary_dir%/}"
+    local unit_dirs
+    if [ -n "${QEMINGA_SYSTEMD_UNIT_DIRS:-}" ]; then
+        unit_dirs="$QEMINGA_SYSTEMD_UNIT_DIRS"
+    elif [ -n "${QEMINGA_SYSTEMD_UNIT_DIR:-}" ]; then
+        unit_dirs="$primary_dir"
+    else
+        unit_dirs="/etc/systemd/system:/run/systemd/system"
+    fi
+    local dirs=() d sub link
+    local prev_nullglob=0
+    if shopt -q nullglob; then prev_nullglob=1; fi
+    shopt -s nullglob
+    IFS=':' read -r -a dirs <<<"${primary_dir}:${unit_dirs}"
+    for d in "${dirs[@]}"; do
+        [ -n "$d" ] || continue
+        d="${d%/}"
+        for sub in "${d}"/*.wants "${d}"/*.requires "${d}"/*.upholds; do
+            [ -d "$sub" ] || continue
+            link="${sub}/${unit}"
+            if [ -e "$link" ] || [ -L "$link" ]; then
+                printf '%s\n' "$link"
+            fi
+        done
+    done
+    if [ "$prev_nullglob" -eq 0 ]; then shopt -u nullglob; fi
+}
+
+# Disable an owned systemd unit and confirm no enablement state or link remains
+# BEFORE releasing ownership or removing the unit file. Fails closed (returns 1)
+# if `systemctl` is unavailable, if any `.wants`/`.requires`/`.upholds` link
+# remains, if `systemctl is-enabled` still reports enabled/unrecognized state,
+# or if `systemctl disable` fails while enablement cannot be confirmed absent.
+ensure_owned_service_disabled() {
+    local mode="$1" unit_path="$2"
+    if [ "${REC_OWNED_UNIT:-0}" != "1" ] && [ "${OWNED_UNIT:-0}" != "1" ]; then
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        warn "${mode}: systemctl is unavailable while ${OPT_SERVICE}.service is owned by this installation; refusing to release unit ownership"
+        return 1
+    fi
+    local unit="${OPT_SERVICE}.service"
+    local disable_rc=0
+    systemctl disable "$unit" 9>&- 2>/dev/null || disable_rc=$?
+
+    local remaining_link
+    remaining_link="$(find_unit_enablement_links)"
+    remaining_link="${remaining_link%%$'\n'*}"
+    if [ -n "$remaining_link" ]; then
+        warn "${mode}: enablement link '${remaining_link}' still exists for ${unit} after 'systemctl disable' (rc=${disable_rc}); preserving unit ownership for retry"
+        return 1
+    fi
+
+    local enabled_state="" enabled_rc=0
+    enabled_state="$(systemctl is-enabled "$unit" 2>/dev/null)" || enabled_rc=$?
+    enabled_state="${enabled_state%%$'\n'*}"
+    case "$enabled_state" in
+        enabled | enabled-runtime | alias | linked | linked-runtime)
+            warn "${mode}: ${unit} is still enabled ('${enabled_state}') after 'systemctl disable' (rc=${disable_rc}); preserving unit ownership for retry"
+            return 1
+            ;;
+        disabled | static | indirect | generated | transient | masked | masked-runtime | not-found)
+            return 0
+            ;;
+        "")
+            if [ "$disable_rc" -eq 0 ] && [ "$enabled_rc" -eq 0 ]; then
+                return 0
+            fi
+            if [ ! -e "$unit_path" ] && [ ! -L "$unit_path" ]; then
+                return 0
+            fi
+            warn "${mode}: 'systemctl disable ${unit}' failed (rc=${disable_rc}, is-enabled rc=${enabled_rc}) and enablement state could not be confirmed absent; preserving unit ownership for retry"
+            return 1
+            ;;
+        *)
+            warn "${mode}: 'systemctl is-enabled ${unit}' returned unrecognized state '${enabled_state}' (disable rc=${disable_rc}); preserving unit ownership for retry"
+            return 1
+            ;;
+    esac
+}
+
 # Three-outcome journal check shared by `cleanup_install_exit` and
 # `cleanup_update_exit`:
 #   0 -> journal is readable and contains exact line "${key}=${val}"
@@ -7040,13 +7200,16 @@ cmd_install() {
                 fi
                 if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                     validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+                fi
+                validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+                write_update_record "$rec_path" "updating" "preparing" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+                if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                     say "pruning interrupted reinstall stage directory (${REC_UPDATE_STAGE_DIR})"
                     fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                         || die "install: failed to prune interrupted preparing stage '$REC_UPDATE_STAGE_DIR'; preserving preparing record for inspection"
                     REC_UPDATE_STAGE_DIR=""
                     REC_UPDATE_STAGE_ID=""
                 fi
-                validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
                 say "pruning incomplete reinstall snapshot (${REC_UPDATE_BACKUP_DIR})"
                 fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
                     || die "install: failed to prune incomplete preparing snapshot '$REC_UPDATE_BACKUP_DIR'; preserving preparing record for inspection"
@@ -7087,6 +7250,10 @@ cmd_install() {
     if [ "$HAS_INSTALL_RECORD" -eq 1 ] && [ "$REC_STATE" = "installed" ] \
         && [ "$OWNED_CONFIG_DIR" -eq 1 ] && [ "$OWNED_INSTALL_DIR" -eq 1 ] \
         && [ -z "$OPT_JITCONFIG_FILE" ] && [ "$reg_mode" = "configure" ]; then
+        if [ -L "$OPT_INSTALL_DIR" ] || [ ! -d "$OPT_INSTALL_DIR" ] \
+            || [ -L "$OPT_INSTALL_DIR/config.sh" ] || [ ! -x "$OPT_INSTALL_DIR/config.sh" ]; then
+            die "existing installation at $rec_path has no matching persistent .runner registration and executable '${OPT_INSTALL_DIR}/config.sh' is unavailable; in-place reinstall cannot safely roll back a new remote GitHub registration (--replace) — run 'sudo $0 uninstall --config-dir $OPT_CONFIG_DIR' to clear local state and remove runner '${REC_RUNNER_NAME:-$runner_name}' on '${REC_TARGET_URL:-$TARGET_URL}' manually in the repository or organization's Settings -> Actions -> Runners on GitHub before re-enrolling"
+        fi
         die "existing installation at $rec_path has no matching persistent .runner registration; in-place reinstall cannot safely roll back a new remote GitHub registration (--replace) — run 'sudo $0 uninstall --config-dir $OPT_CONFIG_DIR' (with --token-file if deregistering) before re-enrolling"
     fi
 
@@ -7690,19 +7857,24 @@ cmd_update() {
     #   it on disk, durably persist `UPDATE_PHASE=restored`, ONLY THEN prune
     #   the verified backup container, re-lock permissions, and preserve
     #   original `UPDATE_WAS_ACTIVE`.
-    # - restored: prune any still-present backup container, ensure permissions
-    #   are locked, and preserve original `UPDATE_WAS_ACTIVE` across the retry.
+    # - restored: confirm any active owned service is stopped first (retaining
+    #   restart intent), durably sync `UPDATE_PHASE=restored` before pruning any
+    #   still-present backup container, re-lock permissions, and preserve
+    #   original `UPDATE_WAS_ACTIVE` across the retry.
     local was_active=0
     if [ "$REC_STATE" = "updating" ]; then
         if [ "$REC_UPDATE_PHASE" = "preparing" ]; then
             if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+            fi
+            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+            write_update_record "$_UPDATE_RECORD_PATH" "updating" "preparing" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                     || die "update: failed to prune interrupted preparing stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
                 REC_UPDATE_STAGE_DIR=""
                 REC_UPDATE_STAGE_ID=""
             fi
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
             say "pruning incomplete snapshot from interrupted preparation (${REC_UPDATE_BACKUP_DIR})"
             fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
                 || die "update: failed to prune incomplete preparing backup '$REC_UPDATE_BACKUP_DIR'; preserving updating record for inspection"
@@ -7714,12 +7886,15 @@ cmd_update() {
         elif [ "$REC_UPDATE_PHASE" = "committed" ]; then
             if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
+            fi
+            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+            write_update_record "$_UPDATE_RECORD_PATH" "updating" "committed" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+            if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                     || die "update: failed to reclaim leftover stage '$REC_UPDATE_STAGE_DIR' after committed update; preserving updating record for inspection"
                 REC_UPDATE_STAGE_DIR=""
                 REC_UPDATE_STAGE_ID=""
             fi
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
             say "finishing backup cleanup for committed update (${REC_UPDATE_BACKUP_DIR})"
             fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
                 || die "update: failed to prune committed update backup '$REC_UPDATE_BACKUP_DIR'; preserving updating record for inspection"
@@ -7733,6 +7908,10 @@ cmd_update() {
             _UPDATE_WAS_ACTIVE="$was_active"
             ensure_owned_service_stopped_for_restore update \
                 || die "update: refusing to restore interrupted update backup without confirming ${OPT_SERVICE}.service is stopped"
+            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
+                was_active=1
+                _UPDATE_WAS_ACTIVE=1
+            fi
             if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
                 say "reclaiming leftover stage directory from interrupted update (${REC_UPDATE_STAGE_DIR})"
@@ -7763,13 +7942,22 @@ cmd_update() {
         else
             was_active="$REC_UPDATE_WAS_ACTIVE"
             _UPDATE_WAS_ACTIVE="$was_active"
+            ensure_owned_service_stopped_for_restore update \
+                || die "update: refusing to finalize restored update without confirming ${OPT_SERVICE}.service is stopped"
+            if [ "${_SERVICE_WAS_ACTIVE:-0}" -eq 1 ]; then
+                was_active=1
+                _UPDATE_WAS_ACTIVE=1
+            fi
             if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
                 validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+                write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
                 say "pruning verified backup container from restored update (${REC_UPDATE_BACKUP_DIR})"
                 fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
                     || die "update: failed to prune restored update backup '$REC_UPDATE_BACKUP_DIR'; preserving restored record for inspection"
                 REC_UPDATE_BACKUP_DIR=""
                 REC_UPDATE_BACKUP_ID=""
+                write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
+            elif [ "$was_active" != "$REC_UPDATE_WAS_ACTIVE" ]; then
                 write_update_record "$_UPDATE_RECORD_PATH" "updating" "restored" "" "" "" "" "$was_active"
             fi
             lock_runner_permissions
@@ -8561,14 +8749,23 @@ cmd_uninstall() {
         if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
             validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
             verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
+        fi
+        if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
+            verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
+        fi
+        if [ "$REC_UPDATE_PHASE" = "preparing" ] || [ "$REC_UPDATE_PHASE" = "committed" ] || [ "$REC_UPDATE_PHASE" = "restored" ]; then
+            if [ -n "$REC_UPDATE_STAGE_DIR" ] || [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
+                write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "$REC_UPDATE_PHASE" "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
+            fi
+        fi
+        if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
             fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                 || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
             REC_UPDATE_STAGE_DIR=""
             REC_UPDATE_STAGE_ID=""
         fi
         if [ -n "$REC_UPDATE_BACKUP_DIR" ]; then
-            validate_update_backup_path "$OPT_INSTALL_DIR" "$REC_UPDATE_BACKUP_DIR"
-            verify_resource_volume install "update backup directory" "$REC_UPDATE_BACKUP_DIR"
             if [ "$REC_UPDATE_PHASE" = "preparing" ] || [ "$REC_UPDATE_PHASE" = "committed" ] || [ "$REC_UPDATE_PHASE" = "restored" ]; then
                 fs_ops safe-rmtree-id "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" \
                     || die "uninstall: failed to prune ${REC_UPDATE_PHASE} update backup '$REC_UPDATE_BACKUP_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
@@ -8607,13 +8804,16 @@ cmd_uninstall() {
 
     # Only stop/disable the unit if this installation actually created/owns it
     # and its recorded backing volume matches. Require confirmed deactivation
-    # before running guest domain cleanup, deregistration, or resource removal
-    # so live runner processes or jobs are never torn down underneath them.
+    # AND confirmed removal of enablement links before running guest domain
+    # cleanup, deregistration, or resource removal so live runner processes
+    # are never torn down underneath them and stale `.wants` links are never
+    # left behind to be inherited by a future unit under the same name.
     if [ "$REC_OWNED_UNIT" = "1" ]; then
         verify_resource_volume unit "systemd unit" "$unit_path"
         ensure_owned_service_stopped uninstall \
             || die "uninstall: refusing to clean up or remove runner resources without confirming ${OPT_SERVICE}.service is stopped; preserving $OPT_CONFIG_DIR/install.env for retry"
-        systemctl disable "${OPT_SERVICE}.service" 9>&- 2>/dev/null || true
+        ensure_owned_service_disabled uninstall "$unit_path" \
+            || die "uninstall: refusing to release ${OPT_SERVICE}.service ownership because enablement could not be confirmed removed; preserving $OPT_CONFIG_DIR/install.env for retry"
     fi
 
     # Run THIS installer's own domain-only cleanup logic (with a minimal
@@ -8690,7 +8890,9 @@ EOF
     fi
 
     # Optional deregistration from GitHub if a removal token was supplied (only
-    # when this installation actually owns OPT_INSTALL_DIR).
+    # when this installation actually owns OPT_INSTALL_DIR). If local
+    # `config.sh` is unavailable, emit a clear diagnostic naming the recorded
+    # runner and target BEFORE discarding local state/install.env.
     if [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ -n "$OPT_TOKEN_FILE" ] \
         && [ ! -L "$OPT_INSTALL_DIR" ] && [ ! -L "$OPT_INSTALL_DIR/config.sh" ] \
         && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
@@ -8704,10 +8906,17 @@ EOF
         say "deregistering runner from GitHub"
         safe_chown_runner_dir "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR" "$REC_VOL_INSTALL_DIR" "$skip_children"
         run_runner_config_with_token "$rm_token" remove --unattended \
-            || warn "deregistration failed (remove manually in GitHub Settings -> Actions -> Runners)"
+            || warn "deregistration failed for runner '${REC_RUNNER_NAME:-<unknown>}' on '${REC_TARGET_URL:-<unknown>}' (remove manually in the repository or organization's Settings -> Actions -> Runners on GitHub)"
         unset rm_token
+    elif [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ -n "$OPT_TOKEN_FILE" ]; then
+        warn "cannot run local deregistration for runner '${REC_RUNNER_NAME:-<unknown>}' on '${REC_TARGET_URL:-<unknown>}' because executable '${OPT_INSTALL_DIR}/config.sh' (or service account '${OPT_USER}') is unavailable; remove the runner registration manually in the repository or organization's Settings -> Actions -> Runners on GitHub"
     elif [ "$REC_OWNED_INSTALL_DIR" != "1" ] && [ -n "$OPT_TOKEN_FILE" ]; then
-        warn "skipping runner deregistration: $OPT_INSTALL_DIR is not owned by this installation (already removed or never created)"
+        warn "skipping local deregistration for runner '${REC_RUNNER_NAME:-<unknown>}' on '${REC_TARGET_URL:-<unknown>}': $OPT_INSTALL_DIR is not owned by this installation (already removed or never created); if still registered, remove it manually in the repository or organization's Settings -> Actions -> Runners on GitHub"
+    elif [ "$REC_OWNED_INSTALL_DIR" = "1" ] && [ "${REC_EPHEMERAL:-0}" != "1" ] \
+        && [ -n "${REC_RUNNER_NAME:-}" ] \
+        && { [ -L "$OPT_INSTALL_DIR" ] || [ ! -d "$OPT_INSTALL_DIR" ] \
+            || [ -L "$OPT_INSTALL_DIR/config.sh" ] || [ ! -x "$OPT_INSTALL_DIR/config.sh" ]; }; then
+        warn "runner directory or executable '${OPT_INSTALL_DIR}/config.sh' is unavailable; clearing local state, and if runner '${REC_RUNNER_NAME}' on '${REC_TARGET_URL:-<unknown>}' is still registered on GitHub, remove it manually in the repository or organization's Settings -> Actions -> Runners"
     fi
 
     # Stage each owned resource into a private root-only container on the same

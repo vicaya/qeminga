@@ -123,22 +123,31 @@ hosted TCG lane:
 - **Trust boundary:** `libvirt-kvm.yml` is triggered **only** via
   `workflow_dispatch` (never `pull_request`, `pull_request_target`, or
   comments), with `permissions: contents: read` and zero secrets passed to
-  the self-hosted runner. The `candidate` job builds
-  `cargo build --release --locked --features seccomp` on GitHub-hosted
-  `ubuntu-24.04` / `ubuntu-24.04-arm`, and the `kvm` job verifies the
-  binary against `--expect-sha256 "${{ needs.candidate.outputs.sha256 }}"`
-  with no Rust toolchain, no `apt-get`, and no `sudo` on the self-hosted
-  runner.
+  the self-hosted runner. A hosted `resolve` job pins one vetted 40-hex
+  `vicaya/qeminga` commit (`$GITHUB_SHA` when dispatched in
+  `vicaya/qeminga`, or `qeminga-target.rev` / `vicaya/qeminga`
+  `refs/heads/main` when dispatched from a private controller repository)
+  and passes it to both `x86_64` and `aarch64` lanes so the hosted
+  `candidate` checkout, the self-hosted `kvm` checkout, and the release
+  candidate manifest all verify the exact same `vicaya/qeminga` commit.
+  The `candidate` job builds `cargo build --release --locked --features seccomp`
+  on GitHub-hosted `ubuntu-24.04` / `ubuntu-24.04-arm`, and the `kvm` job
+  verifies the binary against
+  `--expect-sha256 "${{ needs.candidate.outputs.sha256 }}"` with no Rust
+  toolchain, no `apt-get`, and no `sudo` on the self-hosted runner.
 - **Native KVM on both architectures:** `scripts/ci/libvirt-kvm-smoke.sh`
-  boots a disposable guest with `<domain type='kvm'>` and
-  `<cpu mode='host-passthrough' check='none'/>` (`x86_64`: `q35`,
-  SeaBIOS, `<apic/>`; `aarch64`: `virt`, UEFI from `qemu-efi-aarch64` /
-  `edk2-aarch64`, `<gic version='host'/>` to match GICv2 or GICv3 arm64
-  servers automatically), proves KVM via `virsh dumpxml`, HMP `info kvm`
-  (`kvm support: enabled`), and the QEMU command line (`-accel kvm` /
-  `accel=kvm`, refusing any TCG fallback), installs the candidate via
-  `scripts/ci/libvirt-tcg-guest.sh`, runs `scripts/e2e-libvirt.sh`, and
-  records `suite: "libvirt-kvm-smoke-v1"` with `accelerator: "kvm"`.
+  (sharing candidate manifest/digest checks, pinned Ubuntu cloud image
+  digests, and verified image fetch with `scripts/ci/libvirt-tcg-smoke.sh`
+  via `scripts/ci/libvirt-smoke-common.sh`) boots a disposable guest with
+  `<domain type='kvm'>` and `<cpu mode='host-passthrough' check='none'/>`
+  (`x86_64`: `q35`, SeaBIOS, `<apic/>`; `aarch64`: `virt`, UEFI from
+  `qemu-efi-aarch64` / `edk2-aarch64`, `<gic version='host'/>` to match
+  GICv2 or GICv3 arm64 servers automatically), proves KVM via `virsh dumpxml`,
+  HMP `info kvm` (`kvm support: enabled`), and the QEMU command line
+  (`-accel kvm` / `accel=kvm`, refusing any TCG fallback), installs the
+  candidate via `scripts/ci/libvirt-tcg-guest.sh`, runs
+  `scripts/e2e-libvirt.sh`, and records `suite: "libvirt-kvm-smoke-v1"`
+  with `accelerator: "kvm"`.
 - **Unprivileged by default:** defaults to `QEMINGA_E2E_CONNECT=qemu:///session`
   with QEMU user-mode networking (`<interface type='user'>` via `libslirp`)
   and refuses to run as root in session mode.
@@ -146,43 +155,74 @@ hosted TCG lane:
 ### Setting up a community-donated KVM runner (`x86_64` or `arm64`)
 
 Community members with a Linux KVM server (bare metal or nested-KVM VPS,
-`x86_64` or `aarch64`/`arm64`, Ubuntu/Debian or Fedora/RHEL with systemd)
-can check readiness and provision a hardened runner with
-`scripts/setup-kvm-runner.sh`:
+`x86_64` or `aarch64`/`arm64`, Ubuntu/Debian or Fedora/RHEL with systemd
+and cgroup v2) can check readiness and provision a hardened runner with
+`scripts/setup-kvm-runner.sh`.
+
+**GitHub-side dispatch restriction is mandatory:** never register a donated
+runner directly on public `vicaya/qeminga`. In `actions/runner`, action
+preparation runs before `ACTIONS_RUNNER_HOOK_JOB_STARTED`, and steps with
+`if: always()` or `if: failure()` still execute after a hook failure, so a
+hook alone cannot keep untrusted jobs off the runner. Register the runner
+against either:
+
+1. **Private controller repository (default, #53):** a private repository
+   containing `.github/workflows/libvirt-kvm.yml` and
+   `.github/workflows/libvirt-kvm-lane.yml` (optionally pinning a 40-hex
+   commit in `qeminga-target.rev`; otherwise resolving `vicaya/qeminga`
+   `refs/heads/main`). `install` checks repository visibility and refuses
+   public repositories (including `vicaya/qeminga`).
+2. **Restricted organization runner group:** an organization runner group
+   (`--org https://github.com/<org> --runner-group <GROUP> --allow-repo vicaya/qeminga`)
+   restricted in GitHub's runner-group settings to the reviewed repository
+   and workflow/ref.
 
 ```sh
-# 1. Read-only check (architecture, /dev/kvm, libvirt/QEMU, AAVMF on arm64, RAM/disk, DNS)
+# 1. Read-only check (architecture, /dev/kvm, cgroup v2, libvirt/QEMU, AAVMF on arm64, RAM/disk, DNS)
 scripts/setup-kvm-runner.sh preflight
 
-# 2. One-command hardened setup (prompts for the 1-hour GitHub registration token
-#    with hidden input, or pass --token-file /path/to/mode-0600-token or --token-file -)
+# 2. One-command hardened setup against the private controller repository
+#    (prompts for the 1-hour GitHub registration token with hidden input, or
+#    pass --token-file /path/to/mode-0600-token or --token-file -)
 sudo scripts/setup-kvm-runner.sh install \
-  --repo https://github.com/vicaya/qeminga
+  --repo https://github.com/<owner>/qeminga-kvm-controller
+
+# Alternative: restricted GitHub organization runner group
+# sudo scripts/setup-kvm-runner.sh install \
+#   --org https://github.com/<org> \
+#   --runner-group <restricted-group> \
+#   --allow-repo vicaya/qeminga
 
 # Inspect active hardening score, policy, and logs:
 scripts/setup-kvm-runner.sh status
 journalctl -u qeminga-kvm-runner.service -f
 ```
 
-For a private controller repository (issue #53) or one-shot ephemeral runs,
-pass `--repo https://github.com/<owner>/<controller>`, `--ephemeral`, or
-`--jitconfig-file /path/to/jitconfig` (mode `0600`; the single-use credential
-is delivered via systemd `LoadCredential=` and removed automatically on
+For one-shot ephemeral runs, pass `--ephemeral` or
+`--jitconfig-file /path/to/jitconfig` (mode `0600`; the single-use
+credential is validated for its target URL and resolved workspace path,
+delivered via systemd `LoadCredential=`, and removed automatically on
 service stop). You can inspect the generated unit and hooks before touching
 the host with `render-unit` and `render-hooks`.
 
 ### Security-by-default controls on donated runners
 
-1. **Dedicated locked account (`qeminga-runner`):** system user with
-   `/usr/sbin/nologin`, no `sudo`, no `libvirt`, `docker`, or `adm` group;
-   only supplementary group `kvm` (to open `/dev/kvm`). Setup refuses to
-   reuse an existing account that belongs to any privileged group.
+1. **Dedicated locked account (`qeminga-runner`) and scoped ownership:**
+   system user with `/usr/sbin/nologin`, no `sudo`, no `libvirt`, `docker`,
+   or `adm` group; only supplementary group `kvm` (to open `/dev/kvm`).
+   `install` records the provisioned UID/GID and dedicated, non-overlapping
+   paths in root-owned `/etc/qeminga-runner/install.env` (`0600`), refuses
+   to adopt unrelated pre-existing accounts (or accounts in any group beyond
+   `{qeminga-runner, kvm}`) or unmanaged pre-existing directories, stops any
+   existing runner service before mutating state, and creates runtime state
+   subdirectories (`work/`, `images/`, `image-cache/`, etc.) as the
+   unprivileged runner user rather than root.
 2. **Unprivileged `qemu:///session` isolation:** installs only minimal
    session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
    `libvirt-clients`, `qemu-system-x86` or `qemu-system-arm` +
-   `qemu-efi-aarch64`, `qemu-utils`, `genisoimage`, `jq`, `curl`); no
-   `libvirt-daemon-system`, no host bridge, no `docker`, and no access to
-   the donor's own `qemu:///system` VMs.
+   `qemu-efi-aarch64`, `qemu-utils`, `genisoimage`, `jq`, `curl`,
+   `python3`); no `libvirt-daemon-system`, no host bridge, no `docker`, and
+   no access to the donor's own `qemu:///system` VMs.
 3. **Kernel-enforced systemd sandbox:** `NoNewPrivileges=yes`, empty
    `CapabilityBoundingSet=` / `AmbientCapabilities=`, `ProtectSystem=strict`,
    `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectProc=invisible`,
@@ -194,39 +234,55 @@ the host with `render-unit` and `render-hooks`.
    and host-protecting bounds (`MemoryMax=80%`, `TasksMax=512`, optional
    `--cpu-quota`). (`MemoryDenyWriteExecute` is omitted because `.NET`,
    Node.js, and QEMU need JIT mappings.)
-4. **Cgroup BPF egress firewall:** denies cloud instance metadata
+4. **Verified cgroup BPF egress firewall:** denies cloud instance metadata
    (`169.254.0.0/16`, `fe80::/10`, and AWS IPv6 IMDS `fd00:ec2::254/128`
    unconditionally, even with `--no-lan-deny`), multicast, and private LANs
    (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`,
    `fc00::/7`) by default while allowing `localhost`
-   (`systemd-resolved` at `127.0.0.53`). Because QEMU runs in the same
-   cgroup, disposable guest VMs inherit the same block. Hosts with a
-   private DNS resolver can pass `--allow-ip <ip>/32` (IMDS ranges and
-   default routes are always refused).
-5. **Host-enforced pre- and post-job hooks:** root-owned
+   (`systemd-resolved` at `127.0.0.53`). Because systemd silently skips
+   `IPAddressDeny=` on hosts or containers without cgroup BPF firewalling,
+   `ExecStartPre=/usr/local/libexec/qeminga-runner/check-egress-firewall.sh`
+   verifies inside the runner's own cgroup that outbound IMDS datagrams
+   return `EPERM` before `Runner.Listener` starts (failing closed with exit
+   `78` and `RestartPreventExitStatus=78` if filtering is inactive). Because
+   QEMU runs in the same cgroup, disposable guest VMs inherit the same
+   block. Hosts with a private DNS resolver can pass `--allow-ip <ip>/32`
+   (IMDS ranges and default routes are always refused).
+5. **Host-enforced pre- and post-job hooks (defense-in-depth):** root-owned
    `/usr/local/libexec/qeminga-runner/hook-job-{started,completed}.sh`
    wired via systemd `Environment=` and configured by root-owned
-   `/etc/qeminga-runner/policy.env` (`0640`). Before any checkout or job
-   step runs, `hook-job-started.sh` enforces exact whole-string allowlists
-   on `GITHUB_REPOSITORY`, `GITHUB_EVENT_NAME` (default `workflow_dispatch`
-   only; `pull_request` and `pull_request_target` are unconditionally
-   refused), `GITHUB_REF` (default `refs/heads/main`), `GITHUB_WORKFLOW_REF`
-   (default `.github/workflows/libvirt-kvm.yml`), and optional
-   `--allow-actor`, plus checks `/dev/kvm` and stale `qeminga-e2e-*`
-   domains. After every job, `hook-job-completed.sh` destroys/undefines any
-   stray `qeminga-e2e-*` session domains (leaving unrelated domains alone
-   and keeping disks if state is unknown) and scrubs the runner work
-   directory while keeping the SHA-256-verified image cache.
-6. **Pinned & read-only runner binaries:** downloads official
-   `actions/runner` over HTTPS TLS 1.2+ and checks the pinned SHA-256
-   digest for `linux-x64` or `linux-arm64` before extraction. Registration
-   tokens are refused on the command line (`--token` is rejected) and
-   passed via `ACTIONS_RUNNER_INPUT_TOKEN`. Auto-updates are disabled by
-   default (`--disableupdate`) so runner binaries stay kernel-read-only;
-   GitHub requires runner updates within 30 days of a new release — update
-   cleanly with `sudo scripts/setup-kvm-runner.sh update` (or opt in to
-   GitHub self-updates with `--allow-auto-update`). Remove everything with
-   `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`.
+   `/etc/qeminga-runner/policy.env` (`0640`). As a second check behind
+   GitHub-side repo/runner-group restriction, `hook-job-started.sh`
+   enforces exact whole-string allowlists on `GITHUB_REPOSITORY`,
+   `GITHUB_EVENT_NAME` (default `workflow_dispatch` only; `pull_request`
+   and `pull_request_target` are unconditionally refused), `GITHUB_REF`
+   (default `refs/heads/main`), `GITHUB_WORKFLOW_REF` (default
+   `.github/workflows/libvirt-kvm.yml`), and optional `--allow-actor`, plus
+   checks `/dev/kvm` and stale `qeminga-e2e-*` domains. After every job,
+   `hook-job-completed.sh` destroys/undefines any stray `qeminga-e2e-*`
+   session domains (leaving unrelated domains alone and keeping disks if
+   state is unknown) and scrubs the runner's actual validated work
+   directory (including `_work` for JIT runners) while keeping the
+   SHA-256-verified image cache.
+6. **Pinned, read-only runner binaries & safe reinstall/uninstall:**
+   downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
+   pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
+   extraction. Registration tokens are refused on the command line
+   (`--token` is rejected) and passed solely via the inherited
+   `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls inspect
+   existing `.runner` registrations before stopping the service (reusing
+   matching registrations, refusing incompatible ones, and restoring locked
+   permissions + restarting the service if reconfiguration fails).
+   Auto-updates are disabled by default (`--disableupdate`) so runner
+   binaries stay kernel-read-only; GitHub requires runner updates within
+   30 days of a new release — update cleanly with
+   `sudo scripts/setup-kvm-runner.sh update` (or opt in to GitHub
+   self-updates with `--allow-auto-update`). Remove everything owned by the
+   recorded installation with
+   `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
+   (uninstall refuses to delete unrecorded paths and preserves
+   `$STATE_DIR/images` if session domain cleanup cannot confirm domains are
+   gone).
 
 ### Running the KVM smoke script locally (unprivileged)
 

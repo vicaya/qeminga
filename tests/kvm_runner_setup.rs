@@ -16,7 +16,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-const REPO_URL: &str = "https://github.com/vicaya/qeminga";
+const REPO_URL: &str = "https://github.com/vicaya/qeminga-kvm-controller";
+const PUBLIC_REPO_URL: &str = "https://github.com/vicaya/qeminga";
 
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -246,7 +247,9 @@ fn rendered_unit_is_hardened_and_unprivileged_by_default() {
         "IPAddressDeny=fc00::/7",
         "IPAddressDeny=fe80::/10",
         "IPAddressDeny=fd00:ec2::254/128",
+        "ExecStartPre=/usr/local/libexec/qeminga-runner/check-egress-firewall.sh",
         "ExecStart=/opt/qeminga-runner/bin/runsvc.sh",
+        "RestartPreventExitStatus=78",
         "Environment=XDG_RUNTIME_DIR=/run/qeminga-kvm-runner",
         "Environment=QEMINGA_E2E_CONNECT=qemu:///session",
         "Environment=LIBVIRT_DEFAULT_URI=qemu:///session",
@@ -313,6 +316,10 @@ fn rendered_units_pass_systemd_analyze_verify() {
     write_exec(&fake_bin.join("runsvc.sh"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_bin.join("Runner.Listener"), "#!/bin/sh\nexit 0\n");
     write_exec(&fake_hooks.join("run-jit.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &fake_hooks.join("check-egress-firewall.sh"),
+        "#!/bin/sh\nexit 0\n",
+    );
     let jit_cfg = fake_cfg.join("jitconfig");
     std::fs::write(&jit_cfg, "dummy").unwrap();
     std::fs::set_permissions(&jit_cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -375,6 +382,13 @@ fn rendered_units_pass_systemd_analyze_verify() {
             .output()
             .unwrap();
         let combined = text(&verify);
+        if !verify.status.success()
+            && std::env::var_os("CI").is_none()
+            && combined.contains("Failed to create /run/systemd")
+        {
+            eprintln!("skipped systemd-analyze verify in unprivileged container: {combined}");
+            return;
+        }
         assert!(
             verify.status.success(),
             "{name}: systemd-analyze verify failed:\n{combined}\nunit:\n{}",
@@ -729,7 +743,9 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
     let log = dir.path().join("virsh.log");
 
     let log_str = log.to_str().unwrap();
-    let valid_wf_ref = "vicaya/qeminga/.github/workflows/libvirt-kvm.yml@refs/heads/main";
+    let ctrl_repo = "vicaya/qeminga-kvm-controller";
+    let valid_wf_ref =
+        "vicaya/qeminga-kvm-controller/.github/workflows/libvirt-kvm.yml@refs/heads/main";
     fn base_env<'a>(
         log: &'a str,
         repo: &'a str,
@@ -756,7 +772,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
         &bin,
         &base_env(
             log_str,
-            "vicaya/qeminga",
+            ctrl_repo,
             "workflow_dispatch",
             "refs/heads/main",
             valid_wf_ref,
@@ -776,15 +792,15 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
     for (label, repo, event, git_ref, wf_ref, actor) in [
         (
             "prefix-repo",
-            "vicaya/qeminga-fork",
+            "vicaya/qeminga-kvm-controller-fork",
             "workflow_dispatch",
             "refs/heads/main",
-            "vicaya/qeminga-fork/.github/workflows/libvirt-kvm.yml@refs/heads/main",
+            "vicaya/qeminga-kvm-controller-fork/.github/workflows/libvirt-kvm.yml@refs/heads/main",
             "vicaya",
         ),
         (
             "pull_request",
-            "vicaya/qeminga",
+            ctrl_repo,
             "pull_request",
             "refs/heads/main",
             valid_wf_ref,
@@ -792,7 +808,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
         ),
         (
             "pull_request_target",
-            "vicaya/qeminga",
+            ctrl_repo,
             "pull_request_target",
             "refs/heads/main",
             valid_wf_ref,
@@ -800,7 +816,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
         ),
         (
             "unlisted-push",
-            "vicaya/qeminga",
+            ctrl_repo,
             "push",
             "refs/heads/main",
             valid_wf_ref,
@@ -808,23 +824,23 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
         ),
         (
             "wrong-branch",
-            "vicaya/qeminga",
+            ctrl_repo,
             "workflow_dispatch",
             "refs/heads/feature",
-            "vicaya/qeminga/.github/workflows/libvirt-kvm.yml@refs/heads/feature",
+            "vicaya/qeminga-kvm-controller/.github/workflows/libvirt-kvm.yml@refs/heads/feature",
             "vicaya",
         ),
         (
             "wrong-workflow",
-            "vicaya/qeminga",
+            ctrl_repo,
             "workflow_dispatch",
             "refs/heads/main",
-            "vicaya/qeminga/.github/workflows/ci.yml@refs/heads/main",
+            "vicaya/qeminga-kvm-controller/.github/workflows/ci.yml@refs/heads/main",
             "vicaya",
         ),
         (
             "wrong-actor",
-            "vicaya/qeminga",
+            ctrl_repo,
             "workflow_dispatch",
             "refs/heads/main",
             valid_wf_ref,
@@ -856,7 +872,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
         &bin,
         &base_env(
             log_str,
-            "vicaya/qeminga",
+            ctrl_repo,
             "workflow_dispatch",
             "refs/heads/main",
             valid_wf_ref,
@@ -868,7 +884,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
     // Missing /dev/kvm fails closed.
     let mut no_kvm_env = base_env(
         log_str,
-        "vicaya/qeminga",
+        ctrl_repo,
         "workflow_dispatch",
         "refs/heads/main",
         valid_wf_ref,
@@ -881,7 +897,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
     // Stale qeminga-e2e-* domain or failing virsh listing fails closed.
     let mut stale_env = base_env(
         log_str,
-        "vicaya/qeminga",
+        ctrl_repo,
         "workflow_dispatch",
         "refs/heads/main",
         valid_wf_ref,
@@ -893,7 +909,7 @@ fn job_started_hook_allows_exact_matching_dispatch_and_refuses_everything_else()
 
     let mut list_fail_env = base_env(
         log_str,
-        "vicaya/qeminga",
+        ctrl_repo,
         "workflow_dispatch",
         "refs/heads/main",
         valid_wf_ref,
@@ -1026,6 +1042,7 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
             "sha256sum",
             "tar",
             "systemctl",
+            "python3",
             &format!("qemu-system-{arch}"),
         ] {
             write_exec(&bin.join(tool), "#!/bin/sh\nexit 0\n");
@@ -1037,6 +1054,8 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
         std::fs::write(&fw_vars, b"vars").unwrap();
         let resolv = dir.path().join("resolv.conf");
         std::fs::write(&resolv, "nameserver 127.0.0.53\n").unwrap();
+        let cgroup_ctrls = dir.path().join("cgroup.controllers");
+        std::fs::write(&cgroup_ctrls, "cpu memory pids\n").unwrap();
         let log = dir.path().join("virsh.log");
 
         let ok = run_setup_env(
@@ -1047,12 +1066,37 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
                 ("QEMINGA_AAVMF_CODE", fw_code.to_str().unwrap()),
                 ("QEMINGA_AAVMF_VARS", fw_vars.to_str().unwrap()),
                 ("QEMINGA_RESOLV_CONF", resolv.to_str().unwrap()),
+                ("QEMINGA_CGROUP_CONTROLLERS", cgroup_ctrls.to_str().unwrap()),
                 ("QEMINGA_MIN_DISK_GIB", "0"),
                 ("QEMINGA_MIN_RAM_MIB", "0"),
             ],
             Some(&bin),
         );
         assert!(ok.status.success(), "{arch}: {}", text(&ok));
+
+        // Missing cgroup v2 fails preflight (systemd IPAddressDeny BPF firewall requires cgroup v2).
+        let no_cg2 = run_setup_env(
+            &["preflight", "--state-dir", dir.path().to_str().unwrap()],
+            &[
+                ("FAKE_LOG", log.to_str().unwrap()),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", fw_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", fw_vars.to_str().unwrap()),
+                ("QEMINGA_RESOLV_CONF", resolv.to_str().unwrap()),
+                (
+                    "QEMINGA_CGROUP_CONTROLLERS",
+                    "/nonexistent/cgroup.controllers",
+                ),
+                ("QEMINGA_MIN_DISK_GIB", "0"),
+                ("QEMINGA_MIN_RAM_MIB", "0"),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            !no_cg2.status.success(),
+            "{arch}: missing cgroup v2 must fail preflight: {}",
+            text(&no_cg2)
+        );
 
         // Missing /dev/kvm fails preflight on both arches.
         let no_kvm = run_setup_env(
@@ -1063,6 +1107,7 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
                 ("QEMINGA_AAVMF_CODE", fw_code.to_str().unwrap()),
                 ("QEMINGA_AAVMF_VARS", fw_vars.to_str().unwrap()),
                 ("QEMINGA_RESOLV_CONF", resolv.to_str().unwrap()),
+                ("QEMINGA_CGROUP_CONTROLLERS", cgroup_ctrls.to_str().unwrap()),
                 ("QEMINGA_MIN_DISK_GIB", "0"),
                 ("QEMINGA_MIN_RAM_MIB", "0"),
             ],
@@ -1081,6 +1126,7 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
                 ("QEMINGA_AAVMF_CODE", fw_code.to_str().unwrap()),
                 ("QEMINGA_AAVMF_VARS", fw_vars.to_str().unwrap()),
                 ("QEMINGA_RESOLV_CONF", priv_resolv.to_str().unwrap()),
+                ("QEMINGA_CGROUP_CONTROLLERS", cgroup_ctrls.to_str().unwrap()),
                 ("QEMINGA_MIN_DISK_GIB", "0"),
                 ("QEMINGA_MIN_RAM_MIB", "0"),
             ],
@@ -1103,6 +1149,7 @@ fn preflight_supports_x86_64_and_aarch64_and_detects_missing_kvm_or_firmware() {
                     ("QEMINGA_AAVMF_CODE", "/nonexistent/AAVMF_CODE.fd"),
                     ("QEMINGA_AAVMF_VARS", "/nonexistent/AAVMF_VARS.fd"),
                     ("QEMINGA_RESOLV_CONF", resolv.to_str().unwrap()),
+                    ("QEMINGA_CGROUP_CONTROLLERS", cgroup_ctrls.to_str().unwrap()),
                     ("QEMINGA_MIN_DISK_GIB", "0"),
                     ("QEMINGA_MIN_RAM_MIB", "0"),
                 ],
@@ -1326,6 +1373,22 @@ fn registration_and_uninstall_pass_tokens_only_via_inherited_env_never_argv() {
     write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
     write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
     write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+# Report uid 0 for ownership checks while delegating mode checks to real stat.
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then
+    echo 0
+    exit 0
+fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
+    mode="$(/usr/bin/stat -c '%a' "$3")"
+    echo "0:${mode}"
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
         &bin.join("runuser"),
         r#"#!/bin/sh
 printf '%s\n' "$*" > "${FAKE_RUNUSER_ARGV:?}"
@@ -1342,6 +1405,23 @@ exit 0
         std::fs::create_dir_all(d).unwrap();
     }
     write_exec(&install_dir.join("config.sh"), "#!/bin/sh\nexit 0\n");
+    std::fs::write(
+        cfg_dir.join("install.env"),
+        format!(
+            "RECORD_SCHEMA=1\nSERVICE=qeminga-test-nonexistent-unit\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nINSTALL_DIR={}\nSTATE_DIR={}\nHOOK_DIR={}\nCONFIG_DIR={}\nTARGET_URL={REPO_URL}\nRUNNER_GROUP=\nRUNNER_NAME=test-runner\nLABELS=qeminga-kvm\nEPHEMERAL=0\nALLOW_AUTO_UPDATE=0\nWORK_DIR={}/work\n",
+            install_dir.display(),
+            state_dir.display(),
+            hook_dir.display(),
+            cfg_dir.display(),
+            state_dir.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        cfg_dir.join("install.env"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
 
     // 1. Direct test of registration helper run_runner_config_with_token.
     let reg_argv_log = dir.path().join("runuser-reg.argv");
@@ -1354,7 +1434,7 @@ exit 0
     let reg = Command::new("bash")
         .args([
             "-c",
-            r#"source "$1"; OPT_USER="qeminga-runner"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; run_runner_config_with_token "SECRET_REG_TOKEN_12345" --unattended --replace --url "https://github.com/vicaya/qeminga""#,
+            r#"source "$1"; OPT_USER="qeminga-runner"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; run_runner_config_with_token "SECRET_REG_TOKEN_12345" --unattended --replace --url "https://github.com/vicaya/qeminga-kvm-controller""#,
             "_",
             script().to_str().unwrap(),
             install_dir.to_str().unwrap(),
@@ -1499,4 +1579,891 @@ exit 0
         std::fs::read_to_string(&listener_jit).unwrap(),
         "JIT_SECRET_VALUE"
     );
+}
+
+// ---- Round 2 security & lifecycle hardening tests -------------------------
+
+fn b64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = u32::from(chunk[0]);
+        let b1 = if chunk.len() > 1 {
+            u32::from(chunk[1])
+        } else {
+            0
+        };
+        let b2 = if chunk.len() > 2 {
+            u32::from(chunk[2])
+        } else {
+            0
+        };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[((n >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[(n & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+fn make_jit_config(github_url: &str, work_folder: &str) -> String {
+    let runner_json = format!(
+        "\u{feff}{{\"agentId\":1,\"agentName\":\"jit-test\",\"gitHubUrl\":\"{github_url}\",\"workFolder\":\"{work_folder}\"}}"
+    );
+    let outer = format!("{{\".runner\":\"{}\"}}", b64(runner_json.as_bytes()));
+    b64(outer.as_bytes())
+}
+
+#[test]
+fn refuses_direct_public_repo_registration_and_requires_controller_or_runner_group() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Direct registration against public vicaya/qeminga must be refused everywhere.
+    for args in [
+        vec!["render-unit", "--repo", PUBLIC_REPO_URL, "--arch", "x86_64"],
+        vec![
+            "render-hooks",
+            "--repo",
+            PUBLIC_REPO_URL,
+            "--out",
+            tmp.path().to_str().unwrap(),
+        ],
+    ] {
+        let out = run_setup(&args);
+        assert!(
+            !out.status.success(),
+            "public repo must be refused for {args:?}: {}",
+            text(&out)
+        );
+        let msg = text(&out).to_ascii_lowercase();
+        assert!(
+            msg.contains("private") || msg.contains("controller") || msg.contains("runner-group"),
+            "error should guide operator to private controller or runner group: {msg}"
+        );
+    }
+
+    // verify_private_repo fails closed when GitHub reports a public repository (HTTP 200, private=false)
+    // and succeeds when GitHub returns 404 (unauthenticated private repository).
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+if [ "${FAKE_REPO_PUBLIC:-0}" = 1 ]; then
+    printf '{"private":false}\n200'
+else
+    printf '{"message":"Not Found"}\n404'
+fi
+"#,
+    );
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let pub_check = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; verify_private_repo "someone/public-repo""#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_REPO_PUBLIC", "1")
+        .output()
+        .unwrap();
+    assert!(
+        !pub_check.status.success(),
+        "public repository must fail verify_private_repo: {}",
+        text(&pub_check)
+    );
+    let priv_check = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; verify_private_repo "vicaya/qeminga-kvm-controller""#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_REPO_PUBLIC", "0")
+        .output()
+        .unwrap();
+    assert!(
+        priv_check.status.success(),
+        "private repository (HTTP 404 unauth) should pass verify_private_repo: {}",
+        text(&priv_check)
+    );
+
+    // Organization runner-group mode requires BOTH a non-Default --runner-group AND --allow-repo.
+    for bad_org_args in [
+        vec![
+            "render-unit",
+            "--org",
+            "https://github.com/myorg",
+            "--arch",
+            "x86_64",
+        ],
+        vec![
+            "render-unit",
+            "--org",
+            "https://github.com/myorg",
+            "--runner-group",
+            "Default",
+            "--allow-repo",
+            "vicaya/qeminga",
+            "--arch",
+            "x86_64",
+        ],
+        vec![
+            "render-unit",
+            "--org",
+            "https://github.com/myorg",
+            "--runner-group",
+            "qeminga-kvm-restricted",
+            "--arch",
+            "x86_64",
+        ],
+        vec![
+            "render-unit",
+            "--repo",
+            REPO_URL,
+            "--org",
+            "https://github.com/myorg",
+            "--runner-group",
+            "qeminga-kvm-restricted",
+            "--allow-repo",
+            "vicaya/qeminga",
+            "--arch",
+            "x86_64",
+        ],
+    ] {
+        let out = run_setup(&bad_org_args);
+        assert!(
+            !out.status.success(),
+            "unsafe org args must fail {bad_org_args:?}: {}",
+            text(&out)
+        );
+    }
+
+    let hooks_org = tmp.path().join("org-hooks");
+    let ok_org = run_setup(&[
+        "render-hooks",
+        "--org",
+        "https://github.com/myorg",
+        "--runner-group",
+        "qeminga-kvm-restricted",
+        "--allow-repo",
+        "vicaya/qeminga",
+        "--out",
+        hooks_org.to_str().unwrap(),
+    ]);
+    assert!(ok_org.status.success(), "{}", text(&ok_org));
+    let policy = std::fs::read_to_string(hooks_org.join("policy.env")).unwrap();
+    assert!(
+        policy.contains("ALLOWED_REPOSITORY=vicaya/qeminga\n"),
+        "{policy}"
+    );
+
+    // Documentation must default to the private controller repo, never direct public vicaya/qeminga.
+    let testing_doc = std::fs::read_to_string(root().join("docs/testing.md")).unwrap();
+    assert!(
+        !testing_doc.contains("install \\\n  --repo https://github.com/vicaya/qeminga\n"),
+        "docs/testing.md must not instruct registering directly on public vicaya/qeminga"
+    );
+}
+
+#[test]
+fn provision_state_dirs_uses_runner_uid_and_stops_service_before_mutating() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(&bin.join("install"), FAKE_INSTALL);
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then
+    echo "0:755"
+    exit 0
+fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_RUNUSER_LOG:?}"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+
+    let state_dir = dir.path().join("state");
+    let install_log = dir.path().join("install.log");
+    let runuser_log = dir.path().join("runuser.log");
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let ok = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_STATE_DIR="$2"; OPT_USER="qeminga-runner"; provision_state_dirs"#,
+            "_",
+            script().to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_INSTALL_LOG", &install_log)
+        .env("FAKE_RUNUSER_LOG", &runuser_log)
+        .output()
+        .unwrap();
+    assert!(
+        ok.status.success(),
+        "provision_state_dirs failed: {}",
+        text(&ok)
+    );
+
+    // Root install -d must touch ONLY the top-level state directory, never any descendant.
+    let root_installs = std::fs::read_to_string(&install_log).unwrap();
+    assert!(
+        !root_installs.contains("/work")
+            && !root_installs.contains("/images")
+            && !root_installs.contains("/.local"),
+        "root install must not create state descendants: {root_installs}"
+    );
+    let user_calls = std::fs::read_to_string(&runuser_log).unwrap();
+    assert!(
+        user_calls.contains("-u qeminga-runner"),
+        "state descendants must be created as service user: {user_calls}"
+    );
+    for sub in [
+        "work",
+        "images",
+        "image-cache",
+        ".config",
+        ".cache",
+        ".local/share",
+    ] {
+        assert!(state_dir.join(sub).is_dir(), "missing state subdir {sub}");
+    }
+
+    // Symlinked top-level state dir must be refused.
+    let real_target = dir.path().join("real-target");
+    std::fs::create_dir_all(&real_target).unwrap();
+    let sym_state = dir.path().join("sym-state");
+    symlink(&real_target, &sym_state).unwrap();
+    let bad = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_STATE_DIR="$2"; OPT_USER="qeminga-runner"; provision_state_dirs"#,
+            "_",
+            script().to_str().unwrap(),
+            sym_state.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_INSTALL_LOG", &install_log)
+        .env("FAKE_RUNUSER_LOG", &runuser_log)
+        .output()
+        .unwrap();
+    assert!(!bad.status.success(), "symlinked state dir must be refused");
+
+    // In cmd_install, systemctl stop must happen before provision_state_dirs.
+    let body = std::fs::read_to_string(script()).unwrap();
+    let install_fn = &body[body.find("cmd_install()").unwrap()..];
+    let stop_pos = install_fn.find("systemctl stop").unwrap();
+    let prov_pos = install_fn.find("provision_state_dirs").unwrap();
+    assert!(
+        stop_pos < prov_pos,
+        "cmd_install must stop the existing service before mutating state directories"
+    );
+}
+
+#[test]
+fn egress_firewall_check_gates_unit_startup_and_fails_closed_when_unfiltered() {
+    let dir = tempfile::tempdir().unwrap();
+    let hooks_out = dir.path().join("hooks");
+    let rendered = run_setup(&[
+        "render-hooks",
+        "--repo",
+        REPO_URL,
+        "--out",
+        hooks_out.to_str().unwrap(),
+    ]);
+    assert!(rendered.status.success(), "{}", text(&rendered));
+
+    let check = hooks_out.join("check-egress-firewall.sh");
+    assert!(
+        check.is_file(),
+        "render-hooks must write check-egress-firewall.sh"
+    );
+
+    // Controlled local check on an unfiltered cgroup (no IPAddressDeny BPF active):
+    // must fail closed with EX_CONFIG (78) before the listener ever starts.
+    let unfiltered = Command::new("bash")
+        .arg(&check)
+        .env("QEMINGA_RUNNER_POLICY", hooks_out.join("policy.env"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        unfiltered.status.code(),
+        Some(78),
+        "unfiltered cgroup must exit 78 (EX_CONFIG): {}",
+        text(&unfiltered)
+    );
+    assert!(
+        text(&unfiltered).contains("169.254.169.254") || text(&unfiltered).contains("BPF"),
+        "diagnostic should explain failed egress block: {}",
+        text(&unfiltered)
+    );
+
+    // Controlled simulated outcomes via sitecustomize hook on PYTHONPATH:
+    let site_dir = dir.path().join("site");
+    std::fs::create_dir_all(&site_dir).unwrap();
+    std::fs::write(
+        site_dir.join("sitecustomize.py"),
+        r#"import errno, os, socket
+mode = os.environ.get("FAKE_SOCKET_MODE")
+if mode:
+    _orig = socket.socket.sendto
+    def _patched(self, data, addr):
+        host = addr[0]
+        if mode == "v4_eperm_v6_unreach":
+            if host == "169.254.169.254":
+                raise OSError(errno.EPERM, "Operation not permitted")
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+        if mode == "v4_unreach_v6_eperm":
+            if host == "fd00:ec2::254":
+                raise OSError(errno.EPERM, "Operation not permitted")
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+        if mode == "all_unreach":
+            raise OSError(errno.ENETUNREACH, "Network is unreachable")
+        if mode == "v4_eperm_v6_sent":
+            if host == "169.254.169.254":
+                raise OSError(errno.EPERM, "Operation not permitted")
+            return len(data)
+        return _orig(self, data, addr)
+    socket.socket.sendto = _patched
+"#,
+    )
+    .unwrap();
+
+    for (mode, want_code) in [
+        ("v4_eperm_v6_unreach", 0),
+        ("v4_unreach_v6_eperm", 0),
+        ("all_unreach", 78),
+        ("v4_eperm_v6_sent", 78),
+    ] {
+        let out = Command::new("bash")
+            .arg(&check)
+            .env("PYTHONPATH", &site_dir)
+            .env("FAKE_SOCKET_MODE", mode)
+            .env("QEMINGA_RUNNER_POLICY", hooks_out.join("policy.env"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(want_code),
+            "mode={mode}: {}",
+            text(&out)
+        );
+    }
+}
+
+#[test]
+fn install_record_scopes_uninstall_refuses_unmanaged_dirs_and_preserves_images_on_cleanup_failure()
+{
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(
+        &bin.join("id"),
+        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo 0; fi\nexit 0\n",
+    );
+    write_exec(&bin.join("systemctl"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("chown"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("runuser"),
+        r#"#!/bin/sh
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        *) shift ;;
+    esac
+done
+exec "$@"
+"#,
+    );
+
+    // 1. Uninstall WITHOUT a valid install.env must refuse and leave unrelated directories intact.
+    let shared_install = dir.path().join("shared-install");
+    let shared_state = dir.path().join("shared-state");
+    let shared_hooks = dir.path().join("shared-hooks");
+    let shared_cfg = dir.path().join("shared-cfg");
+    for d in [&shared_install, &shared_state, &shared_hooks, &shared_cfg] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::write(shared_install.join("precious.txt"), b"do-not-delete").unwrap();
+
+    let no_rec = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-test-unmanaged",
+            "--install-dir",
+            shared_install.to_str().unwrap(),
+            "--state-dir",
+            shared_state.to_str().unwrap(),
+            "--hook-dir",
+            shared_hooks.to_str().unwrap(),
+            "--config-dir",
+            shared_cfg.to_str().unwrap(),
+        ],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !no_rec.status.success(),
+        "uninstall without install.env must fail closed: {}",
+        text(&no_rec)
+    );
+    assert!(
+        shared_install.join("precious.txt").exists(),
+        "unrelated files must NEVER be deleted without install.env"
+    );
+
+    // 2. check_dedicated_managed_dirs rejects overlapping paths and pre-existing unmanaged dirs on fresh install.
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let overlap = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$2/sub"; OPT_HOOK_DIR="$3"; OPT_CONFIG_DIR="$4"; check_dedicated_managed_dirs 0"#,
+            "_",
+            script().to_str().unwrap(),
+            dir.path().join("ov-a").to_str().unwrap(),
+            dir.path().join("ov-b").to_str().unwrap(),
+            dir.path().join("ov-c").to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        !overlap.status.success(),
+        "overlapping dirs must be refused"
+    );
+
+    let unmanaged = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_HOOK_DIR="$4"; OPT_CONFIG_DIR="$5"; check_dedicated_managed_dirs 0"#,
+            "_",
+            script().to_str().unwrap(),
+            shared_install.to_str().unwrap(),
+            dir.path().join("fresh-state").to_str().unwrap(),
+            dir.path().join("fresh-hooks").to_str().unwrap(),
+            dir.path().join("fresh-cfg").to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        !unmanaged.status.success(),
+        "fresh install must refuse to adopt pre-existing unmanaged directory: {}",
+        text(&unmanaged)
+    );
+
+    // 3. Uninstall preserves state/images when hook-job-completed.sh reports failure (unknown domain state).
+    let case3 = dir.path().join("preserve-images");
+    let inst3 = case3.join("runner");
+    let state3 = case3.join("state");
+    let hooks3 = case3.join("hooks");
+    let cfg3 = case3.join("cfg");
+    let vm_disk = state3.join("images/qeminga-e2e-55-1-x86_64/root.qcow2");
+    std::fs::create_dir_all(vm_disk.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(&inst3).unwrap();
+    std::fs::create_dir_all(&hooks3).unwrap();
+    std::fs::create_dir_all(&cfg3).unwrap();
+    std::fs::write(&vm_disk, b"active-vm-disk").unwrap();
+    std::fs::write(
+        cfg3.join("policy.env"),
+        "ALLOWED_REPOSITORY=vicaya/qeminga-kvm-controller\n",
+    )
+    .unwrap();
+    write_exec(
+        &hooks3.join("hook-job-completed.sh"),
+        "#!/bin/sh\necho 'cannot establish domain state' >&2\nexit 1\n",
+    );
+    std::fs::write(
+        cfg3.join("install.env"),
+        format!(
+            "RECORD_SCHEMA=1\nSERVICE=qeminga-test-preserve\nUSER=qeminga-runner\nUSER_UID=995\nUSER_GID=995\nUSER_CREATED=1\nINSTALL_DIR={}\nSTATE_DIR={}\nHOOK_DIR={}\nCONFIG_DIR={}\nTARGET_URL={REPO_URL}\nRUNNER_GROUP=\nRUNNER_NAME=test\nLABELS=qeminga-kvm\nEPHEMERAL=0\nALLOW_AUTO_UPDATE=0\nWORK_DIR={}/work\n",
+            inst3.display(),
+            state3.display(),
+            hooks3.display(),
+            cfg3.display(),
+            state3.display(),
+        ),
+    )
+    .unwrap();
+
+    let fail_uninst = run_setup_env(
+        &[
+            "uninstall",
+            "--service",
+            "qeminga-test-preserve",
+            "--install-dir",
+            inst3.to_str().unwrap(),
+            "--state-dir",
+            state3.to_str().unwrap(),
+            "--hook-dir",
+            hooks3.to_str().unwrap(),
+            "--config-dir",
+            cfg3.to_str().unwrap(),
+        ],
+        &[],
+        Some(&bin),
+    );
+    assert!(
+        !fail_uninst.status.success(),
+        "uninstall must fail non-zero when cleanup hook cannot confirm domains absent: {}",
+        text(&fail_uninst)
+    );
+    assert!(
+        vm_disk.exists(),
+        "VM disk under images/ MUST be preserved when cleanup hook fails"
+    );
+}
+
+#[test]
+fn ensure_service_user_refuses_unrelated_account_and_extra_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    write_exec(&bin.join("getent"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("usermod"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("id"),
+        r#"#!/bin/sh
+case "$1" in
+    -u) echo "${FAKE_UID:-995}" ;;
+    -g) echo "${FAKE_GID:-995}" ;;
+    -gn) echo "${FAKE_PGROUP:-qeminga-runner}" ;;
+    -nG) echo "${FAKE_GROUPS:-qeminga-runner kvm}" ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    // 1. Fresh install (HAS_INSTALL_RECORD=0) must refuse an already-existing unrelated account.
+    let fresh = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_USER="qeminga-runner"; HAS_INSTALL_RECORD=0; ensure_service_user"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .output()
+        .unwrap();
+    assert!(
+        !fresh.status.success(),
+        "fresh install must refuse existing unrelated user: {}",
+        text(&fresh)
+    );
+
+    // 2. Reinstall with matching UID, GID, and exact allowlisted groups {qeminga-runner, kvm} succeeds.
+    let ok_reuse = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_USER="qeminga-runner"; HAS_INSTALL_RECORD=1; REC_USER_UID=995; REC_USER_GID=995; REC_USER_CREATED=1; ensure_service_user"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_UID", "995")
+        .env("FAKE_GID", "995")
+        .env("FAKE_GROUPS", "qeminga-runner kvm")
+        .output()
+        .unwrap();
+    assert!(
+        ok_reuse.status.success(),
+        "matching managed account should reuse cleanly: {}",
+        text(&ok_reuse)
+    );
+
+    // 3. Extra site-specific group (outside {qeminga-runner, kvm}) must be refused.
+    let extra_group = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_USER="qeminga-runner"; HAS_INSTALL_RECORD=1; REC_USER_UID=995; REC_USER_GID=995; REC_USER_CREATED=1; ensure_service_user"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_GROUPS", "qeminga-runner kvm site-backups")
+        .output()
+        .unwrap();
+    assert!(
+        !extra_group.status.success(),
+        "unexpected site-specific group must be refused: {}",
+        text(&extra_group)
+    );
+
+    // 4. UID drift from recorded UID must be refused.
+    let uid_drift = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_USER="qeminga-runner"; HAS_INSTALL_RECORD=1; REC_USER_UID=995; REC_USER_GID=995; REC_USER_CREATED=1; ensure_service_user"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_UID", "1050")
+        .output()
+        .unwrap();
+    assert!(
+        !uid_drift.status.success(),
+        "mismatched UID must be refused: {}",
+        text(&uid_drift)
+    );
+}
+
+#[test]
+fn existing_registration_check_and_rollback_on_failed_reconfig() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path().join("runner");
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&install_dir).unwrap();
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    // Write a UTF-8-BOM .runner file like actions/runner produces.
+    let runner_json = format!(
+        "\u{feff}{{\"agentId\":1,\"agentName\":\"qeminga-kvm-x86_64-box\",\"gitHubUrl\":\"{REPO_URL}\",\"workFolder\":\"{}/work\"}}",
+        state_dir.display()
+    );
+    std::fs::write(install_dir.join(".runner"), &runner_json).unwrap();
+
+    // 1. Matching existing registration returns "reuse".
+    let reuse = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; check_existing_registration "$4" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(reuse.status.success(), "{}", text(&reuse));
+    assert_eq!(String::from_utf8_lossy(&reuse.stdout).trim(), "reuse");
+
+    // 2. Incompatible target URL or runner name must fail immediately before mutating anything.
+    let mismatch = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_EPHEMERAL=0; OPT_LABELS="qeminga-kvm"; OPT_RUNNER_GROUP=""; OPT_JITCONFIG_FILE=""; HAS_INSTALL_RECORD=1; REC_TARGET_URL="$4"; REC_RUNNER_NAME="qeminga-kvm-x86_64-box"; REC_LABELS="qeminga-kvm"; REC_RUNNER_GROUP=""; REC_EPHEMERAL=0; check_existing_registration "https://github.com/other/controller" "qeminga-kvm-x86_64-box""#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+            REPO_URL,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !mismatch.status.success(),
+        "incompatible existing registration must be refused: {}",
+        text(&mismatch)
+    );
+
+    // 3. Failed config.sh restores locked permissions and restarts previously-active service.
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let sc_log = dir.path().join("systemctl.log");
+    let chown_log = dir.path().join("chown.log");
+    let install_log = dir.path().join("install.log");
+    write_exec(
+        &bin.join("systemctl"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"${FAKE_SC_LOG:?}\"\nexit 0\n",
+    );
+    write_exec(&bin.join("chown"), FAKE_CHOWN);
+    write_exec(&bin.join("install"), FAKE_INSTALL);
+    write_exec(&bin.join("runuser"), "#!/bin/sh\nexit 1\n");
+    std::fs::create_dir_all(install_dir.join("bin")).unwrap();
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let rb = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; OPT_INSTALL_DIR="$2"; OPT_STATE_DIR="$3"; OPT_USER="qeminga-runner"; OPT_SERVICE="qeminga-kvm-runner"; OPT_ALLOW_AUTO_UPDATE=0; OPT_EPHEMERAL=0; register_runner_with_rollback 1 "TOK" --unattended"#,
+            "_",
+            script().to_str().unwrap(),
+            install_dir.to_str().unwrap(),
+            state_dir.to_str().unwrap(),
+        ])
+        .env("PATH", &path_env)
+        .env("FAKE_SC_LOG", &sc_log)
+        .env("FAKE_CHOWN_LOG", &chown_log)
+        .env("FAKE_INSTALL_LOG", &install_log)
+        .output()
+        .unwrap();
+    assert!(
+        !rb.status.success(),
+        "failed config.sh must still exit non-zero"
+    );
+    let sc = std::fs::read_to_string(&sc_log).unwrap();
+    assert!(
+        sc.contains("start qeminga-kvm-runner.service"),
+        "rollback must restart previously active service: {sc}"
+    );
+    let ch = std::fs::read_to_string(&chown_log).unwrap();
+    assert!(
+        ch.contains("-h -R -P root:root"),
+        "rollback must restore locked runner permissions: {ch}"
+    );
+}
+
+#[test]
+fn jit_workspace_validation_and_post_job_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let install_dir = dir.path().join("runner");
+    let state_dir = dir.path().join("state");
+    let hooks_out = dir.path().join("hooks");
+    let bin = dir.path().join("bin");
+    for d in [
+        install_dir.join("bin"),
+        install_dir.join("_work"),
+        state_dir.join("work"),
+        state_dir.join("images"),
+        state_dir.join("image-cache"),
+        bin.clone(),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    write_exec(&bin.join("virsh"), FAKE_VIRSH_STATEFUL);
+
+    // 1. Default GitHub JIT API workFolder ("_work" under install_dir) is validated and scrubbed.
+    let jit_default_file = dir.path().join("jit-default");
+    std::fs::write(&jit_default_file, make_jit_config(REPO_URL, "_work")).unwrap();
+    std::fs::set_permissions(&jit_default_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let rendered = run_setup(&[
+        "render-hooks",
+        "--repo",
+        REPO_URL,
+        "--install-dir",
+        install_dir.to_str().unwrap(),
+        "--state-dir",
+        state_dir.to_str().unwrap(),
+        "--jitconfig-file",
+        jit_default_file.to_str().unwrap(),
+        "--out",
+        hooks_out.to_str().unwrap(),
+    ]);
+    assert!(rendered.status.success(), "{}", text(&rendered));
+    let policy_path = hooks_out.join("policy.env");
+    let policy = std::fs::read_to_string(&policy_path).unwrap();
+    assert!(
+        policy.contains(&format!("WORK_DIR={}/_work\n", install_dir.display())),
+        "default JIT _work must be recorded in policy.env:\n{policy}"
+    );
+
+    // Populate _work with files + dotfiles and verify hook-job-completed.sh scrubs _work cleanly.
+    std::fs::write(install_dir.join("_work/secret.txt"), b"leftover").unwrap();
+    std::fs::write(install_dir.join("_work/.dotfile"), b"leftover").unwrap();
+    std::fs::write(install_dir.join("bin/keep"), b"runner-bin").unwrap();
+    std::fs::write(state_dir.join("image-cache/img"), b"cache").unwrap();
+    let log = dir.path().join("virsh.log");
+    let cleanup = run_hook(
+        &hooks_out.join("hook-job-completed.sh"),
+        &policy_path,
+        &bin,
+        &[("FAKE_LOG", log.to_str().unwrap())],
+    );
+    assert!(cleanup.status.success(), "{}", text(&cleanup));
+    assert_eq!(
+        std::fs::read_dir(install_dir.join("_work"))
+            .unwrap()
+            .count(),
+        0,
+        "JIT _work directory must be scrubbed completely"
+    );
+    assert!(
+        install_dir.join("bin/keep").exists(),
+        "bin/ must stay untouched"
+    );
+    assert!(
+        state_dir.join("image-cache/img").exists(),
+        "image-cache must stay untouched"
+    );
+
+    // 2. Malicious/escaped JIT workFolder or mismatched gitHubUrl must fail closed.
+    for (label, url, wf) in [
+        ("traversal", REPO_URL, "../../etc"),
+        ("outside-abs", REPO_URL, "/tmp/outside"),
+        ("bin-dir", REPO_URL, "bin"),
+        ("dot-dir", REPO_URL, "."),
+        ("wrong-repo", "https://github.com/evil/repo", "_work"),
+    ] {
+        let bad_jit = dir.path().join(format!("jit-{label}"));
+        std::fs::write(&bad_jit, make_jit_config(url, wf)).unwrap();
+        std::fs::set_permissions(&bad_jit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let out_dir = dir.path().join(format!("hooks-{label}"));
+        let out = run_setup(&[
+            "render-hooks",
+            "--repo",
+            REPO_URL,
+            "--install-dir",
+            install_dir.to_str().unwrap(),
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--jitconfig-file",
+            bad_jit.to_str().unwrap(),
+            "--out",
+            out_dir.to_str().unwrap(),
+        ]);
+        assert!(
+            !out.status.success(),
+            "bad JIT config ({label}) must be refused: {}",
+            text(&out)
+        );
+    }
 }

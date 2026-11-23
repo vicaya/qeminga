@@ -580,15 +580,16 @@ fn the_image_cache_key_names_the_pinned_release_and_digest() {
         let output = lane(&["image-key", arch]);
         assert!(output.status.success(), "{}", text(&output));
         let key = String::from_utf8(output.stdout).unwrap();
-        let script = std::fs::read_to_string(script()).unwrap();
-        let release = script
+        let common =
+            std::fs::read_to_string(root().join("scripts/ci/libvirt-smoke-common.sh")).unwrap();
+        let release = common
             .lines()
             .find_map(|l| l.strip_prefix("IMAGE_RELEASE=\""))
             .unwrap()
             .trim_end_matches('"');
         assert!(key.contains(release), "{key}");
         let var = format!("IMAGE_SHA256_{arch}=\"");
-        let digest = script
+        let digest = common
             .lines()
             .find_map(|l| l.strip_prefix(var.as_str()))
             .unwrap()

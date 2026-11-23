@@ -26,6 +26,10 @@ on:
         description: RUNNER_ARCH value (X64 or ARM64)
         type: string
         required: true
+      target_rev:
+        description: Vetted 40-hex vicaya/qeminga commit resolved by caller
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -42,14 +46,20 @@ jobs:
     timeout-minutes: 30
     outputs:
       sha256: ${{ steps.digest.outputs.sha256 }}
+    env:
+      TARGET_REV: ${{ inputs.target_rev }}
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: vicaya/qeminga
+          ref: ${{ inputs.target_rev }}
           persist-credentials: false
       - name: Install pinned toolchain (rust-toolchain.toml)
         run: rustup toolchain install && rustup show active-toolchain
-      - name: The runner is a native ${{ inputs.arch }} machine
+      - name: The runner is a native ${{ inputs.arch }} machine at the vetted commit
         run: |
+          [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_REV"
           test "$(uname -m)" = "${{ inputs.arch }}"
           test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
           rustc -vV | grep -qx "host: ${{ inputs.arch }}-unknown-linux-gnu"
@@ -65,7 +75,7 @@ jobs:
         run: |
           version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
           scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
-            --binary target/release/qeminga --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --binary target/release/qeminga --arch "$ARCH" --source-sha "$TARGET_REV" \
             --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --runner "$RUNNER_LABEL"
       - uses: actions/upload-artifact@v4
@@ -84,14 +94,19 @@ jobs:
     timeout-minutes: 30
     env:
       ARCH: ${{ inputs.arch }}
+      TARGET_REV: ${{ inputs.target_rev }}
       OUT: ${{ github.workspace }}/libvirt-kvm-out
       QEMINGA_E2E_CONNECT: qemu:///session
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: vicaya/qeminga
+          ref: ${{ inputs.target_rev }}
           persist-credentials: false
-      - name: The runner is a native ${{ inputs.arch }} machine
+      - name: The runner is a native ${{ inputs.arch }} machine at the vetted commit
         run: |
+          [[ "$TARGET_REV" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_REV"
           test "$(uname -m)" = "${{ inputs.arch }}"
           test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}"
       - uses: actions/download-artifact@v4
@@ -103,7 +118,7 @@ jobs:
           cache="${QEMINGA_E2E_IMAGE_CACHE:-$GITHUB_WORKSPACE/libvirt-kvm-image-cache}"
           mkdir -p "$cache"
           scripts/ci/libvirt-kvm-smoke.sh run --arch "$ARCH" \
-            --candidate candidate --source-sha "$GITHUB_SHA" \
+            --candidate candidate --source-sha "$TARGET_REV" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
             --image-cache "$cache" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"

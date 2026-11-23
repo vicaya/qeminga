@@ -87,32 +87,58 @@ fn sha256_hex(path: &Path) -> String {
         .collect()
 }
 
-// ---- candidate manifest & image-pin parity --------------------------------
+fn common_script() -> PathBuf {
+    root().join("scripts/ci/libvirt-smoke-common.sh")
+}
+
+// ---- candidate manifest & shared image-pin helper -------------------------
 
 #[test]
-fn kvm_and_tcg_scripts_pin_the_same_guest_image_and_packaging_files() {
+fn kvm_and_tcg_scripts_share_common_candidate_and_image_helper() {
+    let common = std::fs::read_to_string(common_script())
+        .unwrap_or_else(|e| panic!("missing scripts/ci/libvirt-smoke-common.sh: {e}"));
     let kvm = std::fs::read_to_string(script()).unwrap();
     let tcg = std::fs::read_to_string(tcg_script()).unwrap();
-    let extract = |text: &str, key: &str| {
-        let prefix = format!("{key}=\"");
-        text.lines()
-            .find_map(|l| l.strip_prefix(&prefix))
-            .and_then(|rest| rest.strip_suffix('"'))
-            .unwrap_or_else(|| panic!("missing {key}"))
-            .to_owned()
-    };
-    for key in [
-        "IMAGE_RELEASE",
-        "IMAGE_SHA256_x86_64",
-        "IMAGE_SHA256_aarch64",
-        "PACKAGING_FILES",
-        "BUILD_COMMAND",
+
+    // Shared pins and candidate/image-fetch logic live in one file.
+    for required in [
+        "SOURCE_REPOSITORY=\"vicaya/qeminga\"",
+        "BUILD_COMMAND=\"cargo build --release --locked --features seccomp\"",
+        "PACKAGING_FILES=\"",
+        "IMAGE_RELEASE=\"",
+        "IMAGE_SHA256_x86_64=\"",
+        "IMAGE_SHA256_aarch64=\"",
+        "cmd_manifest()",
+        "cmd_verify_candidate()",
+        "cmd_image_key()",
+        "cmd_fetch_image()",
     ] {
-        assert_eq!(
-            extract(&kvm, key),
-            extract(&tcg, key),
-            "{key} must stay identical between TCG and KVM lane scripts"
+        assert!(
+            common.contains(required),
+            "common helper must define {required:?}"
         );
+    }
+
+    for (label, body) in [("kvm", &kvm), ("tcg", &tcg)] {
+        assert!(
+            body.contains("source \"$HERE/libvirt-smoke-common.sh\""),
+            "{label} script must source libvirt-smoke-common.sh"
+        );
+        for duplicated in [
+            "IMAGE_RELEASE=\"",
+            "IMAGE_SHA256_x86_64=\"",
+            "IMAGE_SHA256_aarch64=\"",
+            "PACKAGING_FILES=\"",
+            "BUILD_COMMAND=\"",
+            "cmd_manifest()",
+            "cmd_verify_candidate()",
+            "cmd_fetch_image()",
+        ] {
+            assert!(
+                !body.contains(duplicated),
+                "{label} script must not duplicate {duplicated:?} (keep in libvirt-smoke-common.sh)"
+            );
+        }
     }
 }
 
@@ -503,14 +529,22 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         !text.contains("source_sha:"),
         "libvirt-kvm.yml must not accept a user-controlled source_sha input:\n{text}"
     );
+    // Resolve one vetted vicaya/qeminga commit once (works both from a private controller
+    // repository via qeminga-target.rev / vicaya/qeminga main and from vicaya/qeminga itself).
+    let resolve = job(&text, "resolve");
+    assert!(resolve.contains("target_rev:"), "{resolve}");
+    assert!(resolve.contains("vicaya/qeminga"), "{resolve}");
+    assert!(resolve.contains("qeminga-target.rev"), "{resolve}");
+    assert!(resolve.contains("persist-credentials: false"), "{resolve}");
+
     let lane = lane_workflow();
     assert!(
         !lane.contains("source_sha:"),
-        "libvirt-kvm-lane.yml must not accept a source_sha ref input:\n{lane}"
+        "libvirt-kvm-lane.yml must not accept a source_sha input:\n{lane}"
     );
     assert!(
-        !lane.contains("ref:"),
-        "libvirt-kvm-lane.yml must check out the dispatched commit without overriding ref:\n{lane}"
+        lane.contains("target_rev:"),
+        "libvirt-kvm-lane.yml must accept the resolved target_rev:\n{lane}"
     );
 
     for (arch, build_runner, runner_arch) in [
@@ -518,6 +552,7 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         ("aarch64", "ubuntu-24.04-arm", "ARM64"),
     ] {
         let j = job(&text, arch);
+        assert!(j.contains("needs: resolve"), "{arch}");
         assert!(
             j.contains("uses: ./.github/workflows/libvirt-kvm-lane.yml"),
             "{arch}"
@@ -529,6 +564,10 @@ fn kvm_workflow_never_triggers_on_pull_requests_and_supports_both_arches() {
         );
         assert!(
             j.contains(&format!("runner_arch: {runner_arch}\n")),
+            "{arch}"
+        );
+        assert!(
+            j.contains("target_rev: ${{ needs.resolve.outputs.target_rev }}\n"),
             "{arch}"
         );
     }
@@ -546,12 +585,18 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
 
     let build = job(&text, "candidate");
     assert!(build.contains("runs-on: ${{ inputs.build_runner }}"));
+    assert!(build.contains("repository: vicaya/qeminga"));
+    assert!(build.contains("ref: ${{ inputs.target_rev }}"));
     assert!(build.contains("cargo build --release --locked --features seccomp\n"));
     assert!(build.contains("sha256: ${{ steps.digest.outputs.sha256 }}"));
     assert!(build.contains("persist-credentials: false"));
     assert!(
-        build.contains(r#"--source-sha "$GITHUB_SHA""#),
-        "candidate must stamp manifest with $GITHUB_SHA:\n{build}"
+        build.contains(r#"test "$(git rev-parse HEAD)" = "$TARGET_REV""#),
+        "candidate must verify checked-out commit equals target_rev:\n{build}"
+    );
+    assert!(
+        build.contains(r#"--source-sha "$TARGET_REV""#),
+        "candidate must stamp manifest with the vetted vicaya/qeminga TARGET_REV:\n{build}"
     );
     for forbidden in ["--all-features", "test-fakes", "seccomp-log"] {
         assert!(!build.contains(forbidden), "candidate: {forbidden}");
@@ -562,14 +607,20 @@ fn kvm_lane_builds_on_hosted_runner_and_tests_unprivileged_on_self_hosted_kvm_ru
     assert!(
         kvm.contains(r#"runs-on: [self-hosted, linux, "${{ inputs.runner_arch }}", qeminga-kvm]"#)
     );
+    assert!(kvm.contains("repository: vicaya/qeminga"));
+    assert!(kvm.contains("ref: ${{ inputs.target_rev }}"));
     assert!(kvm.contains("cancel-in-progress: false"));
     assert!(kvm.contains("timeout-minutes:"));
     assert!(kvm.contains("persist-credentials: false"));
     assert!(kvm.contains(r#"test "$(uname -m)" = "${{ inputs.arch }}""#));
     assert!(kvm.contains(r#"test "$RUNNER_ARCH" = "${{ inputs.runner_arch }}""#));
     assert!(
-        kvm.contains(r#"--source-sha "$GITHUB_SHA""#),
-        "kvm job must verify candidate against $GITHUB_SHA:\n{kvm}"
+        kvm.contains(r#"test "$(git rev-parse HEAD)" = "$TARGET_REV""#),
+        "kvm job must verify checked-out commit equals target_rev:\n{kvm}"
+    );
+    assert!(
+        kvm.contains(r#"--source-sha "$TARGET_REV""#),
+        "kvm job must verify candidate against the vetted vicaya/qeminga TARGET_REV:\n{kvm}"
     );
     assert!(kvm.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#));
     assert!(kvm.contains("libvirt-kvm-smoke.sh run"));

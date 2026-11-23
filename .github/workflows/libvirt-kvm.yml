@@ -2,13 +2,19 @@
 # KVM runners (provisioned with scripts/setup-kvm-runner.sh).
 #
 # Security: NEVER triggered by pull_request, pull_request_target, or comments
-# because this repository is public and community members may donate runners.
-# Only maintainers with write access can dispatch it via workflow_dispatch,
-# and each runner additionally enforces a root-owned pre-job allowlist hook.
+# because vicaya/qeminga is public and community members may donate runners.
+# Donors register against a private controller repository (default, #53) or an
+# organization runner group restricted by GitHub to this workflow and ref; each
+# runner additionally enforces a root-owned pre-job allowlist hook as defense in
+# depth.
 #
-# Each architecture builds its release candidate on a GitHub-hosted ephemeral
-# runner, then exercises that exact SHA-256-anchored binary on the matching
-# self-hosted KVM runner (no sudo, no Rust toolchain, unprivileged
+# `resolve` pins ONE vetted vicaya/qeminga commit (from $GITHUB_SHA when run in
+# vicaya/qeminga, or from a committed `qeminga-target.rev` pin file /
+# vicaya/qeminga refs/heads/main when run in a private controller repository) so
+# both architectures, both checkouts, and the manifest always use that exact
+# commit. Each architecture builds its release candidate on a GitHub-hosted
+# ephemeral runner, then exercises that exact SHA-256-anchored binary on the
+# matching self-hosted KVM runner (no sudo, no Rust toolchain, unprivileged
 # qemu:///session). tests/libvirt_kvm.rs checks both workflow files' shape and
 # scripts/ci/libvirt-kvm-smoke.sh's fail-closed logic.
 name: libvirt KVM smoke
@@ -29,20 +35,50 @@ permissions:
   contents: read
 
 jobs:
+  resolve:
+    name: resolve vetted qeminga commit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      target_rev: ${{ steps.pin.outputs.target_rev }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Pin single vetted vicaya/qeminga commit
+        id: pin
+        run: |
+          if [ "$GITHUB_REPOSITORY" = "vicaya/qeminga" ]; then
+            rev="$GITHUB_SHA"
+          elif [ -f qeminga-target.rev ]; then
+            rev="$(awk 'NF && $1 !~ /^#/ { print $1; exit }' qeminga-target.rev)"
+          else
+            rev="$(git ls-remote https://github.com/vicaya/qeminga.git refs/heads/main | awk 'NR == 1 { print $1 }')"
+          fi
+          if ! [[ "$rev" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::could not resolve a 40-hex vetted vicaya/qeminga commit (got '$rev')"
+            exit 1
+          fi
+          echo "target_rev=$rev" >> "$GITHUB_OUTPUT"
+
   x86_64:
     name: x86_64
+    needs: resolve
     if: inputs.arch == 'both' || inputs.arch == 'x86_64'
     uses: ./.github/workflows/libvirt-kvm-lane.yml
     with:
       arch: x86_64
       build_runner: ubuntu-24.04
       runner_arch: X64
+      target_rev: ${{ needs.resolve.outputs.target_rev }}
 
   aarch64:
     name: aarch64
+    needs: resolve
     if: inputs.arch == 'both' || inputs.arch == 'aarch64'
     uses: ./.github/workflows/libvirt-kvm-lane.yml
     with:
       arch: aarch64
       build_runner: ubuntu-24.04-arm
       runner_arch: ARM64
+      target_rev: ${{ needs.resolve.outputs.target_rev }}

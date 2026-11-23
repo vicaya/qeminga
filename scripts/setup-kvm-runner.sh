@@ -16,21 +16,30 @@
 #     MemoryMax=80%, TasksMax=512, and cgroup IPAddressDeny blocking cloud
 #     instance metadata (169.254.0.0/16, fe80::/10, fd00:ec2::254/128) and
 #     private RFC1918/CGNAT/ULA LANs.
+#   - GitHub-side assignment restriction first, hook second: donors register
+#     against a private controller repository (default, #53) or an organization
+#     runner group restricted by GitHub to the reviewed workflow and ref
+#     (--org + --runner-group + --allow-repo). Direct registration on the public
+#     vicaya/qeminga repository is refused because actions/runner v2.338.2 runs
+#     action setup before ACTIONS_RUNNER_HOOK_JOB_STARTED and still evaluates
+#     `if: always()` / `if: failure()` steps after a failed hook.
 #   - Host-enforced root-owned runner hooks (ACTIONS_RUNNER_HOOK_JOB_STARTED /
-#     COMPLETED) configured via systemd Environment= (never runner-writable):
-#     exact whole-string allowlists for repository, event (workflow_dispatch by
-#     default; pull_request and pull_request_target unconditionally refused),
-#     ref, workflow, and optional actor; stale-domain check before each job and
-#     automatic workspace + stray-domain scrub after every job.
+#     COMPLETED) and ExecStartPre egress-firewall verification configured via
+#     systemd (never runner-writable): exact whole-string allowlists for
+#     repository, event, ref, workflow, and optional actor; startup gated on
+#     effective cgroup BPF blocking of cloud IMDS; stale-domain check before
+#     each job and automatic workspace + stray-domain scrub after every job.
 #   - Pinned GitHub actions/runner archive verified by SHA-256 for both x64 and
 #     arm64 before extraction; runner binaries stay kernel-read-only by default
-#     (--disableupdate); registration tokens are never accepted on the CLI.
+#     (--disableupdate); registration tokens are never accepted on the CLI or
+#     passed in process argv; root-owned install record scopes uninstall.
 #
 # Usage:
 #   scripts/setup-kvm-runner.sh preflight [OPTIONS]
-#   sudo scripts/setup-kvm-runner.sh install --repo https://github.com/OWNER/REPO [OPTIONS]
-#   scripts/setup-kvm-runner.sh render-unit --repo https://github.com/OWNER/REPO [OPTIONS]
-#   scripts/setup-kvm-runner.sh render-hooks --repo https://github.com/OWNER/REPO --out DIR [OPTIONS]
+#   sudo scripts/setup-kvm-runner.sh install --repo https://github.com/OWNER/PRIVATE-CONTROLLER [OPTIONS]
+#   sudo scripts/setup-kvm-runner.sh install --org https://github.com/ORG --runner-group GROUP --allow-repo vicaya/qeminga [OPTIONS]
+#   scripts/setup-kvm-runner.sh render-unit --repo https://github.com/OWNER/PRIVATE-CONTROLLER [OPTIONS]
+#   scripts/setup-kvm-runner.sh render-hooks --repo https://github.com/OWNER/PRIVATE-CONTROLLER --out DIR [OPTIONS]
 #   scripts/setup-kvm-runner.sh fetch-runner --arch ARCH --dest FILE [--version V --sha256 HEX] [--url URL]
 #   scripts/setup-kvm-runner.sh status [OPTIONS]
 #   sudo scripts/setup-kvm-runner.sh update [--version V --sha256 HEX] [OPTIONS]
@@ -49,6 +58,7 @@ RUNNER_SHA256_x86_64="baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390
 # shellcheck disable=SC2034 # read via indirect expansion in pinned_runner_sha256
 RUNNER_SHA256_aarch64="670adb2f268fe21dcbb58b3db0e0aa9d5b3bddfe2c651481336e561ff86de945"
 
+PUBLIC_QEMINGA_SLUG="vicaya/qeminga"
 DEFAULT_USER="qeminga-runner"
 DEFAULT_SERVICE="qeminga-kvm-runner"
 DEFAULT_INSTALL_DIR="/opt/qeminga-runner"
@@ -71,26 +81,31 @@ usage() {
 Usage: scripts/setup-kvm-runner.sh <subcommand> [options]
 
 Subcommands:
-  preflight     Read-only host check (arch, /dev/kvm, libvirt/QEMU, AAVMF on arm64, RAM/disk, DNS)
+  preflight     Read-only host check (arch, /dev/kvm, cgroup v2, libvirt/QEMU, AAVMF on arm64, RAM/disk, DNS)
   install       Install packages, create locked user, verify & register runner, install hardened unit
   render-unit   Print the hardened systemd unit to stdout without modifying the host
-  render-hooks  Write hook-job-started.sh, hook-job-completed.sh, and policy.env into --out DIR
+  render-hooks  Write hook scripts, egress firewall check, and policy.env into --out DIR
   fetch-runner  Download and SHA-256 verify the pinned actions/runner tarball for x86_64 or aarch64
   status        Show service status, systemd security score, KVM state, and active policy
   update        Stop service, replace actions/runner with a SHA-256-verified archive, restart
-  uninstall     Stop & remove service, clean stray qeminga domains, optionally deregister & purge user
+  uninstall     Stop & remove service (using install record), clean stray qeminga domains, optionally deregister & purge user
+
+Registration target (choose ONE; direct registration on public vicaya/qeminga is refused):
+  --repo URL             Private controller repository URL (https://github.com/OWNER/PRIVATE-REPO)
+  --org URL              GitHub organization URL (https://github.com/ORG); requires --runner-group and --allow-repo
+  --runner-group GROUP   GitHub organization runner group restricted to the reviewed workflow/ref (not Default)
+  --allow-repo SLUG      Exact OWNER/REPO allowlisted in hook policy when using --org
 
 Common options:
-  --repo URL             GitHub repository URL (https://github.com/OWNER/REPO)
   --arch ARCH            x86_64 (or amd64/x64) or aarch64 (or arm64); defaults to uname -m
   --name NAME            Runner name (default: qeminga-kvm-<arch>-<host>)
   --labels LIST          Comma-separated extra labels (default: qeminga-kvm)
   --user USER            Dedicated service user (default: qeminga-runner; root refused)
   --service NAME         Systemd service base name (default: qeminga-kvm-runner)
-  --install-dir DIR      Runner binaries directory (default: /opt/qeminga-runner)
-  --state-dir DIR        Runner work/images/cache directory (default: /var/lib/qeminga-runner)
-  --hook-dir DIR         Root-owned hook scripts directory (default: /usr/local/libexec/qeminga-runner)
-  --config-dir DIR       Root-owned policy directory (default: /etc/qeminga-runner)
+  --install-dir DIR      Dedicated runner binaries directory (default: /opt/qeminga-runner)
+  --state-dir DIR        Dedicated runner work/images/cache directory (default: /var/lib/qeminga-runner)
+  --hook-dir DIR         Dedicated root-owned hook scripts directory (default: /usr/local/libexec/qeminga-runner)
+  --config-dir DIR       Dedicated root-owned policy/record directory (default: /etc/qeminga-runner)
 
 Registration credentials (never pass --token on the CLI):
   --token-file PATH      Read registration/removal token from mode-0600 file, or '-' for stdin
@@ -103,7 +118,7 @@ Runner binary pinning:
   --allow-auto-update    Opt in to GitHub self-updates (default: --disableupdate, read-only binaries)
   --ephemeral            Register for a single job only (Restart=no, auto-deregisters on exit)
 
-Host-side job admission policy (enforced before any workflow step runs):
+Host-side job admission policy (defense in depth alongside GitHub-side assignment restrictions):
   --allow-event EVENT    Repeatable; default: workflow_dispatch (pull_request* always refused)
   --allow-ref REF        Repeatable exact ref; default: refs/heads/main (no wildcards)
   --allow-workflow PATH  Repeatable workflow path; default: .github/workflows/libvirt-kvm.yml
@@ -117,7 +132,7 @@ Hardening & resource bounds:
   --no-lan-deny          Do not deny RFC1918/CGNAT/ULA (IPv4 & IPv6 cloud IMDS are STILL denied)
   --skip-packages        Skip apt-get/dnf package installation during install
   --no-start             Do not enable/start the systemd service at the end of install
-  --purge-user           (uninstall only) Also remove the dedicated service user and group
+  --purge-user           (uninstall only) Also remove the dedicated service user if created by this script
 EOF
 }
 
@@ -179,7 +194,65 @@ check_repo_url() {
         *.git) die "--repo must not end in .git: '$1'" ;;
         */../* | */.. | */./* | */.) die "--repo must not contain dot segments: '$1'" ;;
     esac
+    local slug="${url#https://github.com/}"
+    if [ "${slug,,}" = "$PUBLIC_QEMINGA_SLUG" ]; then
+        die "refusing direct registration on public repository '${slug}': actions/runner runs action setup before job-start hooks and evaluates 'if: always()'/'if: failure()' steps after hook denial. Register against a private controller repository (--repo https://github.com/OWNER/PRIVATE-CONTROLLER) or a GitHub-restricted organization runner group (--org https://github.com/ORG --runner-group GROUP --allow-repo ${PUBLIC_QEMINGA_SLUG})"
+    fi
     echo "$url"
+}
+
+check_org_url() {
+    local url="${1%/}"
+    [[ "$url" =~ ^https://github\.com/[A-Za-z0-9._-]+$ ]] \
+        || die "--org must be an HTTPS GitHub organization URL (https://github.com/ORG): '$1'"
+    case "$url" in
+        *.git | */.. | */.) die "invalid --org URL: '$1'" ;;
+    esac
+    echo "$url"
+}
+
+check_runner_group() {
+    local g="$1"
+    [[ "$g" =~ ^[A-Za-z0-9._-]([A-Za-z0-9._\ -]{0,62}[A-Za-z0-9._-])?$ ]] \
+        || die "invalid --runner-group '$g'"
+    if [ "${g,,}" = "default" ]; then
+        die "refusing --runner-group '$g': use a dedicated GitHub runner group restricted to the reviewed workflow and ref, never Default"
+    fi
+}
+
+check_repo_slug() {
+    local s="$1"
+    [[ "$s" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+        || die "--allow-repo must be OWNER/REPO: '$s'"
+    case "$s" in
+        *.git | *..* | */. | ./*) die "invalid --allow-repo '$s'" ;;
+    esac
+}
+
+verify_private_repo() {
+    local slug="$1" resp code body is_private
+    command -v curl >/dev/null 2>&1 || die "curl is required to verify repository visibility"
+    command -v jq >/dev/null 2>&1 || die "jq is required to verify repository visibility"
+    resp="$(curl -sS --proto '=https' --tlsv1.2 --max-time 20 -H 'Accept: application/vnd.github+json' -w '\n%{http_code}' "https://api.github.com/repos/${slug}")" \
+        || die "cannot query GitHub API to verify '${slug}' is a private controller repository"
+    code="${resp##*$'\n'}"
+    body="${resp%$'\n'*}"
+    case "$code" in
+        404)
+            # Unauthenticated GitHub API returns 404 for private repositories.
+            return 0
+            ;;
+        200)
+            is_private="$(printf '%s' "$body" | jq -r '.private // false' 2>/dev/null || echo false)"
+            if [ "$is_private" = "true" ]; then
+                return 0
+            fi
+            die "refusing to register donor directly on public repository '${slug}': register against a private controller repository (--repo) or a GitHub-restricted organization runner group (--org ... --runner-group ... --allow-repo ...)"
+            ;;
+        *)
+            die "cannot verify '${slug}' is private (GitHub API returned HTTP ${code}); refusing to register against unverified repository visibility"
+            ;;
+    esac
 }
 
 repo_slug_of() {
@@ -355,9 +428,55 @@ read_secret_file() {
     printf '%s' "$val"
 }
 
+# Decode a GitHub JIT config payload, verify its gitHubUrl matches the expected
+# registration target, and return the validated canonical workspace path
+# (matching actions/runner HostContext.cs: Path.Combine(Root, workFolder)).
+resolve_jit_work_dir() {
+    local jit_b64="$1" expected_url="$2" outer runner_b64 runner_json gh_url wf
+    command -v jq >/dev/null 2>&1 || die "jq is required to validate --jitconfig-file"
+    command -v base64 >/dev/null 2>&1 || die "base64 is required to validate --jitconfig-file"
+    outer="$(printf '%s' "$jit_b64" | base64 -d 2>/dev/null)" \
+        || die "invalid base64 in --jitconfig-file"
+    runner_b64="$(printf '%s' "$outer" | jq -er '.[".runner"] // empty' 2>/dev/null)" \
+        || die "--jitconfig-file JSON is missing .runner entry"
+    [ -n "$runner_b64" ] || die "--jitconfig-file .runner entry is empty"
+    runner_json="$(printf '%s' "$runner_b64" | base64 -d 2>/dev/null | sed '1s/^\xef\xbb\xbf//')" \
+        || die "invalid base64 in --jitconfig-file .runner entry"
+    gh_url="$(printf '%s' "$runner_json" | jq -er '.gitHubUrl // empty' 2>/dev/null)" \
+        || die "--jitconfig-file .runner lacks gitHubUrl"
+    wf="$(printf '%s' "$runner_json" | jq -er '.workFolder // empty' 2>/dev/null)" \
+        || die "--jitconfig-file .runner lacks workFolder"
+
+    local norm_got="${gh_url%/}" norm_want="${expected_url%/}"
+    if [ "${norm_got,,}" != "${norm_want,,}" ]; then
+        die "--jitconfig-file gitHubUrl '${gh_url}' does not match registration target '${expected_url}'"
+    fi
+
+    if [[ "$wf" == /* ]]; then
+        check_abs_path "JIT workFolder" "$wf"
+        wf="${wf%/}"
+        if [ "${wf#"$OPT_STATE_DIR"/}" = "$wf" ]; then
+            die "refusing JIT workFolder '$wf' outside managed state directory '$OPT_STATE_DIR'"
+        fi
+        echo "$wf"
+    else
+        [[ "$wf" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || die "refusing unsafe relative JIT workFolder '$wf' (expected a single directory name like _work or a path under $OPT_STATE_DIR)"
+        case "$wf" in
+            . | .. | .* | bin | externals | _diag | run.sh | config.sh | env.sh)
+                die "refusing reserved JIT workFolder '$wf'"
+                ;;
+        esac
+        echo "${OPT_INSTALL_DIR}/${wf}"
+    fi
+}
+
 # ---- option parsing -------------------------------------------------------
 
 OPT_REPO=""
+OPT_ORG=""
+OPT_RUNNER_GROUP=""
+OPT_ALLOW_REPO=""
 OPT_ARCH=""
 OPT_NAME=""
 OPT_LABELS="$DEFAULT_LABELS"
@@ -389,6 +508,17 @@ OPT_ALLOW_WORKFLOWS=()
 OPT_ALLOW_ACTORS=()
 OPT_ALLOW_IPS=()
 
+# Track whether paths/identities were explicitly set on the CLI (for uninstall verification).
+SET_USER=0
+SET_SERVICE=0
+SET_INSTALL_DIR=0
+SET_STATE_DIR=0
+SET_HOOK_DIR=0
+
+TARGET_URL=""
+ALLOWED_REPO_SLUG=""
+RESOLVED_WORK_DIR=""
+
 parse_common_opts() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -396,14 +526,17 @@ parse_common_opts() {
                 die "refusing ${1%%=*} on the command line (visible in ps and shell history); use interactive prompt, --token-file PATH (mode 0600), --token-file - (stdin), --jitconfig-file PATH, or QEMINGA_RUNNER_TOKEN"
                 ;;
             --repo) [ $# -ge 2 ] || die "--repo needs a value"; OPT_REPO="$(check_repo_url "$2")"; shift 2 ;;
+            --org) [ $# -ge 2 ] || die "--org needs a value"; OPT_ORG="$(check_org_url "$2")"; shift 2 ;;
+            --runner-group) [ $# -ge 2 ] || die "--runner-group needs a value"; check_runner_group "$2"; OPT_RUNNER_GROUP="$2"; shift 2 ;;
+            --allow-repo) [ $# -ge 2 ] || die "--allow-repo needs a value"; check_repo_slug "$2"; OPT_ALLOW_REPO="$2"; shift 2 ;;
             --arch) [ $# -ge 2 ] || die "--arch needs a value"; OPT_ARCH="$(normalize_arch "$2")"; shift 2 ;;
             --name) [ $# -ge 2 ] || die "--name needs a value"; check_runner_name "$2"; OPT_NAME="$2"; shift 2 ;;
             --labels) [ $# -ge 2 ] || die "--labels needs a value"; check_labels "$2"; OPT_LABELS="$2"; shift 2 ;;
-            --user) [ $# -ge 2 ] || die "--user needs a value"; check_user_name "$2"; OPT_USER="$2"; shift 2 ;;
-            --service) [ $# -ge 2 ] || die "--service needs a value"; check_service_name "$2"; OPT_SERVICE="$2"; shift 2 ;;
-            --install-dir) [ $# -ge 2 ] || die "--install-dir needs a value"; check_abs_path --install-dir "$2"; OPT_INSTALL_DIR="${2%/}"; shift 2 ;;
-            --state-dir) [ $# -ge 2 ] || die "--state-dir needs a value"; check_abs_path --state-dir "$2"; OPT_STATE_DIR="${2%/}"; shift 2 ;;
-            --hook-dir) [ $# -ge 2 ] || die "--hook-dir needs a value"; check_abs_path --hook-dir "$2"; OPT_HOOK_DIR="${2%/}"; shift 2 ;;
+            --user) [ $# -ge 2 ] || die "--user needs a value"; check_user_name "$2"; OPT_USER="$2"; SET_USER=1; shift 2 ;;
+            --service) [ $# -ge 2 ] || die "--service needs a value"; check_service_name "$2"; OPT_SERVICE="$2"; SET_SERVICE=1; shift 2 ;;
+            --install-dir) [ $# -ge 2 ] || die "--install-dir needs a value"; check_abs_path --install-dir "$2"; OPT_INSTALL_DIR="${2%/}"; SET_INSTALL_DIR=1; shift 2 ;;
+            --state-dir) [ $# -ge 2 ] || die "--state-dir needs a value"; check_abs_path --state-dir "$2"; OPT_STATE_DIR="${2%/}"; SET_STATE_DIR=1; shift 2 ;;
+            --hook-dir) [ $# -ge 2 ] || die "--hook-dir needs a value"; check_abs_path --hook-dir "$2"; OPT_HOOK_DIR="${2%/}"; SET_HOOK_DIR=1; shift 2 ;;
             --config-dir) [ $# -ge 2 ] || die "--config-dir needs a value"; check_abs_path --config-dir "$2"; OPT_CONFIG_DIR="${2%/}"; shift 2 ;;
             --token-file) [ $# -ge 2 ] || die "--token-file needs a value"; OPT_TOKEN_FILE="$2"; shift 2 ;;
             --jitconfig-file) [ $# -ge 2 ] || die "--jitconfig-file needs a value"; OPT_JITCONFIG_FILE="$2"; OPT_EPHEMERAL=1; shift 2 ;;
@@ -432,10 +565,31 @@ parse_common_opts() {
     done
 }
 
+resolve_target_registration() {
+    local subcmd="$1"
+    if [ -n "$OPT_REPO" ] && [ -n "$OPT_ORG" ]; then
+        die "$subcmd: --repo and --org are mutually exclusive"
+    fi
+    if [ -n "$OPT_ORG" ]; then
+        [ -n "$OPT_RUNNER_GROUP" ] || die "$subcmd: --org requires --runner-group GROUP (restricted by GitHub to the reviewed workflow and ref)"
+        [ -n "$OPT_ALLOW_REPO" ] || die "$subcmd: --org requires --allow-repo OWNER/REPO for the job-admission hook policy"
+        TARGET_URL="$OPT_ORG"
+        ALLOWED_REPO_SLUG="$OPT_ALLOW_REPO"
+    elif [ -n "$OPT_REPO" ]; then
+        [ -z "$OPT_RUNNER_GROUP" ] || die "$subcmd: --runner-group applies only with --org"
+        [ -z "$OPT_ALLOW_REPO" ] || die "$subcmd: --allow-repo applies only with --org"
+        TARGET_URL="$OPT_REPO"
+        ALLOWED_REPO_SLUG="$(repo_slug_of "$OPT_REPO")"
+    else
+        die "$subcmd requires --repo https://github.com/OWNER/PRIVATE-CONTROLLER or --org https://github.com/ORG --runner-group GROUP --allow-repo OWNER/REPO"
+    fi
+}
+
 finalize_policy_defaults() {
     [ ${#OPT_ALLOW_EVENTS[@]} -gt 0 ] || OPT_ALLOW_EVENTS=("$DEFAULT_EVENT")
     [ ${#OPT_ALLOW_REFS[@]} -gt 0 ] || OPT_ALLOW_REFS=("$DEFAULT_REF")
     [ ${#OPT_ALLOW_WORKFLOWS[@]} -gt 0 ] || OPT_ALLOW_WORKFLOWS=("$DEFAULT_WORKFLOW")
+    [ -n "$RESOLVED_WORK_DIR" ] || RESOLVED_WORK_DIR="${OPT_STATE_DIR}/work"
 }
 
 resolve_runner_sha256() {
@@ -498,6 +652,9 @@ cmd_fetch_runner() {
 
 write_policy_file() {
     local dest="$1" slug="$2"
+    local work_dir="${RESOLVED_WORK_DIR:-${OPT_STATE_DIR}/work}"
+    local deny_lan=1
+    [ "$OPT_NO_LAN_DENY" -eq 1 ] && deny_lan=0
     cat >"$dest" <<EOF
 # Managed by scripts/setup-kvm-runner.sh — root-owned, read-only to runner.
 # Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
@@ -506,10 +663,12 @@ ALLOWED_EVENTS=${OPT_ALLOW_EVENTS[*]}
 ALLOWED_REFS=${OPT_ALLOW_REFS[*]}
 ALLOWED_WORKFLOWS=${OPT_ALLOW_WORKFLOWS[*]}
 ALLOWED_ACTORS=${OPT_ALLOW_ACTORS[*]}
+INSTALL_DIR=${OPT_INSTALL_DIR}
 STATE_DIR=${OPT_STATE_DIR}
-WORK_DIR=${OPT_STATE_DIR}/work
+WORK_DIR=${work_dir}
 IMAGES_DIR=${OPT_STATE_DIR}/images
 IMAGE_CACHE_DIR=${OPT_STATE_DIR}/image-cache
+DENY_LAN=${deny_lan}
 LIBVIRT_CONNECT=qemu:///session
 EOF
 }
@@ -518,10 +677,11 @@ write_job_started_hook() {
     local dest="$1"
     cat >"$dest" <<'EOF'
 #!/usr/bin/env bash
-# Host-enforced pre-job admission guard for qeminga KVM self-hosted runners.
+# Host-enforced pre-job admission guard for qeminga KVM self-hosted runners
+# (defense in depth alongside GitHub-side assignment restrictions).
 # Installed root-owned (0755) outside the runner directory and wired via the
 # systemd unit's Environment=ACTIONS_RUNNER_HOOK_JOB_STARTED so a workflow job
-# cannot modify or bypass it. Runs BEFORE actions/checkout or any job step.
+# cannot modify or bypass it.
 #
 # Rules: exact whole-string matches only (noglob), fail closed on any missing
 # or mismatched field, never print full env or enable `set -x` (job logs are
@@ -559,7 +719,7 @@ while IFS='=' read -r key val; do
         ALLOWED_WORKFLOWS) ALLOWED_WORKFLOWS="$val" ;;
         ALLOWED_ACTORS) ALLOWED_ACTORS="$val" ;;
         LIBVIRT_CONNECT) LIBVIRT_CONNECT="$val" ;;
-        STATE_DIR | WORK_DIR | IMAGES_DIR | IMAGE_CACHE_DIR) ;;
+        INSTALL_DIR | STATE_DIR | WORK_DIR | IMAGES_DIR | IMAGE_CACHE_DIR | DENY_LAN) ;;
         *) deny "unknown policy key '$key'" ;;
     esac
 done <"$POLICY"
@@ -638,7 +798,8 @@ write_job_completed_hook() {
 # Installed root-owned (0755) and wired via ACTIONS_RUNNER_HOOK_JOB_COMPLETED.
 # Destroys/undefines only stray qeminga-e2e-* session domains, removes their
 # run directories only after confirming the domain is absent, and scrubs the
-# runner work directory while preserving the SHA-256-verified image cache.
+# runner work directory (including validated JIT workspaces) while preserving
+# the SHA-256-verified image cache.
 set -uo pipefail
 export LC_ALL=C LANG=C
 
@@ -651,6 +812,7 @@ if [ ! -f "$POLICY" ] || [ ! -r "$POLICY" ]; then
     die "missing or unreadable policy file $POLICY"
 fi
 
+INSTALL_DIR=""
 STATE_DIR=""
 WORK_DIR=""
 IMAGES_DIR=""
@@ -659,6 +821,7 @@ LIBVIRT_CONNECT="qemu:///session"
 while IFS='=' read -r key val; do
     case "$key" in
         '' | '#'*) continue ;;
+        INSTALL_DIR) INSTALL_DIR="$val" ;;
         STATE_DIR) STATE_DIR="$val" ;;
         WORK_DIR) WORK_DIR="$val" ;;
         IMAGES_DIR) IMAGES_DIR="$val" ;;
@@ -666,17 +829,41 @@ while IFS='=' read -r key val; do
     esac
 done <"$POLICY"
 
-safe_subdir() {
+safe_path_syntax() {
     local p="$1"
     [[ "$p" =~ ^/[A-Za-z0-9._/-]+$ ]] || return 1
     [ "$p" != "/" ] || return 1
     case "$p" in
         */../* | */.. | */./* | */. | *//*) return 1 ;;
     esac
+}
+
+safe_subdir() {
+    local p="$1"
+    safe_path_syntax "$p" || return 1
     [ -n "$STATE_DIR" ] && [ "${p#"$STATE_DIR"/}" != "$p" ]
 }
 
-safe_subdir "$WORK_DIR" || die "refusing unsafe WORK_DIR '$WORK_DIR'"
+safe_work_dir() {
+    local p="$1" rel
+    safe_path_syntax "$p" || return 1
+    if safe_subdir "$p"; then
+        return 0
+    fi
+    # Validated JIT workspaces (e.g. GitHub API default `_work`) live directly
+    # under INSTALL_DIR as a single non-reserved component.
+    if [ -n "$INSTALL_DIR" ] && safe_path_syntax "$INSTALL_DIR" && [ "${p#"$INSTALL_DIR"/}" != "$p" ]; then
+        rel="${p#"$INSTALL_DIR"/}"
+        [[ "$rel" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+        case "$rel" in
+            . | .. | .* | bin | externals | _diag | run.sh | config.sh | env.sh) return 1 ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+safe_work_dir "$WORK_DIR" || die "refusing unsafe WORK_DIR '$WORK_DIR'"
 safe_subdir "$IMAGES_DIR" || die "refusing unsafe IMAGES_DIR '$IMAGES_DIR'"
 [ "$LIBVIRT_CONNECT" = "qemu:///session" ] || die "refusing unexpected LIBVIRT_CONNECT '$LIBVIRT_CONNECT'"
 
@@ -758,16 +945,105 @@ if command -v virsh >/dev/null 2>&1; then
         done
         shopt -u nullglob
     fi
+elif [ -d "$IMAGES_DIR" ]; then
+    shopt -s nullglob
+    for dir in "$IMAGES_DIR"/qeminga-e2e-*; do
+        [ -e "$dir" ] || continue
+        log "virsh is unavailable while $dir exists; keeping disks"
+        rc=1
+        break
+    done
+    shopt -u nullglob
 fi
 
 # Scrub the runner work directory between jobs (including dotfiles) so no
 # checked-out source or temporary files persist across jobs.
-if [ -d "$WORK_DIR" ]; then
+if [ -d "$WORK_DIR" ] && [ ! -L "$WORK_DIR" ]; then
     find "$WORK_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
     log "scrubbed work directory $WORK_DIR"
 fi
 
 exit "$rc"
+EOF
+    chmod 0755 "$dest"
+}
+
+write_egress_firewall_check() {
+    local dest="$1"
+    cat >"$dest" <<'EOF'
+#!/usr/bin/env bash
+# Root-owned ExecStartPre gate: verifies that systemd's cgroup BPF
+# IPAddressDeny= firewall is actively enforced inside this unit's cgroup before
+# the runner listener starts. Exits 78 (EX_CONFIG, matched by
+# RestartPreventExitStatus=78) on hosts/containers where cgroup BPF filtering
+# is unsupported or silently skipped by systemd.
+set -euo pipefail
+export LC_ALL=C LANG=C
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "qeminga-egress-check: python3 is required to verify cgroup BPF egress filtering" >&2
+    exit 78
+fi
+
+python3 - <<'PY'
+import errno
+import socket
+import sys
+
+# Unconditional cloud IMDS endpoints denied by IPAddressDeny=link-local and
+# IPAddressDeny=fd00:ec2::254/128. With cgroup BPF active, sendto() is rejected
+# synchronously in ip_local_out()/ip6_local_out() with EPERM before any packet
+# leaves the host.
+PROBES = [
+    ("IPv4 IMDS", socket.AF_INET, ("169.254.169.254", 80)),
+    ("IPv6 IMDS", socket.AF_INET6, ("fd00:ec2::254", 80)),
+]
+UNROUTED = {
+    errno.ENETUNREACH,
+    errno.EHOSTUNREACH,
+    errno.EAFNOSUPPORT,
+    errno.EADDRNOTAVAIL,
+}
+
+proved_eperm = False
+for label, family, addr in PROBES:
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+    except OSError as exc:
+        if exc.errno in UNROUTED:
+            continue
+        sys.stderr.write(
+            f"qeminga-egress-check: unexpected socket error probing {label} ({addr[0]}): {exc}\n"
+        )
+        sys.exit(78)
+    try:
+        sock.sendto(b"x", addr)
+    except OSError as exc:
+        if exc.errno == errno.EPERM:
+            proved_eperm = True
+        elif exc.errno in UNROUTED:
+            continue
+        else:
+            sys.stderr.write(
+                f"qeminga-egress-check: {label} ({addr[0]}) returned unexpected errno {exc.errno} ({exc.strerror}); cgroup BPF IPAddressDeny= is not proven active\n"
+            )
+            sys.exit(78)
+    else:
+        sys.stderr.write(
+            f"qeminga-egress-check: {label} ({addr[0]}) was NOT blocked by cgroup BPF IPAddressDeny= (sendto succeeded); refusing to start runner listener\n"
+        )
+        sys.exit(78)
+    finally:
+        sock.close()
+
+if not proved_eperm:
+    sys.stderr.write(
+        "qeminga-egress-check: no IMDS probe returned EPERM (cgroup BPF IPAddressDeny= not proven active in this service cgroup); refusing to start runner listener\n"
+    )
+    sys.exit(78)
+
+print("qeminga-egress-check: PASS (cgroup BPF IPAddressDeny= actively blocks IMDS with EPERM)")
+PY
 EOF
     chmod 0755 "$dest"
 }
@@ -792,16 +1068,21 @@ EOF
 
 cmd_render_hooks() {
     parse_common_opts "$@"
-    [ -n "$OPT_REPO" ] || die "render-hooks requires --repo URL"
+    resolve_target_registration render-hooks
     [ -n "$OPT_OUT" ] || die "render-hooks requires --out DIR"
+    if [ -n "$OPT_JITCONFIG_FILE" ]; then
+        local jit_cfg
+        jit_cfg="$(read_secret_file --jitconfig-file "$OPT_JITCONFIG_FILE")"
+        RESOLVED_WORK_DIR="$(resolve_jit_work_dir "$jit_cfg" "$TARGET_URL")"
+        unset jit_cfg
+    fi
     finalize_policy_defaults
-    local slug
-    slug="$(repo_slug_of "$OPT_REPO")"
     mkdir -p "$OPT_OUT"
-    write_policy_file "$OPT_OUT/policy.env" "$slug"
+    write_policy_file "$OPT_OUT/policy.env" "$ALLOWED_REPO_SLUG"
     write_job_started_hook "$OPT_OUT/hook-job-started.sh"
     write_job_completed_hook "$OPT_OUT/hook-job-completed.sh"
-    echo "wrote $OPT_OUT/policy.env, $OPT_OUT/hook-job-started.sh, $OPT_OUT/hook-job-completed.sh"
+    write_egress_firewall_check "$OPT_OUT/check-egress-firewall.sh"
+    echo "wrote $OPT_OUT/policy.env, $OPT_OUT/hook-job-started.sh, $OPT_OUT/hook-job-completed.sh, $OPT_OUT/check-egress-firewall.sh"
 }
 
 # ---- render-unit ----------------------------------------------------------
@@ -839,7 +1120,7 @@ StateDirectoryMode=0700"
         runner_fs_directives="# Auto-update opted in: runner root is writable; hooks and policy remain read-only.
 ReadWritePaths=${OPT_INSTALL_DIR}"
     elif [ "$OPT_EPHEMERAL" -eq 1 ]; then
-        runner_fs_directives="# Ephemeral/JIT mode writes/deletes .runner/.credentials; binaries and .env remain read-only.
+        runner_fs_directives="# Ephemeral/JIT mode writes/deletes .runner/.credentials (and validated JIT _work); binaries and .env remain read-only.
 ReadWritePaths=${OPT_INSTALL_DIR}
 ReadOnlyPaths=${OPT_INSTALL_DIR}/bin
 ReadOnlyPaths=${OPT_INSTALL_DIR}/externals
@@ -878,7 +1159,7 @@ IPAddressDeny=fc00::/7"
 
     cat <<EOF
 # Hardened systemd unit for a community-donated qeminga KVM GitHub Actions runner.
-# Generated by scripts/setup-kvm-runner.sh for ${OPT_REPO} (${arch}).
+# Generated by scripts/setup-kvm-runner.sh for ${TARGET_URL} (${arch}).
 #
 # Security model:
 #   - Dedicated locked service user (${OPT_USER}), zero Linux capabilities,
@@ -886,6 +1167,8 @@ IPAddressDeny=fc00::/7"
 #   - Unprivileged qemu:///session libvirt inside this unit's cgroup, so every
 #     disposable KVM guest inherits DevicePolicy=closed (/dev/kvm only),
 #     ProtectSystem=strict, MemoryMax, TasksMax, and cgroup IPAddressDeny.
+#   - ExecStartPre verifies that cgroup BPF IPAddressDeny= actively rejects IMDS
+#     with EPERM in this unit's cgroup before starting the runner listener.
 #   - MemoryDenyWriteExecute is intentionally omitted because .NET (actions/runner),
 #     Node.js (JS actions), and QEMU require executable JIT mappings.
 [Unit]
@@ -900,10 +1183,12 @@ User=${OPT_USER}
 Group=${OPT_USER}
 SupplementaryGroups=kvm
 WorkingDirectory=${OPT_INSTALL_DIR}
+ExecStartPre=${OPT_HOOK_DIR}/check-egress-firewall.sh
 ExecStart=${exec_start}
 ${cred_line}
 ${stop_post_line}
 Restart=${restart_policy}
+RestartPreventExitStatus=78
 RestartSec=5s
 KillMode=control-group
 KillSignal=${kill_signal}
@@ -977,7 +1262,7 @@ EOF
 
 cmd_render_unit() {
     parse_common_opts "$@"
-    [ -n "$OPT_REPO" ] || die "render-unit requires --repo URL"
+    resolve_target_registration render-unit
     local arch
     arch="${OPT_ARCH:-$(normalize_arch "$(uname -m)")}"
     # Strip blank lines caused by optional directives (e.g. CPUQuota / LoadCredential).
@@ -1027,6 +1312,16 @@ cmd_preflight() {
         echo "  FAIL: systemd (systemctl) not found"; fail=1
     fi
 
+    # systemd IPAddressDeny= requires cgroup v2 unified hierarchy for BPF attachment;
+    # the service unit also runs ExecStartPre check-egress-firewall.sh inside the cgroup.
+    local cg_ctrls="${QEMINGA_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}"
+    if [ -r "$cg_ctrls" ]; then
+        echo "  ok: cgroup v2 unified hierarchy present ($cg_ctrls)"
+    else
+        echo "  FAIL: cgroup v2 unified hierarchy missing ($cg_ctrls); required for systemd IPAddressDeny= BPF firewall"
+        fail=1
+    fi
+
     # KVM check: /dev/kvm is authoritative on both x86_64 and aarch64
     # (aarch64 does not report vmx/svm in /proc/cpuinfo).
     local kvm_dev="${QEMINGA_KVM_DEVICE:-/dev/kvm}"
@@ -1043,7 +1338,7 @@ cmd_preflight() {
     fi
 
     local tool
-    for tool in virsh libvirtd "qemu-system-$arch" qemu-img genisoimage jq curl sha256sum tar; do
+    for tool in virsh libvirtd "qemu-system-$arch" qemu-img genisoimage jq curl sha256sum tar python3; do
         if command -v "$tool" >/dev/null 2>&1; then
             echo "  ok: tool $tool"
         else
@@ -1123,7 +1418,7 @@ install_packages() {
         apt-get update -qq
         DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
             libvirt-daemon libvirt-daemon-driver-qemu libvirt-clients \
-            qemu-utils genisoimage jq curl ca-certificates "${arch_pkgs[@]}"
+            qemu-utils genisoimage jq curl ca-certificates python3 "${arch_pkgs[@]}"
     elif command -v dnf >/dev/null 2>&1; then
         local arch_pkgs=()
         case "$arch" in
@@ -1132,10 +1427,172 @@ install_packages() {
         esac
         dnf install -y -q \
             libvirt-daemon-driver-qemu libvirt-client \
-            qemu-img genisoimage jq curl ca-certificates "${arch_pkgs[@]}"
+            qemu-img genisoimage jq curl ca-certificates python3 "${arch_pkgs[@]}"
     else
-        die "neither apt-get nor dnf found; install libvirt-daemon, qemu-system-${arch}, qemu-img, genisoimage, jq, curl manually and rerun with --skip-packages"
+        die "neither apt-get nor dnf found; install libvirt-daemon, qemu-system-${arch}, qemu-img, genisoimage, jq, curl, python3 manually and rerun with --skip-packages"
     fi
+}
+
+# ---- installation record & dedicated directory guards ---------------------
+
+HAS_INSTALL_RECORD=0
+REC_SCHEMA=""
+REC_SERVICE=""
+REC_USER=""
+REC_USER_UID=""
+REC_USER_GID=""
+REC_USER_CREATED=""
+REC_INSTALL_DIR=""
+REC_STATE_DIR=""
+REC_HOOK_DIR=""
+REC_CONFIG_DIR=""
+REC_TARGET_URL=""
+REC_RUNNER_GROUP=""
+REC_RUNNER_NAME=""
+REC_LABELS=""
+REC_EPHEMERAL=""
+REC_ALLOW_AUTO_UPDATE=""
+REC_WORK_DIR=""
+
+MANAGED_USER_UID=""
+MANAGED_USER_GID=""
+MANAGED_USER_CREATED="0"
+
+is_reserved_system_dir() {
+    case "$1" in
+        / | /bin | /boot | /dev | /etc | /home | /lib | /lib64 | /mnt | /opt | /proc | /root | /run | /sbin | /srv | /sys | /tmp | /usr | /usr/bin | /usr/lib | /usr/local | /usr/local/bin | /usr/local/libexec | /usr/sbin | /var | /var/lib | /var/log | /var/tmp)
+            return 0
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+check_trusted_parent_dir() {
+    local target="$1" cur
+    cur="$(dirname "$target")"
+    while [ ! -e "$cur" ] && [ "$cur" != "/" ]; do
+        [ ! -L "$cur" ] || die "refusing symlinked parent directory '$cur' for '$target'"
+        cur="$(dirname "$cur")"
+    done
+    [ ! -L "$cur" ] || die "refusing symlinked parent directory '$cur' for '$target'"
+    [ -d "$cur" ] || die "parent '$cur' of '$target' is not a directory"
+    local info owner mode
+    info="$(stat -c '%u:%a' "$cur")" || die "cannot stat parent directory '$cur'"
+    owner="${info%%:*}"
+    mode="${info#*:}"
+    [ "$owner" -eq 0 ] || die "parent directory '$cur' of '$target' is owned by uid $owner (must be root)"
+    if [ "$((8#$mode & 022))" -ne 0 ]; then
+        die "parent directory '$cur' of '$target' has mode $mode (must not be group- or world-writable)"
+    fi
+}
+
+check_dedicated_managed_dirs() {
+    local allow_existing="$1"
+    local dirs=("$OPT_INSTALL_DIR" "$OPT_STATE_DIR" "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR")
+    local i j a b
+    for i in 0 1 2 3; do
+        a="${dirs[$i]}"
+        check_abs_path "managed directory" "$a"
+        if is_reserved_system_dir "$a"; then
+            die "refusing shared system directory '$a' as a managed runner directory"
+        fi
+        [ ! -L "$a" ] || die "refusing symlinked managed directory '$a'"
+        check_trusted_parent_dir "$a"
+        if [ "$allow_existing" -eq 0 ] && [ -e "$a" ]; then
+            die "refusing to adopt existing unmanaged path '$a' (no installation record at $OPT_CONFIG_DIR/install.env); choose a dedicated path or remove it first"
+        fi
+        if [ -e "$a" ] && [ ! -d "$a" ]; then
+            die "managed path '$a' exists and is not a directory"
+        fi
+    done
+    for i in 0 1 2 3; do
+        for j in 0 1 2 3; do
+            [ "$i" -lt "$j" ] || continue
+            a="${dirs[$i]}"
+            b="${dirs[$j]}"
+            if [ "$a" = "$b" ] || [ "${a#"$b"/}" != "$a" ] || [ "${b#"$a"/}" != "$b" ]; then
+                die "managed directories must be distinct and non-overlapping: '$a' vs '$b'"
+            fi
+        done
+    done
+}
+
+read_install_record() {
+    local rec="$1"
+    [ ! -L "$rec" ] || die "refusing symlinked installation record '$rec'"
+    [ -f "$rec" ] || die "missing installation record '$rec'"
+    local owner
+    owner="$(stat -c '%u' "$rec")" || die "cannot stat installation record '$rec'"
+    [ "$owner" -eq 0 ] || die "refusing installation record '$rec' owned by uid $owner (must be root)"
+
+    REC_SCHEMA="" REC_SERVICE="" REC_USER="" REC_USER_UID="" REC_USER_GID=""
+    REC_USER_CREATED="" REC_INSTALL_DIR="" REC_STATE_DIR="" REC_HOOK_DIR=""
+    REC_CONFIG_DIR="" REC_TARGET_URL="" REC_RUNNER_GROUP="" REC_RUNNER_NAME=""
+    REC_LABELS="" REC_EPHEMERAL="" REC_ALLOW_AUTO_UPDATE="" REC_WORK_DIR=""
+
+    local key val
+    while IFS='=' read -r key val; do
+        case "$key" in
+            '' | '#'*) continue ;;
+            RECORD_SCHEMA) REC_SCHEMA="$val" ;;
+            SERVICE) REC_SERVICE="$val" ;;
+            USER) REC_USER="$val" ;;
+            USER_UID) REC_USER_UID="$val" ;;
+            USER_GID) REC_USER_GID="$val" ;;
+            USER_CREATED) REC_USER_CREATED="$val" ;;
+            INSTALL_DIR) REC_INSTALL_DIR="$val" ;;
+            STATE_DIR) REC_STATE_DIR="$val" ;;
+            HOOK_DIR) REC_HOOK_DIR="$val" ;;
+            CONFIG_DIR) REC_CONFIG_DIR="$val" ;;
+            TARGET_URL) REC_TARGET_URL="$val" ;;
+            RUNNER_GROUP) REC_RUNNER_GROUP="$val" ;;
+            RUNNER_NAME) REC_RUNNER_NAME="$val" ;;
+            LABELS) REC_LABELS="$val" ;;
+            EPHEMERAL) REC_EPHEMERAL="$val" ;;
+            ALLOW_AUTO_UPDATE) REC_ALLOW_AUTO_UPDATE="$val" ;;
+            WORK_DIR) REC_WORK_DIR="$val" ;;
+            *) die "unknown key '$key' in installation record '$rec'" ;;
+        esac
+    done <"$rec"
+
+    [ "$REC_SCHEMA" = "1" ] || die "unsupported installation record schema '${REC_SCHEMA:-<empty>}' in '$rec'"
+    [ -n "$REC_SERVICE" ] && [ -n "$REC_USER" ] && [ -n "$REC_INSTALL_DIR" ] \
+        && [ -n "$REC_STATE_DIR" ] && [ -n "$REC_HOOK_DIR" ] && [ -n "$REC_CONFIG_DIR" ] \
+        || die "incomplete installation record '$rec'"
+    [[ "$REC_USER_UID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_UID '$REC_USER_UID' in '$rec'"
+    [[ "$REC_USER_GID" =~ ^[1-9][0-9]*$ ]] || die "invalid USER_GID '$REC_USER_GID' in '$rec'"
+    HAS_INSTALL_RECORD=1
+}
+
+write_install_record() {
+    local dest="$1" runner_name="$2"
+    [ ! -L "$dest" ] || die "refusing symlinked installation record '$dest'"
+    local tmp
+    tmp="$(mktemp "$(dirname "$dest")/.install.env.XXXXXX")"
+    cat >"$tmp" <<EOF
+# Managed by scripts/setup-kvm-runner.sh — root-owned installation record.
+# Parsed strictly as KEY=VALUE lines (never sourced or eval'd).
+RECORD_SCHEMA=1
+SERVICE=${OPT_SERVICE}
+USER=${OPT_USER}
+USER_UID=${MANAGED_USER_UID}
+USER_GID=${MANAGED_USER_GID}
+USER_CREATED=${MANAGED_USER_CREATED}
+INSTALL_DIR=${OPT_INSTALL_DIR}
+STATE_DIR=${OPT_STATE_DIR}
+HOOK_DIR=${OPT_HOOK_DIR}
+CONFIG_DIR=${OPT_CONFIG_DIR}
+TARGET_URL=${TARGET_URL}
+RUNNER_GROUP=${OPT_RUNNER_GROUP}
+RUNNER_NAME=${runner_name}
+LABELS=${OPT_LABELS}
+EPHEMERAL=${OPT_EPHEMERAL}
+ALLOW_AUTO_UPDATE=${OPT_ALLOW_AUTO_UPDATE}
+WORK_DIR=${RESOLVED_WORK_DIR}
+EOF
+    chown -h root:root "$tmp"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$dest"
 }
 
 ensure_service_user() {
@@ -1143,18 +1600,27 @@ ensure_service_user() {
     getent group kvm >/dev/null 2>&1 || die "group 'kvm' does not exist (is KVM enabled on this host?)"
 
     if id "$OPT_USER" >/dev/null 2>&1; then
-        local uid groups g
+        if [ "$HAS_INSTALL_RECORD" -ne 1 ]; then
+            die "account '$OPT_USER' already exists with no installation record at $OPT_CONFIG_DIR/install.env; refusing to adopt or modify a pre-existing account (pass --user <new-name>)"
+        fi
+        local uid gid pgroup groups g
         uid="$(id -u "$OPT_USER")"
+        gid="$(id -g "$OPT_USER")"
+        pgroup="$(id -gn "$OPT_USER")"
         [ "$uid" -ne 0 ] || die "existing user $OPT_USER has uid 0"
+        [ "$uid" = "$REC_USER_UID" ] || die "user '$OPT_USER' uid $uid does not match recorded uid $REC_USER_UID; refusing to reuse"
+        [ "$gid" = "$REC_USER_GID" ] || die "user '$OPT_USER' gid $gid does not match recorded gid $REC_USER_GID; refusing to reuse"
+        [ "$pgroup" = "$OPT_USER" ] || die "user '$OPT_USER' primary group '$pgroup' does not match '$OPT_USER'; refusing to reuse"
         groups="$(id -nG "$OPT_USER")"
         for g in $groups; do
-            case "$g" in
-                root | sudo | wheel | admin | docker | libvirt | libvirt-qemu | adm | disk | shadow | lxd | podman | systemd-journal)
-                    die "existing user $OPT_USER belongs to privileged group '$g'; refusing to reuse"
-                    ;;
-            esac
+            if [ "$g" != "$OPT_USER" ] && [ "$g" != "kvm" ]; then
+                die "existing user $OPT_USER belongs to unexpected group '$g' (only '$OPT_USER' and 'kvm' are permitted); refusing to reuse"
+            fi
         done
-        usermod -s /usr/sbin/nologin "$OPT_USER"
+        usermod -s /usr/sbin/nologin -G kvm "$OPT_USER"
+        MANAGED_USER_UID="$uid"
+        MANAGED_USER_GID="$gid"
+        MANAGED_USER_CREATED="${REC_USER_CREATED:-1}"
     else
         useradd --system --user-group \
             --home-dir "$OPT_STATE_DIR" \
@@ -1162,8 +1628,32 @@ ensure_service_user() {
             --shell /usr/sbin/nologin \
             "$OPT_USER"
         passwd -l "$OPT_USER" >/dev/null 2>&1 || true
+        usermod -G kvm "$OPT_USER"
+        MANAGED_USER_UID="$(id -u "$OPT_USER")"
+        MANAGED_USER_GID="$(id -g "$OPT_USER")"
+        MANAGED_USER_CREATED="1"
     fi
-    usermod -aG kvm "$OPT_USER"
+}
+
+# Create/validate only the top-level state directory as root (under a trusted
+# root-owned parent), then create all descendants with the service UID so a
+# runner-planted symlink can never redirect root ownership or chmod changes.
+provision_state_dirs() {
+    [ ! -L "$OPT_STATE_DIR" ] || die "refusing symlinked state directory: $OPT_STATE_DIR"
+    check_trusted_parent_dir "$OPT_STATE_DIR"
+    if [ -e "$OPT_STATE_DIR" ] && [ ! -d "$OPT_STATE_DIR" ]; then
+        die "state path '$OPT_STATE_DIR' exists and is not a directory"
+    fi
+    install -d -m 0700 -o "$OPT_USER" -g "$OPT_USER" "$OPT_STATE_DIR"
+    command -v runuser >/dev/null 2>&1 || die "runuser (util-linux) is required to provision state subdirectories as $OPT_USER"
+    runuser -u "$OPT_USER" -- mkdir -p -m 0700 \
+        "$OPT_STATE_DIR/work" \
+        "$OPT_STATE_DIR/images" \
+        "$OPT_STATE_DIR/image-cache" \
+        "$OPT_STATE_DIR/.config" \
+        "$OPT_STATE_DIR/.cache" \
+        "$OPT_STATE_DIR/.local" \
+        "$OPT_STATE_DIR/.local/share"
 }
 
 lock_runner_permissions() {
@@ -1213,7 +1703,7 @@ lock_runner_permissions() {
         fi
 
         # Ephemeral/JIT mode needs the runner user to create/remove .runner/.credentials*
-        # in the root directory while bin/, externals/, scripts, and .env stay ReadOnlyPaths.
+        # (and validated JIT _work) while bin/, externals/, scripts, and .env stay ReadOnlyPaths.
         if [ "$OPT_EPHEMERAL" -eq 1 ]; then
             chown -h "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
             chmod 0750 "$OPT_INSTALL_DIR"
@@ -1233,12 +1723,86 @@ run_runner_config_with_token() {
     )
 }
 
+# Inspect any existing .runner registration BEFORE stopping the live service or
+# mutating files. Prints "configure" when no .runner exists, prints "reuse"
+# when an existing registration matches the requested target and settings, and
+# dies immediately when an existing registration is incompatible.
+check_existing_registration() {
+    local want_url="$1" want_name="$2"
+    local runner_file="$OPT_INSTALL_DIR/.runner"
+    [ ! -L "$runner_file" ] || die "refusing symlinked runner file: $runner_file"
+    if [ ! -e "$runner_file" ]; then
+        echo "configure"
+        return 0
+    fi
+    [ -f "$runner_file" ] || die "refusing non-regular runner file: $runner_file"
+    if [ -n "$OPT_JITCONFIG_FILE" ]; then
+        die "existing persistent registration found at $runner_file; run 'sudo $0 uninstall --token-file ...' before provisioning a JIT runner"
+    fi
+    command -v jq >/dev/null 2>&1 || die "jq is required to inspect existing runner registration"
+    local json got_url got_name got_work
+    json="$(sed '1s/^\xef\xbb\xbf//' "$runner_file")"
+    got_url="$(printf '%s' "$json" | jq -er '.gitHubUrl // empty' 2>/dev/null)" \
+        || die "existing $runner_file is malformed (missing gitHubUrl); uninstall before reinstalling"
+    got_name="$(printf '%s' "$json" | jq -er '.agentName // empty' 2>/dev/null)" \
+        || die "existing $runner_file is malformed (missing agentName); uninstall before reinstalling"
+    got_work="$(printf '%s' "$json" | jq -er '.workFolder // empty' 2>/dev/null)" \
+        || die "existing $runner_file is malformed (missing workFolder); uninstall before reinstalling"
+
+    local norm_got="${got_url%/}" norm_want="${want_url%/}"
+    local want_work="${OPT_STATE_DIR}/work"
+    if [ "${norm_got,,}" != "${norm_want,,}" ]; then
+        die "existing registration in $runner_file targets '$got_url', not '$want_url'; run 'sudo $0 uninstall --token-file ...' first"
+    fi
+    if [ "$got_name" != "$want_name" ]; then
+        die "existing registration in $runner_file has runner name '$got_name', not '$want_name'; run 'sudo $0 uninstall --token-file ...' first"
+    fi
+    if [ "$got_work" != "$want_work" ]; then
+        die "existing registration in $runner_file uses work folder '$got_work', not '$want_work'; run 'sudo $0 uninstall --token-file ...' first"
+    fi
+    if [ "$HAS_INSTALL_RECORD" -eq 1 ]; then
+        local norm_rec="${REC_TARGET_URL%/}"
+        if [ -n "$norm_rec" ] && [ "${norm_rec,,}" != "${norm_want,,}" ]; then
+            die "existing installation record targets '$REC_TARGET_URL', not '$want_url'; run 'sudo $0 uninstall --token-file ...' first"
+        fi
+        if [ -n "$REC_RUNNER_NAME" ] && [ "$REC_RUNNER_NAME" != "$want_name" ]; then
+            die "existing installation record has runner name '$REC_RUNNER_NAME', not '$want_name'; run 'sudo $0 uninstall --token-file ...' first"
+        fi
+        if [ -n "$REC_WORK_DIR" ] && [ "$REC_WORK_DIR" != "$want_work" ]; then
+            die "existing installation record uses work dir '$REC_WORK_DIR', not '$want_work'; run 'sudo $0 uninstall --token-file ...' first"
+        fi
+        if [ "$REC_LABELS" != "$OPT_LABELS" ] || [ "$REC_RUNNER_GROUP" != "$OPT_RUNNER_GROUP" ] || [ "$REC_EPHEMERAL" != "$OPT_EPHEMERAL" ]; then
+            die "existing registration in $OPT_INSTALL_DIR differs in labels/runner-group/ephemeral mode; run 'sudo $0 uninstall --token-file ...' first"
+        fi
+    fi
+    echo "reuse"
+}
+
+register_runner_with_rollback() {
+    local was_active="$1" token="$2"
+    shift 2
+    chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+    local rc=0
+    if run_runner_config_with_token "$token" "$@"; then
+        return 0
+    else
+        rc=$?
+    fi
+    warn "runner registration failed (exit $rc); restoring locked runner permissions"
+    lock_runner_permissions || true
+    if [ "$was_active" -eq 1 ] && command -v systemctl >/dev/null 2>&1; then
+        warn "restarting previously active ${OPT_SERVICE}.service"
+        systemctl start "${OPT_SERVICE}.service" || true
+    fi
+    return "$rc"
+}
+
 # ---- install --------------------------------------------------------------
 
 cmd_install() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "install must run as root (e.g. sudo $0 install ...)"
-    [ -n "$OPT_REPO" ] || die "install requires --repo https://github.com/OWNER/REPO"
+    resolve_target_registration install
     if [ -n "$OPT_TOKEN_FILE" ] && [ -n "$OPT_JITCONFIG_FILE" ]; then
         die "--token-file and --jitconfig-file are mutually exclusive"
     fi
@@ -1251,9 +1815,26 @@ cmd_install() {
     local kvm_dev="${QEMINGA_KVM_DEVICE:-/dev/kvm}"
     [ -c "$kvm_dev" ] || die "KVM device $kvm_dev does not exist; refusing to register a non-KVM host as a KVM runner"
 
-    finalize_policy_defaults
-    local slug runner_name
-    slug="$(repo_slug_of "$OPT_REPO")"
+    local cg_ctrls="${QEMINGA_CGROUP_CONTROLLERS:-/sys/fs/cgroup/cgroup.controllers}"
+    [ -r "$cg_ctrls" ] || die "cgroup v2 unified hierarchy missing ($cg_ctrls); required for systemd IPAddressDeny= BPF firewall"
+
+    # Load and validate existing installation record (if reinstalling) BEFORE
+    # mutating any live state, directories, or service status.
+    local rec_path="$OPT_CONFIG_DIR/install.env"
+    if [ -e "$rec_path" ] || [ -L "$rec_path" ]; then
+        read_install_record "$rec_path"
+        [ "$REC_SERVICE" = "$OPT_SERVICE" ] || die "existing record at $rec_path is for service '$REC_SERVICE', not '$OPT_SERVICE'"
+        [ "$REC_USER" = "$OPT_USER" ] || die "existing record at $rec_path is for user '$REC_USER', not '$OPT_USER'"
+        [ "$REC_INSTALL_DIR" = "$OPT_INSTALL_DIR" ] || die "existing record at $rec_path manages install dir '$REC_INSTALL_DIR', not '$OPT_INSTALL_DIR'"
+        [ "$REC_STATE_DIR" = "$OPT_STATE_DIR" ] || die "existing record at $rec_path manages state dir '$REC_STATE_DIR', not '$OPT_STATE_DIR'"
+        [ "$REC_HOOK_DIR" = "$OPT_HOOK_DIR" ] || die "existing record at $rec_path manages hook dir '$REC_HOOK_DIR', not '$OPT_HOOK_DIR'"
+        [ "$REC_CONFIG_DIR" = "$OPT_CONFIG_DIR" ] || die "existing record at $rec_path manages config dir '$REC_CONFIG_DIR', not '$OPT_CONFIG_DIR'"
+        check_dedicated_managed_dirs 1
+    else
+        check_dedicated_managed_dirs 0
+    fi
+
+    local runner_name
     if [ -n "$OPT_NAME" ]; then
         runner_name="$OPT_NAME"
     else
@@ -1263,17 +1844,24 @@ cmd_install() {
     fi
     check_runner_name "$runner_name"
 
+    # Detect existing registration compatibility BEFORE stopping the live runner.
+    local reg_mode
+    reg_mode="$(check_existing_registration "$TARGET_URL" "$runner_name")"
+
     # Acquire registration token or JIT config before mutating the host.
     local reg_token="" jit_config=""
     if [ -n "$OPT_JITCONFIG_FILE" ]; then
         jit_config="$(read_secret_file --jitconfig-file "$OPT_JITCONFIG_FILE")"
+        RESOLVED_WORK_DIR="$(resolve_jit_work_dir "$jit_config" "$TARGET_URL")"
+    elif [ "$reg_mode" = "reuse" ]; then
+        say "reusing existing matching runner registration in ${OPT_INSTALL_DIR}"
     elif [ -n "$OPT_TOKEN_FILE" ]; then
         reg_token="$(read_secret_file --token-file "$OPT_TOKEN_FILE")"
     elif [ -n "${QEMINGA_RUNNER_TOKEN:-}" ]; then
         reg_token="$QEMINGA_RUNNER_TOKEN"
         unset QEMINGA_RUNNER_TOKEN
     elif [ -t 0 ]; then
-        printf 'GitHub runner registration token for %s (input hidden): ' "$OPT_REPO" >&2
+        printf 'GitHub runner registration token for %s (input hidden): ' "$TARGET_URL" >&2
         IFS= read -r -s reg_token
         printf '\n' >&2
         [ -n "$reg_token" ] || die "registration token cannot be empty"
@@ -1281,31 +1869,31 @@ cmd_install() {
         die "provide a registration token via --token-file PATH (mode 0600), --token-file - (stdin), --jitconfig-file PATH, QEMINGA_RUNNER_TOKEN, or an interactive terminal"
     fi
 
+    finalize_policy_defaults
+
     if [ "$OPT_SKIP_PACKAGES" -eq 0 ]; then
         install_packages "$arch"
+    fi
+
+    # Verify private repository visibility for --repo targets (after curl/jq are installed).
+    if [ -n "$OPT_REPO" ]; then
+        verify_private_repo "$ALLOWED_REPO_SLUG"
     fi
 
     if [ "$arch" = "aarch64" ]; then
         find_aavmf >/dev/null || die "missing AArch64 UEFI firmware (install qemu-efi-aarch64 or edk2-aarch64)"
     fi
 
-    ensure_service_user
-
-    # Provision state directories (mode 0700, owned by service user).
-    install -d -m 0700 -o "$OPT_USER" -g "$OPT_USER" \
-        "$OPT_STATE_DIR" \
-        "$OPT_STATE_DIR/work" \
-        "$OPT_STATE_DIR/images" \
-        "$OPT_STATE_DIR/image-cache" \
-        "$OPT_STATE_DIR/.config" \
-        "$OPT_STATE_DIR/.cache" \
-        "$OPT_STATE_DIR/.local/share"
-
-    # Stop existing service if reinstalling/updating in place.
+    # Stop existing service BEFORE mutating any directories, state, or files.
+    local was_active=0
     if systemctl is-active --quiet "${OPT_SERVICE}.service" 2>/dev/null; then
+        was_active=1
         say "stopping existing ${OPT_SERVICE}.service"
         systemctl stop "${OPT_SERVICE}.service"
     fi
+
+    ensure_service_user
+    provision_state_dirs
 
     # Download, SHA-256 verify, and extract actions/runner.
     local tarball fetch_args=()
@@ -1328,45 +1916,51 @@ cmd_install() {
         "$OPT_INSTALL_DIR/bin/installdependencies.sh" >/dev/null
     fi
 
-    # Install root-owned hooks and policy.
-    say "installing root-owned job guard and cleanup hooks"
+    # Install root-owned hooks, egress firewall gate, policy, and installation record.
+    say "installing root-owned job guard, egress check, and cleanup hooks"
     install -d -m 0755 -o root -g root "$OPT_HOOK_DIR"
     install -d -m 0750 -o root -g "$OPT_USER" "$OPT_CONFIG_DIR"
-    write_policy_file "$OPT_CONFIG_DIR/policy.env" "$slug"
-    chown "root:${OPT_USER}" "$OPT_CONFIG_DIR/policy.env"
+    write_policy_file "$OPT_CONFIG_DIR/policy.env" "$ALLOWED_REPO_SLUG"
+    chown -h "root:${OPT_USER}" "$OPT_CONFIG_DIR/policy.env"
     chmod 0640 "$OPT_CONFIG_DIR/policy.env"
     write_job_started_hook "$OPT_HOOK_DIR/hook-job-started.sh"
     write_job_completed_hook "$OPT_HOOK_DIR/hook-job-completed.sh"
-    chown root:root "$OPT_HOOK_DIR/hook-job-started.sh" "$OPT_HOOK_DIR/hook-job-completed.sh"
+    write_egress_firewall_check "$OPT_HOOK_DIR/check-egress-firewall.sh"
+    chown -h root:root \
+        "$OPT_HOOK_DIR/hook-job-started.sh" \
+        "$OPT_HOOK_DIR/hook-job-completed.sh" \
+        "$OPT_HOOK_DIR/check-egress-firewall.sh"
+    write_install_record "$OPT_CONFIG_DIR/install.env" "$runner_name"
 
     if [ -n "$jit_config" ]; then
-        say "installing one-shot JIT config credential"
+        say "installing one-shot JIT config credential (workspace: ${RESOLVED_WORK_DIR})"
         write_jit_launcher "$OPT_HOOK_DIR/run-jit.sh"
-        chown root:root "$OPT_HOOK_DIR/run-jit.sh"
+        chown -h root:root "$OPT_HOOK_DIR/run-jit.sh"
         umask 0177
         printf '%s\n' "$jit_config" >"$OPT_CONFIG_DIR/jitconfig"
         umask 0022
-        chown root:root "$OPT_CONFIG_DIR/jitconfig"
+        chown -h root:root "$OPT_CONFIG_DIR/jitconfig"
         chmod 0600 "$OPT_CONFIG_DIR/jitconfig"
         unset jit_config
-    else
+    elif [ "$reg_mode" = "configure" ]; then
         command -v runuser >/dev/null 2>&1 || die "runuser (util-linux) is required to register the runner as $OPT_USER"
-        # Register as the unprivileged runner user, passing the token via
-        # inherited ACTIONS_RUNNER_INPUT_TOKEN (never in argv / ps).
-        say "registering runner '${runner_name}' (${arch}, labels=${OPT_LABELS}) against ${OPT_REPO}"
-        chown -h -R -P "${OPT_USER}:${OPT_USER}" "$OPT_INSTALL_DIR"
+        say "registering runner '${runner_name}' (${arch}, labels=${OPT_LABELS}) against ${TARGET_URL}"
         local cfg_args=(
             --unattended
             --replace
-            --url "$OPT_REPO"
+            --url "$TARGET_URL"
             --name "$runner_name"
             --labels "$OPT_LABELS"
-            --work "$OPT_STATE_DIR/work"
+            --work "$RESOLVED_WORK_DIR"
         )
+        [ -n "$OPT_RUNNER_GROUP" ] && cfg_args+=(--runnergroup "$OPT_RUNNER_GROUP")
         [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && cfg_args+=(--disableupdate)
         [ "$OPT_EPHEMERAL" -eq 1 ] && cfg_args+=(--ephemeral)
 
-        run_runner_config_with_token "$reg_token" "${cfg_args[@]}"
+        if ! register_runner_with_rollback "$was_active" "$reg_token" "${cfg_args[@]}"; then
+            unset reg_token
+            die "runner registration failed"
+        fi
         unset reg_token
     fi
 
@@ -1377,7 +1971,7 @@ cmd_install() {
     say "installing hardened systemd unit ${unit_path}"
     render_unit_text "$arch" | awk 'NF || prev_nf { print } { prev_nf = NF }' >"$unit_path"
     chmod 0644 "$unit_path"
-    chown root:root "$unit_path"
+    chown -h root:root "$unit_path"
 
     if command -v systemd-analyze >/dev/null 2>&1; then
         systemd-analyze verify --man=no "$unit_path" || die "systemd-analyze verify failed for $unit_path"
@@ -1399,11 +1993,14 @@ cmd_install() {
     echo
     echo "qeminga KVM runner installed:"
     echo "  service:     ${OPT_SERVICE}.service"
-    echo "  user:        ${OPT_USER} (supplementary group: kvm; zero sudo/libvirt/docker)"
+    echo "  target:      ${TARGET_URL}${OPT_RUNNER_GROUP:+ (runner-group: ${OPT_RUNNER_GROUP})}"
+    echo "  user:        ${OPT_USER} (uid=${MANAGED_USER_UID}, supplementary group: kvm only)"
     echo "  arch:        ${arch} (GitHub labels: self-hosted, linux, $(gh_runner_arch_of "$arch"), ${OPT_LABELS})"
     echo "  libvirt:     qemu:///session (unprivileged, isolated from host system VMs)"
+    echo "  workspace:   ${RESOLVED_WORK_DIR}"
     echo "  policy:      ${OPT_CONFIG_DIR}/policy.env"
-    echo "  hooks:       ${OPT_HOOK_DIR}/hook-job-{started,completed}.sh"
+    echo "  record:      ${OPT_CONFIG_DIR}/install.env"
+    echo "  hooks:       ${OPT_HOOK_DIR}/{hook-job-started,hook-job-completed,check-egress-firewall}.sh"
     if [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ]; then
         echo "  updates:     manual (--disableupdate, read-only binaries); GitHub requires runner updates"
         echo "               within 30 days of a new release — run: sudo $0 update"
@@ -1438,6 +2035,14 @@ cmd_status() {
 cmd_update() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "update must run as root"
+    if [ -e "$OPT_CONFIG_DIR/install.env" ] || [ -L "$OPT_CONFIG_DIR/install.env" ]; then
+        read_install_record "$OPT_CONFIG_DIR/install.env"
+        [ "$SET_INSTALL_DIR" -eq 0 ] && OPT_INSTALL_DIR="$REC_INSTALL_DIR"
+        [ "$SET_SERVICE" -eq 0 ] && OPT_SERVICE="$REC_SERVICE"
+        [ "$SET_USER" -eq 0 ] && OPT_USER="$REC_USER"
+        [ "$OPT_EPHEMERAL" -eq 0 ] && [ "$REC_EPHEMERAL" = "1" ] && OPT_EPHEMERAL=1
+        [ "$OPT_ALLOW_AUTO_UPDATE" -eq 0 ] && [ "$REC_ALLOW_AUTO_UPDATE" = "1" ] && OPT_ALLOW_AUTO_UPDATE=1
+    fi
     [ ! -L "$OPT_INSTALL_DIR" ] || die "refusing symlinked runner directory: $OPT_INSTALL_DIR"
     [ -d "$OPT_INSTALL_DIR" ] || die "runner directory $OPT_INSTALL_DIR does not exist"
     local arch
@@ -1479,6 +2084,37 @@ cmd_update() {
 cmd_uninstall() {
     parse_common_opts "$@"
     [ "$(id -u)" -eq 0 ] || die "uninstall must run as root"
+
+    # Refuse to delete anything without a valid root-owned installation record.
+    local rec_path="$OPT_CONFIG_DIR/install.env"
+    read_install_record "$rec_path"
+
+    # Verify any explicitly passed CLI options match the recorded installation.
+    if [ "$SET_SERVICE" -eq 1 ] && [ "$OPT_SERVICE" != "$REC_SERVICE" ]; then
+        die "--service '$OPT_SERVICE' does not match installation record '$REC_SERVICE'"
+    fi
+    if [ "$SET_USER" -eq 1 ] && [ "$OPT_USER" != "$REC_USER" ]; then
+        die "--user '$OPT_USER' does not match installation record '$REC_USER'"
+    fi
+    if [ "$SET_INSTALL_DIR" -eq 1 ] && [ "$OPT_INSTALL_DIR" != "$REC_INSTALL_DIR" ]; then
+        die "--install-dir '$OPT_INSTALL_DIR' does not match installation record '$REC_INSTALL_DIR'"
+    fi
+    if [ "$SET_STATE_DIR" -eq 1 ] && [ "$OPT_STATE_DIR" != "$REC_STATE_DIR" ]; then
+        die "--state-dir '$OPT_STATE_DIR' does not match installation record '$REC_STATE_DIR'"
+    fi
+    if [ "$SET_HOOK_DIR" -eq 1 ] && [ "$OPT_HOOK_DIR" != "$REC_HOOK_DIR" ]; then
+        die "--hook-dir '$OPT_HOOK_DIR' does not match installation record '$REC_HOOK_DIR'"
+    fi
+    [ "$OPT_CONFIG_DIR" = "$REC_CONFIG_DIR" ] || die "--config-dir '$OPT_CONFIG_DIR' does not match installation record '$REC_CONFIG_DIR'"
+
+    OPT_SERVICE="$REC_SERVICE"
+    OPT_USER="$REC_USER"
+    OPT_INSTALL_DIR="$REC_INSTALL_DIR"
+    OPT_STATE_DIR="$REC_STATE_DIR"
+    OPT_HOOK_DIR="$REC_HOOK_DIR"
+    OPT_CONFIG_DIR="$REC_CONFIG_DIR"
+    check_dedicated_managed_dirs 1
+
     local unit_path="/etc/systemd/system/${OPT_SERVICE}.service"
 
     if command -v systemctl >/dev/null 2>&1; then
@@ -1487,18 +2123,33 @@ cmd_uninstall() {
     fi
 
     # Run the post-job cleanup hook as the runner user to destroy any stray
-    # qeminga-e2e-* session domains before removing state files.
+    # qeminga-e2e-* session domains before removing state files. Preserve the
+    # images directory if domain cleanup cannot confirm domains are gone.
+    local cleanup_rc=0
     if command -v runuser >/dev/null 2>&1 && id "$OPT_USER" >/dev/null 2>&1 && [ -x "$OPT_HOOK_DIR/hook-job-completed.sh" ] && [ -f "$OPT_CONFIG_DIR/policy.env" ]; then
         say "running cleanup hook to remove stray qeminga session domains"
-        runuser -u "$OPT_USER" -- env \
+        if ! runuser -u "$OPT_USER" -- env \
             "HOME=$OPT_STATE_DIR" \
             "XDG_RUNTIME_DIR=/run/${OPT_SERVICE}" \
             "QEMINGA_RUNNER_POLICY=$OPT_CONFIG_DIR/policy.env" \
-            "$OPT_HOOK_DIR/hook-job-completed.sh" || warn "cleanup hook reported errors; continuing uninstall"
+            "$OPT_HOOK_DIR/hook-job-completed.sh"; then
+            cleanup_rc=1
+            warn "cleanup hook could not confirm all qeminga domains are gone; preserving $OPT_STATE_DIR/images"
+        fi
+    elif [ -d "$OPT_STATE_DIR/images" ]; then
+        local leftover=""
+        shopt -s nullglob
+        for leftover in "$OPT_STATE_DIR/images"/qeminga-e2e-*; do
+            [ -e "$leftover" ] && cleanup_rc=1 && break
+        done
+        shopt -u nullglob
+        if [ "$cleanup_rc" -ne 0 ]; then
+            warn "cleanup hook unavailable while VM directories remain under $OPT_STATE_DIR/images; preserving $OPT_STATE_DIR/images"
+        fi
     fi
 
     # Optional deregistration from GitHub if a removal token was supplied.
-    if [ -n "$OPT_TOKEN_FILE" ] && [ ! -L "$OPT_INSTALL_DIR" ] && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
+    if [ -n "$OPT_TOKEN_FILE" ] && [ ! -L "$OPT_INSTALL_DIR" ] && [ ! -L "$OPT_INSTALL_DIR/config.sh" ] && [ -x "$OPT_INSTALL_DIR/config.sh" ] && id "$OPT_USER" >/dev/null 2>&1; then
         command -v runuser >/dev/null 2>&1 || die "runuser is required to deregister the runner as $OPT_USER"
         local rm_token
         rm_token="$(read_secret_file --token-file "$OPT_TOKEN_FILE")"
@@ -1513,15 +2164,31 @@ cmd_uninstall() {
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
     fi
-    rm -rf --one-file-system -- "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR" "$OPT_INSTALL_DIR" "$OPT_STATE_DIR"
 
-    if [ "$OPT_PURGE_USER" -eq 1 ] && id "$OPT_USER" >/dev/null 2>&1; then
-        userdel "$OPT_USER" || warn "could not delete user $OPT_USER"
-        if getent group "$OPT_USER" >/dev/null 2>&1; then
-            groupdel "$OPT_USER" || true
+    if [ "$cleanup_rc" -eq 0 ]; then
+        rm -rf --one-file-system -- "$OPT_HOOK_DIR" "$OPT_CONFIG_DIR" "$OPT_INSTALL_DIR" "$OPT_STATE_DIR"
+        if [ "$OPT_PURGE_USER" -eq 1 ] && [ "$REC_USER_CREATED" = "1" ] && id "$OPT_USER" >/dev/null 2>&1; then
+            local cur_uid
+            cur_uid="$(id -u "$OPT_USER")"
+            if [ "$cur_uid" = "$REC_USER_UID" ] && [ "$cur_uid" -ne 0 ]; then
+                userdel "$OPT_USER" || warn "could not delete user $OPT_USER"
+                if getent group "$OPT_USER" >/dev/null 2>&1; then
+                    groupdel "$OPT_USER" || true
+                fi
+            else
+                warn "refusing --purge-user: current uid '$cur_uid' does not match recorded uid '$REC_USER_UID'"
+            fi
         fi
+        echo "uninstalled ${OPT_SERVICE}"
+    else
+        # Remove runner binaries and scratch/cache directories while preserving
+        # images/, libvirt session .config/, hooks, and config/install.env so
+        # the operator can inspect domains and re-run uninstall cleanly.
+        rm -rf --one-file-system -- "$OPT_INSTALL_DIR" \
+            "$OPT_STATE_DIR/work" "$OPT_STATE_DIR/image-cache" \
+            "$OPT_STATE_DIR/.cache" "$OPT_STATE_DIR/.local"
+        die "partial uninstall of ${OPT_SERVICE}: preserved $OPT_STATE_DIR/images, $OPT_STATE_DIR/.config, $OPT_HOOK_DIR, and $OPT_CONFIG_DIR because libvirt domain cleanup did not confirm domains absent"
     fi
-    echo "uninstalled ${OPT_SERVICE}"
 }
 
 # ---- dispatch -------------------------------------------------------------

@@ -256,6 +256,46 @@ esac
     );
 }
 
+fn runner_registration_config_script(agent_name: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{{"gitHubUrl":"{REPO_URL}","agentName":"{agent_name}","workFolder":"%s","disableUpdate":true,"ephemeral":false}}\n' "${{HOME}}/work" > "$dir/.runner"
+exit 0
+"#
+    )
+}
+
+fn build_versioned_runner_pkg(
+    out_dir: &Path,
+    src: &Path,
+    tag: &str,
+    archive_name: &str,
+    config_script: &str,
+) -> (PathBuf, String) {
+    std::fs::create_dir_all(src.join("bin")).unwrap();
+    std::fs::create_dir_all(src.join("externals")).unwrap();
+    write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+    write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+    write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+    write_exec(&src.join("config.sh"), config_script);
+    std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+    std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
+    let tb = out_dir.join(archive_name);
+    assert!(
+        Command::new("tar")
+            .args(["-czf", tb.to_str().unwrap(), "-C"])
+            .arg(src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sha = sha256_of(&std::fs::read(&tb).unwrap());
+    (tb, sha)
+}
+
 // ---- architecture support & runner archive verification -------------------
 
 #[test]
@@ -13649,31 +13689,9 @@ esac
 "#,
     );
 
+    let cfg_sh = runner_registration_config_script("tx-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"tx-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        let st = Command::new("tar")
-            .args(["-czf", tb.to_str().unwrap(), "-C"])
-            .arg(src)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(st.success());
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -14961,31 +14979,9 @@ fn update_keeps_previous_runner_until_replacement_starts_and_commits_before_prun
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("start-tx-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"start-tx-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        let st = Command::new("tar")
-            .args(["-czf", tb.to_str().unwrap(), "-C"])
-            .arg(src)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(st.success());
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -15232,31 +15228,9 @@ fn update_recovery_handles_interrupted_manifest_preparation_and_rejects_corrupt_
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("manifest-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"manifest-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        let st = Command::new("tar")
-            .args(["-czf", tb.to_str().unwrap(), "-C"])
-            .arg(src)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(st.success());
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -15744,31 +15718,9 @@ fn reinstall_existing_runner_validates_bundle_before_mutating_and_rolls_back_on_
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("reinst-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"reinst-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        let st = Command::new("tar")
-            .args(["-czf", tb.to_str().unwrap(), "-C"])
-            .arg(src)
-            .arg(".")
-            .status()
-            .unwrap();
-        assert!(st.success());
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -16166,33 +16118,9 @@ fn restore_runner_backup_is_idempotent_and_retains_verified_container_until_rest
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("idemp-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"idemp-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -16452,33 +16380,9 @@ fn publishing_recovery_and_uninstall_stop_active_replacement_service_before_rest
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("stop-first-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"stop-first-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -16777,33 +16681,9 @@ fn interrupted_update_recovers_across_remount_with_tx_marker_and_volume() {
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("remount-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"remount-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -17205,55 +17085,18 @@ fn privileged_interrupted_update_recovers_across_remount_in_fresh_mount_namespac
     let rt_root = dir.path().join("run");
     let backing = dir.path().join("backing");
     let mount_pt = dir.path().join("mnt");
-    let dummy_mp = dir.path().join("dummy-mp");
     let v1_src = dir.path().join("v1-src");
     let v2_src = dir.path().join("v2-src");
-    for d in [
-        &bin,
-        &units,
-        &rt_root,
-        &backing,
-        &mount_pt,
-        &dummy_mp,
-        &v1_src.join("bin"),
-        &v1_src.join("externals"),
-        &v2_src.join("bin"),
-        &v2_src.join("externals"),
-    ] {
+    for d in [&bin, &units, &rt_root, &backing, &mount_pt] {
         std::fs::create_dir_all(d).unwrap();
     }
     install_standard_mock_bin(&bin);
 
-    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"remount-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
-    };
-    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
-    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+    let cfg_sh = runner_registration_config_script("remount-box");
+    let (v1_tb, v1_sha) =
+        build_versioned_runner_pkg(dir.path(), &v1_src, "v1", "v1.tar.gz", &cfg_sh);
+    let (v2_tb, v2_sha) =
+        build_versioned_runner_pkg(dir.path(), &v2_src, "v2", "v2.tar.gz", &cfg_sh);
 
     let active_flag = dir.path().join("svc.active");
     write_exec(
@@ -17289,10 +17132,28 @@ esac
         std::env::var("PATH").unwrap_or_default()
     );
 
+    // Keep ns1 (and its bind mount M1) pinned alive until ns2 has mounted the same
+    // backing directory and captured M2, so Linux cannot reuse M1's released mount ID.
+    struct ChildGuard(Option<std::process::Child>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                drop(child.stdin.take());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     // Namespace 1 (real root mount namespace, private propagation — no userns needed):
-    // mount backing -> mount_pt, record kernel mnt_id M1, install v1, and crash update mid-publish!
+    // mount backing -> mount_pt, record kernel mnt_id M1, install v1, crash update mid-publish,
+    // signal readiness, and keep the bind mount pinned until stdin closes.
     let m1_file = dir.path().join("mnt_id_1");
-    let ns1 = Command::new("unshare")
+    let ns1_ready = dir.path().join("ns1.ready");
+    let ns1_log_path = dir.path().join("ns1.log");
+    let ns1_stdout = std::fs::File::create(&ns1_log_path).unwrap();
+    let ns1_stderr = ns1_stdout.try_clone().unwrap();
+    let ns1_child = Command::new("unshare")
         .args([
             "-m",
             "--propagation",
@@ -17320,7 +17181,11 @@ FAKE_GOOD_TARBALL="${{10}}" QEMINGA_TEST_CRASH_PUBLISH_AFTER=1 bash "$4" update 
   --config-dir "$7" \
   --runner-sha256 "${{11}}"
 rc=$?
+set -e
 [ "$rc" -eq 99 ]
+: > "${{12}}.tmp"
+mv "${{12}}.tmp" "${{12}}"
+IFS= read -r _ || true
 "#
             ),
             "_",
@@ -17335,6 +17200,7 @@ rc=$?
             v1_sha.as_str(),
             v2_tb.to_str().unwrap(),
             v2_sha.as_str(),
+            ns1_ready.to_str().unwrap(),
         ])
         .env("PATH", &path_env)
         .env("FAKE_USER_FLAG", &user_flag)
@@ -17347,13 +17213,26 @@ rc=$?
         .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
         .env("QEMINGA_AAVMF_CODE", &aavmf_code)
         .env("QEMINGA_AAVMF_VARS", &aavmf_vars)
-        .output()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::from(ns1_stdout))
+        .stderr(std::process::Stdio::from(ns1_stderr))
+        .spawn()
         .unwrap();
-    assert!(
-        ns1.status.success(),
-        "Namespace 1 setup+crash failed: {}",
-        text(&ns1)
-    );
+    let mut ns1_guard = ChildGuard(Some(ns1_child));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ns1_ready.exists() {
+        if let Some(status) = ns1_guard.0.as_mut().unwrap().try_wait().unwrap() {
+            let _ = ns1_guard.0.take();
+            let log = std::fs::read_to_string(&ns1_log_path).unwrap_or_default();
+            panic!("Namespace 1 exited ({status}) before signalling readiness:\n{log}");
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for Namespace 1 setup+crash:\n{}",
+            std::fs::read_to_string(&ns1_log_path).unwrap_or_default()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     let m1 = std::fs::read_to_string(&m1_file)
         .unwrap()
         .trim()
@@ -17388,8 +17267,9 @@ rc=$?
         "backup container must contain a 0600 .qeminga-tx-id marker surviving remount"
     );
 
-    // Namespace 2: mount dummy first to guarantee a brand-new kernel mnt_id M2 != M1, then mount
-    // the SAME backing filesystem at mount_pt and resume `update` -> MUST succeed cleanly!
+    // Namespace 2: while ns1 still holds M1 live in the kernel, bind-mount the SAME
+    // backing directory at mount_pt (guaranteed distinct kernel mnt_id M2 != M1)
+    // and resume `update` -> MUST succeed cleanly!
     let m2_file = dir.path().join("mnt_id_2");
     let ns2 = Command::new("unshare")
         .args([
@@ -17399,15 +17279,13 @@ rc=$?
             "bash",
             "-c",
             r#"set -euo pipefail
-mount --bind "$1" "$1"
-mount --bind "$2" "$3"
-python3 -c 'import os, sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); print([l.split(":")[1].strip() for l in open(f"/proc/self/fdinfo/{fd}") if l.startswith("mnt_id:")][0])' "$3" > "$4"
-bash "$5" update \
-  --config-dir "$6" \
-  --runner-sha256 "$7"
+mount --bind "$1" "$2"
+python3 -c 'import os, sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); print([l.split(":")[1].strip() for l in open(f"/proc/self/fdinfo/{fd}") if l.startswith("mnt_id:")][0])' "$2" > "$3"
+bash "$4" update \
+  --config-dir "$5" \
+  --runner-sha256 "$6"
 "#,
             "_",
-            dummy_mp.to_str().unwrap(),
             backing.to_str().unwrap(),
             mount_pt.to_str().unwrap(),
             m2_file.to_str().unwrap(),
@@ -17435,7 +17313,16 @@ bash "$5" update \
         .to_string();
     assert_ne!(
         m1, m2,
-        "fresh mount namespace remount must produce a distinct kernel mnt_id (m1={m1}, m2={m2})"
+        "fresh mount namespace remount while M1 is pinned must produce a distinct kernel mnt_id (m1={m1}, m2={m2})"
+    );
+    // Release ns1's mount namespace now that M2 has been verified distinct from M1.
+    let mut ns1_live = ns1_guard.0.take().unwrap();
+    drop(ns1_live.stdin.take());
+    let ns1_status = ns1_live.wait().unwrap();
+    assert!(
+        ns1_status.success(),
+        "Namespace 1 failed on clean release ({ns1_status}):\n{}",
+        std::fs::read_to_string(&ns1_log_path).unwrap_or_default()
     );
     assert!(
         backing.join("runner/bin/v2-marker").exists()
@@ -17671,33 +17558,9 @@ fn legacy_updating_record_without_phase_provides_actionable_diagnostic_and_guard
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("leg-upd-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"leg-upd-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -18045,43 +17908,92 @@ rc, ident1, err = exec_fs_op(["path-identity", c1])
 assert rc == 0 and ident1, f"path-identity failed: rc={rc} err={err}"
 c1_ino = os.lstat(c1).st_ino
 
-# Simulate crash immediately after top-level `.qeminga-tx-id` is unlinked (before rmdir).
+# Simulate fsync(tfd) failure BEFORE top-level `.qeminga-tx-id` unlink, then normal ordering
+# (payload deletes -> fsync(tfd) -> top-level `.qeminga-tx-id` unlink -> crash before rmdir).
 events = []
 real_unlink = os.unlink
 real_rmdir = os.rmdir
+real_fsync = os.fsync
+real_fstat = os.fstat
 
 class SimulatedCrash(BaseException):
     pass
 
-def spy_hook(ns):
-    orig_os = ns["os"]
-    class SpyOs:
-        def __getattr__(self, name):
-            return getattr(orig_os, name)
-        def unlink(self, path, *args, **kwargs):
-            dfd = kwargs.get("dir_fd")
-            is_top_tx = (
-                path == ".qeminga-tx-id"
-                and dfd is not None
-                and os.fstat(dfd).st_ino == c1_ino
-            )
-            events.append(("unlink_top_tx" if is_top_tx else "unlink", path))
-            real_unlink(path, *args, **kwargs)
-            if is_top_tx:
-                raise SimulatedCrash("crash right after top-level tx marker unlink")
-        def rmdir(self, path, *args, **kwargs):
-            events.append(("rmdir", path))
-            return real_rmdir(path, *args, **kwargs)
-    ns["os"] = SpyOs()
+def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=None):
+    def spy_hook(ns):
+        orig_os = ns["os"]
+        class SpyOs:
+            def __getattr__(self, name):
+                return getattr(orig_os, name)
+            def fsync(self, fd):
+                st = real_fstat(fd)
+                if st.st_ino == c1_ino:
+                    events.append(("fsync_top_dir", st.st_ino))
+                    if fail_top_fsync:
+                        raise OSError(errno.EIO, "simulated dir fsync failure")
+                else:
+                    events.append(("fsync", st.st_ino))
+                return real_fsync(fd)
+            def unlink(self, path, *args, **kwargs):
+                dfd = kwargs.get("dir_fd")
+                is_top_tx = (
+                    path == ".qeminga-tx-id"
+                    and dfd is not None
+                    and real_fstat(dfd).st_ino == c1_ino
+                )
+                events.append(("unlink_top_tx" if is_top_tx else "unlink", path))
+                real_unlink(path, *args, **kwargs)
+                if crash_after_top_tx and is_top_tx:
+                    raise SimulatedCrash("crash right after top-level tx marker unlink")
+            def rmdir(self, path, *args, **kwargs):
+                events.append(("rmdir", path))
+                return real_rmdir(path, *args, **kwargs)
+            def fstat(self, fd):
+                st = real_fstat(fd)
+                if fake_uid_ino is not None and st.st_ino == fake_uid_ino:
+                    vals = list(st)
+                    vals[4] = os.geteuid() + 1  # st_uid mismatch
+                    return os.stat_result(vals)
+                return st
+        ns["os"] = SpyOs()
+    return spy_hook
 
+# 1a-i. Persistence boundary: failing os.fsync(tfd) after payload cleanup MUST propagate EIO
+#       while `.qeminga-tx-id` is STILL present on disk!
+rc_sync_fail, _, err_sync_fail = exec_fs_op(
+    ["safe-rmtree-id", c1, ident1],
+    hook=make_spy_hook(fail_top_fsync=True, crash_after_top_tx=False),
+)
+assert rc_sync_fail != 0, f"fsync(tfd) failure MUST propagate non-zero exit: events={events}"
+assert "simulated dir fsync failure" in err_sync_fail, err_sync_fail
+assert os.path.isdir(c1) and os.listdir(c1) == [".qeminga-tx-id"], (
+    f"marker MUST remain intact when dir fsync fails after payload clearing: {os.listdir(c1) if os.path.isdir(c1) else 'missing'}"
+)
+assert ("fsync_top_dir", c1_ino) in events, f"expected fsync(tfd) after payload removal: {events}"
+assert ("unlink_top_tx", ".qeminga-tx-id") not in events, (
+    f"marker must NOT be unlinked when fsync(tfd) fails: {events}"
+)
+
+# Re-add payload and verify full ordering: payload unlinks -> fsync(tfd) -> unlink(.qeminga-tx-id).
+open(os.path.join(c1, "retry_payload"), "wb").write(b"p")
+events.clear()
 crashed = False
 try:
-    exec_fs_op(["safe-rmtree-id", c1, ident1], hook=spy_hook)
+    exec_fs_op(
+        ["safe-rmtree-id", c1, ident1],
+        hook=make_spy_hook(fail_top_fsync=False, crash_after_top_tx=True),
+    )
 except SimulatedCrash:
     crashed = True
 assert crashed, f"expected SimulatedCrash right after top-level .qeminga-tx-id unlink; events={events}"
 assert events[-1] == ("unlink_top_tx", ".qeminga-tx-id"), (
     f"top-level .qeminga-tx-id MUST be unlinked LAST after all payload deletions: {events}"
+)
+payload_idx = events.index(("unlink", "retry_payload"))
+fsync_idx = events.index(("fsync_top_dir", c1_ino))
+tx_idx = events.index(("unlink_top_tx", ".qeminga-tx-id"))
+assert payload_idx < fsync_idx < tx_idx, (
+    f"expected payload unlink < fsync(tfd) < marker unlink, got {events}"
 )
 assert os.path.isdir(c1) and os.listdir(c1) == [], (
     f"after post-marker-unlink crash, container must be empty and still exist: {os.listdir(c1) if os.path.isdir(c1) else 'missing'}"
@@ -18128,7 +18040,36 @@ rc_diff_ino, _, err_diff_ino = exec_fs_op(["safe-rmtree-id", c3, ident3])
 assert rc_diff_ino != 0 and "directory inode changed" in err_diff_ino, err_diff_ino
 assert os.path.isdir(c3), "substituted empty dir with different inode must not be removed"
 
-# 1e. Security: empty directory with SAME inode but relaxed mode (0755, not 0700) MUST fail closed!
+# 1e. Security: relaxed mode (0750 / 0770) OR wrong owner MUST fail closed EVEN WHEN
+#     a genuine `.qeminga-tx-id` marker is present, preserving ALL payload files!
+c4_marked = os.path.join(root, ".qeminga-update-backup.case4-marked")
+os.makedirs(os.path.join(c4_marked, "sub"), mode=0o700)
+os.chmod(c4_marked, 0o700)
+open(os.path.join(c4_marked, "keep.txt"), "wb").write(b"precious")
+open(os.path.join(c4_marked, "sub", "nested.txt"), "wb").write(b"nested-precious")
+rc, ident4m, err = exec_fs_op(["path-identity", c4_marked])
+assert rc == 0, err
+for bad_mode in (0o750, 0o770, 0o755):
+    os.chmod(c4_marked, bad_mode)
+    rc_bad_m, _, err_bad_m = exec_fs_op(["safe-rmtree-id", c4_marked, ident4m])
+    assert rc_bad_m != 0, f"safe-rmtree-id MUST reject marked dir with mode {oct(bad_mode)}"
+    assert "must be owned by current user with mode 0700" in err_bad_m, err_bad_m
+    assert os.path.isfile(os.path.join(c4_marked, "keep.txt")), "payload must remain untouched on relaxed mode"
+    assert os.path.isfile(os.path.join(c4_marked, "sub", "nested.txt")), "nested payload must remain untouched"
+    assert os.path.isfile(os.path.join(c4_marked, ".qeminga-tx-id")), "marker must remain untouched"
+
+# Owner mismatch with mode 0700 and genuine marker MUST also fail closed and preserve payload!
+os.chmod(c4_marked, 0o700)
+c4m_ino = os.lstat(c4_marked).st_ino
+rc_bad_owner, _, err_bad_owner = exec_fs_op(
+    ["safe-rmtree-id", c4_marked, ident4m],
+    hook=make_spy_hook(fake_uid_ino=c4m_ino),
+)
+assert rc_bad_owner != 0, "safe-rmtree-id MUST reject marked dir owned by another user"
+assert "must be owned by current user with mode 0700" in err_bad_owner, err_bad_owner
+assert os.path.isfile(os.path.join(c4_marked, "keep.txt")), "payload must remain untouched on owner mismatch"
+
+# Empty directory with SAME inode, missing marker, and relaxed mode (0755) MUST also fail closed!
 c4 = os.path.join(root, ".qeminga-update-backup.case4")
 os.makedirs(c4, mode=0o700)
 os.chmod(c4, 0o700)
@@ -18137,7 +18078,7 @@ assert rc == 0, err
 os.unlink(os.path.join(c4, ".qeminga-tx-id"))
 os.chmod(c4, 0o755)
 rc_mode, _, err_mode = exec_fs_op(["safe-rmtree-id", c4, ident4])
-assert rc_mode != 0 and "missing transaction identity marker" in err_mode, err_mode
+assert rc_mode != 0 and "must be owned by current user with mode 0700" in err_mode, err_mode
 assert os.path.isdir(c4), "non-0700 empty dir without marker must not be removed"
 
 # 1f. Security: non-delete op (`restore-runner-backup`) on an empty 0700 dir missing `.qeminga-tx-id`
@@ -18149,6 +18090,88 @@ rc_vol, vol_id, err_vol = exec_fs_op(["volume-id", fake_runner])
 assert rc_vol == 0 and vol_id, err_vol
 rc_restore, _, err_restore = exec_fs_op(["restore-runner-backup", fake_runner, vol_id, c4, ident4, "", "0"])
 assert rc_restore != 0 and "missing transaction identity marker" in err_restore, err_restore
+
+# 1g. Stage retirement persistence boundary (`publish-runner-stage`): must fsync(sfd) after
+#     rmdir("payload") and BEFORE unlinking `.qeminga-tx-id`, propagating EIO with marker intact!
+def make_stage_payload(stage_path, tag):
+    os.makedirs(os.path.join(stage_path, "payload", "bin"), mode=0o700)
+    os.makedirs(os.path.join(stage_path, "payload", "externals"), mode=0o700)
+    os.chmod(stage_path, 0o700)
+    for rel in ("bin/Runner.Listener", "bin/runsvc.sh", "config.sh", "run.sh", "env.sh"):
+        p = os.path.join(stage_path, "payload", rel)
+        open(p, "wb").write(b"#!/bin/sh\nexit 0\n")
+        os.chmod(p, 0o755)
+    open(os.path.join(stage_path, "payload", "bin", f"{tag}-bin"), "wb").write(tag.encode())
+
+st_dir = os.path.join(root, ".qeminga-extract.stage-sync")
+make_stage_payload(st_dir, "v2")
+bk_dir = os.path.join(root, ".qeminga-update-backup.stage-sync")
+os.makedirs(bk_dir, mode=0o700)
+os.chmod(bk_dir, 0o700)
+rc_si, st_ident, err_si = exec_fs_op(["path-identity", st_dir])
+assert rc_si == 0, err_si
+rc_bi, bk_ident, err_bi = exec_fs_op(["path-identity", bk_dir])
+assert rc_bi == 0, err_bi
+st_ino = os.lstat(st_dir).st_ino
+st_events = []
+
+def stage_sync_hook(target_ino, fail_stage_sync):
+    def hook(ns):
+        orig_os = ns["os"]
+        class StageSpyOs:
+            def __getattr__(self, name):
+                return getattr(orig_os, name)
+            def rmdir(self, path, *args, **kwargs):
+                dfd = kwargs.get("dir_fd")
+                if path == "payload" and dfd is not None and real_fstat(dfd).st_ino == target_ino:
+                    st_events.append("rmdir_payload")
+                return real_rmdir(path, *args, **kwargs)
+            def fsync(self, fd):
+                if real_fstat(fd).st_ino == target_ino:
+                    st_events.append("fsync_stage_dir")
+                    if fail_stage_sync:
+                        raise OSError(errno.EIO, "simulated stage dir fsync failure")
+                return real_fsync(fd)
+            def unlink(self, path, *args, **kwargs):
+                dfd = kwargs.get("dir_fd")
+                if path == ".qeminga-tx-id" and dfd is not None and real_fstat(dfd).st_ino == target_ino:
+                    st_events.append("unlink_stage_tx")
+                return real_unlink(path, *args, **kwargs)
+        ns["os"] = StageSpyOs()
+    return hook
+
+rc_sw_fail, _, err_sw_fail = exec_fs_op(
+    ["publish-runner-stage", fake_runner, vol_id, st_dir, st_ident, bk_dir, bk_ident, ""],
+    hook=stage_sync_hook(st_ino, fail_stage_sync=True),
+)
+assert rc_sw_fail != 0 and "simulated stage dir fsync failure" in err_sw_fail, (
+    f"publish-runner-stage MUST propagate stage dir fsync error: rc={rc_sw_fail} err={err_sw_fail} events={st_events}"
+)
+assert st_events == ["rmdir_payload", "fsync_stage_dir"], f"unexpected stage sync events: {st_events}"
+assert os.path.isdir(st_dir) and os.listdir(st_dir) == [".qeminga-tx-id"], (
+    f"stage marker must stay intact when stage dir fsync fails: {os.listdir(st_dir) if os.path.isdir(st_dir) else 'missing'}"
+)
+# And verify normal publish-runner-stage ordering: rmdir_payload -> fsync_stage_dir -> unlink_stage_tx!
+st_dir2 = os.path.join(root, ".qeminga-extract.stage-sync-ok")
+make_stage_payload(st_dir2, "v3")
+bk_dir2 = os.path.join(root, ".qeminga-update-backup.stage-sync-ok")
+os.makedirs(bk_dir2, mode=0o700)
+os.chmod(bk_dir2, 0o700)
+rc_si2, st_ident2, err_si2 = exec_fs_op(["path-identity", st_dir2])
+assert rc_si2 == 0, err_si2
+rc_bi2, bk_ident2, err_bi2 = exec_fs_op(["path-identity", bk_dir2])
+assert rc_bi2 == 0, err_bi2
+st_ino2 = os.lstat(st_dir2).st_ino
+st_events.clear()
+rc_sw_ok, _, err_sw_ok = exec_fs_op(
+    ["publish-runner-stage", fake_runner, vol_id, st_dir2, st_ident2, bk_dir2, bk_ident2, ""],
+    hook=stage_sync_hook(st_ino2, fail_stage_sync=False),
+)
+assert rc_sw_ok == 0, f"publish-runner-stage normal sync failed: {err_sw_ok}"
+assert st_events == ["rmdir_payload", "fsync_stage_dir", "unlink_stage_tx"], (
+    f"expected rmdir_payload -> fsync_stage_dir -> unlink_stage_tx, got {st_events}"
+)
+assert not os.path.exists(st_dir2), "stage dir must be removed after normal retirement"
 "##,
             script().to_str().unwrap(),
             py_root.to_str().unwrap(),
@@ -18181,32 +18204,9 @@ assert rc_restore != 0 and "missing transaction identity marker" in err_restore,
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("prune-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"prune-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -18441,35 +18441,16 @@ fn reinstall_refuses_in_place_re_enrollment_when_runner_registration_missing() {
 
     let cfg_invoked = dir.path().join("config_sh.invoked");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            &format!(
-                r#"#!/bin/sh
+        let cfg_sh = format!(
+            r#"#!/bin/sh
 dir="$(dirname "$0")"
 if [ -n "${{FAKE_CFG_LOG:-}}" ]; then printf '{tag}\n' >> "$FAKE_CFG_LOG"; fi
 printf '{{"gitHubUrl":"{REPO_URL}","agentName":"reg-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}}\n' "${{HOME}}/work" > "$dir/.runner"
 printf 'creds-{tag}\n' > "$dir/.credentials"
 exit 0
 "#
-            ),
         );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -18724,32 +18705,9 @@ fn update_and_reinstall_preserve_backup_when_publishing_record_dir_fsync_fails_a
     assert_eq!(std::fs::read(&rf_dst).unwrap(), b"NEW\n");
     assert!(!rf_src.exists());
 
+    let cfg_sh = runner_registration_config_script("fsync-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"fsync-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -19151,32 +19109,9 @@ fn service_state_checks_fail_closed_on_manager_error_unknown_state_and_stop_acti
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("svcstate-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"svcstate-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -19522,24 +19457,7 @@ fn reinstall_records_preparing_phase_before_copying_jit_credential_and_recovers_
     install_standard_mock_bin(&bin);
 
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("config.sh"), "#!/bin/sh\nexit 0\n");
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, "#!/bin/sh\nexit 0\n")
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
@@ -19806,32 +19724,9 @@ fn migrate_record_recognizes_and_validates_preceding_376eed2_phased_journals() {
     }
     install_standard_mock_bin(&bin);
 
+    let cfg_sh = runner_registration_config_script("prev-box");
     let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
-        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
-        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
-        write_exec(
-            &src.join("config.sh"),
-            r#"#!/bin/sh
-dir="$(dirname "$0")"
-printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"prev-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
-exit 0
-"#,
-        );
-        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
-        let tb = dir.path().join(name);
-        assert!(
-            Command::new("tar")
-                .args(["-czf", tb.to_str().unwrap(), "-C"])
-                .arg(src)
-                .arg(".")
-                .status()
-                .unwrap()
-                .success()
-        );
-        let sha = sha256_of(&std::fs::read(&tb).unwrap());
-        (tb, sha)
+        build_versioned_runner_pkg(dir.path(), src, tag, name, &cfg_sh)
     };
     let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
     let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");

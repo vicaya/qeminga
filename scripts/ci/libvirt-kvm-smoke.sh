@@ -469,7 +469,14 @@ cmd_run() {
 
     say "disposable KVM guest $name in $dir"
     [ ! -e "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
-    mkdir -m 0700 "$dir"
+    local dir_mode=0700
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        # System libvirt runs QEMU under an unprivileged account (for example
+        # libvirt-qemu) that needs traversal permission on the run directory to
+        # open guest disks, serial logs, and NVRAM — matching libvirt-tcg-smoke.sh.
+        dir_mode=0755
+    fi
+    mkdir -m "$dir_mode" "$dir"
     fetch_image "$arch" "$dir/root.qcow2" "$cache"
     qemu-img resize -q "$dir/root.qcow2" 8G
 

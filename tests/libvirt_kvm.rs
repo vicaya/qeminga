@@ -411,6 +411,132 @@ fn stale_check_and_cleanup_protect_unrelated_domains_and_unknown_state() {
     assert!(other.join("root.qcow2").exists());
 }
 
+#[test]
+fn kvm_run_directory_permissions_match_libvirt_connection_mode() {
+    require_jq();
+    let arch = std::env::consts::ARCH;
+    assert!(
+        arch == "x86_64" || arch == "aarch64",
+        "unexpected test arch {arch}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+
+    // Build a valid candidate bundle matching the host arch.
+    let binary = dir.path().join("qeminga-bin");
+    std::fs::write(&binary, b"fake release binary\n").unwrap();
+    let candidate = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        candidate.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "77",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "test-runner",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&candidate.join("qeminga"));
+
+    // Fake preflight + curl (exits non-zero so `run` stops right after creating $dir).
+    write_exec(
+        &bin.join("virsh"),
+        r#"#!/bin/sh
+case "$1" in --connect=*) shift ;; esac
+case "$1" in
+    version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
+    net-info) echo "Active:         yes"; exit 0 ;;
+    list) echo ""; exit 0 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
+    write_exec(&bin.join("genisoimage"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join(format!("qemu-system-{arch}")),
+        "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
+    );
+    write_exec(&bin.join("curl"), "#!/bin/sh\nexit 22\n");
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
+    );
+    write_exec(
+        &bin.join("id"),
+        "#!/bin/sh\nif [ \"$1\" = -u ]; then echo \"${FAKE_ID_U:?}\"; exit 0; fi\nexec /usr/bin/id \"$@\"\n",
+    );
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    for (connect_uri, fake_caller_num, run_id, expected_mode) in [
+        ("qemu:///session", "1000", "77", 0o700u32),
+        ("qemu:///system", "0", "78", 0o755u32),
+    ] {
+        let images = dir.path().join(format!("images-{run_id}"));
+        let out_dir = dir.path().join(format!("out-{run_id}"));
+        let run_out = lane_env(
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                run_id,
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", connect_uri),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", fake_caller_num),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            !run_out.status.success(),
+            "expected fake curl failure after run dir creation for {connect_uri}: {}",
+            text(&run_out)
+        );
+        let run_dir = images.join(format!("qeminga-e2e-{run_id}-1-{arch}"));
+        assert!(
+            run_dir.is_dir(),
+            "run dir should have been created before image fetch for {connect_uri}: {}",
+            text(&run_out)
+        );
+        let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, expected_mode,
+            "run dir mode for {connect_uri} must be {expected_mode:#o}, got {mode:#o}"
+        );
+    }
+}
+
 // ---- result contract ------------------------------------------------------
 
 const MANDATORY: [&str; 4] = [

@@ -4193,15 +4193,26 @@ def verify_dir_identity(
     allow_empty_missing_tx=False,
 ):
     # Enforce same-operation mount consistency between parent and child FDs,
-    # while binding cross-invocation identity to persistent parent/target
-    # inodes, backing volume fingerprint, and root-owned 0600 `.qeminga-tx-id`.
-    if dst.st_dev != pst.st_dev or d_mnt != p_mnt:
+    # private ownership/mode (euid + 0700) on the live directory descriptor,
+    # and cross-invocation identity bound to persistent parent/target inodes,
+    # backing volume fingerprint, and root-owned 0600 `.qeminga-tx-id`.
+    cur_st = os.fstat(dfd)
+    if (
+        dst.st_dev != pst.st_dev
+        or cur_st.st_dev != pst.st_dev
+        or d_mnt != p_mnt
+    ):
         raise OSError(errno.EXDEV, f"refusing {label} '{target}': crosses mount boundary")
     verify_parent_identity(pfd, pst, parent, expected_ident, entries, label, target)
-    if dst.st_ino != expected_ident["t_ino"]:
+    if dst.st_ino != expected_ident["t_ino"] or cur_st.st_ino != expected_ident["t_ino"]:
         raise OSError(
             errno.EXDEV,
             f"refusing {label} '{target}': directory inode changed (leaving for inspection)",
+        )
+    if cur_st.st_uid != os.geteuid() or (cur_st.st_mode & 0o777) != 0o700:
+        raise OSError(
+            errno.EACCES,
+            f"refusing {label} '{target}': private directory must be owned by current user with mode 0700 (leaving for inspection)",
         )
     d_vol = volume_id_of_fd(dfd, target, entries)
     if d_vol != expected_ident["vol"]:
@@ -4214,13 +4225,8 @@ def verify_dir_identity(
         # Pruning deletes `.qeminga-tx-id` last right before `os.rmdir`. If a crash
         # interrupts that final window, retrying `safe-rmtree-id` may finish
         # removing the already-empty, euid-owned 0700 directory whose parent/target
-        # inodes and backing volume still match — never deleting any contents.
-        if (
-            allow_empty_missing_tx
-            and dst.st_uid == os.geteuid()
-            and (dst.st_mode & 0o777) == 0o700
-            and not os.listdir(dfd)
-        ):
+        # inodes and backing volume were verified above — never deleting any contents.
+        if allow_empty_missing_tx and not os.listdir(dfd):
             return False
         raise OSError(
             errno.EXDEV,
@@ -4478,6 +4484,7 @@ try:
                     finally:
                         os.close(p_sfd)
                     os.rmdir("payload", dir_fd=sfd)
+                    os.fsync(sfd)
                     try:
                         os.unlink(TX_MARKER_NAME, dir_fd=sfd)
                     except FileNotFoundError:
@@ -4683,6 +4690,7 @@ try:
                     finally:
                         os.close(p_sfd)
                     os.rmdir("payload", dir_fd=sfd)
+                    os.fsync(sfd)
                     try:
                         os.unlink(TX_MARKER_NAME, dir_fd=sfd)
                     except FileNotFoundError:
@@ -5058,6 +5066,7 @@ try:
                         mountpoints,
                         skip_names=(TX_MARKER_NAME,),
                     )
+                    os.fsync(tfd)
                     mst = assert_entry_same_mount(
                         tfd,
                         TX_MARKER_NAME,

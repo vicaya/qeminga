@@ -3956,6 +3956,11 @@ exit 0
     );
     write_exec(&bin.join("virsh"), FAKE_VIRSH);
 
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"fw-code").unwrap();
+    std::fs::write(&aavmf_vars, b"fw-vars").unwrap();
+
     let inst = dir.path().join("runner");
     let state = dir.path().join("state");
     let hooks = dir.path().join("hooks");
@@ -3971,6 +3976,8 @@ exit 0
         ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
         ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
         ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
     ];
     let install_args = [
         "install",
@@ -4007,7 +4014,8 @@ exit 0
     );
     assert!(
         user_flag.exists(),
-        "service user was created before download failed"
+        "service user was created before download failed: {}",
+        text(&fail1)
     );
     let rec_after_fail = std::fs::read_to_string(cfg.join("install.env")).unwrap_or_else(|e| {
         panic!(

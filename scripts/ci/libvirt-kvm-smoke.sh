@@ -30,6 +30,8 @@
 #       --binary-sha256 HEX --accelerator ACCEL
 #   libvirt-kvm-smoke.sh ensure-result --out DIR --arch ARCH --source-sha SHA
 #       [--expect-sha256 HEX]
+#   libvirt-kvm-smoke.sh stage-evidence --out DIR --stage DIR --arch ARCH
+#       --source-sha SHA [--expect-sha256 HEX]
 #   libvirt-kvm-smoke.sh verify-pass --out DIR --arch ARCH --source-sha SHA
 #       --expect-sha256 HEX
 #   libvirt-kvm-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
@@ -88,15 +90,17 @@ qemu_log_of() {
     fi
 }
 
-check_out_path() {
-    local p="$1"
-    [ -n "$p" ] || die "--out must not be empty"
+check_no_dot_segments() {
+    local flag="$1" p="$2"
+    [ -n "$p" ] || die "$flag must not be empty"
     case "$p" in
         . | .. | ./* | ../* | */. | */.. | */./* | */../*)
-            die "--out must not contain '.' or '..' segments: '$p'"
+            die "$flag must not contain '.' or '..' segments: '$p'"
             ;;
     esac
 }
+
+check_out_path() { check_no_dot_segments --out "$1"; }
 
 # Resolve AArch64 UEFI firmware (Debian/Ubuntu or Fedora/RHEL).
 resolve_aavmf() {
@@ -454,58 +458,17 @@ cmd_cleanup() {
 
 write_result() {
     local out="$1" arch="$2" sha="$3" digest="$4" accel="$5" all_not_run="${6:-0}"
-    local tests='{}' overall=pass t status machine image image_sha result_json
+    local machine image image_sha write_op="write-session-result"
     machine="$(machine_of "$arch")" || return 1
     image="$(image_file_of "$arch")" || return 1
     image_sha="$(image_sha_of "$arch")" || return 1
-    local read_op
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        read_op="read-evidence-stdout"
-    else
-        read_op="read-session-evidence-stdout"
+        write_op="write-result"
     fi
-    for t in $MANDATORY_TESTS; do
-        if [ "$all_not_run" = 1 ]; then
-            status=not_run
-        else
-            local marker_raw="" marker_rc=0
-            if marker_raw="$(sys_fs_ops "$read_op" --quiet-missing "$out" "$t" "tests")"; then
-                case "$(printf '%s' "$marker_raw" | tr -d '[:space:]')" in
-                    pass) status=pass ;;
-                    *) status=fail ;;
-                esac
-            else
-                marker_rc=$?
-                case "$marker_rc" in
-                    2) status=not_run ;;
-                    4) status=fail ;;
-                    *) return 1 ;;
-                esac
-            fi
-        fi
-        [ "$status" = pass ] || overall=fail
-        tests="$(jq -c --arg t "$t" --arg s "$status" '. + {($t): $s}' <<<"$tests")" || return 1
-    done
-    [ "$accel" = kvm ] || overall=fail
-    result_json="$(jq -n \
-        --arg suite "$SUITE" --arg repo "$SOURCE_REPOSITORY" --arg sha "$sha" \
-        --arg arch "$arch" --arg digest "$digest" --arg accel "$accel" \
-        --arg machine "$machine" \
-        --arg image "$image" --arg image_release "$IMAGE_RELEASE" \
-        --arg image_sha "$image_sha" \
-        --argjson tests "$tests" --arg result "$overall" \
-        '{schema: 1, suite: $suite, source_repository: $repo, source_sha: $sha,
-          architecture: $arch, candidate_binary_sha256: $digest,
-          virtualization: {hypervisor: "qemu", accelerator: $accel, machine: $machine},
-          guest: {image: $image, image_release: $image_release, image_sha256: $image_sha},
-          tests: $tests, result: $result}')" || return 1
-    local publish_op="publish-session-evidence-stdin"
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        publish_op="publish-evidence-stdin"
-    fi
-    printf '%s\n' "$result_json" | sys_fs_ops "$publish_op" "$out" "result.json" || return 1
-    printf '%s\n' "$result_json" || return 1
-    [ "$overall" = pass ]
+    sys_fs_ops "$write_op" \
+        "$out" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "" \
+        "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" \
+        "$digest" "$accel" "$all_not_run"
 }
 
 cmd_result() {
@@ -576,6 +539,30 @@ cmd_ensure_result() {
         "$out" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "$expect" \
         "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" "$NO_DIGEST" \
         || die "cannot verify or ensure result.json at $out/result.json; preserving any existing evidence"
+}
+
+cmd_stage_evidence() {
+    parse_opts "$@"
+    local out stage arch sha expect machine image image_sha stage_op="stage-session-evidence"
+    out="$(need out)"; stage="$(need stage)"; arch="$(need arch)"; sha="$(need source_sha)"
+    expect="${opt_expect_sha256:-}"
+    check_out_path "$out"
+    check_no_dot_segments --stage "$stage"
+    check_arch "$arch"; check_sha "$sha"
+    if [ -n "$expect" ]; then
+        [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
+    fi
+    command -v python3 >/dev/null || die "missing tool: python3"
+    machine="$(machine_of "$arch")" || exit 1
+    image="$(image_file_of "$arch")" || exit 1
+    image_sha="$(image_sha_of "$arch")" || exit 1
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        stage_op="stage-evidence"
+    fi
+    sys_fs_ops "$stage_op" \
+        "$out" "$stage" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "$expect" \
+        "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" \
+        || die "cannot stage verified allowlisted evidence from $out into $stage"
 }
 
 cmd_verify_pass() {
@@ -1081,7 +1068,7 @@ EOF
     [ "$install" = pass ] || exit 1
 
     say "AC16: scripts/e2e-libvirt.sh"
-    local e2e_tmp="" e2e_rc=0 e2e_publish_op="publish-session-evidence-stdin"
+    local e2e_tmp="" e2e_rc=0 e2e_pub_rc=0 e2e_publish_op="publish-session-evidence-stdin"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         e2e_publish_op="publish-evidence-stdin"
     fi
@@ -1094,9 +1081,14 @@ EOF
     else
         e2e_rc=$?
     fi
-    sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.log" <"$e2e_tmp" || true
-    rm -f "$e2e_tmp"
-    if [ "$e2e_rc" -eq 0 ]; then
+    if sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.log" <"$e2e_tmp"; then
+        e2e_pub_rc=0
+        rm -f "$e2e_tmp"
+    else
+        e2e_pub_rc=$?
+        echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); retaining transcript at $e2e_tmp" >&2
+    fi
+    if [ "$e2e_rc" -eq 0 ] && [ "$e2e_pub_rc" -eq 0 ]; then
         mark libvirt_interop pass
     else
         mark libvirt_interop fail
@@ -1132,6 +1124,7 @@ case "$sub" in
     run) cmd_run "$@" ;;
     result) cmd_result "$@" ;;
     ensure-result) cmd_ensure_result "$@" ;;
+    stage-evidence) cmd_stage_evidence "$@" ;;
     verify-pass) cmd_verify_pass "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
     -h | --help) usage ;;

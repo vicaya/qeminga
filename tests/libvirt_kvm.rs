@@ -5483,6 +5483,26 @@ fn evidence_dir_init_run_clears_stale_diagnostics_and_session_logs_stay_private(
         sess_run_dir.display()
     );
 
+    let as_root = running_as_root();
+    let sess_serial_dest = sess_run_dir.join("serial.log");
+    let mut sess_run_envs: Vec<(&str, &str)> = vec![
+        ("QEMINGA_E2E_CONNECT", "qemu:///session"),
+        ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
+        ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
+        ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
+        ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+        ("FAKE_DOM_NAME", &sess_name),
+        ("FAKE_DUMPXML_CONTENT", &sess_xml),
+        ("FAKE_APPEND_QLOG_FILE", sess_qlog.to_str().unwrap()),
+        ("FAKE_APPEND_QLOG_TEXT", "PRIVATE_SESSION_QEMU_CMDLINE"),
+        ("FAKE_PLANT_SERIAL_DEST", sess_serial_dest.to_str().unwrap()),
+        ("FAKE_PLANT_SERIAL_CONTENT", "PRIVATE_SESSION_SERIAL"),
+    ];
+    push_test_sysfs_root(&mut sess_run_envs, fx.dir.path(), as_root);
+
     let sess_run = lane_env(
         &[
             "run",
@@ -5501,25 +5521,7 @@ fn evidence_dir_init_run_clears_stale_diagnostics_and_session_logs_stay_private(
             "--expect-sha256",
             &fx.digest,
         ],
-        &[
-            ("QEMINGA_E2E_CONNECT", "qemu:///session"),
-            ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
-            ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
-            ("QEMINGA_KVM_DEVICE", "/dev/null"),
-            ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
-            ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
-            ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
-            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
-            ("FAKE_DOM_NAME", &sess_name),
-            ("FAKE_DUMPXML_CONTENT", &sess_xml),
-            ("FAKE_APPEND_QLOG_FILE", sess_qlog.to_str().unwrap()),
-            ("FAKE_APPEND_QLOG_TEXT", "PRIVATE_SESSION_QEMU_CMDLINE"),
-            (
-                "FAKE_PLANT_SERIAL_DEST",
-                sess_run_dir.join("serial.log").to_str().unwrap(),
-            ),
-            ("FAKE_PLANT_SERIAL_CONTENT", "PRIVATE_SESSION_SERIAL"),
-        ],
+        &sess_run_envs,
         Some(&fx.session_bin),
     );
     assert!(!sess_run.status.success(), "{}", text(&sess_run));
@@ -5542,6 +5544,19 @@ fn evidence_dir_init_run_clears_stale_diagnostics_and_session_logs_stay_private(
 
     // Reusing `sess_out` for a second session run with zero new QEMU log bytes clears stale qemu.log!
     let sess_name2 = fx.run_name("124");
+    let mut sess_run2_envs: Vec<(&str, &str)> = vec![
+        ("QEMINGA_E2E_CONNECT", "qemu:///session"),
+        ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
+        ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
+        ("QEMINGA_KVM_DEVICE", "/dev/null"),
+        ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
+        ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
+        ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
+        ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+        ("FAKE_DOM_NAME", &sess_name2),
+        ("FAKE_DUMPXML_CONTENT", &sess_xml),
+    ];
+    push_test_sysfs_root(&mut sess_run2_envs, fx.dir.path(), as_root);
     let sess_run2 = lane_env(
         &[
             "run",
@@ -5560,18 +5575,7 @@ fn evidence_dir_init_run_clears_stale_diagnostics_and_session_logs_stay_private(
             "--expect-sha256",
             &fx.digest,
         ],
-        &[
-            ("QEMINGA_E2E_CONNECT", "qemu:///session"),
-            ("QEMINGA_E2E_IMAGES", sess_images.to_str().unwrap()),
-            ("QEMINGA_E2E_QEMU_LOG_DIR", sess_qlogs.to_str().unwrap()),
-            ("QEMINGA_KVM_DEVICE", "/dev/null"),
-            ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
-            ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
-            ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
-            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
-            ("FAKE_DOM_NAME", &sess_name2),
-            ("FAKE_DUMPXML_CONTENT", &sess_xml),
-        ],
+        &sess_run2_envs,
         Some(&fx.session_bin),
     );
     assert!(!sess_run2.status.success(), "{}", text(&sess_run2));
@@ -6058,6 +6062,16 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
     let out_step_idx = smoke
         .find(r#"out="${RUNNER_TEMP:?}/libvirt-kvm-hosted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}""#)
         .unwrap_or_else(|| panic!("missing RUNNER_TEMP per-run OUT setup step:\n{smoke}"));
+    let out_step_start = smoke[..out_step_idx].rfind("- name:").unwrap();
+    let out_step = &smoke[out_step_start..out_step_idx];
+    assert!(
+        out_step.contains("id: prep_out"),
+        "output-dir setup step must expose id: prep_out for downstream gating:\n{out_step}"
+    );
+    assert!(
+        smoke.contains("id: checkout"),
+        "checkout step must expose id: checkout for downstream gating:\n{smoke}"
+    );
     assert!(
         smoke.contains(r#"echo "OUT=$out" >> "$GITHUB_ENV""#),
         "per-run OUT must be exported via GITHUB_ENV:\n{smoke}"
@@ -6067,11 +6081,19 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         "OUT must be prepared before the first fail-fast check so early failures still publish evidence"
     );
 
-    // Cleanup, fallback failure-result generation (for early exits before `run` installs its
-    // EXIT trap), summary, and artifact upload all run under `if: always()` in order.
+    // Cleanup, fallback failure-result generation, fresh allowlisted staging,
+    // summary, and artifact upload run under `if: always()` ONLY when `OUT` was
+    // prepared and verified — never letting an unset `env.OUT` widen upload to `/`
+    // or letting unverified/symlinked files under `$OUT` reach summary/upload.
     let cleanup_idx = smoke.find("libvirt-kvm-smoke.sh cleanup").unwrap();
     let cleanup_step = &smoke[smoke[..cleanup_idx].rfind("- name:").unwrap()..cleanup_idx];
-    assert!(cleanup_step.contains("if: always()"), "{cleanup_step}");
+    assert!(
+        cleanup_step.contains("if: always()")
+            && cleanup_step.contains("steps.prep_out.outcome == 'success'")
+            && cleanup_step.contains("steps.checkout.outcome == 'success'")
+            && cleanup_step.contains("env.OUT != ''"),
+        "cleanup step must be gated on prep_out, checkout, and non-empty OUT:\n{cleanup_step}"
+    );
 
     let fallback_idx = smoke
         .find("libvirt-kvm-smoke.sh ensure-result")
@@ -6079,9 +6101,19 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
             panic!("missing early-failure structured result.json ensure-result step:\n{smoke}")
         });
     let fallback_start = smoke[..fallback_idx].rfind("- name:").unwrap();
-    let summary_idx = smoke.find("- name: Result summary").unwrap();
-    let fallback_step = &smoke[fallback_start..summary_idx];
-    assert!(fallback_step.contains("if: always()"), "{fallback_step}");
+    let stage_idx = smoke
+        .find("libvirt-kvm-smoke.sh stage-evidence")
+        .unwrap_or_else(|| panic!("missing fresh allowlisted stage-evidence step:\n{smoke}"));
+    let stage_start = smoke[..stage_idx].rfind("- name:").unwrap();
+    let fallback_step = &smoke[fallback_start..stage_start];
+    assert!(
+        fallback_step.contains("id: ensure_result")
+            && fallback_step.contains("if: always()")
+            && fallback_step.contains("steps.prep_out.outcome == 'success'")
+            && fallback_step.contains("steps.checkout.outcome == 'success'")
+            && fallback_step.contains("env.OUT != ''"),
+        "ensure-result step must expose id: ensure_result and gate on prep_out, checkout, and non-empty OUT:\n{fallback_step}"
+    );
     assert!(fallback_step.contains(r#"--out "$OUT""#), "{fallback_step}");
     assert!(
         fallback_step.contains(r#"--arch "$ARCH""#),
@@ -6096,25 +6128,63 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         "fallback must bind any preserved pass record to the candidate digest:\n{fallback_step}"
     );
 
-    let upload_idx = smoke.find("actions/upload-artifact").unwrap();
-    let upload_step = &smoke[smoke[..upload_idx].rfind("- name:").unwrap()..upload_idx];
-    assert!(upload_step.contains("if: always()"), "{upload_step}");
+    let summary_idx = smoke.find("- name: Result summary").unwrap();
+    let stage_step = &smoke[stage_start..summary_idx];
+    assert!(
+        stage_step.contains("id: stage_evidence")
+            && stage_step.contains("if: always()")
+            && stage_step.contains("steps.prep_out.outcome == 'success'")
+            && stage_step.contains("steps.checkout.outcome == 'success'")
+            && stage_step.contains("steps.ensure_result.outcome == 'success'")
+            && stage_step.contains("env.OUT != ''"),
+        "stage-evidence step must expose id: stage_evidence and gate on prep_out, checkout, ensure_result, and non-empty OUT:\n{stage_step}"
+    );
 
-    // On an otherwise-green job path (no `if: always()`), explicitly require a
-    // validated run-bound passing `result.json` AFTER upload so replacing
-    // missing/invalid evidence with a failure record can never finish green.
+    let upload_idx = smoke.find("uses: actions/upload-artifact").unwrap();
+    let upload_start = smoke[..upload_idx].rfind("- name:").unwrap();
+    let summary_step = &smoke[summary_idx..upload_start];
+    assert!(
+        summary_step.contains("if: always()")
+            && summary_step.contains("steps.prep_out.outcome == 'success'")
+            && summary_step.contains("steps.ensure_result.outcome == 'success'")
+            && summary_step.contains("steps.stage_evidence.outcome == 'success'")
+            && summary_step.contains("steps.stage_evidence.outputs.dir != ''")
+            && summary_step.contains("read-session-evidence-stdout")
+            && !summary_step.contains(r#"cat "$OUT/result.json""#),
+        "summary step must gate on verified staging and read result.json via verified reader:\n{summary_step}"
+    );
+
     let verify_idx = smoke
         .find("libvirt-kvm-smoke.sh verify-pass")
         .unwrap_or_else(|| {
             panic!("missing success-path validated pass gate (verify-pass):\n{smoke}")
         });
     let verify_start = smoke[..verify_idx].rfind("- name:").unwrap();
+    let upload_step = &smoke[upload_start..verify_start];
+    assert!(
+        upload_step.contains("if: always()")
+            && upload_step.contains("steps.prep_out.outcome == 'success'")
+            && upload_step.contains("steps.ensure_result.outcome == 'success'")
+            && upload_step.contains("steps.stage_evidence.outcome == 'success'")
+            && upload_step.contains("steps.stage_evidence.outputs.dir != ''")
+            && upload_step.contains("path: ${{ steps.stage_evidence.outputs.dir }}/")
+            && !upload_step.contains("${{ env.OUT }}"),
+        "upload step must gate on prep_out/ensure_result/stage_evidence and upload only the staged directory (never env.OUT):\n{upload_step}"
+    );
+
+    // On an otherwise-green job path (no `if: always()`), explicitly require a
+    // validated run-bound passing `result.json` AFTER upload so replacing
+    // missing/invalid evidence with a failure record can never finish green.
     let verify_step = &smoke[verify_start..];
     assert!(
         !verify_step.contains("if: always()"),
         "verify-pass gate must run only on the success path (not if: always()):\n{verify_step}"
     );
-    assert!(verify_step.contains(r#"--out "$OUT""#), "{verify_step}");
+    assert!(
+        verify_step.contains("STAGE_DIR: ${{ steps.stage_evidence.outputs.dir }}")
+            && verify_step.contains(r#"--out "$STAGE_DIR""#),
+        "verify-pass must validate the exact staged evidence directory uploaded to the artifact:\n{verify_step}"
+    );
     assert!(verify_step.contains(r#"--arch "$ARCH""#), "{verify_step}");
     assert!(
         verify_step.contains(r#"--source-sha "$GITHUB_SHA""#),
@@ -6127,10 +6197,11 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
 
     assert!(
         cleanup_idx < fallback_idx
-            && fallback_idx < summary_idx
+            && fallback_idx < stage_idx
+            && stage_idx < summary_idx
             && summary_idx < upload_idx
             && upload_idx < verify_idx,
-        "cleanup -> fallback result -> summary -> upload -> verify-pass ordering must hold"
+        "cleanup -> fallback result -> stage-evidence -> summary -> upload -> verify-pass ordering must hold"
     );
 }
 
@@ -6251,7 +6322,7 @@ exit "$rc""#
         "publisher must never move temp file inside an existing result.json directory"
     );
 
-    // Case 2: `publish-session-evidence-stdin` fails (simulated rename/publish error)
+    // Case 2: `write-session-result` fails (simulated rename/publish error)
     // after all four checks passed -> MUST propagate nonzero under `|| rc=1`.
     let dir2 = private_tempdir();
     assert_eq!(
@@ -6270,13 +6341,13 @@ exit "$rc""#
     write_exec(
         &fake_bin.join("python3"),
         &format!(
-            "#!/bin/sh\nfor a in \"$@\"; do\n  if [ \"$a\" = \"publish-session-evidence-stdin\" ]; then\n    echo 'libvirt-kvm-smoke: simulated publish failure' >&2\n    exit 1\n  fi\ndone\nexec {real_python3} \"$@\"\n"
+            "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    write-session-result|publish-session-evidence-stdin)\n      echo 'libvirt-kvm-smoke: simulated publish failure' >&2\n      exit 1\n      ;;\n  esac\ndone\nexec {real_python3} \"$@\"\n"
         ),
     );
     let res2 = run_trap_context(dir2.path(), &out2, Some(&fake_bin), false);
     assert!(
         !res2.status.success(),
-        "failing publish-session-evidence-stdin must fail write_result in || rc=1 trap context: {}",
+        "failing write-session-result must fail write_result in || rc=1 trap context: {}",
         text(&res2)
     );
     assert!(
@@ -6414,12 +6485,12 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
     let wr_end = script_src[wr_start..].find("\ncmd_result()").unwrap() + wr_start;
     let write_result_fn = &script_src[wr_start..wr_end];
     assert!(
-        write_result_fn.contains("publish-session-evidence-stdin")
-            && write_result_fn.contains("publish-evidence-stdin")
+        write_result_fn.contains("write-session-result")
+            && write_result_fn.contains("write-result")
             && !write_result_fn.contains(".result.json.tmp")
             && !write_result_fn.contains(r#">"$out/result.json""#)
             && !write_result_fn.contains(r#"cat -- "$out/result.json""#),
-        "write_result must publish atomically through verified dir-fd sys_fs_ops publishers:\n{write_result_fn}"
+        "write_result must read markers and publish atomically through locked sys_fs_ops write-result ops:\n{write_result_fn}"
     );
 
     // Helper: produce an authentic writer-generated `result.json` using the
@@ -8630,6 +8701,102 @@ esac
         None,
     );
     assert!(verified.status.success(), "{}", text(&verified));
+
+    // Subcase 2 (Review #21 P2): when `e2e-libvirt.sh` succeeds but publishing
+    // `e2e-libvirt.log` into `$OUT` fails (e.g., blocking directory at destination),
+    // `cmd_run` MUST fail closed: mark `libvirt_interop` as `fail`, record overall
+    // `result: "fail"`, exit non-zero, and retain the captured `0600` transcript
+    // under `$run_dir/e2e-libvirt.*.log` instead of deleting it.
+    let blocked_out = sys_root.join("blocked-e2e-log-out");
+    create_dir_mode(&blocked_out, 0o700);
+    create_dir_mode(&blocked_out.join("e2e-libvirt.log"), 0o700);
+    let run_name_blocked = format!("qeminga-e2e-89-1-{arch}");
+    let run_dir_blocked = images.join(&run_name_blocked);
+    let qlog_file_blocked = qlog_dir.join(format!("{run_name_blocked}.log"));
+    let state_file_blocked = dir.path().join("dom-blocked.state");
+    let frozen_file_blocked = dir.path().join("dom-blocked.frozen");
+    let mut cmd_blocked = Command::new("/bin/sh");
+    cmd_blocked
+        .args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
+        .arg(script())
+        .args([
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "89",
+            "--run-attempt",
+            "1",
+            "--out",
+            blocked_out.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ])
+        .env("PATH", &path_env)
+        .env("QEMINGA_E2E_CONNECT", "qemu:///session")
+        .env("QEMINGA_E2E_IMAGES", &images)
+        .env("QEMINGA_E2E_QEMU_LOG_DIR", &qlog_dir)
+        .env("QEMINGA_KVM_DEVICE", "/dev/null")
+        .env("QEMINGA_AAVMF_CODE", &aavmf_code)
+        .env("QEMINGA_AAVMF_VARS", &aavmf_vars)
+        .env("FAKE_IMAGE_SHA", &pinned_image_sha)
+        .env("FAKE_RUN_DIR", &run_dir_blocked)
+        .env("FAKE_QLOG_FILE", &qlog_file_blocked)
+        .env("FAKE_STATE_FILE", &state_file_blocked)
+        .env("FAKE_FROZEN_FILE", &frozen_file_blocked);
+    apply_test_sysfs_root(&mut cmd_blocked, &sys_root, as_root);
+    let out_blocked = cmd_blocked.output().unwrap();
+    assert!(
+        !out_blocked.status.success(),
+        "failed e2e-libvirt.log publication must fail cmd_run:\n{}",
+        text(&out_blocked)
+    );
+    let blocked_stderr = String::from_utf8_lossy(&out_blocked.stderr);
+    assert!(
+        blocked_stderr.contains("e2e-libvirt.log") && blocked_stderr.contains("retaining"),
+        "expected diagnostic noting failed e2e-libvirt.log publish and retained transcript:\n{blocked_stderr}"
+    );
+    let blocked_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(blocked_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(blocked_doc["result"], "fail");
+    assert_eq!(blocked_doc["tests"]["libvirt_interop"], "fail");
+    assert_eq!(blocked_doc["tests"]["production_install"], "pass");
+    assert_eq!(blocked_doc["tests"]["accelerator_kvm"], "pass");
+    assert_eq!(blocked_doc["tests"]["agent_shutdown"], "pass");
+    let retained_logs: Vec<PathBuf> = std::fs::read_dir(&run_dir_blocked)
+        .unwrap()
+        .filter_map(|e| {
+            let p = e.ok()?.path();
+            let name = p.file_name()?.to_string_lossy();
+            if name.starts_with("e2e-libvirt.") && name.ends_with(".log") {
+                Some(p)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        retained_logs.len(),
+        1,
+        "captured AC16 transcript must be retained in run dir when publish fails: {retained_logs:?}"
+    );
+    let retained_meta = std::fs::symlink_metadata(&retained_logs[0]).unwrap();
+    assert!(retained_meta.file_type().is_file() && retained_meta.nlink() == 1);
+    assert_eq!(
+        retained_meta.mode() & 0o777,
+        0o600,
+        "retained transcript must keep private 0600 permissions"
+    );
+    assert!(
+        std::fs::read_to_string(&retained_logs[0])
+            .unwrap()
+            .contains("guest-ping"),
+        "retained transcript must contain captured AC16 output"
+    );
 }
 
 #[test]
@@ -8833,7 +9000,7 @@ fn out_path_rejects_dotdot_segments_and_concurrent_writer_is_never_clobbered() {
             "-IB",
             "-c",
             r#"
-import errno, fcntl, importlib.util, json, os, subprocess, sys, time
+import errno, fcntl, importlib.util, json, os, select, subprocess, sys
 
 spec_loader = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
 mod = importlib.util.module_from_spec(spec_loader)
@@ -8867,6 +9034,72 @@ def install_atomic(dir_path, payload):
     finally:
         os.close(fd)
     os.replace(tmp, os.path.join(dir_path, "result.json"))
+
+def wait_pipe_msg(rfd, expected, timeout=10.0, label="pipe signal"):
+    ready, _, _ = select.select([rfd], [], [], timeout)
+    assert ready, f"timed out waiting for {label} ({expected!r})"
+    got = os.read(rfd, 256)
+    assert got == expected, f"{label}: expected {expected!r}, got {got!r}"
+
+LOCK_HOOK_CHILD = r"""
+import fcntl, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+before_w, after_w = int(sys.argv[2]), int(sys.argv[3])
+real_flock = mod.fcntl.flock
+def hooked_flock(fd, op):
+    if (op & fcntl.LOCK_EX) == fcntl.LOCK_EX:
+        os.write(before_w, b"LOCKING\n")
+    res = real_flock(fd, op)
+    if (op & fcntl.LOCK_EX) == fcntl.LOCK_EX:
+        os.write(after_w, b"ACQUIRED\n")
+    return res
+mod.fcntl.flock = hooked_flock
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+HOLD_AFTER_UNLINK_CHILD = r"""
+import importlib.util, os, select, sys
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+mid_w, go_r = int(sys.argv[2]), int(sys.argv[3])
+real_unlink = mod.os.unlink
+paused = [False]
+def hooked_unlink(path, *args, **kwargs):
+    res = real_unlink(path, *args, **kwargs)
+    if path == "result.json" and not paused[0]:
+        paused[0] = True
+        os.write(mid_w, b"MID_RESET\n")
+        ready, _, _ = select.select([go_r], [], [], 10.0)
+        assert ready, "timed out waiting for parent GO signal in init-run"
+        os.read(go_r, 64)
+    return res
+mod.os.unlink = hooked_unlink
+sys.exit(mod.main(sys.argv[4:]))
+"""
+
+HOLD_IN_WRITE_CHILD = r"""
+import fcntl, importlib.util, os, select, sys
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+in_w, go_r = int(sys.argv[2]), int(sys.argv[3])
+real_flock = mod.fcntl.flock
+paused = [False]
+def hooked_flock(fd, op):
+    res = real_flock(fd, op)
+    if (op & fcntl.LOCK_EX) == fcntl.LOCK_EX and not paused[0]:
+        paused[0] = True
+        os.write(in_w, b"IN_WRITE\n")
+        ready, _, _ = select.select([go_r], [], [], 10.0)
+        assert ready, "timed out waiting for parent GO signal in write-session-result"
+        os.read(go_r, 64)
+    return res
+mod.fcntl.flock = hooked_flock
+sys.exit(mod.main(sys.argv[4:]))
+"""
 
 root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
 try:
@@ -8967,17 +9200,102 @@ try:
     finally:
         mod.os.fchmod = orig_fchmod
 
-    # 3e. Cross-process `flock` serialization: while parent holds LOCK_EX on `out_fd`,
-    #     child `ensure-session-result` blocks until parent finishes installing valid passing
-    #     report, then child observes and preserves it!
+    # 3d2 (Review #21 P2): carry the rejected file's observed_id on EvidenceUnsafeError
+    #     instead of doing a second lstat! If a concurrent writer replaces an unsafe
+    #     symlink or world-writable file with a valid passing report right after
+    #     `_read_evidence_bytes_from_open_dir` rejects it, `ensure_result_file` MUST
+    #     detect the inode change, retry validation, and PRESERVE the valid report!
+    for case_name in ("symlink", "world-writable"):
+        unsafe_race = os.path.join(root_path, f"race-unsafe-{case_name}")
+        os.mkdir(unsafe_race, 0o700)
+        rpath = os.path.join(unsafe_race, "result.json")
+        if case_name == "symlink":
+            os.symlink("/nonexistent-target", rpath)
+        else:
+            fd = os.open(rpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, b"{}\n")
+                os.fchmod(fd, 0o666)
+            finally:
+                os.close(fd)
+        unsafe_st = os.lstat(rpath)
+        unsafe_id = (unsafe_st.st_dev, unsafe_st.st_ino)
+        orig_read_open = mod._read_evidence_bytes_from_open_dir
+        swapped_unsafe = [False]
+        def hook_read_unsafe(*args, **kwargs):
+            try:
+                return orig_read_open(*args, **kwargs)
+            except mod.EvidenceUnsafeError as exc:
+                assert getattr(exc, "observed_id", None) == unsafe_id, (
+                    f"{case_name}: EvidenceUnsafeError must carry rejected inode {unsafe_id}, "
+                    f"got {getattr(exc, 'observed_id', None)}"
+                )
+                if not swapped_unsafe[0]:
+                    swapped_unsafe[0] = True
+                    install_atomic(unsafe_race, valid_pass_bytes)
+                raise
+        mod._read_evidence_bytes_from_open_dir = hook_read_unsafe
+        try:
+            replaced = mod.ensure_result_file(
+                unsafe_race, result_spec, fallback_bytes,
+                session=True, root_fd=root_fd, root_path=root_path,
+            )
+            assert not replaced, (
+                f"{case_name}: ensure_result_file must preserve concurrent valid report "
+                "installed right after unsafe rejection"
+            )
+            assert open(rpath, "rb").read() == valid_pass_bytes
+            leftovers = [n for n in os.listdir(unsafe_race) if n.startswith(".qeminga-evidence.")]
+            assert not leftovers, f"leftover temp files: {leftovers}"
+        finally:
+            mod._read_evidence_bytes_from_open_dir = orig_read_open
+
+    # 3d3 (Review #21 P2): ELOOP between regular lstat and O_NOFOLLOW open must retry
+    #     so the next lstat observes the symlink's real inode (NOT the replaced regular
+    #     file's inode).
+    eloop_dir = os.path.join(root_path, "race-eloop-id")
+    os.mkdir(eloop_dir, 0o700)
+    install_atomic(eloop_dir, b'{"schema": 1, "truncated":')
+    eloop_rpath = os.path.join(eloop_dir, "result.json")
+    sym_id_holder = [None]
+    swapped_eloop = [False]
+    def swap_to_symlink_on_open(path, flags, *args, **kwargs):
+        if path == "result.json" and not swapped_eloop[0]:
+            swapped_eloop[0] = True
+            tmp_sym = os.path.join(eloop_dir, ".tmp-sym")
+            os.symlink("/nonexistent-eloop", tmp_sym)
+            os.replace(tmp_sym, eloop_rpath)
+            st = os.lstat(eloop_rpath)
+            sym_id_holder[0] = (st.st_dev, st.st_ino)
+        return orig_open(path, flags, *args, **kwargs)
+    mod.os.open = swap_to_symlink_on_open
+    try:
+        try:
+            mod.read_evidence_bytes(
+                eloop_dir, "result.json", session=True, root_fd=root_fd, root_path=root_path
+            )
+            raise AssertionError("must reject symlink installed between lstat and open")
+        except mod.EvidenceUnsafeError as exc:
+            assert exc.errno == errno.ELOOP, exc
+            assert exc.observed_id == sym_id_holder[0], (
+                f"ELOOP retry must capture symlink inode {sym_id_holder[0]}, got {exc.observed_id}"
+            )
+    finally:
+        mod.os.open = orig_open
+
+    # 3e (Review #21 P3): Cross-process `flock` serialization synchronized on the child's
+    #     actual `LOCK_EX` attempt via pipes (no sleep-based race assumptions; 10s watchdog).
     flock_dir = os.path.join(root_path, "race-flock")
     os.mkdir(flock_dir, 0o700)
     dfd = os.open(flock_dir, mod.READ_DIR_FLAGS)
+    before_r, before_w = os.pipe()
+    after_r, after_w = os.pipe()
     try:
         fcntl.flock(dfd, fcntl.LOCK_EX)
         child = subprocess.Popen(
             [
-                sys.executable, "-IB", sys.argv[1],
+                sys.executable, "-IB", "-c", LOCK_HOOK_CHILD,
+                sys.argv[1], str(before_w), str(after_w),
                 "ensure-session-result",
                 flock_dir,
                 result_spec["suite"],
@@ -8992,17 +9310,29 @@ try:
                 " ".join(result_spec["mandatory_tests"]),
                 "0" * 64,
             ],
+            pass_fds=(before_w, after_w),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        time.sleep(0.15)
-        assert child.poll() is None, "ensure-session-result must wait on LOCK_EX before publishing fallback"
+        os.close(before_w); before_w = -1
+        os.close(after_w); after_w = -1
+        # Wait until the child actually enters fcntl.flock(..., LOCK_EX).
+        wait_pipe_msg(before_r, b"LOCKING\n", label="ensure-session-result LOCK_EX entry")
+        # While parent still holds LOCK_EX, child MUST remain blocked and write nothing.
+        ready_after, _, _ = select.select([after_r], [], [], 0.05)
+        assert not ready_after, "ensure-session-result acquired LOCK_EX while parent held it!"
+        assert child.poll() is None, "ensure-session-result exited while parent held LOCK_EX"
+        assert not os.path.exists(os.path.join(flock_dir, "result.json"))
         install_atomic(flock_dir, valid_pass_bytes)
         fcntl.flock(dfd, fcntl.LOCK_UN)
+        wait_pipe_msg(after_r, b"ACQUIRED\n", label="ensure-session-result LOCK_EX acquisition")
         stdout, stderr = child.communicate(timeout=10)
         assert child.returncode == 0, f"child failed: {stdout!r} {stderr!r}"
         assert open(os.path.join(flock_dir, "result.json"), "rb").read() == valid_pass_bytes
     finally:
+        for fd_tmp in (before_r, before_w, after_r, after_w):
+            if fd_tmp >= 0:
+                os.close(fd_tmp)
         os.close(dfd)
 
     # 3f. Validate explicit JSON parser rejects non-UTF8, NaN, concatenated, and bool schema.
@@ -9014,6 +9344,164 @@ try:
         b"[" * 5000 + b"]" * 5000,
     ):
         assert not mod.validate_result_bytes(bad_payload, **result_spec, require_pass=False)
+
+    # 3g (Review #21 P2): Two-process deterministic synchronization proving `init-run`
+    #     and `write-session-result` are strictly serialized on `out_fd`, so a reset can
+    #     NEVER leave a passing report synthesized from the previous run's markers in
+    #     either interleaving.
+    def populate_old_pass_dir(dpath):
+        os.mkdir(dpath, 0o700)
+        tdir = os.path.join(dpath, "tests")
+        os.mkdir(tdir, 0o700)
+        for t in result_spec["mandatory_tests"]:
+            fd = os.open(os.path.join(tdir, t), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, b"pass\n")
+            finally:
+                os.close(fd)
+        install_atomic(dpath, valid_pass_bytes)
+
+    write_args = [
+        "write-session-result",
+        "",  # placeholder for out_dir
+        result_spec["suite"],
+        result_spec["source_repository"],
+        result_spec["source_sha"],
+        result_spec["arch"],
+        result_spec["expect_sha256"],
+        result_spec["machine"],
+        result_spec["image"],
+        result_spec["image_release"],
+        result_spec["image_sha"],
+        " ".join(result_spec["mandatory_tests"]),
+        result_spec["expect_sha256"],
+        "kvm",
+        "0",
+    ]
+
+    # Interleaving A: `init-run` unlinks `result.json` and pauses BEFORE clearing `tests/*`;
+    # concurrent `write-session-result` MUST block on LOCK_EX until `init-run` clears all
+    # markers, then see `not_run` and write a `"fail"` report (NEVER `"pass"`).
+    dir_a = os.path.join(root_path, "interleave-init-then-write")
+    populate_old_pass_dir(dir_a)
+    mid_r, mid_w = os.pipe()
+    go_r, go_w = os.pipe()
+    b_bef_r, b_bef_w = os.pipe()
+    b_aft_r, b_aft_w = os.pipe()
+    try:
+        proc_init = subprocess.Popen(
+            [
+                sys.executable, "-IB", "-c", HOLD_AFTER_UNLINK_CHILD,
+                sys.argv[1], str(mid_w), str(go_r),
+                "prepare-session-evidence-dir", dir_a, "init-run",
+            ],
+            pass_fds=(mid_w, go_r),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(mid_w); mid_w = -1
+        os.close(go_r); go_r = -1
+        wait_pipe_msg(mid_r, b"MID_RESET\n", label="init-run mid-reset pause")
+
+        wa = list(write_args)
+        wa[1] = dir_a
+        proc_write = subprocess.Popen(
+            [
+                sys.executable, "-IB", "-c", LOCK_HOOK_CHILD,
+                sys.argv[1], str(b_bef_w), str(b_aft_w),
+                *wa,
+            ],
+            pass_fds=(b_bef_w, b_aft_w),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(b_bef_w); b_bef_w = -1
+        os.close(b_aft_w); b_aft_w = -1
+        wait_pipe_msg(b_bef_r, b"LOCKING\n", label="write-session-result LOCK_EX entry")
+        ready_b, _, _ = select.select([b_aft_r], [], [], 0.05)
+        assert not ready_b, "write-session-result must wait for init-run to finish clearing tests/*"
+        assert proc_write.poll() is None
+
+        os.write(go_w, b"GO\n")
+        os.close(go_w); go_w = -1
+        out_i, err_i = proc_init.communicate(timeout=10)
+        assert proc_init.returncode == 0, f"init-run failed: {out_i!r} {err_i!r}"
+        wait_pipe_msg(b_aft_r, b"ACQUIRED\n", label="write-session-result LOCK_EX after init-run")
+        out_w, err_w = proc_write.communicate(timeout=10)
+        assert proc_write.returncode == 1, (
+            f"write-session-result after init-run must fail (all not_run), got rc={proc_write.returncode}: "
+            f"{out_w!r} {err_w!r}"
+        )
+        doc_a = json.loads(open(os.path.join(dir_a, "result.json"), "rb").read().decode("utf-8"))
+        assert doc_a["result"] == "fail", f"stale pass survived reset: {doc_a}"
+        for t in result_spec["mandatory_tests"]:
+            assert doc_a["tests"][t] == "not_run", f"marker {t} survived reset: {doc_a}"
+    finally:
+        for fd_tmp in (mid_r, mid_w, go_r, go_w, b_bef_r, b_bef_w, b_aft_r, b_aft_w):
+            if fd_tmp >= 0:
+                os.close(fd_tmp)
+
+    # Interleaving B: `write-session-result` acquires LOCK_EX first; concurrent `init-run`
+    # MUST block until `write-session-result` finishes publishing, then remove BOTH
+    # `result.json` AND all 4 markers so NO passing report survives the reset.
+    dir_b = os.path.join(root_path, "interleave-write-then-init")
+    populate_old_pass_dir(dir_b)
+    in_r, in_w = os.pipe()
+    go2_r, go2_w = os.pipe()
+    i_bef_r, i_bef_w = os.pipe()
+    i_aft_r, i_aft_w = os.pipe()
+    try:
+        wb = list(write_args)
+        wb[1] = dir_b
+        proc_write2 = subprocess.Popen(
+            [
+                sys.executable, "-IB", "-c", HOLD_IN_WRITE_CHILD,
+                sys.argv[1], str(in_w), str(go2_r),
+                *wb,
+            ],
+            pass_fds=(in_w, go2_r),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(in_w); in_w = -1
+        os.close(go2_r); go2_r = -1
+        wait_pipe_msg(in_r, b"IN_WRITE\n", label="write-session-result LOCK_EX hold")
+
+        proc_init2 = subprocess.Popen(
+            [
+                sys.executable, "-IB", "-c", LOCK_HOOK_CHILD,
+                sys.argv[1], str(i_bef_w), str(i_aft_w),
+                "prepare-session-evidence-dir", dir_b, "init-run",
+            ],
+            pass_fds=(i_bef_w, i_aft_w),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(i_bef_w); i_bef_w = -1
+        os.close(i_aft_w); i_aft_w = -1
+        wait_pipe_msg(i_bef_r, b"LOCKING\n", label="init-run LOCK_EX entry")
+        ready_i, _, _ = select.select([i_aft_r], [], [], 0.05)
+        assert not ready_i, "init-run must wait for write-session-result to release LOCK_EX"
+        assert proc_init2.poll() is None
+
+        os.write(go2_w, b"GO\n")
+        os.close(go2_w); go2_w = -1
+        out_w2, err_w2 = proc_write2.communicate(timeout=10)
+        assert proc_write2.returncode == 0, f"write-session-result failed: {out_w2!r} {err_w2!r}"
+        wait_pipe_msg(i_aft_r, b"ACQUIRED\n", label="init-run LOCK_EX after write-session-result")
+        out_i2, err_i2 = proc_init2.communicate(timeout=10)
+        assert proc_init2.returncode == 0, f"init-run failed: {out_i2!r} {err_i2!r}"
+        assert not os.path.exists(os.path.join(dir_b, "result.json")), (
+            "init-run must remove result.json written by preceding write-session-result"
+        )
+        for t in result_spec["mandatory_tests"]:
+            assert not os.path.exists(os.path.join(dir_b, "tests", t)), (
+                f"init-run must remove marker {t}"
+            )
+    finally:
+        for fd_tmp in (in_r, in_w, go2_r, go2_w, i_bef_r, i_bef_w, i_aft_r, i_aft_w):
+            if fd_tmp >= 0:
+                os.close(fd_tmp)
 finally:
     os.close(root_fd)
 "#,
@@ -9031,5 +9519,362 @@ finally:
     assert!(
         !py_fixture_dir.join("__pycache__").exists(),
         "Python -IB test invocation must not create __pycache__ in the test-owned module directory"
+    );
+}
+
+#[test]
+fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_dirs() {
+    require_jq();
+    let as_root = running_as_root();
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_dir_mode(&sys_root, 0o755);
+    let digest = "a".repeat(64);
+    let outside_secret = dir.path().join("outside-secret.txt");
+    write_file_mode(&outside_secret, 0o600, b"DO-NOT-EXFILTRATE\n");
+
+    // 1. Positive control (both session and system modes):
+    //    `$OUT` contains valid passing `result.json`, allowlisted logs, `tests/*`
+    //    markers, PLUS a stray regular file, a stray symlink pointing outside, a
+    //    stray subdirectory, and a stray symlink inside `tests/`.
+    //    `stage-evidence` MUST create a fresh `0700` staging directory containing
+    //    ONLY verified allowlisted regular single-link `0600` files, omitting all
+    //    stray files/symlinks/subdirs!
+    for mode in ["qemu:///session", "qemu:///system"] {
+        let mut envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", mode)];
+        push_test_sysfs_root(&mut envs, &sys_root, as_root);
+        let tag = mode.replace([':', '/'], "_");
+        let dir_mode = if mode == "qemu:///system" {
+            0o755
+        } else {
+            0o700
+        };
+        let file_mode = if mode == "qemu:///system" {
+            0o644
+        } else {
+            0o600
+        };
+
+        let out_dir = sys_root.join(format!("stage-src-{tag}"));
+        create_dir_mode(&out_dir, dir_mode);
+        create_dir_mode(&out_dir.join("tests"), dir_mode);
+        for t in MANDATORY {
+            write_file_mode(&out_dir.join("tests").join(t), file_mode, b"pass\n");
+        }
+        let gen_res = lane_env(
+            &[
+                "result",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--binary-sha256",
+                &digest,
+                "--accelerator",
+                "kvm",
+            ],
+            &envs,
+            None,
+        );
+        assert!(gen_res.status.success(), "{mode}: {}", text(&gen_res));
+        write_file_mode(&out_dir.join("versions.txt"), file_mode, b"qemu 8.2\n");
+        write_file_mode(&out_dir.join("serial.log"), file_mode, b"RESULT PASS\n");
+        write_file_mode(&out_dir.join("stray.txt"), file_mode, b"UNEXPECTED\n");
+        create_dir_mode(&out_dir.join("extra-subdir"), dir_mode);
+        write_file_mode(
+            &out_dir.join("extra-subdir").join("nested.txt"),
+            file_mode,
+            b"NESTED\n",
+        );
+        std::os::unix::fs::symlink(&outside_secret, out_dir.join("evil-link")).unwrap();
+        std::os::unix::fs::symlink(&outside_secret, out_dir.join("tests").join("evil-marker"))
+            .unwrap();
+
+        let stage_dir = sys_root.join(format!("stage-dst-{tag}"));
+        let staged = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--stage",
+                stage_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            staged.status.success(),
+            "{mode}: stage-evidence failed:\n{}",
+            text(&staged)
+        );
+
+        let stage_meta = std::fs::symlink_metadata(&stage_dir).unwrap();
+        assert!(stage_meta.file_type().is_dir());
+        assert_eq!(stage_meta.mode() & 0o777, 0o700);
+
+        let mut top_entries: Vec<String> = std::fs::read_dir(&stage_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        top_entries.sort();
+        assert_eq!(
+            top_entries,
+            vec!["result.json", "serial.log", "tests", "versions.txt"],
+            "{mode}: only allowlisted regular files and tests/ may be staged"
+        );
+        for fname in ["result.json", "serial.log", "versions.txt"] {
+            let meta = std::fs::symlink_metadata(stage_dir.join(fname)).unwrap();
+            assert!(meta.file_type().is_file() && meta.nlink() == 1);
+            assert_eq!(
+                meta.mode() & 0o777,
+                0o600,
+                "{mode}: staged {fname} must be 0600"
+            );
+        }
+        let mut staged_tests: Vec<String> = std::fs::read_dir(stage_dir.join("tests"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        staged_tests.sort();
+        let mut expected_tests: Vec<String> = MANDATORY.iter().map(|s| (*s).to_string()).collect();
+        expected_tests.sort();
+        assert_eq!(staged_tests, expected_tests);
+        for t in MANDATORY {
+            let meta = std::fs::symlink_metadata(stage_dir.join("tests").join(t)).unwrap();
+            assert!(meta.file_type().is_file() && meta.nlink() == 1);
+            assert_eq!(meta.mode() & 0o777, 0o600);
+        }
+
+        // Calling stage-evidence again against the already-existing stage_dir MUST fail (EEXIST).
+        let reuse = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--stage",
+                stage_dir.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            !reuse.status.success(),
+            "{mode}: stage-evidence must refuse pre-existing --stage directory:\n{}",
+            text(&reuse)
+        );
+    }
+
+    // 2. Valid structured failure `result.json` alongside a symlinked optional log
+    //    (`serial.log`) and symlinked optional test marker (`tests/agent_shutdown`):
+    //    `stage-evidence` MUST still succeed so the valid structured failure report
+    //    can be uploaded, warn about skipping the unsafe optional files, and NEVER
+    //    stage those symlinks!
+    let mut sess_envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", "qemu:///session")];
+    push_test_sysfs_root(&mut sess_envs, &sys_root, as_root);
+
+    let fail_out = sys_root.join("stage-fail-with-bad-opt");
+    create_dir_mode(&fail_out, 0o700);
+    let ensured = lane_env(
+        &[
+            "ensure-result",
+            "--out",
+            fail_out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &sess_envs,
+        None,
+    );
+    assert!(ensured.status.success(), "{}", text(&ensured));
+    std::os::unix::fs::symlink(&outside_secret, fail_out.join("serial.log")).unwrap();
+    create_dir_mode(&fail_out.join("tests"), 0o700);
+    std::os::unix::fs::symlink(
+        &outside_secret,
+        fail_out.join("tests").join("agent_shutdown"),
+    )
+    .unwrap();
+    write_file_mode(&fail_out.join("versions.txt"), 0o600, b"qemu 8.2\n");
+
+    let fail_stage = sys_root.join("stage-fail-dst");
+    let staged_fail = lane_env(
+        &[
+            "stage-evidence",
+            "--out",
+            fail_out.to_str().unwrap(),
+            "--stage",
+            fail_stage.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &sess_envs,
+        None,
+    );
+    assert!(
+        staged_fail.status.success(),
+        "valid structured fail result.json must still stage when optional log is unsafe:\n{}",
+        text(&staged_fail)
+    );
+    assert!(
+        String::from_utf8_lossy(&staged_fail.stderr).contains("serial.log"),
+        "expected warning on stderr about skipped unsafe serial.log:\n{}",
+        text(&staged_fail)
+    );
+    assert!(fail_stage.join("result.json").is_file());
+    assert!(fail_stage.join("versions.txt").is_file());
+    assert!(
+        !fail_stage.join("serial.log").exists(),
+        "symlinked optional serial.log must NOT be staged"
+    );
+    assert!(
+        !fail_stage.join("tests").exists(),
+        "tests/ subdir must not be created when no valid markers exist"
+    );
+
+    // 3. Reject missing result.json, invalid/mismatched result.json, symlinked result.json,
+    //    shared-writable 0777 $OUT, dot-dot in --stage, and --stage inside $OUT — leaving
+    //    NO staging directory behind on any rejection!
+    let bad_0777 = sys_root.join("stage-0777");
+    create_dir_mode(&bad_0777, 0o700);
+    std::fs::set_permissions(&bad_0777, std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    let missing_res = sys_root.join("stage-no-result");
+    create_dir_mode(&missing_res, 0o700);
+
+    let sym_res = sys_root.join("stage-sym-result");
+    create_dir_mode(&sym_res, 0o700);
+    std::os::unix::fs::symlink(fail_out.join("result.json"), sym_res.join("result.json")).unwrap();
+
+    let bad_json = sys_root.join("stage-bad-json");
+    create_dir_mode(&bad_json, 0o700);
+    write_file_mode(&bad_json.join("result.json"), 0o600, b"{\"broken\":");
+
+    for (idx, bad_src) in [&bad_0777, &missing_res, &sym_res, &bad_json]
+        .iter()
+        .enumerate()
+    {
+        let bad_dst = sys_root.join(format!("stage-should-not-exist-{idx}"));
+        let res = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                bad_src.to_str().unwrap(),
+                "--stage",
+                bad_dst.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &sess_envs,
+            None,
+        );
+        assert!(
+            !res.status.success(),
+            "stage-evidence must reject invalid/unsafe source {}:\n{}",
+            bad_src.display(),
+            text(&res)
+        );
+        assert!(
+            !bad_dst.exists(),
+            "rejected stage-evidence must not publish {}",
+            bad_dst.display()
+        );
+    }
+
+    let dotdot_stage = format!("{}/nonexistent/../stage-dotdot", sys_root.display());
+    let res_dd = lane_env(
+        &[
+            "stage-evidence",
+            "--out",
+            fail_out.to_str().unwrap(),
+            "--stage",
+            &dotdot_stage,
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &sess_envs,
+        None,
+    );
+    assert!(!res_dd.status.success());
+    assert!(!sys_root.join("stage-dotdot").exists());
+
+    let inside_out_stage = fail_out.join("nested-stage");
+    let res_inside = lane_env(
+        &[
+            "stage-evidence",
+            "--out",
+            fail_out.to_str().unwrap(),
+            "--stage",
+            inside_out_stage.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &sess_envs,
+        None,
+    );
+    assert!(!res_inside.status.success());
+    assert!(!inside_out_stage.exists());
+
+    let sym_stage = sys_root.join("stage-dangling-symlink");
+    std::os::unix::fs::symlink(dir.path().join("nonexistent-target"), &sym_stage).unwrap();
+    let res_sym_stage = lane_env(
+        &[
+            "stage-evidence",
+            "--out",
+            fail_out.to_str().unwrap(),
+            "--stage",
+            sym_stage.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &sess_envs,
+        None,
+    );
+    assert!(
+        !res_sym_stage.status.success(),
+        "stage-evidence must refuse a pre-existing dangling symlink at --stage:\n{}",
+        text(&res_sym_stage)
+    );
+    assert!(
+        std::fs::symlink_metadata(&sym_stage)
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }

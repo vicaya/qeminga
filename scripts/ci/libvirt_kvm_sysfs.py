@@ -74,6 +74,11 @@ class EvidenceDirUnsafeError(OSError):
 class EvidenceUnsafeError(OSError):
     """Evidence file or tests subdirectory failed type, link, mount, trust, or size checks."""
 
+    def __init__(self, err, msg, *, observed_id=None, is_dir=False):
+        super().__init__(err, msg)
+        self.observed_id = observed_id
+        self.is_dir = is_dir
+
 
 class EvidenceInvalidError(OSError):
     """Evidence file was read cleanly, but its contents failed JSON/schema validation."""
@@ -1260,49 +1265,50 @@ def publish_evidence_bytes(
         root_path=root_path,
     )
     try:
-        if subdir is not None:
-            out_st = os.fstat(out_fd)
-            out_mnt = fd_mnt_id(out_fd)
-            sub_fd = _create_evidence_dir_in_fd(
-                out_fd, out_path, subdir, dir_mode, owner_uids
-            )
-            try:
-                sst = os.fstat(sub_fd)
-                if sst.st_dev != out_st.st_dev or fd_mnt_id(sub_fd) != out_mnt:
-                    raise EvidenceDirUnsafeError(
-                        errno.EXDEV,
-                        f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, subdir)}'",
-                    )
-                _publish_evidence_stream(
-                    sub_fd,
-                    dest_name,
-                    lambda fd: _write_all_fd(fd, data),
-                    mode=file_mode,
+        lock_out = subdir == "tests" or (subdir is None and dest_name == "result.json")
+        if lock_out:
+            fcntl.flock(out_fd, fcntl.LOCK_EX)
+        try:
+            if subdir is not None:
+                out_st = os.fstat(out_fd)
+                out_mnt = fd_mnt_id(out_fd)
+                sub_fd = _create_evidence_dir_in_fd(
+                    out_fd, out_path, subdir, dir_mode, owner_uids
                 )
-            finally:
-                os.close(sub_fd)
-        else:
-            lock_result = dest_name == "result.json"
-            if lock_result:
-                fcntl.flock(out_fd, fcntl.LOCK_EX)
-            try:
+                try:
+                    sst = os.fstat(sub_fd)
+                    if sst.st_dev != out_st.st_dev or fd_mnt_id(sub_fd) != out_mnt:
+                        raise EvidenceDirUnsafeError(
+                            errno.EXDEV,
+                            f"refusing cross-mount evidence subdirectory '{os.path.join(out_path, subdir)}'",
+                        )
+                    _publish_evidence_stream(
+                        sub_fd,
+                        dest_name,
+                        lambda fd: _write_all_fd(fd, data),
+                        mode=file_mode,
+                    )
+                finally:
+                    os.close(sub_fd)
+            else:
                 _publish_evidence_stream(
                     out_fd,
                     dest_name,
                     lambda fd: _write_all_fd(fd, data),
                     mode=file_mode,
                 )
-            finally:
-                if lock_result:
-                    try:
-                        fcntl.flock(out_fd, fcntl.LOCK_UN)
-                    except OSError:
-                        pass
+        finally:
+            if lock_out:
+                try:
+                    fcntl.flock(out_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
     finally:
         os.close(out_fd)
 
 
 MAX_EVIDENCE_READ_BYTES = 1024 * 1024
+MAX_EVIDENCE_STAGE_BYTES = 16 * 1024 * 1024
 MAX_TEST_MARKER_BYTES = 64
 MAX_IDENTITY_RETRIES = 3
 
@@ -1399,27 +1405,33 @@ def _read_evidence_bytes_from_open_dir(
                 raise EvidenceMissingError(
                     errno.ENOENT, f"evidence file '{target_label}' does not exist"
                 )
+            lst_id = (lst.st_dev, lst.st_ino)
             if stat.S_ISLNK(lst.st_mode):
                 raise EvidenceUnsafeError(
                     errno.ELOOP,
                     f"refusing symlinked evidence file '{target_label}'",
+                    observed_id=lst_id,
                 )
             if not stat.S_ISREG(lst.st_mode):
                 raise EvidenceUnsafeError(
                     errno.EINVAL,
                     f"refusing non-regular evidence file '{target_label}'",
+                    observed_id=lst_id,
+                    is_dir=stat.S_ISDIR(lst.st_mode),
                 )
             if lst.st_uid not in owner_uids:
                 raise EvidenceUnsafeError(
                     errno.EACCES,
                     f"refusing untrusted evidence file '{target_label}' "
                     f"(owned by untrusted uid {lst.st_uid})",
+                    observed_id=lst_id,
                 )
             if lst.st_mode & 0o022:
                 raise EvidenceUnsafeError(
                     errno.EACCES,
                     f"refusing shared-writable evidence file '{target_label}' "
                     f"(mode {oct(lst.st_mode & 0o7777)})",
+                    observed_id=lst_id,
                 )
             try:
                 ffd = os.open(
@@ -1434,9 +1446,14 @@ def _read_evidence_bytes_from_open_dir(
                 )
             except OSError as exc:
                 if exc.errno == errno.ELOOP:
-                    raise EvidenceUnsafeError(
-                        errno.ELOOP,
-                        f"refusing symlinked evidence file '{target_label}'",
+                    # `lstat` just observed a regular file, so `ELOOP` means the
+                    # entry changed between `lstat` and `open`; retry so the next
+                    # `lstat` captures the replacement entry's actual inode.
+                    if attempt < max_identity_retries:
+                        continue
+                    raise OSError(
+                        errno.EAGAIN,
+                        f"evidence file '{target_label}' changed during verification",
                     )
                 raise
             try:
@@ -1448,16 +1465,20 @@ def _read_evidence_bytes_from_open_dir(
                         errno.EAGAIN,
                         f"evidence file '{target_label}' changed during verification",
                     )
+                fst_id = (fst.st_dev, fst.st_ino)
                 if fd_mnt_id(ffd) != dir_mnt:
                     raise EvidenceUnsafeError(
                         errno.EXDEV,
                         f"refusing cross-mount or bind-mounted evidence file '{target_label}'",
+                        observed_id=fst_id,
                     )
                 if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
                     raise EvidenceUnsafeError(
                         errno.EINVAL,
                         f"refusing unsafe evidence file '{target_label}' "
                         "(must be regular file with nlink == 1)",
+                        observed_id=fst_id,
+                        is_dir=stat.S_ISDIR(fst.st_mode),
                     )
                 trusted_owner, is_writable, reason = dir_trust_info(
                     ffd, fst, owner_uids
@@ -1467,11 +1488,13 @@ def _read_evidence_bytes_from_open_dir(
                         errno.EACCES,
                         f"refusing untrusted or shared-writable evidence file "
                         f"'{target_label}' ({reason})",
+                        observed_id=fst_id,
                     )
                 if fst.st_size > bound:
                     raise EvidenceUnsafeError(
                         errno.EFBIG,
                         f"evidence file '{target_label}' exceeds {bound} bytes",
+                        observed_id=fst_id,
                     )
                 chunks = []
                 total = 0
@@ -1484,6 +1507,7 @@ def _read_evidence_bytes_from_open_dir(
                         raise EvidenceUnsafeError(
                             errno.EFBIG,
                             f"evidence file '{target_label}' exceeds {bound} bytes",
+                            observed_id=fst_id,
                         )
                     chunks.append(chunk)
                 data = b"".join(chunks)
@@ -1491,9 +1515,10 @@ def _read_evidence_bytes_from_open_dir(
                     raise EvidenceUnsafeError(
                         errno.EINVAL,
                         f"refusing NUL byte in test status marker '{target_label}'",
+                        observed_id=fst_id,
                     )
                 if return_identity:
-                    return data, (fst.st_dev, fst.st_ino)
+                    return data, fst_id
                 return data
             finally:
                 os.close(ffd)
@@ -1689,7 +1714,21 @@ def ensure_result_file(
     root_path="/",
     max_publish_retries=MAX_IDENTITY_RETRIES,
 ):
-    """Atomically preserve a valid ``result.json`` or publish ``fallback_bytes`` under ``flock``.
+    """Preserve a valid ``result.json`` or publish ``fallback_bytes`` under ``flock(out_fd, LOCK_EX)``.
+
+    Coordinated suite operations (``prepare_evidence_dir(..., init_run=True)``,
+    ``publish_evidence_bytes`` for ``result.json`` and ``tests/*``,
+    ``write_result_file``, ``ensure_result_file``, and ``stage_evidence_dir``)
+    serialize on ``flock(out_fd)``. When ``result.json`` is absent, publication
+    uses kernel-atomic ``renameat2(RENAME_NOREPLACE)`` so a newly created report
+    is never clobbered even by an uncoordinated writer. When an existing
+    destination is invalid or unsafe, the rejected inode identity observed during
+    validation (``EvidenceUnsafeError.observed_id`` or ``existing_id``) is carried
+    directly into the pre-replace identity recheck and retried on change (without
+    a second ``lstat`` after rejection); because POSIX/Linux has no single atomic
+    inode-compare-and-replace syscall, the final ``lstat`` and ``os.replace``
+    remain distinct operations with respect to writers outside the ``flock``
+    protocol.
 
     Returns ``True`` when the fallback report was published and ``False`` when an
     existing valid run-bound report was preserved untouched.
@@ -1720,18 +1759,21 @@ def ensure_result_file(
                     )
                 except EvidenceMissingError:
                     existing_state = ("missing", None)
-                except EvidenceUnsafeError:
-                    try:
-                        cur_lst = os.lstat("result.json", dir_fd=out_fd)
-                    except FileNotFoundError:
-                        existing_state = ("missing", None)
-                    else:
-                        if stat.S_ISDIR(cur_lst.st_mode):
-                            raise OSError(
-                                errno.EISDIR,
-                                "evidence target 'result.json' is a directory",
-                            )
-                        existing_state = ("unsafe", (cur_lst.st_dev, cur_lst.st_ino))
+                except EvidenceUnsafeError as exc:
+                    if exc.is_dir:
+                        raise OSError(
+                            errno.EISDIR,
+                            "evidence target 'result.json' is a directory",
+                        )
+                    if exc.observed_id is None:
+                        if attempt < max_publish_retries:
+                            continue
+                        raise OSError(
+                            errno.EAGAIN,
+                            f"evidence file '{os.path.join(out_path, 'result.json')}' "
+                            "failed verification without stable identity",
+                        )
+                    existing_state = ("unsafe", exc.observed_id)
                 else:
                     if validate_result_bytes(data, **spec, require_pass=False):
                         return False
@@ -1772,6 +1814,356 @@ def ensure_result_file(
                         f"evidence file '{os.path.join(out_path, 'result.json')}' "
                         "changed concurrently before fallback publication",
                     )
+        finally:
+            try:
+                fcntl.flock(out_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(out_fd)
+
+
+def write_result_file(
+    out_dir,
+    spec,
+    digest,
+    accel,
+    *,
+    all_not_run=False,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Atomically read test markers and publish ``result.json`` under ``flock(out_fd, LOCK_EX)``.
+
+    Holding ``LOCK_EX`` on ``out_fd`` across both marker reads and report
+    publication serializes ``write-result`` against ``prepare_evidence_dir(...,
+    init_run=True)``, ``mark`` (``publish_evidence_bytes(..., subdir="tests")``),
+    ``ensure_result_file``, and ``stage_evidence_dir`` so an overlapping reset
+    can never leave a passing report synthesized from previous markers.
+
+    Returns ``(payload_bytes, overall_passed)``.
+    """
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        raise OSError(errno.EINVAL, f"bad candidate binary digest '{digest}'")
+    if not isinstance(accel, str) or not accel:
+        raise OSError(errno.EINVAL, "accelerator must be a non-empty string")
+    mandatory_tests = spec["mandatory_tests"]
+    for name in mandatory_tests:
+        if name not in ALLOWED_TEST_FILES:
+            raise OSError(errno.EINVAL, f"unexpected test result filename '{name}'")
+
+    owner_uids = _evidence_owner_uids(session)
+    file_mode = 0o600 if session else 0o644
+    out_fd, out_path = _open_verified_evidence_dir(
+        out_dir,
+        create_missing=True,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    try:
+        fcntl.flock(out_fd, fcntl.LOCK_EX)
+        try:
+            tests = {}
+            overall = "pass"
+            for name in mandatory_tests:
+                if all_not_run:
+                    status = "not_run"
+                else:
+                    try:
+                        marker_raw = _read_evidence_bytes_from_open_dir(
+                            out_fd,
+                            out_path,
+                            name,
+                            subdir="tests",
+                            bound=MAX_TEST_MARKER_BYTES,
+                            owner_uids=owner_uids,
+                        )
+                    except EvidenceMissingError:
+                        status = "not_run"
+                    except EvidenceUnsafeError:
+                        status = "fail"
+                    else:
+                        if re.sub(rb"[ \t\r\n\v\f]+", b"", marker_raw) == b"pass":
+                            status = "pass"
+                        else:
+                            status = "fail"
+                if status != "pass":
+                    overall = "fail"
+                tests[name] = status
+            if accel != "kvm":
+                overall = "fail"
+            doc = {
+                "schema": 1,
+                "suite": spec["suite"],
+                "source_repository": spec["source_repository"],
+                "source_sha": spec["source_sha"],
+                "architecture": spec["arch"],
+                "candidate_binary_sha256": digest,
+                "virtualization": {
+                    "hypervisor": "qemu",
+                    "accelerator": accel,
+                    "machine": spec["machine"],
+                },
+                "guest": {
+                    "image": spec["image"],
+                    "image_release": spec["image_release"],
+                    "image_sha256": spec["image_sha"],
+                },
+                "tests": tests,
+                "result": overall,
+            }
+            payload = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+            _publish_evidence_stream(
+                out_fd,
+                "result.json",
+                lambda fd: _write_all_fd(fd, payload),
+                mode=file_mode,
+            )
+            return payload, overall == "pass"
+        finally:
+            try:
+                fcntl.flock(out_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(out_fd)
+
+
+def _write_stage_file(dir_fd, name, data, mode=0o600):
+    fd = os.open(
+        name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+        0o600,
+        dir_fd=dir_fd,
+    )
+    try:
+        _write_all_fd(fd, data)
+        remove_xattr_if_present(fd, b"system.posix_acl_access")
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _open_verified_stage_parent(
+    stage_dir, *, session=False, root_fd=None, root_path="/"
+):
+    _reject_dot_segments(stage_dir, "evidence staging directory")
+    abs_stage = os.path.abspath(stage_dir)
+    stage_base = os.path.basename(abs_stage)
+    stage_parent = os.path.dirname(abs_stage)
+    if not stage_base or stage_base in (".", ".."):
+        raise EvidenceDirUnsafeError(
+            errno.EINVAL, f"invalid evidence staging directory '{stage_dir}'"
+        )
+    ancestor_uids = _evidence_ancestor_uids(session)
+    owner_uids = _evidence_owner_uids(session)
+    dir_mode = 0o700 if session else 0o755
+    cur_fd, cur_path, _, remaining = walk_existing_prefix(
+        stage_parent,
+        0,
+        {0},
+        ancestor_uids,
+        check_traversal=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    try:
+        for comp in remaining:
+            next_fd = _create_evidence_dir_in_fd(
+                cur_fd, cur_path, comp, dir_mode, owner_uids
+            )
+            next_path = os.path.join(cur_path, comp)
+            os.close(cur_fd)
+            cur_fd, cur_path = next_fd, next_path
+        verify_dir_fd(
+            cur_fd,
+            cur_path,
+            0,
+            {0},
+            ancestor_uids,
+            allow_sticky_writable=False,
+            check_traversal=False,
+        )
+        return cur_fd, cur_path, stage_base
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+
+def stage_evidence_dir(
+    out_dir,
+    stage_dir,
+    spec,
+    *,
+    session=False,
+    root_fd=None,
+    root_path="/",
+):
+    """Copy ONLY verified allowlisted regular files from ``out_dir`` into a fresh ``0700`` ``stage_dir``.
+
+    Requires ``out_dir`` to be verified and ``result.json`` to exist, pass
+    regular single-link verification, and match ``spec``. Optional allowlisted
+    logs and ``tests/*`` markers that are unsafe (e.g. symlinked or oversized)
+    are skipped with a stderr warning so a valid structured failure report can
+    still be published; any non-allowlisted files, symlinks, or subdirectories
+    under ``out_dir`` are ignored completely. Fails with ``EEXIST`` if
+    ``stage_dir`` already exists (published atomically via ``renameat2_noreplace``).
+    """
+    _reject_dot_segments(out_dir, "evidence directory")
+    _reject_dot_segments(stage_dir, "evidence staging directory")
+    abs_stage = os.path.abspath(stage_dir)
+    owner_uids = _evidence_owner_uids(session)
+    out_fd, out_path = _open_verified_evidence_dir(
+        out_dir,
+        create_missing=False,
+        session=session,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    try:
+        out_prefix = out_path.rstrip("/") + "/"
+        if abs_stage == out_path or abs_stage.startswith(out_prefix):
+            raise EvidenceDirUnsafeError(
+                errno.EINVAL,
+                f"evidence staging directory '{stage_dir}' must not be inside '{out_path}'",
+            )
+        fcntl.flock(out_fd, fcntl.LOCK_SH)
+        try:
+            result_data = _read_evidence_bytes_from_open_dir(
+                out_fd,
+                out_path,
+                "result.json",
+                bound=MAX_EVIDENCE_READ_BYTES,
+                owner_uids=owner_uids,
+            )
+            if not validate_result_bytes(result_data, **spec, require_pass=False):
+                raise EvidenceInvalidError(
+                    errno.EINVAL,
+                    f"result.json in '{out_dir}' is malformed or does not match run binding",
+                )
+
+            parent_fd, parent_path, stage_base = _open_verified_stage_parent(
+                stage_dir,
+                session=session,
+                root_fd=root_fd,
+                root_path=root_path,
+            )
+            try:
+                resolved_stage = os.path.join(parent_path, stage_base)
+                if resolved_stage == out_path or resolved_stage.startswith(out_prefix):
+                    raise EvidenceDirUnsafeError(
+                        errno.EINVAL,
+                        f"evidence staging directory '{resolved_stage}' must not be inside '{out_path}'",
+                    )
+                try:
+                    os.lstat(stage_base, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise FileExistsError(
+                        errno.EEXIST,
+                        f"evidence staging directory '{resolved_stage}' already exists",
+                    )
+
+                tmp_stage = f".qeminga-stage.{os.urandom(8).hex()}"
+                os.mkdir(tmp_stage, 0o700, dir_fd=parent_fd)
+                published = False
+                tmp_fd = None
+                try:
+                    tmp_fd = os.open(tmp_stage, READ_DIR_FLAGS, dir_fd=parent_fd)
+                    remove_xattr_if_present(tmp_fd, b"system.posix_acl_default")
+                    remove_xattr_if_present(tmp_fd, b"system.posix_acl_access")
+                    os.fchmod(tmp_fd, 0o700)
+
+                    _write_stage_file(tmp_fd, "result.json", result_data, mode=0o600)
+
+                    for name in sorted(ALLOWED_EVIDENCE_FILES - {"result.json"}):
+                        try:
+                            data = _read_evidence_bytes_from_open_dir(
+                                out_fd,
+                                out_path,
+                                name,
+                                bound=MAX_EVIDENCE_STAGE_BYTES,
+                                owner_uids=owner_uids,
+                            )
+                        except EvidenceMissingError:
+                            continue
+                        except EvidenceUnsafeError as exc:
+                            msg = exc.strerror if exc.strerror else str(exc)
+                            sys.stderr.write(
+                                f"libvirt-kvm-smoke: skipping unsafe optional evidence file '{name}': {msg}\n"
+                            )
+                            continue
+                        _write_stage_file(tmp_fd, name, data, mode=0o600)
+
+                    staged_markers = []
+                    for tname in sorted(ALLOWED_TEST_FILES):
+                        try:
+                            mdata = _read_evidence_bytes_from_open_dir(
+                                out_fd,
+                                out_path,
+                                tname,
+                                subdir="tests",
+                                bound=MAX_TEST_MARKER_BYTES,
+                                owner_uids=owner_uids,
+                            )
+                        except EvidenceMissingError:
+                            continue
+                        except EvidenceUnsafeError as exc:
+                            msg = exc.strerror if exc.strerror else str(exc)
+                            sys.stderr.write(
+                                f"libvirt-kvm-smoke: skipping unsafe optional test marker 'tests/{tname}': {msg}\n"
+                            )
+                            continue
+                        staged_markers.append((tname, mdata))
+
+                    if staged_markers:
+                        os.mkdir("tests", 0o700, dir_fd=tmp_fd)
+                        st_tests_fd = os.open("tests", READ_DIR_FLAGS, dir_fd=tmp_fd)
+                        try:
+                            remove_xattr_if_present(
+                                st_tests_fd, b"system.posix_acl_default"
+                            )
+                            remove_xattr_if_present(
+                                st_tests_fd, b"system.posix_acl_access"
+                            )
+                            os.fchmod(st_tests_fd, 0o700)
+                            for tname, mdata in staged_markers:
+                                _write_stage_file(st_tests_fd, tname, mdata, mode=0o600)
+                            os.fsync(st_tests_fd)
+                        finally:
+                            os.close(st_tests_fd)
+
+                    os.fsync(tmp_fd)
+                    os.close(tmp_fd)
+                    tmp_fd = None
+                    renameat2_noreplace(parent_fd, tmp_stage, parent_fd, stage_base)
+                    published = True
+                    os.fsync(parent_fd)
+                finally:
+                    if tmp_fd is not None:
+                        os.close(tmp_fd)
+                    if not published:
+                        try:
+                            cfd = os.open(tmp_stage, READ_DIR_FLAGS, dir_fd=parent_fd)
+                            try:
+                                cst = os.fstat(cfd)
+                                rmtree_same_mount(
+                                    cfd,
+                                    cst.st_dev,
+                                    fd_mnt_id(cfd),
+                                    os.path.join(parent_path, tmp_stage),
+                                )
+                            finally:
+                                os.close(cfd)
+                            os.rmdir(tmp_stage, dir_fd=parent_fd)
+                        except OSError:
+                            pass
+            finally:
+                os.close(parent_fd)
         finally:
             try:
                 fcntl.flock(out_fd, fcntl.LOCK_UN)
@@ -2664,8 +3056,42 @@ def main(argv):
                 root_path=root_path,
             )
             if published:
+                if sys.stdout is None:
+                    raise OSError(errno.EBADF, "stdout is closed")
                 sys.stdout.buffer.write(fallback_bytes)
                 sys.stdout.buffer.flush()
+        elif op in ("write-result", "write-session-result"):
+            is_session = op == "write-session-result"
+            spec = _result_spec_from_argv(argv[2:12])
+            digest = argv[12]
+            accel = argv[13]
+            all_not_run = len(argv) > 14 and argv[14] == "1"
+            payload, passed = write_result_file(
+                argv[1],
+                spec,
+                digest,
+                accel,
+                all_not_run=all_not_run,
+                session=is_session,
+                root_fd=root_fd,
+                root_path=root_path,
+            )
+            if sys.stdout is None:
+                raise OSError(errno.EBADF, "stdout is closed")
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+            return 0 if passed else 1
+        elif op in ("stage-evidence", "stage-session-evidence"):
+            is_session = op == "stage-session-evidence"
+            spec = _result_spec_from_argv(argv[3:13])
+            stage_evidence_dir(
+                argv[1],
+                argv[2],
+                spec,
+                session=is_session,
+                root_fd=root_fd,
+                root_path=root_path,
+            )
         elif op == "collect-serial-log":
             expected_dir_id = argv[5] if len(argv) > 5 and argv[5] else None
             collect_serial_log(

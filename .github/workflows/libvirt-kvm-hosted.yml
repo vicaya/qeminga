@@ -22,7 +22,9 @@
 # before `libvirt-kvm-smoke.sh run` installs its result-writing trap, a
 # fallback `if: always()` step writes a structured `libvirt-kvm-smoke-v1`
 # failure `result.json` (`accelerator: unknown`, unexecuted checks `not_run`,
-# unverified-digest sentinel) before the summary and artifact upload.
+# unverified-digest sentinel), and a gated `stage-evidence` step copies only
+# verified allowlisted regular files into a fresh `0700` staging directory
+# before the summary and artifact upload.
 # Self-hosted x86_64 and aarch64 KVM runners remain in
 # `.github/workflows/libvirt-kvm.yml` (`workflow_dispatch` only).
 # `tests/libvirt_kvm.rs` checks this file's shape.
@@ -123,12 +125,14 @@ jobs:
       IMAGE_CACHE: ${{ github.workspace }}/libvirt-kvm-image-cache
     steps:
       - name: Prepare per-run output directory
+        id: prep_out
         run: |
           out="${RUNNER_TEMP:?}/libvirt-kvm-hosted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           rm -rf -- "$out"
           mkdir -p -m 0700 "$out"
           echo "OUT=$out" >> "$GITHUB_ENV"
-      - uses: actions/checkout@v4
+      - id: checkout
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
       - name: The runner is a native x86_64 machine
@@ -183,7 +187,7 @@ jobs:
             --image-cache "$IMAGE_CACHE" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
       - name: Clean up this run's domain and disks
-        if: always()
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && env.OUT != ''
         run: |
           scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$ARCH" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
@@ -193,33 +197,52 @@ jobs:
       # valid run-bound `libvirt-kvm-smoke-v1` record exists so the summary and
       # evidence artifact always carry valid JSON identifying this run.
       - name: Record structured failure if run did not produce result.json
-        if: always()
+        id: ensure_result
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && env.OUT != ''
         run: |
           scripts/ci/libvirt-kvm-smoke.sh ensure-result --out "$OUT" \
             --arch "$ARCH" --source-sha "$GITHUB_SHA" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
-      - name: Result summary
-        if: always()
+      # Copy only verified allowlisted regular files (plus verified `tests/*`
+      # markers) into a fresh per-run `0700` staging directory so neither the
+      # summary nor `actions/upload-artifact` can ever read symlinks or widen
+      # traversal outside verified run outputs.
+      - name: Stage verified allowlisted evidence for upload
+        id: stage_evidence
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && steps.ensure_result.outcome == 'success' && env.OUT != ''
         run: |
+          stage="${RUNNER_TEMP:?}/libvirt-kvm-hosted-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$"
+          scripts/ci/libvirt-kvm-smoke.sh stage-evidence --out "$OUT" --stage "$stage" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
+          echo "dir=$stage" >> "$GITHUB_OUTPUT"
+      - name: Result summary
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && steps.ensure_result.outcome == 'success' && steps.stage_evidence.outcome == 'success' && steps.stage_evidence.outputs.dir != ''
+        env:
+          STAGE_DIR: ${{ steps.stage_evidence.outputs.dir }}
+        run: |
+          result_json="$(python3 -IB scripts/ci/libvirt_kvm_sysfs.py read-session-evidence-stdout "$STAGE_DIR" result.json)"
           {
             echo "## libvirt KVM smoke (hosted $ARCH)"
             echo
             echo '```json'
-            cat "$OUT/result.json" 2>/dev/null || echo '{"result": "missing"}'
+            printf '%s\n' "$result_json"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload evidence
-        if: always()
+        if: always() && steps.prep_out.outcome == 'success' && steps.ensure_result.outcome == 'success' && steps.stage_evidence.outcome == 'success' && steps.stage_evidence.outputs.dir != ''
         uses: actions/upload-artifact@v4
         with:
           name: libvirt-kvm-hosted-x86_64
-          path: ${{ env.OUT }}/
+          path: ${{ steps.stage_evidence.outputs.dir }}/
           if-no-files-found: error
       # Runs only when every preceding step succeeded (no `if: always()`):
       # turns the job red if `ensure-result` had to synthesize/replace invalid
-      # evidence or if the recorded verdict is not a validated run-bound pass.
+      # evidence or if the uploaded verdict is not a validated run-bound pass.
       - name: Require validated passing result.json
+        env:
+          STAGE_DIR: ${{ steps.stage_evidence.outputs.dir }}
         run: |
-          scripts/ci/libvirt-kvm-smoke.sh verify-pass --out "$OUT" \
+          scripts/ci/libvirt-kvm-smoke.sh verify-pass --out "$STAGE_DIR" \
             --arch "$ARCH" --source-sha "$GITHUB_SHA" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"

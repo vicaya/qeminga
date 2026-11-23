@@ -23177,8 +23177,11 @@ fn restored_journal_retains_unpruned_stage_and_inspect_is_readonly_and_fail_clos
         text(&insp_eacces)
     );
 
-    // Replace with forged directory (different inode): MUST return `mismatch` without stamping!
-    std::fs::remove_dir(&stage_a).unwrap();
+    // Replace with forged directory (guaranteed different inode by keeping the original
+    // inode allocated via rename, so ext4 cannot immediately reuse the freed inode):
+    // MUST return `mismatch` without stamping `.qeminga-tx-id`!
+    let saved_orig = inspect_parent.join("saved-orig-inode");
+    std::fs::rename(&stage_a, &saved_orig).unwrap();
     std::fs::create_dir(&stage_a).unwrap();
     std::fs::set_permissions(&stage_a, std::fs::Permissions::from_mode(0o700)).unwrap();
     let insp_forged = Command::new("bash")
@@ -23199,9 +23202,31 @@ fn restored_journal_retains_unpruned_stage_and_inspect_is_readonly_and_fail_clos
         "inspect-path-identity must classify forged dir as `mismatch` without creating .qeminga-tx-id: {}",
         text(&insp_forged)
     );
-
-    // Missing path: MUST return `absent`.
     std::fs::remove_dir(&stage_a).unwrap();
+
+    // Non-empty directory with the original inode but missing `.qeminga-tx-id`:
+    // MUST return `mismatch` without stamping `.qeminga-tx-id`!
+    std::fs::rename(&saved_orig, &stage_a).unwrap();
+    std::fs::write(stage_a.join("unexpected-entry"), b"data\n").unwrap();
+    let insp_nonempty_unmarked = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_nonempty_unmarked.status.success()
+            && String::from_utf8_lossy(&insp_nonempty_unmarked.stdout).trim() == "mismatch"
+            && !stage_a.join(".qeminga-tx-id").exists(),
+        "inspect-path-identity must classify non-empty unmarked dir as `mismatch` without stamping: {}",
+        text(&insp_nonempty_unmarked)
+    );
+    std::fs::remove_dir_all(&stage_a).unwrap();
     let insp_absent = Command::new("bash")
         .args([
             "-c",

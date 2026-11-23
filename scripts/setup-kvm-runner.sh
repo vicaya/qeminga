@@ -2738,8 +2738,10 @@ def check_no_mounts(abs_path, mountpoints):
         os.close(pfd)
 
 
-def clear_dir_contents_same_mount(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints):
+def clear_dir_contents_same_mount(dir_fd, root_dev, root_mnt_id, cur_path, mountpoints, skip_names=()):
     for entry in os.listdir(dir_fd):
+        if entry in skip_names:
+            continue
         child_path = f"{cur_path}/{entry}"
         est = assert_entry_same_mount(dir_fd, entry, root_dev, root_mnt_id, child_path, mountpoints)
         if stat.S_ISDIR(est.st_mode):
@@ -4152,7 +4154,20 @@ def verify_parent_identity(pfd, pst, parent, expected_ident, entries, label, tar
         )
 
 
-def verify_dir_identity(pfd, pst, p_mnt, parent, dfd, dst, d_mnt, target, expected_ident, entries, label):
+def verify_dir_identity(
+    pfd,
+    pst,
+    p_mnt,
+    parent,
+    dfd,
+    dst,
+    d_mnt,
+    target,
+    expected_ident,
+    entries,
+    label,
+    allow_empty_missing_tx=False,
+):
     # Enforce same-operation mount consistency between parent and child FDs,
     # while binding cross-invocation identity to persistent parent/target
     # inodes, backing volume fingerprint, and root-owned 0600 `.qeminga-tx-id`.
@@ -4170,12 +4185,29 @@ def verify_dir_identity(pfd, pst, p_mnt, parent, dfd, dst, d_mnt, target, expect
             errno.EXDEV,
             f"refusing {label} '{target}': backing volume changed from '{expected_ident['vol']}' to '{d_vol}' (leaving for inspection)",
         )
-    live_tx = ensure_tx_marker(dfd, d_mnt, target, create=False)
+    live_tx = read_tx_marker(dfd, d_mnt, target)
+    if not live_tx:
+        # Pruning deletes `.qeminga-tx-id` last right before `os.rmdir`. If a crash
+        # interrupts that final window, retrying `safe-rmtree-id` may finish
+        # removing the already-empty, euid-owned 0700 directory whose parent/target
+        # inodes and backing volume still match — never deleting any contents.
+        if (
+            allow_empty_missing_tx
+            and dst.st_uid == os.geteuid()
+            and (dst.st_mode & 0o777) == 0o700
+            and not os.listdir(dfd)
+        ):
+            return False
+        raise OSError(
+            errno.EXDEV,
+            f"refusing {label} '{target}': missing transaction identity marker '{TX_MARKER_NAME}' (leaving for inspection)",
+        )
     if live_tx != expected_ident["tx"]:
         raise OSError(
             errno.EXDEV,
             f"refusing {label} '{target}': transaction identity marker mismatch (leaving for inspection)",
         )
+    return True
 
 
 op = sys.argv[1]
@@ -4906,10 +4938,45 @@ try:
             try:
                 tst = os.fstat(tfd)
                 t_mnt = fd_mnt_id(tfd)
-                verify_dir_identity(pfd, pst, p_mnt, parent, tfd, tst, t_mnt, target, ident, entries, "delete")
+                has_marker = verify_dir_identity(
+                    pfd,
+                    pst,
+                    p_mnt,
+                    parent,
+                    tfd,
+                    tst,
+                    t_mnt,
+                    target,
+                    ident,
+                    entries,
+                    "delete",
+                    allow_empty_missing_tx=True,
+                )
                 if tst.st_dev != pst.st_dev or t_mnt != p_mnt:
                     raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
-                clear_dir_contents_same_mount(tfd, tst.st_dev, t_mnt, target, mountpoints)
+                if has_marker:
+                    clear_dir_contents_same_mount(
+                        tfd,
+                        tst.st_dev,
+                        t_mnt,
+                        target,
+                        mountpoints,
+                        skip_names=(TX_MARKER_NAME,),
+                    )
+                    mst = assert_entry_same_mount(
+                        tfd,
+                        TX_MARKER_NAME,
+                        tst.st_dev,
+                        t_mnt,
+                        f"{target}/{TX_MARKER_NAME}",
+                        mountpoints,
+                    )
+                    if not stat.S_ISREG(mst.st_mode):
+                        raise OSError(
+                            errno.EINVAL,
+                            f"unsafe transaction marker '{target}/{TX_MARKER_NAME}'",
+                        )
+                    os.unlink(TX_MARKER_NAME, dir_fd=tfd)
             finally:
                 os.close(tfd)
             lst = os.lstat(base, dir_fd=pfd)

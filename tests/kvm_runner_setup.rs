@@ -16742,7 +16742,450 @@ esac
 }
 
 #[test]
-fn interrupted_update_recovers_across_remount_in_fresh_mount_namespace() {
+fn interrupted_update_recovers_across_remount_with_tx_marker_and_volume() {
+    let dir = private_tempdir();
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let runner_vol = dir.path().join("runner-vol");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &runner_vol,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"remount-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
+exit 0
+"#,
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        std::fs::write(src.join(format!("externals/{tag}-ext")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    let active_flag = dir.path().join("svc.active");
+    write_exec(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+case "$1" in
+    is-active) [ -f "${FAKE_ACTIVE_FLAG:?}" ] && exit 0 || exit 3 ;;
+    stop) rm -f "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    start | enable) touch "${FAKE_ACTIVE_FLAG:?}"; exit 0 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+
+    let dev_out = Command::new("/usr/bin/stat")
+        .args(["-c", "%Hr:%Lr", dir.path().to_str().unwrap()])
+        .output()
+        .unwrap();
+    let root_dev = String::from_utf8(dev_out.stdout).unwrap();
+    let root_dev = root_dev.trim();
+
+    // Boot 1 mountinfo: runner_vol is mount_id 41 on /dev/sdb1 (8:20) with persistent UUID.
+    let mi_boot1 = dir.path().join("mountinfo.boot1");
+    std::fs::write(
+        &mi_boot1,
+        format!(
+            "29 1 {root_dev} / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+             41 29 8:20 / {} rw,relatime shared:2 - ext4 /dev/sdb1 rw\n",
+            runner_vol.display()
+        ),
+    )
+    .unwrap();
+    // Boot 2 mountinfo: same filesystem remounted with DIFFERENT mount_id (209),
+    // DIFFERENT major:minor (8:50), and DIFFERENT block device path (/dev/sde1),
+    // but identical persistent filesystem UUID.
+    let mi_boot2 = dir.path().join("mountinfo.boot2");
+    std::fs::write(
+        &mi_boot2,
+        format!(
+            "29 1 {root_dev} / / rw,relatime shared:1 - ext4 /dev/sda1 rw\n\
+             209 29 8:50 / {} rw,relatime shared:7 - ext4 /dev/sde1 rw\n",
+            runner_vol.display()
+        ),
+    )
+    .unwrap();
+    let uuid_boot1 =
+        "29=11111111-1111-1111-1111-111111111111,41=aaaaaaaa-1111-2222-3333-444444444444";
+    let uuid_boot2 =
+        "29=11111111-1111-1111-1111-111111111111,209=aaaaaaaa-1111-2222-3333-444444444444";
+    let uuid_wrong =
+        "29=11111111-1111-1111-1111-111111111111,209=bbbbbbbb-2222-3333-4444-555555555555";
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = runner_vol.join("runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    // 1. Install v1 and crash update mid-publish under Boot 1 mountinfo.
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "remount-box",
+            "--service",
+            "qeminga-remount-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("QEMINGA_MOUNTINFO", mi_boot1.to_str().unwrap()),
+            ("QEMINGA_FS_UUID_MAP", uuid_boot1),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+    std::fs::write(&active_flag, b"").unwrap();
+
+    let crash_out = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_TEST_CRASH_PUBLISH_AFTER", "1"),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_MOUNTINFO", mi_boot1.to_str().unwrap()),
+            ("QEMINGA_FS_UUID_MAP", uuid_boot1),
+        ],
+        Some(&bin),
+    );
+    assert_eq!(
+        crash_out.status.code(),
+        Some(99),
+        "expected simulated publish crash exit 99: {}",
+        text(&crash_out)
+    );
+
+    let rec_crashed = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    assert!(
+        rec_crashed.contains("UPDATE_PHASE=publishing\n")
+            && rec_crashed.contains("tx:")
+            && !rec_crashed.contains("p_mnt:")
+            && !rec_crashed.contains("t_mnt:")
+            && !rec_crashed.contains("p_dev:")
+            && !rec_crashed.contains("t_dev:"),
+        "saved cross-invocation stage/backup identity MUST bind inodes+tx marker+vol (never ephemeral mnt_id/dev):\n{rec_crashed}"
+    );
+    let bk_path = PathBuf::from(
+        rec_crashed
+            .lines()
+            .find_map(|l| l.strip_prefix("UPDATE_BACKUP_DIR="))
+            .unwrap(),
+    );
+    let bk_tx_marker = bk_path.join(".qeminga-tx-id");
+    assert!(
+        bk_tx_marker.is_file()
+            && (std::fs::metadata(&bk_tx_marker)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777)
+                == 0o600,
+        "backup container must contain a 0600 .qeminga-tx-id marker surviving remount"
+    );
+    let saved_tx = std::fs::read_to_string(&bk_tx_marker).unwrap();
+
+    // 2. Wrong-volume remount (different persistent UUID) MUST fail closed.
+    let wrong_vol_out = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_MOUNTINFO", mi_boot2.to_str().unwrap()),
+            ("QEMINGA_FS_UUID_MAP", uuid_wrong),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !wrong_vol_out.status.success(),
+        "recovery on a different persistent volume UUID must fail closed: {}",
+        text(&wrong_vol_out)
+    );
+
+    // 3. Tampering `.qeminga-tx-id` on the same volume MUST fail closed and preserve the backup.
+    std::fs::write(&bk_tx_marker, "00000000000000000000000000000000\n").unwrap();
+    let bad_tx_out = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_MOUNTINFO", mi_boot2.to_str().unwrap()),
+            ("QEMINGA_FS_UUID_MAP", uuid_boot2),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !bad_tx_out.status.success(),
+        "recovery with mismatched .qeminga-tx-id must fail closed: {}",
+        text(&bad_tx_out)
+    );
+    assert!(
+        text(&bad_tx_out).contains("transaction identity marker mismatch"),
+        "expected tx marker mismatch error: {}",
+        text(&bad_tx_out)
+    );
+    assert!(
+        std::fs::read_to_string(cfg.join("install.env"))
+            .unwrap()
+            .contains("UPDATE_PHASE=publishing\n"),
+        "failed tx verification must keep UPDATE_PHASE=publishing for inspection"
+    );
+    std::fs::write(&bk_tx_marker, &saved_tx).unwrap();
+
+    // 4. Resuming update under Boot 2 mountinfo (new mount_id 209, new dev 8:50, new /dev/sde1,
+    //    same persistent UUID and valid `.qeminga-tx-id`) MUST recover cleanly and publish v2.
+    let resume_out = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_ACTIVE_FLAG", active_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_MOUNTINFO", mi_boot2.to_str().unwrap()),
+            ("QEMINGA_FS_UUID_MAP", uuid_boot2),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        resume_out.status.success(),
+        "interrupted update MUST recover cleanly across remount with new mount_id/device and same UUID: {}",
+        text(&resume_out)
+    );
+    assert!(
+        inst.join("bin/v2-marker").exists()
+            && !inst.join("bin/v1-marker").exists()
+            && inst.join(".runner").exists()
+            && active_flag.exists(),
+        "remount recovery must publish v2 cleanly, preserve .runner, and restart originally active service"
+    );
+    let leftover: Vec<String> = std::fs::read_dir(&runner_vol)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".qeminga-update-backup.") || n.starts_with(".qeminga-extract."))
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "remount recovery must reclaim both stage and backup siblings: {leftover:?}"
+    );
+
+    // 5. Direct fs_ops check: verify changed fd_mnt_id across invocations (101 -> 999) succeeds
+    //    on the same persistent volume while same-operation parent/child mnt_id mismatch (999 vs 777)
+    //    still fails closed with EXDEV.
+    let py_root = dir.path().join("py-mnt-check");
+    std::fs::create_dir_all(&py_root).unwrap();
+    let py_check = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r##"
+import errno, os, sys
+
+script_text = open(sys.argv[1], "r", encoding="utf-8").read()
+fs_section = script_text.split("fs_ops() {\n", 1)[1].split("\nPY\n", 1)[0]
+py_body = fs_section.split("<<'PY'\n", 1)[1].split("\nop = sys.argv[1]", 1)[0]
+op_body = fs_section.split("\nop = sys.argv[1]", 1)[1]
+
+root = sys.argv[2]
+bk = os.path.join(root, ".qeminga-update-backup.demo")
+os.makedirs(os.path.join(bk, "old"), mode=0o700)
+os.chmod(bk, 0o700)
+open(os.path.join(bk, "old", "marker"), "wb").write(b"v1")
+
+def run_op(argv_args, mnt_id_val, mi_path, uuid_map):
+    ns = {"__name__": "__main__"}
+    old_argv = sys.argv[:]
+    old_env = dict(os.environ)
+    try:
+        os.environ["QEMINGA_MOUNTINFO"] = mi_path
+        os.environ["QEMINGA_TEST_MNT_ID"] = str(mnt_id_val)
+        os.environ["QEMINGA_FS_UUID_MAP"] = uuid_map
+        exec(py_body, ns)
+        ns["fd_mnt_id"] = lambda fd: mnt_id_val
+        sys.argv = ["fs_ops"] + argv_args
+        import io
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            exec("op = sys.argv[1]" + op_body, ns)
+        finally:
+            sys.stdout = old_stdout
+        return buf.getvalue().strip(), ns
+    finally:
+        sys.argv = old_argv
+        os.environ.clear()
+        os.environ.update(old_env)
+
+mi1 = os.path.join(root, "mi1")
+mi2 = os.path.join(root, "mi2")
+open(mi1, "w").write(f"101 1 8:20 / {root} rw - ext4 /dev/sdb1 rw\n")
+open(mi2, "w").write(f"999 1 8:50 / {root} rw - ext4 /dev/sde1 rw\n")
+
+ident, _ = run_op(["path-identity", bk], 101, mi1, "101=cccccccc-1111-2222-3333-444444444444")
+assert "tx:" in ident and "p_mnt:" not in ident and "t_mnt:" not in ident, ident
+
+# Same-operation mismatch: parent mnt_id=999 vs child mnt_id=777 MUST raise EXDEV.
+ns = {"__name__": "__main__"}
+os.environ["QEMINGA_MOUNTINFO"] = mi2
+os.environ["QEMINGA_TEST_MNT_ID"] = "999"
+os.environ["QEMINGA_FS_UUID_MAP"] = "999=cccccccc-1111-2222-3333-444444444444"
+exec(py_body, ns)
+pfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+dfd = os.open(bk, os.O_RDONLY | os.O_DIRECTORY)
+try:
+    entries = ns["parse_mountinfo"]()
+    parsed = ns["parse_path_identity"](ident, bk)
+    try:
+        ns["verify_dir_identity"](pfd, os.fstat(pfd), 999, root, dfd, os.fstat(dfd), 777, bk, parsed, entries, "test")
+        raise AssertionError("same-operation parent/child mnt_id mismatch must raise EXDEV")
+    except OSError as exc:
+        assert exc.errno == errno.EXDEV, exc
+finally:
+    os.close(dfd)
+    os.close(pfd)
+
+# Cross-invocation changed mnt_id (101 -> 999) on same persistent UUID MUST succeed for safe-rmtree-id.
+run_op(["safe-rmtree-id", bk, ident], 999, mi2, "999=cccccccc-1111-2222-3333-444444444444")
+assert not os.path.exists(bk), "safe-rmtree-id must remove backup across changed mnt_id on same persistent volume"
+"##,
+            script().to_str().unwrap(),
+            py_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py_check.status.success(),
+        "direct fs_ops remount identity verification failed: {}",
+        text(&py_check)
+    );
+}
+
+#[test]
+#[ignore = "needs root (CAP_SYS_ADMIN) for real private mount-namespace remount"]
+fn privileged_interrupted_update_recovers_across_remount_in_fresh_mount_namespace() {
+    let caller_user_num = String::from_utf8(
+        Command::new("/usr/bin/id")
+            .arg("-u")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert_eq!(
+        caller_user_num, "0",
+        "privileged remount test must run as root (CAP_SYS_ADMIN)"
+    );
+
     let dir = private_tempdir();
     let bin = dir.path().join("bin");
     let units = dir.path().join("etc-systemd");
@@ -16823,56 +17266,6 @@ esac
     std::fs::write(&aavmf_code, b"code").unwrap();
     std::fs::write(&aavmf_vars, b"vars").unwrap();
 
-    // Check whether nested user+mount namespaces are supported in this environment.
-    let caller_user_num = String::from_utf8(
-        Command::new("/usr/bin/id")
-            .arg("-u")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let caller_group_num = String::from_utf8(
-        Command::new("/usr/bin/id")
-            .arg("-g")
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let inner_prefix = if caller_user_num == "0" {
-        String::new()
-    } else {
-        format!("unshare -U --map-user={caller_user_num} --map-group={caller_group_num} ")
-    };
-    let can_remount_ns = Command::new("unshare")
-        .args([
-            "-Ur",
-            "-m",
-            "bash",
-            "-c",
-            &format!(
-                r#"set -euo pipefail
-mount --bind "$1" "$2"
-{inner_prefix}true"#
-            ),
-            "_",
-            backing.to_str().unwrap(),
-            mount_pt.to_str().unwrap(),
-        ])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    assert!(
-        can_remount_ns,
-        "unshare -Ur -m mount namespace test harness must be supported on Linux runners"
-    );
-
-    let inst = mount_pt.join("runner");
     let state = dir.path().join("state");
     let hooks = dir.path().join("hooks");
     let cfg = dir.path().join("cfg");
@@ -16883,20 +17276,20 @@ mount --bind "$1" "$2"
         std::env::var("PATH").unwrap_or_default()
     );
 
-    // Namespace 1: mount backing -> mount_pt, record kernel mnt_id M1, install v1, and crash update mid-publish!
+    // Namespace 1 (real root mount namespace, private propagation — no userns needed):
+    // mount backing -> mount_pt, record kernel mnt_id M1, install v1, and crash update mid-publish!
     let m1_file = dir.path().join("mnt_id_1");
     let ns1 = Command::new("unshare")
         .args([
-            "-Ur",
             "-m",
+            "--propagation",
+            "private",
             "bash",
             "-c",
             &format!(
                 r#"set -euo pipefail
 mount --bind "$1" "$2"
-{inner_prefix}bash -c '
-set -euo pipefail
-python3 -c "import os; fd=os.open(\"$2\", os.O_RDONLY|os.O_DIRECTORY); print([l.split(\":\")[1].strip() for l in open(f\"/proc/self/fdinfo/{{fd}}\") if l.startswith(\"mnt_id:\")][0])" > "$3"
+python3 -c 'import os, sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); print([l.split(":")[1].strip() for l in open(f"/proc/self/fdinfo/{{fd}}") if l.startswith("mnt_id:")][0])' "$2" > "$3"
 bash "$4" install \
   --repo "{REPO_URL}" \
   --name remount-box \
@@ -16915,7 +17308,6 @@ FAKE_GOOD_TARBALL="${{10}}" QEMINGA_TEST_CRASH_PUBLISH_AFTER=1 bash "$4" update 
   --runner-sha256 "${{11}}"
 rc=$?
 [ "$rc" -eq 99 ]
-' _ "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${{10}}" "${{11}}"
 "#
             ),
             "_",
@@ -16962,7 +17354,6 @@ rc=$?
             && !rec_crashed.contains("t_mnt:"),
         "saved cross-invocation stage/backup identity MUST bind inodes+tx marker+vol (never ephemeral mnt_id):\n{rec_crashed}"
     );
-    // Verify `.qeminga-tx-id` exists (mode 0600) inside the persisted backup directory in backing storage.
     let bk_name = Path::new(
         rec_crashed
             .lines()
@@ -16989,23 +17380,19 @@ rc=$?
     let m2_file = dir.path().join("mnt_id_2");
     let ns2 = Command::new("unshare")
         .args([
-            "-Ur",
             "-m",
+            "--propagation",
+            "private",
             "bash",
             "-c",
-            &format!(
-                r#"set -euo pipefail
+            r#"set -euo pipefail
 mount --bind "$1" "$1"
 mount --bind "$2" "$3"
-{inner_prefix}bash -c '
-set -euo pipefail
-python3 -c "import os; fd=os.open(\"$3\", os.O_RDONLY|os.O_DIRECTORY); print([l.split(\":\")[1].strip() for l in open(f\"/proc/self/fdinfo/{{fd}}\") if l.startswith(\"mnt_id:\")][0])" > "$4"
+python3 -c 'import os, sys; fd=os.open(sys.argv[1], os.O_RDONLY|os.O_DIRECTORY); print([l.split(":")[1].strip() for l in open(f"/proc/self/fdinfo/{fd}") if l.startswith("mnt_id:")][0])' "$3" > "$4"
 bash "$5" update \
   --config-dir "$6" \
   --runner-sha256 "$7"
-' _ "$1" "$2" "$3" "$4" "$5" "$6" "$7"
-"#
-            ),
+"#,
             "_",
             dummy_mp.to_str().unwrap(),
             backing.to_str().unwrap(),
@@ -17024,6 +17411,11 @@ bash "$5" update \
         .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
         .output()
         .unwrap();
+    assert!(
+        ns2.status.success(),
+        "interrupted update MUST recover cleanly across remount in fresh mount namespace: {}",
+        text(&ns2)
+    );
     let m2 = std::fs::read_to_string(&m2_file)
         .unwrap()
         .trim()
@@ -17033,15 +17425,11 @@ bash "$5" update \
         "fresh mount namespace remount must produce a distinct kernel mnt_id (m1={m1}, m2={m2})"
     );
     assert!(
-        ns2.status.success(),
-        "interrupted update MUST recover cleanly across remount with new mnt_id (m1={m1}, m2={m2}): {}",
-        text(&ns2)
-    );
-    assert!(
         backing.join("runner/bin/v2-marker").exists()
             && !backing.join("runner/bin/v1-marker").exists()
+            && backing.join("runner/.runner").exists()
             && active_flag.exists(),
-        "remount recovery must publish v2 cleanly and restart originally active service"
+        "remount recovery must publish v2 cleanly, preserve .runner, and restart originally active service"
     );
     let leftover: Vec<String> = std::fs::read_dir(&backing)
         .unwrap()
@@ -17053,7 +17441,6 @@ bash "$5" update \
         leftover.is_empty(),
         "remount recovery must reclaim both stage and backup siblings: {leftover:?}"
     );
-    let _ = inst;
 }
 
 #[test]
@@ -17580,5 +17967,400 @@ esac
         !mig_modern_bad.status.success(),
         "modern UPDATE_PHASE=publishing record missing UPDATE_BACKUP_ID MUST still be rejected: {}",
         text(&mig_modern_bad)
+    );
+}
+
+#[test]
+fn safe_rmtree_id_deletes_tx_marker_last_and_retries_after_post_marker_unlink_crash() {
+    let dir = private_tempdir();
+    let py_root = dir.path().join("py-rmtree");
+    std::fs::create_dir_all(&py_root).unwrap();
+
+    // Part 1: Direct fs_ops Python harness verifying deletion ordering, post-marker-unlink
+    // retryability, and fail-closed substitution checks.
+    let py_out = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r##"
+import errno, io, os, sys
+
+script_text = open(sys.argv[1], "r", encoding="utf-8").read()
+fs_section = script_text.split("fs_ops() {\n", 1)[1].split("\nPY\n", 1)[0]
+py_body = fs_section.split("<<'PY'\n", 1)[1].split("\nop = sys.argv[1]", 1)[0]
+op_body = fs_section.split("\nop = sys.argv[1]", 1)[1]
+
+root = sys.argv[2]
+
+def exec_fs_op(argv_args, hook=None):
+    ns = {"__name__": "__main__"}
+    old_argv = sys.argv[:]
+    buf = io.StringIO()
+    err_buf = io.StringIO()
+    old_stdout, old_stderr = sys.stdout, sys.stderr
+    try:
+        exec(py_body, ns)
+        if hook is not None:
+            hook(ns)
+        sys.argv = ["fs_ops"] + argv_args
+        sys.stdout = buf
+        sys.stderr = err_buf
+        rc = 0
+        try:
+            exec("op = sys.argv[1]" + op_body, ns)
+        except SystemExit as exc:
+            rc = exc.code if isinstance(exc.code, int) else 1
+        return rc, buf.getvalue().strip(), err_buf.getvalue().strip()
+    finally:
+        sys.argv = old_argv
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+# 1a. Build a private container with payload files, nested subdirs, and a nested file also
+#     named `.qeminga-tx-id` inside a subdir (which must be removed with the payload while
+#     the top-level `.qeminga-tx-id` is unlinked LAST).
+c1 = os.path.join(root, ".qeminga-update-backup.case1")
+os.makedirs(os.path.join(c1, "old", "bin"), mode=0o700)
+os.makedirs(os.path.join(c1, "nested"), mode=0o700)
+os.chmod(c1, 0o700)
+open(os.path.join(c1, "old", "bin", "Runner.Listener"), "wb").write(b"bin")
+open(os.path.join(c1, "nested", ".qeminga-tx-id"), "wb").write(b"nested-payload")
+open(os.path.join(c1, "z_file"), "wb").write(b"z")
+open(os.path.join(c1, "a_file"), "wb").write(b"a")
+
+rc, ident1, err = exec_fs_op(["path-identity", c1])
+assert rc == 0 and ident1, f"path-identity failed: rc={rc} err={err}"
+c1_ino = os.lstat(c1).st_ino
+
+# Simulate crash immediately after top-level `.qeminga-tx-id` is unlinked (before rmdir).
+events = []
+real_unlink = os.unlink
+real_rmdir = os.rmdir
+
+class SimulatedCrash(BaseException):
+    pass
+
+def spy_hook(ns):
+    orig_os = ns["os"]
+    class SpyOs:
+        def __getattr__(self, name):
+            return getattr(orig_os, name)
+        def unlink(self, path, *args, **kwargs):
+            dfd = kwargs.get("dir_fd")
+            is_top_tx = (
+                path == ".qeminga-tx-id"
+                and dfd is not None
+                and os.fstat(dfd).st_ino == c1_ino
+            )
+            events.append(("unlink_top_tx" if is_top_tx else "unlink", path))
+            real_unlink(path, *args, **kwargs)
+            if is_top_tx:
+                raise SimulatedCrash("crash right after top-level tx marker unlink")
+        def rmdir(self, path, *args, **kwargs):
+            events.append(("rmdir", path))
+            return real_rmdir(path, *args, **kwargs)
+    ns["os"] = SpyOs()
+
+crashed = False
+try:
+    exec_fs_op(["safe-rmtree-id", c1, ident1], hook=spy_hook)
+except SimulatedCrash:
+    crashed = True
+assert crashed, f"expected SimulatedCrash right after top-level .qeminga-tx-id unlink; events={events}"
+assert events[-1] == ("unlink_top_tx", ".qeminga-tx-id"), (
+    f"top-level .qeminga-tx-id MUST be unlinked LAST after all payload deletions: {events}"
+)
+assert os.path.isdir(c1) and os.listdir(c1) == [], (
+    f"after post-marker-unlink crash, container must be empty and still exist: {os.listdir(c1) if os.path.isdir(c1) else 'missing'}"
+)
+
+# Retry safe-rmtree-id on the exact same empty container -> MUST succeed!
+rc_retry, _, err_retry = exec_fs_op(["safe-rmtree-id", c1, ident1])
+assert rc_retry == 0, f"retry after post-marker-unlink crash MUST succeed: rc={rc_retry} err={err_retry}"
+assert not os.path.exists(c1), "container must be removed after retry"
+
+# 1b. Security: missing `.qeminga-tx-id` on a NON-EMPTY directory (same inode, 0700) MUST fail closed!
+c2 = os.path.join(root, ".qeminga-update-backup.case2")
+os.makedirs(c2, mode=0o700)
+os.chmod(c2, 0o700)
+open(os.path.join(c2, "important.dat"), "wb").write(b"keep-me")
+rc, ident2, err = exec_fs_op(["path-identity", c2])
+assert rc == 0, err
+os.unlink(os.path.join(c2, ".qeminga-tx-id"))
+rc_nonempty, _, err_nonempty = exec_fs_op(["safe-rmtree-id", c2, ident2])
+assert rc_nonempty != 0, "missing .qeminga-tx-id on non-empty dir MUST fail closed"
+assert "missing transaction identity marker" in err_nonempty, err_nonempty
+assert os.path.isfile(os.path.join(c2, "important.dat")), "payload must remain untouched"
+
+# 1c. Security: tampered `.qeminga-tx-id` MUST fail closed!
+open(os.path.join(c2, ".qeminga-tx-id"), "wb").write(b"00000000000000000000000000000000\n")
+os.chmod(os.path.join(c2, ".qeminga-tx-id"), 0o600)
+rc_tamper, _, err_tamper = exec_fs_op(["safe-rmtree-id", c2, ident2])
+assert rc_tamper != 0 and "transaction identity marker mismatch" in err_tamper, err_tamper
+
+# 1d. Security: substituted EMPTY directory with DIFFERENT inode MUST fail closed!
+c3 = os.path.join(root, ".qeminga-update-backup.case3")
+os.makedirs(c3, mode=0o700)
+os.chmod(c3, 0o700)
+rc, ident3, err = exec_fs_op(["path-identity", c3])
+assert rc == 0, err
+os.unlink(os.path.join(c3, ".qeminga-tx-id"))
+# Hold old inode alive via a renamed sibling so new directory gets a strictly distinct inode.
+c3_old = os.path.join(root, ".qeminga-hold-old-inode")
+os.rename(c3, c3_old)
+os.makedirs(c3, mode=0o700)
+os.chmod(c3, 0o700)
+assert os.lstat(c3).st_ino != os.lstat(c3_old).st_ino
+rc_diff_ino, _, err_diff_ino = exec_fs_op(["safe-rmtree-id", c3, ident3])
+assert rc_diff_ino != 0 and "directory inode changed" in err_diff_ino, err_diff_ino
+assert os.path.isdir(c3), "substituted empty dir with different inode must not be removed"
+
+# 1e. Security: empty directory with SAME inode but relaxed mode (0755, not 0700) MUST fail closed!
+c4 = os.path.join(root, ".qeminga-update-backup.case4")
+os.makedirs(c4, mode=0o700)
+os.chmod(c4, 0o700)
+rc, ident4, err = exec_fs_op(["path-identity", c4])
+assert rc == 0, err
+os.unlink(os.path.join(c4, ".qeminga-tx-id"))
+os.chmod(c4, 0o755)
+rc_mode, _, err_mode = exec_fs_op(["safe-rmtree-id", c4, ident4])
+assert rc_mode != 0 and "missing transaction identity marker" in err_mode, err_mode
+assert os.path.isdir(c4), "non-0700 empty dir without marker must not be removed"
+
+# 1f. Security: non-delete op (`restore-runner-backup`) on an empty 0700 dir missing `.qeminga-tx-id`
+#     MUST STILL fail closed (allow_empty_missing_tx is strictly limited to safe-rmtree-id).
+os.chmod(c4, 0o700)
+fake_runner = os.path.join(root, "runner")
+os.makedirs(fake_runner, mode=0o755)
+rc_vol, vol_id, err_vol = exec_fs_op(["volume-id", fake_runner])
+assert rc_vol == 0 and vol_id, err_vol
+rc_restore, _, err_restore = exec_fs_op(["restore-runner-backup", fake_runner, vol_id, c4, ident4, "", "0"])
+assert rc_restore != 0 and "missing transaction identity marker" in err_restore, err_restore
+"##,
+            script().to_str().unwrap(),
+            py_root.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py_out.status.success(),
+        "safe-rmtree-id post-marker-unlink retry/security harness failed: {}",
+        text(&py_out)
+    );
+
+    // Part 2: End-to-end `setup-kvm-runner.sh` committed-update recovery AND uninstall recovery
+    // when the recorded backup container was left empty right after `.qeminga-tx-id` unlink.
+    let bin = dir.path().join("bin");
+    let units = dir.path().join("etc-systemd");
+    let rt_root = dir.path().join("run");
+    let v1_src = dir.path().join("v1-src");
+    let v2_src = dir.path().join("v2-src");
+    for d in [
+        &bin,
+        &units,
+        &rt_root,
+        &v1_src.join("bin"),
+        &v1_src.join("externals"),
+        &v2_src.join("bin"),
+        &v2_src.join("externals"),
+    ] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    install_standard_mock_bin(&bin);
+
+    let build_pkg = |src: &Path, tag: &str, name: &str| -> (PathBuf, String) {
+        write_exec(&src.join("bin/Runner.Listener"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("bin/runsvc.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(&src.join("run.sh"), &format!("#!/bin/sh\necho {tag}\n"));
+        write_exec(&src.join("env.sh"), "#!/bin/sh\nexit 0\n");
+        write_exec(
+            &src.join("config.sh"),
+            r#"#!/bin/sh
+dir="$(dirname "$0")"
+printf '{"gitHubUrl":"https://github.com/vicaya/qeminga-kvm-controller","agentName":"prune-box","workFolder":"%s","disableUpdate":true,"ephemeral":false}\n' "${HOME}/work" > "$dir/.runner"
+exit 0
+"#,
+        );
+        std::fs::write(src.join(format!("bin/{tag}-marker")), tag.as_bytes()).unwrap();
+        let tb = dir.path().join(name);
+        assert!(
+            Command::new("tar")
+                .args(["-czf", tb.to_str().unwrap(), "-C"])
+                .arg(src)
+                .arg(".")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sha = sha256_of(&std::fs::read(&tb).unwrap());
+        (tb, sha)
+    };
+    let (v1_tb, v1_sha) = build_pkg(&v1_src, "v1", "v1.tar.gz");
+    let (v2_tb, v2_sha) = build_pkg(&v2_src, "v2", "v2.tar.gz");
+
+    let user_flag = dir.path().join("user_gecos");
+    let cg_ctrls = dir.path().join("cgroup.controllers");
+    std::fs::write(&cg_ctrls, "cpu memory pids\n").unwrap();
+    let reg_file = dir.path().join("reg-in");
+    std::fs::write(&reg_file, "FAKE_REG\n").unwrap();
+    std::fs::set_permissions(&reg_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let inst = dir.path().join("opt-runner");
+    let state = dir.path().join("state");
+    let hooks = dir.path().join("hooks");
+    let cfg = dir.path().join("cfg");
+    let unit_dir = units.to_str().unwrap();
+
+    let inst_out = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "prune-box",
+            "--service",
+            "qeminga-prune-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(inst_out.status.success(), "{}", text(&inst_out));
+
+    // Create a genuine backup container stamped with path-identity, then simulate interruption
+    // right after `.qeminga-tx-id` unlink (empty 0700 dir with matching inode) in `committed` phase.
+    let bk_upd = dir.path().join(".qeminga-update-backup.posttx1");
+    std::fs::create_dir(&bk_upd).unwrap();
+    std::fs::set_permissions(&bk_upd, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let id_out = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops path-identity "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            bk_upd.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(id_out.status.success(), "{}", text(&id_out));
+    let bk_upd_id = String::from_utf8(id_out.stdout).unwrap().trim().to_string();
+    std::fs::remove_file(bk_upd.join(".qeminga-tx-id")).unwrap();
+
+    let rec_orig = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let rec_committed = rec_orig.replace(
+        "RECORD_STATE=installed\n",
+        &format!(
+            "RECORD_STATE=updating\nUPDATE_PHASE=committed\nUPDATE_BACKUP_DIR={}\nUPDATE_BACKUP_ID={}\nUPDATE_WAS_ACTIVE=0\n",
+            bk_upd.display(),
+            bk_upd_id
+        ),
+    );
+    std::fs::write(cfg.join("install.env"), &rec_committed).unwrap();
+
+    let upd_out = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        upd_out.status.success(),
+        "committed-update recovery must finish pruning an empty post-marker-unlink backup container: {}",
+        text(&upd_out)
+    );
+    assert!(
+        !bk_upd.exists(),
+        "post-marker-unlink backup must be removed"
+    );
+    assert!(inst.join("bin/v2-marker").exists());
+
+    // Now test `uninstall` against an empty post-marker-unlink backup container in `committed` phase.
+    let bk_uninst = dir.path().join(".qeminga-update-backup.posttx2");
+    std::fs::create_dir(&bk_uninst).unwrap();
+    std::fs::set_permissions(&bk_uninst, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let id_out2 = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops path-identity "$2""#,
+            "_",
+            script().to_str().unwrap(),
+            bk_uninst.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(id_out2.status.success(), "{}", text(&id_out2));
+    let bk_uninst_id = String::from_utf8(id_out2.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::remove_file(bk_uninst.join(".qeminga-tx-id")).unwrap();
+
+    let rec_after_upd = std::fs::read_to_string(cfg.join("install.env")).unwrap();
+    let rec_uninst = rec_after_upd.replace(
+        "RECORD_STATE=installed\n",
+        &format!(
+            "RECORD_STATE=updating\nUPDATE_PHASE=committed\nUPDATE_BACKUP_DIR={}\nUPDATE_BACKUP_ID={}\nUPDATE_WAS_ACTIVE=0\n",
+            bk_uninst.display(),
+            bk_uninst_id
+        ),
+    );
+    std::fs::write(cfg.join("install.env"), &rec_uninst).unwrap();
+
+    let uninst_out = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        uninst_out.status.success(),
+        "uninstall must finish pruning an empty post-marker-unlink backup container: {}",
+        text(&uninst_out)
+    );
+    assert!(
+        !bk_uninst.exists(),
+        "uninstall must remove empty post-marker-unlink backup container"
     );
 }

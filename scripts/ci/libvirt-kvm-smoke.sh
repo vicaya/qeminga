@@ -33,6 +33,8 @@
 # Environment overrides:
 #   QEMINGA_E2E_CONNECT               qemu:///session (default) or qemu:///system
 #   QEMINGA_E2E_IMAGES                run image root (default per connect URI)
+#   QEMINGA_E2E_QEMU_USER             override system-mode QEMU user (or +UID)
+#   QEMINGA_E2E_QEMU_GROUP            override system-mode QEMU group (or +GID)
 #   QEMINGA_E2E_BOOT_TIMEOUT_SECS     default 300 (5 min under KVM)
 #   QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS default 120 (2 min under KVM)
 #
@@ -338,230 +340,748 @@ cmd_result() {
 
 mark() { mkdir -p "$OUT/tests"; echo "$2" >"$OUT/tests/$1"; echo "-- $1: $2"; }
 
-QEMU_USER="root"
 QEMU_UID=0
 QEMU_GID=0
 QEMU_GROUPS="0"
 
-# Resolve the user/group identity that system libvirt runs QEMU as (honoring
-# QEMINGA_E2E_QEMU_USER/GROUP overrides, active entries in qemu.conf, and
-# standard distro libvirt accounts).
+# Resolve the user/group DAC identity that the connected system libvirt daemon
+# uses for KVM guests:
+#   1. Explicit overrides (`QEMINGA_E2E_QEMU_USER` / `QEMINGA_E2E_QEMU_GROUP`)
+#   2. Connected daemon's `dac` KVM `<baselabel>` from `virsh capabilities`
+#      (falling back to `qemu` or untyped `dac` baselabel)
+#   3. Active `user`/`group` entries in `QEMINGA_LIBVIRT_QEMU_CONF`
+#      (`/etc/libvirt/qemu.conf`)
+#   4. Standard distro accounts (`libvirt-qemu`, `qemu`, `root`)
+# Follows libvirt's numeric-ID rules: `+NNN` is always numeric; an unprefixed
+# decimal integer falls back to a numeric UID/GID when NSS name lookup fails.
 resolve_system_qemu_identity() {
     local conf="${QEMINGA_LIBVIRT_QEMU_CONF:-/etc/libvirt/qemu.conf}"
-    local user="${QEMINGA_E2E_QEMU_USER:-}"
-    local group="${QEMINGA_E2E_QEMU_GROUP:-}"
-    if [ -z "$user" ] || [ -z "$group" ]; then
-        if [ -r "$conf" ]; then
-            local parsed conf_user conf_group
-            parsed="$(python3 -I - "$conf" <<'PY'
-import re, sys
-u = g = ""
-for raw in open(sys.argv[1], "r", encoding="utf-8", errors="replace"):
-    line = raw.split("#", 1)[0].strip()
-    if not line:
-        continue
-    m = re.match(r'^(user|group)\s*=\s*(["\'])(.*?)\2\s*$', line)
-    if m:
-        if m.group(1) == "user":
-            u = m.group(3).strip()
-        else:
-            g = m.group(3).strip()
-print(f"{u}\t{g}")
-PY
-)"
-            conf_user="${parsed%%$'\t'*}"
-            conf_group="${parsed#*$'\t'}"
-            [ -z "$user" ] && user="$conf_user"
-            [ -z "$group" ] && group="$conf_group"
-        fi
+    local override_user="${QEMINGA_E2E_QEMU_USER:-}"
+    local override_group="${QEMINGA_E2E_QEMU_GROUP:-}"
+    local caps_xml=""
+    if [ -z "$override_user" ] || [ -z "$override_group" ]; then
+        caps_xml="$(v capabilities 2>/dev/null || true)"
     fi
-    if [ -z "$user" ]; then
-        if id -u libvirt-qemu >/dev/null 2>&1; then
-            user="libvirt-qemu"
-        elif id -u qemu >/dev/null 2>&1; then
-            user="qemu"
-        else
-            user="root"
-        fi
-    fi
+    local resolved=""
+    if ! resolved="$(python3 -I - "$conf" "$override_user" "$override_group" 3<<<"$caps_xml" <<'PY'
+import grp, os, pwd, re, sys, xml.etree.ElementTree as ET
 
-    local uid="" gid="" groups="" resolved_name=""
-    if [[ "$user" =~ ^\+[0-9]+$ ]]; then
-        uid="${user#+}"
-        resolved_name="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 || true)"
-    else
-        uid="$(id -u "$user" 2>/dev/null)" || die "cannot resolve system libvirt QEMU user '$user'"
-        resolved_name="$user"
-    fi
+conf_path, user, group = sys.argv[1], sys.argv[2], sys.argv[3]
+with os.fdopen(3, "r", encoding="utf-8", errors="replace") as caps_fh:
+    caps_xml = caps_fh.read()
 
-    if [ -n "$group" ]; then
-        if [[ "$group" =~ ^\+[0-9]+$ ]]; then
-            gid="${group#+}"
-        else
-            gid="$(getent group "$group" 2>/dev/null | cut -d: -f3 || true)"
-            [ -n "$gid" ] || die "cannot resolve system libvirt QEMU group '$group'"
-        fi
-    elif [ -n "$resolved_name" ]; then
-        gid="$(id -g "$resolved_name" 2>/dev/null)" || die "cannot resolve primary group for QEMU user '$resolved_name'"
-    else
-        gid="$uid"
-    fi
-
-    groups="$gid"
-    if [ -n "$resolved_name" ]; then
-        local sup
-        sup="$(id -G "$resolved_name" 2>/dev/null | tr ' ' ',' || true)"
-        if [ -n "$sup" ]; then
-            groups="${gid},${sup}"
-        fi
-    fi
-
-    QEMU_USER="$user"
-    QEMU_UID="$uid"
-    QEMU_GID="$gid"
-    QEMU_GROUPS="$groups"
-}
-
-# Verify that (QEMU_UID, QEMU_GROUPS) has effective search (+x) permission on
-# every existing directory component from `/` down to the deepest existing
-# prefix of `$1` (evaluating both standard POSIX modes and POSIX access ACLs).
-# Prints the first blocking directory path on failure and returns 1.
-check_qemu_traversal_chain() {
-    local target="$1"
-    python3 -I - "$target" "$QEMU_UID" "$QEMU_GROUPS" <<'PY'
-import os, stat, struct, sys
-
-target = os.path.normpath(sys.argv[1])
-uid = int(sys.argv[2])
-groups = {int(x) for x in sys.argv[3].split(",") if x}
-
-if uid == 0:
-    sys.exit(0)
-
-def can_traverse(path):
-    st = os.stat(path)
-    if not stat.S_ISDIR(st.st_mode):
-        return False
+def parse_dac_baselabel(xml_text):
+    if not xml_text or "<" not in xml_text:
+        return "", ""
     try:
-        raw = os.getxattr(path, b"system.posix_acl_access")
-    except OSError:
-        raw = None
-    if raw and len(raw) >= 4:
-        (ver,) = struct.unpack_from("<I", raw, 0)
-        if ver == 2:
-            mask = 0o7
-            entries = []
-            for off in range(4, len(raw), 8):
-                if off + 8 <= len(raw):
-                    tag, perm, eid = struct.unpack_from("<HHI", raw, off)
-                    entries.append((tag, perm, eid))
-                    if tag == 0x10:
-                        mask = perm
-            if uid == st.st_uid:
-                for tag, perm, _ in entries:
-                    if tag == 0x01:
-                        return bool(perm & 1)
-            for tag, perm, eid in entries:
-                if tag == 0x02 and eid == uid:
-                    return bool((perm & mask) & 1)
-            matched_grp = False
-            for tag, perm, eid in entries:
-                if (tag == 0x04 and st.st_gid in groups) or (tag == 0x08 and eid in groups):
-                    matched_grp = True
-                    if (perm & mask) & 1:
-                        return True
-            if matched_grp:
-                return False
-            for tag, perm, _ in entries:
-                if tag == 0x20:
-                    return bool(perm & 1)
-            return False
-    if uid == st.st_uid:
-        return bool(st.st_mode & 0o100)
-    if st.st_gid in groups:
-        return bool(st.st_mode & 0o010)
-    return bool(st.st_mode & 0o001)
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return "", ""
+    for secmodel in root.findall(".//secmodel"):
+        model_el = secmodel.find("model")
+        if model_el is None or (model_el.text or "").strip() != "dac":
+            continue
+        labels = {}
+        for bl in secmodel.findall("baselabel"):
+            txt = (bl.text or "").strip()
+            if ":" not in txt:
+                continue
+            btype = bl.attrib.get("type", "")
+            labels[btype] = txt
+        chosen = labels.get("kvm") or labels.get("qemu") or labels.get("") or ""
+        if ":" in chosen:
+            u, g = chosen.split(":", 1)
+            return u.strip(), g.strip()
+    return "", ""
 
-parts = [p for p in target.split("/") if p]
-cur = "/"
-if not can_traverse(cur):
-    print(cur)
-    sys.exit(1)
-for part in parts:
-    nxt = os.path.join(cur, part)
-    if not os.path.exists(nxt):
-        break
-    if not can_traverse(nxt):
-        print(nxt)
-        sys.exit(1)
-    cur = nxt
+if not user or not group:
+    cap_u, cap_g = parse_dac_baselabel(caps_xml)
+    if not user and cap_u:
+        user = cap_u
+    if not group and cap_g:
+        group = cap_g
 
-resolved = os.path.realpath(cur)
-if resolved != cur:
-    rcur = "/"
-    if not can_traverse(rcur):
-        print(rcur)
-        sys.exit(1)
-    for part in [p for p in resolved.split("/") if p]:
-        rnxt = os.path.join(rcur, part)
-        if not can_traverse(rnxt):
-            print(rnxt)
+if (not user or not group) and conf_path and os.path.isfile(conf_path) and os.access(conf_path, os.R_OK):
+    conf_u = conf_g = ""
+    with open(conf_path, "r", encoding="utf-8", errors="replace") as fh:
+        for raw in fh:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            m = re.match(r'^(user|group)\s*=\s*(["\'])(.*?)\2\s*$', line)
+            if m:
+                if m.group(1) == "user":
+                    conf_u = m.group(3).strip()
+                else:
+                    conf_g = m.group(3).strip()
+    if not user and conf_u:
+        user = conf_u
+    if not group and conf_g:
+        group = conf_g
+
+if not user:
+    for candidate in ("libvirt-qemu", "qemu"):
+        try:
+            pwd.getpwnam(candidate)
+            user = candidate
+            break
+        except KeyError:
+            pass
+    if not user:
+        user = "root"
+
+pw = None
+if re.fullmatch(r"\+[0-9]+", user):
+    uid = int(user[1:])
+    try:
+        pw = pwd.getpwuid(uid)
+    except KeyError:
+        pw = None
+else:
+    try:
+        pw = pwd.getpwnam(user)
+        uid = pw.pw_uid
+    except KeyError:
+        if re.fullmatch(r"[0-9]+", user):
+            uid = int(user)
+            try:
+                pw = pwd.getpwuid(uid)
+            except KeyError:
+                pw = None
+        else:
+            sys.stderr.write(f"libvirt-kvm-smoke: cannot resolve system libvirt QEMU user '{user}'\n")
             sys.exit(1)
-        rcur = rnxt
+
+if group:
+    if re.fullmatch(r"\+[0-9]+", group):
+        gid = int(group[1:])
+    else:
+        try:
+            gid = grp.getgrnam(group).gr_gid
+        except KeyError:
+            if re.fullmatch(r"[0-9]+", group):
+                gid = int(group)
+            else:
+                sys.stderr.write(f"libvirt-kvm-smoke: cannot resolve system libvirt QEMU group '{group}'\n")
+                sys.exit(1)
+elif pw is not None:
+    gid = pw.pw_gid
+else:
+    gid = uid
+
+groups = {gid}
+if pw is not None:
+    groups.add(pw.pw_gid)
+    try:
+        groups.update(os.getgrouplist(pw.pw_name, gid))
+    except OSError:
+        pass
+
+print(f"{uid}\t{gid}\t{','.join(str(g) for g in sorted(groups))}")
+PY
+    )"; then
+        exit 1
+    fi
+    IFS=$'\t' read -r QEMU_UID QEMU_GID QEMU_GROUPS <<<"$resolved"
+}
+
+# FD-anchored filesystem operations for the root-run `qemu:///system` lane:
+# - Validates every existing ancestor (including intermediate directories visited
+#   through symlink hops) for trusted ownership, protection against replacement
+#   by non-trusted accounts, and QEMU traversal (plus a real Linux kernel child
+#   verdict when running as real root).
+# - Prepares newly created image-root and per-run directories privately via
+#   `.qeminga-e2e-init.<hex>`, clears inherited default ACLs, replaces the full
+#   access ACL with owner rwx + QEMU --x + mask --x (falling back to group-only
+#   `0710` on no-ACL filesystems — never `0711`), and publishes atomically via
+#   `renameat2(RENAME_NOREPLACE)` so a failed grant never leaves a blocking
+#   `0700` public directory behind.
+# - Performs guest file `fchmod 0600`, extended-ACL stripping, and `fchown`
+#   directly on verified open `O_NOFOLLOW` regular-file descriptors.
+sys_fs_ops() {
+    python3 -I - "$@" <<'PY'
+from collections import deque
+import ctypes
+import errno
+import os
+import stat
+import struct
+import sys
+
+READ_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+RENAME_NOREPLACE = 1
+SYMLOOP_MAX = 40
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_RENAMEAT2 = getattr(_LIBC, "renameat2", None)
+if _RENAMEAT2 is not None:
+    _RENAMEAT2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    _RENAMEAT2.restype = ctypes.c_int
+
+
+def renameat2_noreplace(src_dir_fd, src_name, dst_dir_fd, dst_name):
+    if _RENAMEAT2 is not None:
+        rc = _RENAMEAT2(
+            src_dir_fd,
+            os.fsencode(src_name),
+            dst_dir_fd,
+            os.fsencode(dst_name),
+            RENAME_NOREPLACE,
+        )
+        if rc == 0:
+            return
+        err = ctypes.get_errno()
+        if err not in (errno.ENOSYS, errno.EINVAL):
+            raise OSError(err, os.strerror(err), dst_name)
+    try:
+        os.lstat(dst_name, dir_fd=dst_dir_fd)
+    except FileNotFoundError:
+        os.rename(src_name, dst_name, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        return
+    raise FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST), dst_name)
+
+
+def encode_acl(entries):
+    return struct.pack("<I", 2) + b"".join(
+        struct.pack("<HHI", tag, perm, eid) for tag, perm, eid in entries
+    )
+
+
+def decode_acl_fd(fd, attr=b"system.posix_acl_access"):
+    try:
+        raw = os.getxattr(fd, attr)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, errno.EOPNOTSUPP, errno.ENOSYS):
+            return None
+        raise
+    if not raw or len(raw) < 4:
+        return None
+    (ver,) = struct.unpack_from("<I", raw, 0)
+    if ver != 2:
+        return None
+    entries = []
+    for off in range(4, len(raw), 8):
+        if off + 8 <= len(raw):
+            entries.append(struct.unpack_from("<HHI", raw, off))
+    return entries
+
+
+def remove_xattr_if_present(fd, attr):
+    try:
+        os.removexattr(fd, attr)
+    except OSError as exc:
+        if exc.errno not in (errno.ENODATA, errno.EOPNOTSUPP, errno.ENOSYS):
+            raise
+
+
+def effective_perms_fd(fd, st, uid, groups):
+    if uid == 0:
+        return 7
+    entries = decode_acl_fd(fd, b"system.posix_acl_access")
+    if entries:
+        mask = 7
+        for tag, perm, _ in entries:
+            if tag == 0x10:
+                mask = perm
+        if uid == st.st_uid:
+            for tag, perm, _ in entries:
+                if tag == 0x01:
+                    return perm
+            return 0
+        for tag, perm, eid in entries:
+            if tag == 0x02 and eid == uid:
+                return perm & mask
+        matched = [
+            perm & mask
+            for tag, perm, eid in entries
+            if (tag == 0x04 and st.st_gid in groups) or (tag == 0x08 and eid in groups)
+        ]
+        if matched:
+            val = 0
+            for m in matched:
+                val |= m
+            return val
+        for tag, perm, _ in entries:
+            if tag == 0x20:
+                return perm
+        return 0
+    if uid == st.st_uid:
+        return (st.st_mode >> 6) & 7
+    if st.st_gid in groups:
+        return (st.st_mode >> 3) & 7
+    return st.st_mode & 7
+
+
+def can_traverse_fd(fd, st, uid, groups):
+    return stat.S_ISDIR(st.st_mode) and bool(effective_perms_fd(fd, st, uid, groups) & 1)
+
+
+def trusted_owner_uids():
+    euid = os.geteuid()
+    return {0} if euid == 0 else {0, euid}
+
+
+def dir_trust_info(fd, st, trusted_uids):
+    if st.st_uid not in trusted_uids:
+        return False, True, f"owned by untrusted uid {st.st_uid}"
+    entries = decode_acl_fd(fd, b"system.posix_acl_access")
+    if entries:
+        mask = 7
+        for tag, perm, _ in entries:
+            if tag == 0x10:
+                mask = perm
+        for tag, perm, eid in entries:
+            if tag == 0x20 and (perm & 2):
+                return True, True, "world-writable via POSIX ACL"
+            if tag == 0x02 and eid not in trusted_uids and ((perm & mask) & 2):
+                return True, True, f"writable by named uid {eid} via POSIX ACL"
+            if tag == 0x04 and ((perm & mask) & 2):
+                return True, True, f"group-writable (gid {st.st_gid}) via POSIX ACL"
+            if tag == 0x08 and ((perm & mask) & 2):
+                return True, True, f"writable by named gid {eid} via POSIX ACL"
+        return True, False, ""
+    if st.st_mode & 0o002:
+        return True, True, f"world-writable (mode {oct(st.st_mode & 0o7777)})"
+    if st.st_mode & 0o020:
+        return True, True, f"group-writable (mode {oct(st.st_mode & 0o7777)})"
+    return True, False, ""
+
+
+def kernel_verdict_traversal(original_path, qemu_uid, qemu_gid, qemu_groups):
+    if os.geteuid() != 0 or qemu_uid == 0:
+        return
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        code = 0
+        msg = b""
+        try:
+            os.setgroups(sorted(qemu_groups))
+            os.setgid(qemu_gid)
+            os.setuid(qemu_uid)
+            st = os.stat(original_path)
+            if not stat.S_ISDIR(st.st_mode):
+                raise OSError(errno.ENOTDIR, f"'{original_path}' is not a directory")
+            if not os.access(original_path, os.X_OK):
+                raise OSError(errno.EACCES, f"kernel denied X_OK on '{original_path}'")
+        except OSError as exc:
+            code = 1
+            msg = f"{exc.strerror or exc} (errno {exc.errno})".encode("utf-8", errors="replace")
+        except Exception as exc:
+            code = 1
+            msg = str(exc).encode("utf-8", errors="replace")
+        try:
+            if msg:
+                os.write(w_fd, msg)
+        finally:
+            os.close(w_fd)
+            os._exit(code)
+    os.close(w_fd)
+    chunks = []
+    try:
+        while True:
+            chunk = os.read(r_fd, 4096)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(r_fd)
+    _, status = os.waitpid(pid, 0)
+    if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
+        detail = b"".join(chunks).decode("utf-8", errors="replace").strip() or f"status={status}"
+        raise OSError(
+            errno.EACCES,
+            f"kernel denied traversal of '{original_path}' for uid {qemu_uid}: {detail}",
+        )
+
+
+def verify_dir_fd(dfd, path_label, qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=True):
+    st = os.fstat(dfd)
+    if not stat.S_ISDIR(st.st_mode):
+        raise OSError(errno.ENOTDIR, f"image root component '{path_label}' is not a directory")
+    trusted_owner, is_writable, reason = dir_trust_info(dfd, st, trusted_uids)
+    if not trusted_owner:
+        raise OSError(
+            errno.EACCES,
+            f"refusing untrusted ancestor directory '{path_label}' ({reason}); choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+        )
+    if is_writable:
+        if not (allow_sticky_writable and bool(st.st_mode & stat.S_ISVTX)):
+            raise OSError(
+                errno.EACCES,
+                f"refusing shared writable ancestor directory '{path_label}' ({reason}); choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+            )
+    if not can_traverse_fd(dfd, st, qemu_uid, qemu_groups):
+        raise OSError(
+            errno.EACCES,
+            f"QEMU uid {qemu_uid} cannot traverse existing ancestor directory '{path_label}'; adjust its permissions or ACLs or choose a traversable QEMINGA_E2E_IMAGES path",
+        )
+    return st, is_writable, reason
+
+
+def walk_existing_prefix(target, qemu_uid, qemu_groups, trusted_uids):
+    # Walk `target` component by component resolving every symlink hop
+    # explicitly so intermediate directories visited between symlinks are
+    # checked for BOTH control/trust and QEMU traversal.
+    norm = os.path.normpath(target)
+    if not norm.startswith("/"):
+        raise OSError(errno.EINVAL, f"path must be absolute: '{target}'")
+    parts = [p for p in norm.split("/") if p]
+    pending = deque(
+        (part, "/" + "/".join(parts[: idx + 1]), False) for idx, part in enumerate(parts)
+    )
+    cur_fd = os.open("/", READ_DIR_FLAGS)
+    try:
+        cur_path = "/"
+        cur_st, cur_writable, cur_reason = verify_dir_fd(
+            cur_fd, cur_path, qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=True
+        )
+        deepest_lexical = "/"
+        remaining = []
+        symlinks = 0
+        while pending:
+            comp, orig_prefix, from_symlink = pending.popleft()
+            if comp == ".":
+                if orig_prefix is not None:
+                    deepest_lexical = orig_prefix
+                continue
+            if comp == "..":
+                next_fd = os.open("..", READ_DIR_FLAGS, dir_fd=cur_fd)
+                next_path = os.path.dirname(cur_path) or "/"
+                try:
+                    nst, nwritable, nreason = verify_dir_fd(
+                        next_fd, next_path, qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=True
+                    )
+                except Exception:
+                    os.close(next_fd)
+                    raise
+                os.close(cur_fd)
+                cur_fd, cur_path, cur_st, cur_writable, cur_reason = (
+                    next_fd, next_path, nst, nwritable, nreason
+                )
+                if orig_prefix is not None:
+                    deepest_lexical = orig_prefix
+                continue
+            try:
+                lst = os.lstat(comp, dir_fd=cur_fd)
+            except FileNotFoundError:
+                if from_symlink:
+                    raise OSError(errno.ENOENT, f"dangling symlink encountered while resolving '{target}' at '{os.path.join(cur_path, comp)}'")
+                remaining = [comp] + [p[0] for p in pending]
+                break
+            if stat.S_ISLNK(lst.st_mode):
+                symlinks += 1
+                if symlinks > SYMLOOP_MAX:
+                    raise OSError(errno.ELOOP, f"too many symbolic links resolving '{target}'")
+                if lst.st_uid not in trusted_uids:
+                    raise OSError(
+                        errno.EACCES,
+                        f"refusing untrusted symlink '{os.path.join(cur_path, comp)}' owned by uid {lst.st_uid}",
+                    )
+                link_target = os.readlink(comp, dir_fd=cur_fd)
+                if not link_target:
+                    raise OSError(errno.ENOENT, f"empty symlink at '{os.path.join(cur_path, comp)}'")
+                link_parts = [p for p in link_target.split("/") if p]
+                if link_target.startswith("/"):
+                    root_fd = os.open("/", READ_DIR_FLAGS)
+                    try:
+                        rst, rwritable, rreason = verify_dir_fd(
+                            root_fd, "/", qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=True
+                        )
+                    except Exception:
+                        os.close(root_fd)
+                        raise
+                    os.close(cur_fd)
+                    cur_fd, cur_path, cur_st, cur_writable, cur_reason = (
+                        root_fd, "/", rst, rwritable, rreason
+                    )
+                if not link_parts:
+                    if orig_prefix is not None:
+                        deepest_lexical = orig_prefix
+                    continue
+                for idx in range(len(link_parts) - 1, -1, -1):
+                    attach = orig_prefix if idx == len(link_parts) - 1 else None
+                    pending.appendleft((link_parts[idx], attach, True))
+                continue
+            next_path = os.path.join(cur_path, comp)
+            if not stat.S_ISDIR(lst.st_mode):
+                raise OSError(errno.ENOTDIR, f"image root component '{next_path}' is not a directory")
+            next_fd = os.open(comp, READ_DIR_FLAGS, dir_fd=cur_fd)
+            try:
+                nst = os.fstat(next_fd)
+                if nst.st_dev != lst.st_dev or nst.st_ino != lst.st_ino:
+                    raise OSError(errno.EXDEV, f"directory '{next_path}' changed during verification")
+                nst, nwritable, nreason = verify_dir_fd(
+                    next_fd, next_path, qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=True
+                )
+            except Exception:
+                os.close(next_fd)
+                raise
+            os.close(cur_fd)
+            cur_fd, cur_path, cur_st, cur_writable, cur_reason = (
+                next_fd, next_path, nst, nwritable, nreason
+            )
+            if orig_prefix is not None:
+                deepest_lexical = orig_prefix
+
+        # The deepest existing directory will host newly created components or
+        # the per-run directory, so it MUST NOT be writable by other accounts
+        # even when the sticky bit is set.
+        if cur_writable:
+            raise OSError(
+                errno.EACCES,
+                f"refusing shared writable directory '{cur_path}' ({cur_reason}); choose a root-owned non-shared QEMINGA_E2E_IMAGES path",
+            )
+        return cur_fd, cur_path, deepest_lexical, remaining
+    except Exception:
+        os.close(cur_fd)
+        raise
+
+
+def provision_private_dir_fd(tfd, qemu_uid, qemu_gid, qemu_groups):
+    if os.geteuid() == 0:
+        os.fchown(tfd, 0, 0)
+    os.fchmod(tfd, 0o700)
+    # Always strip any inherited default ACL BEFORE creating children or
+    # adjusting access permissions so unrelated accounts never inherit access.
+    remove_xattr_if_present(tfd, b"system.posix_acl_default")
+    if qemu_uid == 0:
+        remove_xattr_if_present(tfd, b"system.posix_acl_access")
+        os.fchmod(tfd, 0o700)
+        return
+
+    disable_acl = os.environ.get("QEMINGA_TEST_DISABLE_ACL") == "1"
+    acl_applied = False
+    if not disable_acl:
+        # Complete replacement access ACL:
+        #   user::rwx, user:<qemu_uid>:--x, group::---, mask::--x, other::---
+        # Replacing the full ACL drops any inherited named user/group entries
+        # and pins the mask strictly to search (--x).
+        acl_bytes = encode_acl(
+            [
+                (0x01, 0o7, 0xFFFFFFFF),
+                (0x02, 0o1, qemu_uid),
+                (0x04, 0o0, 0xFFFFFFFF),
+                (0x10, 0o1, 0xFFFFFFFF),
+                (0x20, 0o0, 0xFFFFFFFF),
+            ]
+        )
+        try:
+            os.setxattr(tfd, b"system.posix_acl_access", acl_bytes)
+            acl_applied = True
+        except OSError as exc:
+            if exc.errno not in (errno.EOPNOTSUPP, errno.ENOSYS):
+                raise
+
+    if acl_applied:
+        if decode_acl_fd(tfd, b"system.posix_acl_default") is not None:
+            raise OSError(errno.EIO, "inherited default ACL remained after removal")
+        entries = decode_acl_fd(tfd, b"system.posix_acl_access") or []
+        expected = {
+            (0x01, 0o7, 0xFFFFFFFF),
+            (0x02, 0o1, qemu_uid),
+            (0x04, 0o0, 0xFFFFFFFF),
+            (0x10, 0o1, 0xFFFFFFFF),
+            (0x20, 0o0, 0xFFFFFFFF),
+        }
+        if set(entries) != expected:
+            raise OSError(errno.EIO, f"unexpected POSIX access ACL after replacement: {entries}")
+    else:
+        # No-ACL fallback: ALWAYS group-only search (`0710`, owning group
+        # `qemu_gid` even when `qemu_gid == 0`), NEVER world-searchable `0711`.
+        remove_xattr_if_present(tfd, b"system.posix_acl_access")
+        owner_uid = 0 if os.geteuid() == 0 else -1
+        os.fchown(tfd, owner_uid, qemu_gid)
+        os.fchmod(tfd, 0o710)
+        st = os.fstat(tfd)
+        if st.st_gid != qemu_gid or (st.st_mode & 0o7777) != 0o710:
+            raise OSError(errno.EIO, f"failed to apply 0710 group {qemu_gid} fallback")
+
+    st = os.fstat(tfd)
+    if not can_traverse_fd(tfd, st, qemu_uid, qemu_groups):
+        raise OSError(errno.EACCES, f"QEMU uid {qemu_uid} still cannot traverse newly provisioned directory")
+
+
+def create_component_in_fd(parent_fd, parent_path, comp, qemu_uid, qemu_gid, qemu_groups, fail_if_exists=False):
+    tmp_name = f".qeminga-e2e-init.{os.urandom(8).hex()}"
+    os.mkdir(tmp_name, 0o700, dir_fd=parent_fd)
+    published = False
+    tfd = None
+    try:
+        tfd = os.open(tmp_name, READ_DIR_FLAGS, dir_fd=parent_fd)
+        provision_private_dir_fd(tfd, qemu_uid, qemu_gid, qemu_groups)
+        os.fsync(tfd)
+        try:
+            renameat2_noreplace(parent_fd, tmp_name, parent_fd, comp)
+        except FileExistsError:
+            if fail_if_exists:
+                raise OSError(errno.EEXIST, f"{os.path.join(parent_path, comp)} already exists; refusing to reuse another run's files")
+            os.close(tfd)
+            tfd = None
+            os.rmdir(tmp_name, dir_fd=parent_fd)
+            return None
+        published = True
+        os.fsync(parent_fd)
+        ret_fd = tfd
+        tfd = None
+        return ret_fd
+    finally:
+        if tfd is not None:
+            os.close(tfd)
+        if not published:
+            try:
+                os.rmdir(tmp_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+
+
+op = sys.argv[1]
+try:
+    if op == "prepare-images-root":
+        target = sys.argv[2]
+        qemu_uid = int(sys.argv[3])
+        qemu_gid = int(sys.argv[4])
+        qemu_groups = {int(x) for x in sys.argv[5].split(",") if x}
+        trusted_uids = trusted_owner_uids()
+        cur_fd, cur_path, deepest_lexical, remaining = walk_existing_prefix(
+            target, qemu_uid, qemu_groups, trusted_uids
+        )
+        try:
+            kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
+            for comp in remaining:
+                next_fd = create_component_in_fd(
+                    cur_fd, cur_path, comp, qemu_uid, qemu_gid, qemu_groups, fail_if_exists=False
+                )
+                next_path = os.path.join(cur_path, comp)
+                if next_fd is None:
+                    next_fd = os.open(comp, READ_DIR_FLAGS, dir_fd=cur_fd)
+                    try:
+                        verify_dir_fd(
+                            next_fd, next_path, qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=False
+                        )
+                    except Exception:
+                        os.close(next_fd)
+                        raise
+                os.close(cur_fd)
+                cur_fd, cur_path = next_fd, next_path
+        finally:
+            os.close(cur_fd)
+        kernel_verdict_traversal(os.path.normpath(target), qemu_uid, qemu_gid, qemu_groups)
+    elif op == "create-run-dir":
+        images_dir = sys.argv[2]
+        run_name = sys.argv[3]
+        qemu_uid = int(sys.argv[4])
+        qemu_gid = int(sys.argv[5])
+        qemu_groups = {int(x) for x in sys.argv[6].split(",") if x}
+        if "/" in run_name or run_name in ("", ".", ".."):
+            raise OSError(errno.EINVAL, f"invalid run dir name '{run_name}'")
+        trusted_uids = trusted_owner_uids()
+        img_fd, img_path, deepest_lexical, remaining = walk_existing_prefix(
+            images_dir, qemu_uid, qemu_groups, trusted_uids
+        )
+        try:
+            if remaining:
+                raise OSError(errno.ENOENT, f"images root '{images_dir}' does not exist")
+            kernel_verdict_traversal(deepest_lexical, qemu_uid, qemu_gid, qemu_groups)
+            rfd = create_component_in_fd(
+                img_fd, img_path, run_name, qemu_uid, qemu_gid, qemu_groups, fail_if_exists=True
+            )
+            os.close(rfd)
+        finally:
+            os.close(img_fd)
+        kernel_verdict_traversal(os.path.join(os.path.normpath(images_dir), run_name), qemu_uid, qemu_gid, qemu_groups)
+    elif op == "handoff-file":
+        images_dir = sys.argv[2]
+        run_name = sys.argv[3]
+        filename = sys.argv[4]
+        qemu_uid = int(sys.argv[5])
+        qemu_gid = int(sys.argv[6])
+        qemu_groups = {int(x) for x in sys.argv[7].split(",") if x}
+        do_chown = sys.argv[8] == "1"
+        if "/" in run_name or "/" in filename or run_name in ("", ".", "..") or filename in ("", ".", ".."):
+            raise OSError(errno.EINVAL, f"invalid run/file name: '{run_name}' / '{filename}'")
+        trusted_uids = trusted_owner_uids()
+        img_fd, img_path, _, remaining = walk_existing_prefix(
+            images_dir, qemu_uid, qemu_groups, trusted_uids
+        )
+        try:
+            if remaining:
+                raise OSError(errno.ENOENT, f"images root '{images_dir}' does not exist")
+            rfd = os.open(run_name, READ_DIR_FLAGS, dir_fd=img_fd)
+            try:
+                verify_dir_fd(
+                    rfd, os.path.join(img_path, run_name), qemu_uid, qemu_groups, trusted_uids, allow_sticky_writable=False
+                )
+                ffd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=rfd)
+                try:
+                    fst = os.fstat(ffd)
+                    if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                        raise OSError(errno.EINVAL, f"refusing unsafe guest file '{filename}' (must be regular file with nlink == 1)")
+                    remove_xattr_if_present(ffd, b"system.posix_acl_access")
+                    os.fchmod(ffd, 0o600)
+                    if do_chown and qemu_uid != 0:
+                        if os.geteuid() == 0:
+                            os.fchown(ffd, qemu_uid, qemu_gid)
+                        else:
+                            print("DELEGATE_CHOWN")
+                    fst_after = os.fstat(ffd)
+                    if (fst_after.st_mode & 0o777) != 0o600:
+                        raise OSError(errno.EIO, f"guest file '{filename}' did not reach mode 0600")
+                finally:
+                    os.close(ffd)
+            finally:
+                os.close(rfd)
+        finally:
+            os.close(img_fd)
+    elif op == "strip-session-dir-acl":
+        target = sys.argv[2]
+        dfd = os.open(target, READ_DIR_FLAGS)
+        try:
+            remove_xattr_if_present(dfd, b"system.posix_acl_default")
+            remove_xattr_if_present(dfd, b"system.posix_acl_access")
+            os.fchmod(dfd, 0o700)
+        finally:
+            os.close(dfd)
+    else:
+        raise OSError(errno.EINVAL, f"unknown sys_fs_ops op '{op}'")
+except OSError as exc:
+    msg = exc.strerror if exc.strerror else str(exc)
+    sys.stderr.write(f"libvirt-kvm-smoke: {msg}\n")
+    sys.exit(1)
 PY
 }
 
-# Grant traversal (--x) on a newly created private directory to the configured
-# system-mode QEMU identity without opening directory listing or world access:
-# prefer a targeted POSIX ACL (`u:<uid>:x` on mode 0700), falling back to
-# `chgrp <gid> + chmod 0710` (or `0711` only when QEMU_GID == 0).
-grant_qemu_traversal() {
-    local target="$1"
-    [ "$QEMU_UID" -ne 0 ] || return 0
-    if command -v setfacl >/dev/null 2>&1; then
-        if setfacl -m "u:${QEMU_UID}:x" "$target" 2>/dev/null \
-            && check_qemu_traversal_chain "$target" >/dev/null 2>&1; then
-            return 0
-        fi
-    fi
-    if [ "$QEMU_GID" -ne 0 ]; then
-        chgrp "$QEMU_GID" "$target" \
-            || die "cannot set group ${QEMU_GID} on $target for QEMU traversal"
-        chmod 0710 "$target"
-    else
-        chmod 0711 "$target"
-    fi
-    local blocked=""
-    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
-        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) still cannot traverse ${blocked:-$target}"
-    fi
-}
-
-# Validate existing ancestors of `$1` without altering their permissions, then
-# create any missing directory components with traversal provisioned for the
-# system-mode QEMU identity even under a restrictive umask (for example 0077).
 prepare_system_images_root() {
     local target="$1"
     resolve_system_qemu_identity
-    local blocked=""
-    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
-        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) cannot traverse existing ancestor directory '${blocked}' of ${target}; adjust its permissions or ACLs or choose a traversable QEMINGA_E2E_IMAGES path"
+    sys_fs_ops prepare-images-root "$target" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" \
+        || exit 1
+}
+
+create_system_run_dir() {
+    local images_dir="$1" run_name="$2"
+    sys_fs_ops create-run-dir "$images_dir" "$run_name" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" \
+        || exit 1
+}
+
+handoff_system_guest_file() {
+    local images_dir="$1" run_name="$2" filename="$3" do_chown="$4"
+    local action=""
+    if ! action="$(sys_fs_ops handoff-file "$images_dir" "$run_name" "$filename" "$QEMU_UID" "$QEMU_GID" "$QEMU_GROUPS" "$do_chown")"; then
+        exit 1
     fi
-    local cur="" part
-    local -a parts=()
-    IFS='/' read -r -a parts <<<"$target"
-    for part in "${parts[@]}"; do
-        [ -n "$part" ] || continue
-        cur="${cur}/${part}"
-        if [ -e "$cur" ]; then
-            [ -d "$cur" ] || die "image root component '$cur' is not a directory"
-            continue
-        fi
-        mkdir -m 0700 "$cur"
-        grant_qemu_traversal "$cur"
-    done
-    if ! blocked="$(check_qemu_traversal_chain "$target")"; then
-        die "QEMU user ${QEMU_USER} (uid ${QEMU_UID}) cannot traverse '${blocked}' under ${target}"
+    if [ "$action" = "DELEGATE_CHOWN" ] && [ "$do_chown" = "1" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
+        chown -h "${QEMU_UID}:${QEMU_GID}" "${images_dir}/${run_name}/${filename}"
+    fi
+}
+
+create_session_run_dir() {
+    local dir="$1"
+    [ ! -e "$dir" ] && [ ! -L "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
+    mkdir -m 0700 "$dir"
+    if command -v python3 >/dev/null 2>&1; then
+        sys_fs_ops strip-session-dir-acl "$dir" || exit 1
     fi
 }
 
@@ -702,20 +1222,23 @@ cmd_run() {
     version="$(jq -er .version "$candidate/manifest.json")"
 
     say "disposable KVM guest $name in $dir"
-    [ ! -e "$dir" ] || die "$dir already exists; refusing to reuse another run's files"
-    mkdir -m 0700 "$dir"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        grant_qemu_traversal "$dir"
+        create_system_run_dir "$IMAGES" "$name"
+    else
+        create_session_run_dir "$dir"
     fi
     (
         umask 0077
         fetch_image "$arch" "$dir/root.qcow2" "$cache"
     )
-    chmod 0600 "$dir/root.qcow2"
-    qemu-img resize -q "$dir/root.qcow2" 8G
-    chmod 0600 "$dir/root.qcow2"
-    if [ "$CONNECT_URI" = "qemu:///system" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
-        chown "${QEMU_UID}:${QEMU_GID}" "$dir/root.qcow2"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        handoff_system_guest_file "$IMAGES" "$name" "root.qcow2" 0
+        qemu-img resize -q "$dir/root.qcow2" 8G
+        handoff_system_guest_file "$IMAGES" "$name" "root.qcow2" 1
+    else
+        chmod 0600 "$dir/root.qcow2"
+        qemu-img resize -q "$dir/root.qcow2" 8G
+        chmod 0600 "$dir/root.qcow2"
     fi
 
     local seed="$dir/seed" payload="$dir/payload"
@@ -736,11 +1259,16 @@ EOF
     cp -r "$candidate/packaging/." "$payload/packaging/"
     echo "$digest" >"$payload/qeminga.sha256"
     install -m 0755 "$HERE/libvirt-tcg-guest.sh" "$payload/guest.sh"
-    genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
-    genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
-    chmod 0600 "$dir/seed.iso" "$dir/payload.iso"
-    if [ "$CONNECT_URI" = "qemu:///system" ] && [ "${QEMU_UID:-0}" -ne 0 ]; then
-        chown "${QEMU_UID}:${QEMU_GID}" "$dir/seed.iso" "$dir/payload.iso"
+    (
+        umask 0077
+        genisoimage -quiet -output "$dir/seed.iso" -volid cidata -joliet -rock "$seed"
+        genisoimage -quiet -output "$dir/payload.iso" -volid QEMINGAE2E -joliet -rock "$payload"
+    )
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        handoff_system_guest_file "$IMAGES" "$name" "seed.iso" 1
+        handoff_system_guest_file "$IMAGES" "$name" "payload.iso" 1
+    else
+        chmod 0600 "$dir/seed.iso" "$dir/payload.iso"
     fi
 
     cmd_domain_xml --arch "$arch" --name "$name" --dir "$dir" --vcpus "$(nproc)" >"$dir/domain.xml"

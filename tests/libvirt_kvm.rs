@@ -487,6 +487,7 @@ fn kvm_run_directory_permissions_match_libvirt_connection_mode() {
 case "$1" in --connect=*) shift ;; esac
 case "$1" in
     version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    capabilities) if [ -n "${FAKE_VIRSH_CAPABILITIES:-}" ]; then printf '%s\n' "$FAKE_VIRSH_CAPABILITIES"; fi; exit 0 ;;
     domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
     net-info) echo "Active:         yes"; exit 0 ;;
     list) echo ""; exit 0 ;;
@@ -981,6 +982,1169 @@ for p in reversed(chain):
             "qemu.conf identity must be applied to root.qcow2 ownership:\n{chowns}"
         );
     }
+
+    // Helper: evaluate effective 3-bit Linux permissions (r=4, w=2, x=1) for (acct, grp) on a
+    // single path using standard POSIX mode + `system.posix_acl_access`.
+    let effective_rights = |target: &Path, acct: &str, grp: &str| -> u8 {
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, struct, sys
+p = sys.argv[1]
+u = int(sys.argv[2])
+g = int(sys.argv[3])
+st = os.stat(p)
+try:
+    raw = os.getxattr(p, b"system.posix_acl_access")
+except OSError:
+    raw = None
+if raw and len(raw) >= 4:
+    ver, = struct.unpack_from("<I", raw, 0)
+    if ver == 2:
+        mask = 7
+        entries = []
+        for off in range(4, len(raw), 8):
+            if off + 8 <= len(raw):
+                tag, perm, eid = struct.unpack_from("<HHI", raw, off)
+                entries.append((tag, perm, eid))
+                if tag == 0x10:
+                    mask = perm
+        if u == st.st_uid:
+            for tag, perm, _ in entries:
+                if tag == 0x01:
+                    print(perm); sys.exit(0)
+        for tag, perm, eid in entries:
+            if tag == 0x02 and eid == u:
+                print(perm & mask); sys.exit(0)
+        matched = [perm & mask for tag, perm, eid in entries if (tag == 0x04 and st.st_gid == g) or (tag == 0x08 and eid == g)]
+        if matched:
+            val = 0
+            for m in matched:
+                val |= m
+            print(val); sys.exit(0)
+        for tag, perm, _ in entries:
+            if tag == 0x20:
+                print(perm); sys.exit(0)
+        print(0); sys.exit(0)
+if u == st.st_uid:
+    print((st.st_mode >> 6) & 7)
+elif g == st.st_gid:
+    print((st.st_mode >> 3) & 7)
+else:
+    print(st.st_mode & 7)
+"#,
+                target.to_str().unwrap(),
+                acct,
+                grp,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    };
+
+    // 6. Parent with a kernel default ACL granting `rwx` to an unrelated user (`64099`):
+    //    Provisioning MUST replace inherited ACL entries completely, limit the mask to `--x`,
+    //    and strip inherited `system.posix_acl_default` before creating children so unrelated
+    //    accounts receive ZERO rights (`0`) on new image-root dirs, run dir, and `root.qcow2`
+    //    while QEMU receives `--x` (`1`) traversal!
+    {
+        let other_acct_num = "64099";
+        let other_grp_num = "64099";
+        let acl_parent = dir.path().join("with-default-acl");
+        std::fs::create_dir(&acl_parent).unwrap();
+        std::fs::set_permissions(&acl_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let set_def = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, struct, sys
+p = sys.argv[1]
+other_u = int(sys.argv[2])
+entries = [
+    (0x01, 7, 0xFFFFFFFF),
+    (0x02, 7, other_u),
+    (0x04, 0, 0xFFFFFFFF),
+    (0x10, 7, 0xFFFFFFFF),
+    (0x20, 0, 0xFFFFFFFF),
+]
+raw = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, perm, eid) for t, perm, eid in entries)
+os.setxattr(p, b"system.posix_acl_default", raw)
+"#,
+                acl_parent.to_str().unwrap(),
+                other_acct_num,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            set_def.status.success(),
+            "test fixture requires POSIX ACL xattr support on tempdir: {}",
+            text(&set_def)
+        );
+
+        let images = acl_parent.join("nested-acl/images");
+        let out_dir = dir.path().join("out-sys-defacl");
+        let run_out = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "82",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ],
+        );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let nested_dir = acl_parent.join("nested-acl");
+        let run_dir = images.join(format!("qeminga-e2e-82-1-{arch}"));
+        let disk = run_dir.join("root.qcow2");
+        assert!(run_dir.is_dir() && disk.is_file(), "{}", text(&run_out));
+
+        for d in [&nested_dir, &images, &run_dir] {
+            assert_eq!(
+                effective_rights(d, qemu_acct_num, &caller_grp_num),
+                1,
+                "QEMU must have search-only (--x = 1) on {}",
+                d.display()
+            );
+            assert_eq!(
+                effective_rights(d, other_acct_num, other_grp_num),
+                0,
+                "unrelated account must have ZERO effective rights (--- = 0) on {} even under parent default ACL",
+                d.display()
+            );
+            let has_def = Command::new("python3")
+                .args([
+                    "-I",
+                    "-c",
+                    r#"
+import os, sys
+try:
+    os.getxattr(sys.argv[1], b"system.posix_acl_default")
+    sys.exit(1)
+except OSError:
+    sys.exit(0)
+"#,
+                    d.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                has_def.status.success(),
+                "inherited default ACL must be stripped on {}",
+                d.display()
+            );
+        }
+        assert_eq!(
+            effective_rights(&disk, other_acct_num, other_grp_num),
+            0,
+            "unrelated account must have ZERO effective rights on root.qcow2"
+        );
+    }
+
+    // 7. Shared writable ancestors MUST be refused with a clear diagnostic BEFORE any
+    //    privileged mutation (mkdir, curl, chmod, chown):
+    //    - 7a: world-writable `0777` ancestor
+    //    - 7b: group-writable `0775` (non-root group) ancestor
+    //    - 7c: sticky world-writable `1777` parent of missing image root
+    //    - 7d: access-ACL-writable (`u:64099:rwx`) ancestor
+    {
+        let shared_world = dir.path().join("shared-0777");
+        let shared_group = dir.path().join("shared-0775");
+        let shared_sticky = dir.path().join("shared-1777");
+        let shared_acl = dir.path().join("shared-acl");
+        for (p, mode) in [
+            (&shared_world, 0o777),
+            (&shared_group, 0o775),
+            (&shared_sticky, 0o1777),
+            (&shared_acl, 0o755),
+        ] {
+            std::fs::create_dir(p).unwrap();
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        let set_acc_acl = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, struct, sys
+p = sys.argv[1]
+entries = [
+    (0x01, 7, 0xFFFFFFFF),
+    (0x02, 7, 64099),
+    (0x04, 5, 0xFFFFFFFF),
+    (0x10, 7, 0xFFFFFFFF),
+    (0x20, 5, 0xFFFFFFFF),
+]
+raw = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, perm, eid) for t, perm, eid in entries)
+os.setxattr(p, b"system.posix_acl_access", raw)
+"#,
+                shared_acl.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(set_acc_acl.status.success(), "{}", text(&set_acc_acl));
+
+        for (idx, parent) in [&shared_world, &shared_group, &shared_sticky, &shared_acl]
+            .iter()
+            .enumerate()
+        {
+            let images = parent.join("images");
+            let out_dir = dir.path().join(format!("out-sys-shared-{idx}"));
+            let curl_log = dir.path().join(format!("curl-shared-{idx}.log"));
+            let chown_log = dir.path().join(format!("chown-shared-{idx}.log"));
+            let run_id = format!("{}", 83 + idx);
+            let run_out = run_with_umask(
+                "0077",
+                &[
+                    "run",
+                    "--arch",
+                    arch,
+                    "--candidate",
+                    candidate.to_str().unwrap(),
+                    "--source-sha",
+                    SHA,
+                    "--run-id",
+                    &run_id,
+                    "--run-attempt",
+                    "1",
+                    "--out",
+                    out_dir.to_str().unwrap(),
+                    "--expect-sha256",
+                    &digest,
+                ],
+                &[
+                    ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                    ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                    ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                    ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                    ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                    ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                    ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                    ("FAKE_ID_U", "0"),
+                    ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                    ("FAKE_CURL_LOG", curl_log.to_str().unwrap()),
+                    ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+                ],
+            );
+            let msg = text(&run_out);
+            assert!(
+                !run_out.status.success(),
+                "shared writable ancestor {} MUST be refused before any mutation: {msg}",
+                parent.display()
+            );
+            assert!(
+                msg.contains(parent.to_str().unwrap()),
+                "shared writable ancestor error must name {}:\n{msg}",
+                parent.display()
+            );
+            assert!(
+                !images.exists() && !curl_log.exists() && !chown_log.exists(),
+                "must refuse shared writable ancestor {} BEFORE mkdir/curl/chown:\n{msg}",
+                parent.display()
+            );
+        }
+    }
+
+    // 8. Live daemon `dac` KVM base label from `virsh capabilities` AND unprefixed numeric
+    //    `qemu.conf` entries with no NSS record:
+    //    - 8a: `virsh capabilities` `dac` KVM baselabel wins over `qemu.conf` when overrides
+    //          are not set.
+    //    - 8b: Unprefixed decimal `user = "64055"` / `group = "64056"` in `qemu.conf` with no
+    //          NSS entries is accepted per libvirt numeric-ID rules.
+    {
+        let qemu_conf = dir.path().join("qemu-caps-vs-conf.conf");
+        std::fs::write(&qemu_conf, "user = \"+64088\"\ngroup = \"+64088\"\n").unwrap();
+        let caps_xml = format!(
+            "<capabilities><host><secmodel><model>dac</model><doi>0</doi><baselabel type='kvm'>+{qemu_acct_num}:+{caller_grp_num}</baselabel><baselabel type='qemu'>+64077:+64077</baselabel></secmodel></host></capabilities>"
+        );
+        let images = dir.path().join("sys-caps-images");
+        let out_dir = dir.path().join("out-sys-caps");
+        let chown_log = dir.path().join("chown-caps.log");
+        let run_out = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "87",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_LIBVIRT_QEMU_CONF", qemu_conf.to_str().unwrap()),
+                ("FAKE_VIRSH_CAPABILITIES", &caps_xml),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CHOWN_LOG", chown_log.to_str().unwrap()),
+            ],
+        );
+        assert!(!run_out.status.success(), "{}", text(&run_out));
+        let chowns = std::fs::read_to_string(&chown_log).unwrap_or_default();
+        assert!(
+            chowns.contains(&format!("{qemu_acct_num}:{caller_grp_num}"))
+                && !chowns.contains("64088"),
+            "connected daemon dac KVM baselabel must take precedence over qemu.conf:\n{chowns}\n{}",
+            text(&run_out)
+        );
+
+        let unmapped_grp_num = "64056";
+        let qemu_conf_num = dir.path().join("qemu-unprefixed-num.conf");
+        std::fs::write(
+            &qemu_conf_num,
+            format!("user = \"{qemu_acct_num}\"\ngroup = \"{unmapped_grp_num}\"\n"),
+        )
+        .unwrap();
+        let images_num = dir.path().join("sys-num-images");
+        let out_dir_num = dir.path().join("out-sys-num");
+        let chown_log_num = dir.path().join("chown-num.log");
+        let run_num = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "88",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir_num.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images_num.to_str().unwrap()),
+                ("QEMINGA_LIBVIRT_QEMU_CONF", qemu_conf_num.to_str().unwrap()),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CHOWN_LOG", chown_log_num.to_str().unwrap()),
+            ],
+        );
+        assert!(!run_num.status.success(), "{}", text(&run_num));
+        let run_dir_num = images_num.join(format!("qeminga-e2e-88-1-{arch}"));
+        assert!(
+            run_dir_num.is_dir(),
+            "unprefixed numeric qemu.conf identity with no NSS entry must succeed: {}",
+            text(&run_num)
+        );
+        let chowns_num = std::fs::read_to_string(&chown_log_num).unwrap_or_default();
+        assert!(
+            chowns_num.contains(&format!("{qemu_acct_num}:{unmapped_grp_num}")),
+            "unprefixed numeric qemu.conf identity must be applied to root.qcow2:\n{chowns_num}"
+        );
+    }
+
+    // 9. Intermediate symlink passing through a non-searchable directory to a searchable final
+    //    target (`link1 -> secret_0700/link2 -> searchable_0755`):
+    //    - 9a: Must refuse BEFORE creating dirs or downloading, reporting `secret_0700`.
+    //    - 9b: Independent real Linux kernel verdict using a mode-`0000` intermediate directory
+    //          (non-searchable by the current caller account) confirms `stat(link1)` gets EACCES
+    //          from the kernel AND `libvirt-kvm-smoke.sh` refuses it too.
+    {
+        let secret_hop = dir.path().join("secret-hop-0700");
+        let final_target = dir.path().join("searchable-target");
+        std::fs::create_dir(&secret_hop).unwrap();
+        std::fs::create_dir(&final_target).unwrap();
+        std::fs::set_permissions(&secret_hop, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&final_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let hop_link = secret_hop.join("hop");
+        std::os::unix::fs::symlink(&final_target, &hop_link).unwrap();
+        let outer_alias = dir.path().join("storage-alias");
+        std::os::unix::fs::symlink(&hop_link, &outer_alias).unwrap();
+
+        let images = outer_alias.join("images");
+        let out_dir = dir.path().join("out-sys-symlink-hop");
+        let curl_log = dir.path().join("curl-symlink-hop.log");
+        let run_hop = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "89",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ("FAKE_CURL_LOG", curl_log.to_str().unwrap()),
+            ],
+        );
+        let hop_msg = text(&run_hop);
+        assert!(
+            !run_hop.status.success()
+                && !final_target.join("images").exists()
+                && !curl_log.exists(),
+            "intermediate non-searchable symlink hop MUST be refused before creating dirs or downloading:\n{hop_msg}"
+        );
+        assert!(
+            hop_msg.contains(secret_hop.to_str().unwrap()),
+            "error must pinpoint the intermediate blocking directory {}:\n{hop_msg}",
+            secret_hop.display()
+        );
+
+        // 9b: Independent real Linux kernel verdict for non-root caller account via 0o000 hop.
+        let caller_acct_num = String::from_utf8(
+            Command::new("/usr/bin/id")
+                .arg("-u")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        if caller_acct_num != "0" {
+            struct RestoreModeGuard(PathBuf);
+            impl Drop for RestoreModeGuard {
+                fn drop(&mut self) {
+                    let _ =
+                        std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+                }
+            }
+            let ksecret = dir.path().join("kernel-secret-0000");
+            std::fs::create_dir(&ksecret).unwrap();
+            std::fs::set_permissions(&ksecret, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let khop = ksecret.join("hop");
+            std::os::unix::fs::symlink(&final_target, &khop).unwrap();
+            let kalias = dir.path().join("kernel-alias");
+            std::os::unix::fs::symlink(&khop, &kalias).unwrap();
+            std::fs::set_permissions(&ksecret, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let _guard = RestoreModeGuard(ksecret.clone());
+
+            // Real kernel verdict on the original lexical path MUST be PermissionDenied (EACCES).
+            let kernel_err = std::fs::metadata(&kalias).unwrap_err();
+            assert_eq!(
+                kernel_err.kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "Linux kernel must return EACCES traversing intermediate 0000 symlink hop"
+            );
+
+            let caller_user_spec = format!("+{caller_acct_num}");
+            let k_out = run_with_umask(
+                "0077",
+                &[
+                    "run",
+                    "--arch",
+                    arch,
+                    "--candidate",
+                    candidate.to_str().unwrap(),
+                    "--source-sha",
+                    SHA,
+                    "--run-id",
+                    "90",
+                    "--run-attempt",
+                    "1",
+                    "--out",
+                    dir.path().join("out-sys-kernel-hop").to_str().unwrap(),
+                    "--expect-sha256",
+                    &digest,
+                ],
+                &[
+                    ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                    (
+                        "QEMINGA_E2E_IMAGES",
+                        kalias.join("images").to_str().unwrap(),
+                    ),
+                    ("QEMINGA_E2E_QEMU_USER", &caller_user_spec),
+                    ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                    ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                    ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                    ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                    ("FAKE_ID_U", "0"),
+                    ("FAKE_IMAGE_SHA", &pinned_image_sha),
+                ],
+            );
+            assert!(
+                !k_out.status.success(),
+                "helper must agree with Linux kernel EACCES verdict on intermediate symlink hop: {}",
+                text(&k_out)
+            );
+        }
+    }
+
+    // 10. Failed first-time image-root provisioning MUST NOT leave behind a `0700` blocking
+    //     public directory — an ordinary retry MUST succeed! Also verify the script never
+    //     falls back to world-searchable mode `0711`.
+    {
+        let retry_parent = dir.path().join("retry-root");
+        let images = retry_parent.join("nested-images");
+        let out_fail = dir.path().join("out-sys-retry-fail");
+        let first_attempt = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "91",
+                "--run-attempt",
+                "1",
+                "--out",
+                out_fail.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", "+64099"),
+                ("QEMINGA_TEST_DISABLE_ACL", "1"),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ],
+        );
+        assert!(
+            !first_attempt.status.success(),
+            "first provisioning attempt with failing grant must fail: {}",
+            text(&first_attempt)
+        );
+        assert!(
+            !retry_parent.exists(),
+            "failed first grant MUST NOT leave behind a blocking 0700 directory at {}",
+            retry_parent.display()
+        );
+
+        let out_ok = dir.path().join("out-sys-retry-ok");
+        let retry_attempt = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "91",
+                "--run-attempt",
+                "2",
+                "--out",
+                out_ok.to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ],
+        );
+        assert!(!retry_attempt.status.success(), "{}", text(&retry_attempt));
+        let run_dir = images.join(format!("qeminga-e2e-91-2-{arch}"));
+        assert!(
+            run_dir.is_dir() && run_dir.join("root.qcow2").is_file(),
+            "ordinary retry after failed first grant MUST succeed cleanly: {}",
+            text(&retry_attempt)
+        );
+
+        // 10b. No-ACL fallback (`QEMINGA_TEST_DISABLE_ACL=1`) MUST set group-only `0710` (zero
+        //      world bits) even when `qemu_gid == 0` — never `0711`.
+        let images_noacl = dir.path().join("sys-noacl-images");
+        let run_noacl = run_with_umask(
+            "0077",
+            &[
+                "run",
+                "--arch",
+                arch,
+                "--candidate",
+                candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "91",
+                "--run-attempt",
+                "3",
+                "--out",
+                dir.path().join("out-sys-noacl").to_str().unwrap(),
+                "--expect-sha256",
+                &digest,
+            ],
+            &[
+                ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+                ("QEMINGA_E2E_IMAGES", images_noacl.to_str().unwrap()),
+                ("QEMINGA_E2E_QEMU_USER", &qemu_user_spec),
+                ("QEMINGA_E2E_QEMU_GROUP", &qemu_group_spec),
+                ("QEMINGA_TEST_DISABLE_ACL", "1"),
+                ("QEMINGA_KVM_DEVICE", "/dev/null"),
+                ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+                ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+                ("FAKE_ID_U", "0"),
+                ("FAKE_IMAGE_SHA", &pinned_image_sha),
+            ],
+        );
+        assert!(!run_noacl.status.success(), "{}", text(&run_noacl));
+        let run_dir_noacl = images_noacl.join(format!("qeminga-e2e-91-3-{arch}"));
+        assert!(run_dir_noacl.is_dir(), "{}", text(&run_noacl));
+        for d in [&images_noacl, &run_dir_noacl] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o710,
+                "no-ACL fallback must set 0710 on {}",
+                d.display()
+            );
+            assert_eq!(effective_rights(d, qemu_acct_num, &caller_grp_num), 1);
+            assert_eq!(effective_rights(d, "64099", "64099"), 0);
+        }
+
+        // Verify `provision_private_dir_fd` with `qemu_gid == 0` under no-ACL fallback uses
+        // group-only `0o710` (group 0) rather than world-searchable `0o711`.
+        let grp0_check = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, sys, types
+
+src = open(sys.argv[1], "r", encoding="utf-8").read()
+fs_sec = src.split("sys_fs_ops() {\n", 1)[1].split("\nPY\n", 1)[0]
+py_body = fs_sec.split("<<'PY'\n", 1)[1].split("\nop = sys.argv[1]", 1)[0]
+
+ns = {"__name__": "__main__"}
+exec(py_body, ns)
+
+target = sys.argv[2]
+os.makedirs(target, mode=0o700)
+fd = os.open(target, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+chowned = []
+chmodded = []
+orig_os = ns["os"]
+class FakeStat:
+    def __init__(self, real_st, gid_override):
+        self._st = real_st
+        self.st_gid = gid_override
+        self.st_uid = 0
+        self.st_mode = real_st.st_mode
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+cur_gid = [0]
+class SpyOs:
+    def __getattr__(self, name):
+        return getattr(orig_os, name)
+    def geteuid(self):
+        return 0
+    def fchown(self, f, u, g):
+        chowned.append((u, g))
+        cur_gid[0] = g
+    def fchmod(self, f, mode):
+        chmodded.append(mode)
+        return orig_os.fchmod(f, mode)
+    def fstat(self, f):
+        return FakeStat(orig_os.fstat(f), cur_gid[0])
+ns["os"] = SpyOs()
+orig_os.environ["QEMINGA_TEST_DISABLE_ACL"] = "1"
+try:
+    ns["provision_private_dir_fd"](fd, 64055, 0, {0})
+    assert (0, 0) in chowned, f"expected fchown(0, 0), got {chowned}"
+    assert chmodded[-1] == 0o710, f"expected 0o710 for qemu_gid=0 fallback, got {oct(chmodded[-1])}"
+    st = ns["os"].fstat(fd)
+    assert ns["effective_perms_fd"](fd, st, 64055, {0}) == 1
+    assert ns["effective_perms_fd"](fd, st, 64099, {64099}) == 0
+finally:
+    orig_os.close(fd)
+"#,
+                script().to_str().unwrap(),
+                dir.path().join("py-grp0-fallback").to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            grp0_check.status.success(),
+            "no-ACL fallback for qemu_gid=0 must use group-only 0710: {}",
+            text(&grp0_check)
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs root (drops privileges in child process to verify real Linux kernel DAC/ACL/symlink verdicts)"]
+fn privileged_kvm_system_lane_kernel_verdicts() {
+    require_jq();
+    let euid_out = Command::new("/usr/bin/id").arg("-u").output().unwrap();
+    assert_eq!(
+        String::from_utf8(euid_out.stdout).unwrap().trim(),
+        "0",
+        "privileged_kvm_system_lane_kernel_verdicts must run as root"
+    );
+    let arch = std::env::consts::ARCH;
+    assert!(arch == "x86_64" || arch == "aarch64");
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = dir.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+
+    let binary = dir.path().join("qeminga-bin");
+    std::fs::write(&binary, b"fake release binary\n").unwrap();
+    let candidate = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        candidate.to_str().unwrap(),
+        "--binary",
+        binary.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "92",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "test-runner",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&candidate.join("qeminga"));
+    let img_key = lane(&["image-key", arch]);
+    assert!(img_key.status.success(), "{}", text(&img_key));
+    let pinned_image_sha = String::from_utf8(img_key.stdout)
+        .unwrap()
+        .trim()
+        .rsplit('-')
+        .next()
+        .unwrap()
+        .to_string();
+
+    write_exec(
+        &bin.join("virsh"),
+        r#"#!/bin/sh
+case "$1" in --connect=*) shift ;; esac
+case "$1" in
+    version) echo "Compiled against library: libvirt 10.0.0"; exit 0 ;;
+    capabilities) if [ -n "${FAKE_VIRSH_CAPABILITIES:-}" ]; then printf '%s\n' "$FAKE_VIRSH_CAPABILITIES"; fi; exit 0 ;;
+    domcapabilities) echo "<domainCapabilities/>"; exit 0 ;;
+    net-info) echo "Active:         yes"; exit 0 ;;
+    list) echo ""; exit 0 ;;
+    define) exit 0 ;;
+    start) exit 42 ;;
+    *) exit 0 ;;
+esac
+"#,
+    );
+    write_exec(&bin.join("qemu-img"), "#!/bin/sh\nexit 0\n");
+    write_exec(
+        &bin.join("genisoimage"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -output) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join(format!("qemu-system-{arch}")),
+        "#!/bin/sh\necho 'QEMU emulator version 8.2.2'\n",
+    );
+    write_exec(
+        &bin.join("curl"),
+        r#"#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf 'fake qcow2 bytes\n' > "$out"
+chmod 0644 "$out"
+exit 0
+"#,
+    );
+    write_exec(
+        &bin.join("sha256sum"),
+        r#"#!/bin/sh
+case "$1" in
+    *.qcow2.part) printf '%s  %s\n' "${FAKE_IMAGE_SHA:?}" "$1"; exit 0 ;;
+esac
+exec /usr/bin/sha256sum "$@"
+"#,
+    );
+    write_exec(
+        &bin.join("df"),
+        "#!/bin/sh\nprintf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\n/dev/mock 99999999 0 99999999 0%% /\\n'\n",
+    );
+    let aavmf_code = dir.path().join("AAVMF_CODE.fd");
+    let aavmf_vars = dir.path().join("AAVMF_VARS.fd");
+    std::fs::write(&aavmf_code, b"code").unwrap();
+    std::fs::write(&aavmf_vars, b"vars").unwrap();
+
+    let run_root = |args: &[&str], env: &[(&str, &str)]| -> Output {
+        let mut cmd = Command::new("bash");
+        cmd.args(["-c", r#"umask 0077; exec bash "$@""#, "_"]);
+        cmd.arg(script()).args(args);
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        cmd.output().unwrap()
+    };
+
+    // Independent Linux kernel verdict helper: forks as real non-root (acct, grp) and checks
+    // os.access(path, mode_bit) / open() directly in the kernel!
+    let kernel_can = |path: &Path, acct: &str, grp: &str, op: &str| -> bool {
+        let out = Command::new("python3")
+            .args([
+                "-I",
+                "-c",
+                r#"
+import os, sys
+p = sys.argv[1]
+u = int(sys.argv[2])
+g = int(sys.argv[3])
+op = sys.argv[4]
+os.setgroups([g])
+os.setgid(g)
+os.setuid(u)
+if op == "x":
+    try:
+        os.stat(p)
+        sys.exit(0 if os.access(p, os.X_OK) else 1)
+    except OSError:
+        sys.exit(1)
+elif op == "r":
+    try:
+        fd = os.open(p, os.O_RDONLY)
+        os.close(fd)
+        sys.exit(0)
+    except OSError:
+        sys.exit(1)
+elif op == "w":
+    try:
+        sys.exit(0 if os.access(p, os.W_OK) else 1)
+    except OSError:
+        sys.exit(1)
+"#,
+                path.to_str().unwrap(),
+                acct,
+                grp,
+                op,
+            ])
+            .output()
+            .unwrap();
+        out.status.success()
+    };
+
+    let qemu_acct = "64055";
+    let qemu_grp = "64055";
+    let other_acct = "64099";
+    let other_grp = "64099";
+
+    // A. Default ACL isolation verified by real Linux kernel as non-root 64055 vs 64099.
+    let acl_parent = dir.path().join("root-defacl");
+    std::fs::create_dir(&acl_parent).unwrap();
+    std::fs::set_permissions(&acl_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let set_def = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            r#"
+import os, struct, sys
+p = sys.argv[1]
+entries = [
+    (0x01, 7, 0xFFFFFFFF),
+    (0x02, 7, 64099),
+    (0x04, 0, 0xFFFFFFFF),
+    (0x10, 7, 0xFFFFFFFF),
+    (0x20, 0, 0xFFFFFFFF),
+]
+raw = struct.pack("<I", 2) + b"".join(struct.pack("<HHI", t, perm, eid) for t, perm, eid in entries)
+os.setxattr(p, b"system.posix_acl_default", raw)
+"#,
+            acl_parent.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(set_def.status.success(), "{}", text(&set_def));
+
+    let images_acl = acl_parent.join("images");
+    let out_acl = run_root(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "92",
+            "--run-attempt",
+            "1",
+            "--out",
+            dir.path().join("out-acl").to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", images_acl.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_USER", "+64055"),
+            ("QEMINGA_E2E_QEMU_GROUP", "+64055"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+    );
+    let run_dir_acl = images_acl.join(format!("qeminga-e2e-92-1-{arch}"));
+    let disk_acl = run_dir_acl.join("root.qcow2");
+    assert!(
+        run_dir_acl.is_dir() && disk_acl.is_file(),
+        "{}",
+        text(&out_acl)
+    );
+    assert!(
+        kernel_can(&run_dir_acl, qemu_acct, qemu_grp, "x")
+            && kernel_can(&disk_acl, qemu_acct, qemu_grp, "r"),
+        "kernel must allow QEMU to traverse run dir and read chowned root.qcow2"
+    );
+    assert!(
+        !kernel_can(&images_acl, other_acct, other_grp, "x")
+            && !kernel_can(&images_acl, other_acct, other_grp, "w")
+            && !kernel_can(&run_dir_acl, other_acct, other_grp, "x")
+            && !kernel_can(&disk_acl, other_acct, other_grp, "r"),
+        "kernel must deny unrelated account 64099 all access even when parent had default:u:64099:rwx"
+    );
+
+    // B. No-ACL fallback with non-root QEMU in group 0: mode 0710 (root:root), NOT 0711.
+    let images_grp0 = dir.path().join("root-grp0-images");
+    let out_grp0 = run_root(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "93",
+            "--run-attempt",
+            "1",
+            "--out",
+            dir.path().join("out-grp0").to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", images_grp0.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_USER", "+64055"),
+            ("QEMINGA_E2E_QEMU_GROUP", "+0"),
+            ("QEMINGA_TEST_DISABLE_ACL", "1"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+    );
+    let run_dir_grp0 = images_grp0.join(format!("qeminga-e2e-93-1-{arch}"));
+    assert!(run_dir_grp0.is_dir(), "{}", text(&out_grp0));
+    assert_eq!(
+        std::fs::metadata(&run_dir_grp0)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o710,
+        "no-ACL fallback for non-root QEMU in group 0 must use 0710, not 0711"
+    );
+    assert!(
+        kernel_can(&run_dir_grp0, qemu_acct, "0", "x")
+            && !kernel_can(&run_dir_grp0, other_acct, other_grp, "x"),
+        "kernel must allow (64055, grp 0) to traverse 0710 dir while blocking unrelated (64099, 64099)"
+    );
+
+    // C. Intermediate symlink through root-owned 0700 dir: kernel denies 64055 and helper agrees.
+    let secret = dir.path().join("root-secret-0700");
+    let pub_target = dir.path().join("root-pub-0755");
+    std::fs::create_dir(&secret).unwrap();
+    std::fs::create_dir(&pub_target).unwrap();
+    std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&pub_target, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let hop = secret.join("hop");
+    std::os::unix::fs::symlink(&pub_target, &hop).unwrap();
+    let alias = dir.path().join("root-alias");
+    std::os::unix::fs::symlink(&hop, &alias).unwrap();
+    assert!(!kernel_can(&alias, qemu_acct, qemu_grp, "x"));
+    let out_hop = run_root(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "94",
+            "--run-attempt",
+            "1",
+            "--out",
+            dir.path().join("out-hop").to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            ("QEMINGA_E2E_IMAGES", alias.join("images").to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_USER", "+64055"),
+            ("QEMINGA_E2E_QEMU_GROUP", "+64055"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+    );
+    assert!(
+        !out_hop.status.success() && !pub_target.join("images").exists(),
+        "real root lane must refuse intermediate non-searchable symlink hop: {}",
+        text(&out_hop)
+    );
+
+    // D. Real non-root-owned (64099) ancestor directory MUST be refused by real root.
+    let nonroot_anc = dir.path().join("nonroot-owned-0755");
+    std::fs::create_dir(&nonroot_anc).unwrap();
+    std::fs::set_permissions(&nonroot_anc, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ch = Command::new("/usr/bin/chown")
+        .args(["64099:64099", nonroot_anc.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(ch.success());
+    let out_nr = run_root(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "95",
+            "--run-attempt",
+            "1",
+            "--out",
+            dir.path().join("out-nonroot").to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_E2E_CONNECT", "qemu:///system"),
+            (
+                "QEMINGA_E2E_IMAGES",
+                nonroot_anc.join("images").to_str().unwrap(),
+            ),
+            ("QEMINGA_E2E_QEMU_USER", "+64055"),
+            ("QEMINGA_E2E_QEMU_GROUP", "+64055"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &pinned_image_sha),
+        ],
+    );
+    assert!(
+        !out_nr.status.success() && !nonroot_anc.join("images").exists(),
+        "real root lane must refuse non-root-owned ancestor before any mutation: {}",
+        text(&out_nr)
+    );
 }
 
 // ---- result contract ------------------------------------------------------

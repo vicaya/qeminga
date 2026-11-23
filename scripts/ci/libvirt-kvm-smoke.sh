@@ -88,6 +88,16 @@ qemu_log_of() {
     fi
 }
 
+check_out_path() {
+    local p="$1"
+    [ -n "$p" ] || die "--out must not be empty"
+    case "$p" in
+        . | .. | ./* | ../* | */. | */.. | */./* | */../*)
+            die "--out must not contain '.' or '..' segments: '$p'"
+            ;;
+    esac
+}
+
 # Resolve AArch64 UEFI firmware (Debian/Ubuntu or Fedora/RHEL).
 resolve_aavmf() {
     local pair code vars
@@ -270,15 +280,17 @@ collect_diagnostics() {
     fi
     sys_fs_ops prepare-session-evidence-dir "$out" 2>/dev/null || return 0
     if [ "$domain_owned" = "1" ]; then
-        v dumpxml "${domain_ref:-$name}" >"$out/domain.xml" 2>/dev/null || true
-        if [ ! -L "$qlog" ] && [ -f "$qlog" ]; then cp -- "$qlog" "$out/qemu.log" || true; fi
+        local dom_xml="$verified_xml"
+        if [ -z "$dom_xml" ]; then
+            dom_xml="$(v dumpxml "${domain_ref:-$name}" 2>/dev/null || true)"
+        fi
+        if [ -n "$dom_xml" ]; then
+            printf '%s\n' "$dom_xml" | sys_fs_ops publish-session-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+        fi
+        sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" 2>/dev/null || true
     fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-        if command -v python3 >/dev/null 2>&1; then
-            sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
-        elif [ ! -L "$dir/serial.log" ] && [ -f "$dir/serial.log" ]; then
-            cp -- "$dir/serial.log" "$out/serial.log" || true
-        fi
+        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
     fi
 }
 
@@ -289,6 +301,9 @@ cmd_cleanup() {
     out="${opt_out:-}"
     check_arch "$arch"
     check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
+    if [ -n "$out" ]; then
+        check_out_path "$out"
+    fi
     local name dir state
     name="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$name"
@@ -459,27 +474,12 @@ write_result() {
           virtualization: {hypervisor: "qemu", accelerator: $accel, machine: $machine},
           guest: {image: $image, image_release: $image_release, image_sha256: $image_sha},
           tests: $tests, result: $result}')" || return 1
+    local publish_op="publish-session-evidence-stdin"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json" || return 1
-        printf '%s\n' "$result_json" || return 1
-    else
-        sys_fs_ops verify-session-evidence-dir "$out" || return 1
-        local tmp
-        tmp="$(mktemp -- "$out/.result.json.tmp.XXXXXX")" || return 1
-        if ! chmod 0600 -- "$tmp"; then
-            rm -f -- "$tmp"
-            return 1
-        fi
-        if ! printf '%s\n' "$result_json" >"$tmp"; then
-            rm -f -- "$tmp"
-            return 1
-        fi
-        if ! mv -f -T -- "$tmp" "$out/result.json"; then
-            rm -f -- "$tmp"
-            return 1
-        fi
-        cat -- "$out/result.json" || return 1
+        publish_op="publish-evidence-stdin"
     fi
+    printf '%s\n' "$result_json" | sys_fs_ops "$publish_op" "$out" "result.json" || return 1
+    printf '%s\n' "$result_json" || return 1
     [ "$overall" = pass ]
 }
 
@@ -488,6 +488,7 @@ cmd_result() {
     local out arch sha digest accel
     out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
     digest="$(need binary_sha256)"; accel="$(need accelerator)"
+    check_out_path "$out"
     check_arch "$arch"; check_sha "$sha"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "bad digest '$digest'"
     command -v python3 >/dev/null || die "missing tool: python3"
@@ -496,128 +497,60 @@ cmd_result() {
 
 # Validates that `$out/result.json` contains exactly one JSON object forming a
 # complete `libvirt-kvm-smoke-v1` record bound to this run's architecture and
-# commit SHA. Reads through `sys_fs_ops` after verifying the evidence directory
-# (trusted in `qemu:///system`, caller-controlled in `qemu:///session`) and a
-# regular single-link file. A `"pass"` record additionally must prove the
-# expected candidate digest, KVM acceleration, and all mandatory checks
-# passing. When `$require_pass` is `1`, only a validated `"pass"` record is
-# accepted.
+# commit SHA. Delegates to `sys_fs_ops` (`verify-result` / `verify-session-result`),
+# which verifies the evidence directory, opens a regular single-link file with
+# retryable handling for concurrent atomic replacement, and parses the bounded
+# UTF-8 JSON explicitly in Python (avoiding jq 1.6 vs jq 1.7 exit-code drift).
 #
 # Exit status:
 #   0: valid run-bound record (and passing when `$require_pass` is `1`)
 #   1: confirmed missing, malformed/mismatched JSON, or unsafe file inside a
-#      verified directory (replaceable by `ensure-result`)
-#   2: untrusted output directory or indeterminate operational read/validator
-#      failure (`ensure-result` must preserve any existing bytes and fail)
+#      verified directory
+#   2: untrusted output directory or indeterminate operational/concurrent-churn
+#      failure
 valid_result_json() {
     local out="$1" arch="$2" sha="$3" expect="$4" require_pass="${5:-0}"
-    local machine image image_sha
+    local machine image image_sha verify_op="verify-session-result" rc=0
     machine="$(machine_of "$arch")" || return 2
     image="$(image_file_of "$arch")" || return 2
     image_sha="$(image_sha_of "$arch")" || return 2
-    local -a jq_args=(
-        -s -e
-        --arg suite "$SUITE"
-        --arg repo "$SOURCE_REPOSITORY"
-        --arg sha "$sha"
-        --arg arch "$arch"
-        --arg expect "$expect"
-        --arg machine "$machine"
-        --arg image "$image"
-        --arg image_release "$IMAGE_RELEASE"
-        --arg image_sha "$image_sha"
-        --arg mandatory "$MANDATORY_TESTS"
-        --argjson require_pass "$require_pass"
-        'length == 1 and (.[0] | (
-           type == "object"
-           and .schema == 1
-           and .suite == $suite
-           and .source_repository == $repo
-           and .source_sha == $sha
-           and .architecture == $arch
-           and (.candidate_binary_sha256 | type == "string" and test("^[0-9a-f]{64}$"))
-           and (.virtualization | type == "object"
-                and .hypervisor == "qemu"
-                and .machine == $machine
-                and (.accelerator | type == "string" and length > 0))
-           and (.guest | type == "object"
-                and .image == $image
-                and .image_release == $image_release
-                and .image_sha256 == $image_sha)
-           and (.tests | type == "object")
-           and ((.tests) as $t | ($mandatory | split(" ")) as $req |
-                ($req | all(. as $k | ($t[$k] == "pass" or $t[$k] == "fail" or $t[$k] == "not_run")))
-                and (
-                  ($require_pass == 0 and .result == "fail")
-                  or (
-                    .result == "pass"
-                    and ($expect | test("^[0-9a-f]{64}$"))
-                    and .candidate_binary_sha256 == $expect
-                    and .virtualization.accelerator == "kvm"
-                    and ($req | all(. as $k | $t[$k] == "pass"))
-                  )
-                ))
-         ))'
-    )
-    local read_op
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        read_op="read-evidence-stdout"
-    else
-        read_op="read-session-evidence-stdout"
+        verify_op="verify-result"
     fi
-    local -a read_cmd=("$read_op")
-    if [ "$require_pass" != 1 ]; then
-        read_cmd+=(--quiet-missing)
-    fi
-    read_cmd+=("$out" "result.json")
-    local -a pstatus=()
-    if sys_fs_ops "${read_cmd[@]}" | jq "${jq_args[@]}" >/dev/null 2>&1; then
+    if sys_fs_ops "$verify_op" \
+        "$out" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "$expect" \
+        "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" "$require_pass"; then
         return 0
     else
-        pstatus=("${PIPESTATUS[@]}")
+        rc=$?
     fi
-    local read_rc="${pstatus[0]:-1}" jq_rc="${pstatus[1]:-1}"
-    case "$read_rc" in
-        0)
-            case "$jq_rc" in
-                0) return 0 ;;
-                1 | 5) return 1 ;;
-                *) return 2 ;;
-            esac
-            ;;
-        2 | 4)
-            return 1
-            ;;
-        *)
-            return 2
-            ;;
+    case "$rc" in
+        2 | 4 | 5) return 1 ;;
+        *) return 2 ;;
     esac
 }
 
 cmd_ensure_result() {
     parse_opts "$@"
-    local out arch sha expect
+    local out arch sha expect machine image image_sha ensure_op="ensure-session-result"
     out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
     expect="${opt_expect_sha256:-}"
+    check_out_path "$out"
     check_arch "$arch"; check_sha "$sha"
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     fi
     command -v python3 >/dev/null || die "missing tool: python3"
-    local check_rc=0
-    valid_result_json "$out" "$arch" "$sha" "$expect" 0 || check_rc=$?
-    if [ "$check_rc" -eq 0 ]; then
-        return 0
-    elif [ "$check_rc" -ne 1 ]; then
-        die "cannot verify existing result.json at $out/result.json; preserving any existing evidence"
-    fi
+    machine="$(machine_of "$arch")" || exit 1
+    image="$(image_file_of "$arch")" || exit 1
+    image_sha="$(image_sha_of "$arch")" || exit 1
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        sys_fs_ops prepare-evidence-dir "$out" || return 1
-    else
-        sys_fs_ops prepare-session-evidence-dir "$out" || return 1
+        ensure_op="ensure-result"
     fi
-    write_result "$out" "$arch" "$sha" "$NO_DIGEST" unknown 1 || true
-    valid_result_json "$out" "$arch" "$sha" "$expect" 0
+    sys_fs_ops "$ensure_op" \
+        "$out" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "$expect" \
+        "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" "$NO_DIGEST" \
+        || die "cannot verify or ensure result.json at $out/result.json; preserving any existing evidence"
 }
 
 cmd_verify_pass() {
@@ -625,6 +558,7 @@ cmd_verify_pass() {
     local out arch sha expect
     out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
     expect="${opt_expect_sha256:-}"
+    check_out_path "$out"
     check_arch "$arch"; check_sha "$sha"
     [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     command -v python3 >/dev/null || die "missing tool: python3"
@@ -928,6 +862,7 @@ cmd_run() {
     arch="$(need arch)"; candidate="$(need candidate)"; sha="$(need source_sha)"
     run_id="$(need run_id)"; attempt="$(need run_attempt)"; OUT="$(need out)"
     expect="$(need expect_sha256)"; cache="${opt_image_cache:-}"
+    check_out_path "$OUT"
     check_arch "$arch"; check_sha "$sha"
     check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
     [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
@@ -966,7 +901,7 @@ cmd_run() {
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         printf '%s\n' "$versions_txt" | sys_fs_ops publish-evidence-stdin "$OUT" "versions.txt"
     else
-        printf '%s\n' "$versions_txt" >"$OUT/versions.txt"
+        printf '%s\n' "$versions_txt" | sys_fs_ops publish-session-evidence-stdin "$OUT" "versions.txt"
     fi
     printf '%s\n' "$versions_txt"
 
@@ -1073,22 +1008,22 @@ EOF
     [ "$install" = pass ] || exit 1
 
     say "AC16: scripts/e2e-libvirt.sh"
+    local e2e_tmp="" e2e_rc=0 e2e_publish_op="publish-session-evidence-stdin"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        local e2e_tmp="" e2e_rc=0
-        e2e_tmp="$(mktemp "$dir/e2e-libvirt.XXXXXX.log")"
-        if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$e2e_tmp"; then
-            e2e_rc=0
-        else
-            e2e_rc=$?
-        fi
-        sys_fs_ops publish-evidence-stdin "$OUT" "e2e-libvirt.log" <"$e2e_tmp" || true
-        rm -f "$e2e_tmp"
-        if [ "$e2e_rc" -eq 0 ]; then
-            mark libvirt_interop pass
-        else
-            mark libvirt_interop fail
-        fi
-    elif bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$OUT/e2e-libvirt.log"; then
+        e2e_publish_op="publish-evidence-stdin"
+    fi
+    e2e_tmp="$(
+        umask 0077
+        mktemp "$dir/e2e-libvirt.XXXXXX.log"
+    )"
+    if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$name" 2>&1 | tee "$e2e_tmp"; then
+        e2e_rc=0
+    else
+        e2e_rc=$?
+    fi
+    sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.log" <"$e2e_tmp" || true
+    rm -f "$e2e_tmp"
+    if [ "$e2e_rc" -eq 0 ]; then
         mark libvirt_interop pass
     else
         mark libvirt_interop fail

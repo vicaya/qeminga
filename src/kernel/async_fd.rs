@@ -48,23 +48,24 @@ impl OwnedAsyncFd {
 
     /// Reports whether Tokio's reactor has already latched hangup or error
     /// readiness (`READ_CLOSED`, `WRITE_CLOSED`, or `ERROR`) on this
-    /// registration. Intended to be checked right before
-    /// [`OwnedAsyncFd::into_fd`] so hangups delivered while reads or writes
-    /// were paused are not discarded on deregistration (§5.7).
+    /// registration. Polls a single `AsyncFd::ready(READABLE | WRITABLE |
+    /// ERROR)` future once so cached bits are inspected directly without
+    /// checking Tokio's task cooperative budget, without masking out
+    /// standalone `ERROR`, and without replacing any existing directional
+    /// read/write waiter (§5.7).
     pub fn has_latched_hangup(&self) -> bool {
+        use std::future::Future;
+        use tokio::io::Interest;
+
         let mut cx = Context::from_waker(std::task::Waker::noop());
-        let is_hangup = |ready: tokio::io::Ready| {
-            ready.is_read_closed() || ready.is_write_closed() || ready.is_error()
-        };
-        if matches!(
-            self.inner.poll_read_ready(&mut cx),
-            Poll::Ready(Ok(guard)) if is_hangup(guard.ready())
-        ) {
-            return true;
-        }
+        let interest = Interest::READABLE | Interest::WRITABLE | Interest::ERROR;
+        let fut = std::pin::pin!(self.inner.ready(interest));
         matches!(
-            self.inner.poll_write_ready(&mut cx),
-            Poll::Ready(Ok(guard)) if is_hangup(guard.ready())
+            fut.poll(&mut cx),
+            Poll::Ready(Ok(guard))
+                if guard.ready().is_read_closed()
+                    || guard.ready().is_write_closed()
+                    || guard.ready().is_error()
         )
     }
 
@@ -505,6 +506,93 @@ mod tests {
         assert!(
             reg.has_latched_hangup(),
             "cached reactor readiness must retain latched EPOLLHUP even after writer2 clears POLLHUP"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn has_latched_hangup_survives_exhausted_coop_budget_and_preserves_waiter() {
+        use nix::fcntl::{OFlag, open};
+        use nix::sys::stat::Mode;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Wake, Waker};
+
+        struct CountWaker(AtomicUsize);
+        impl Wake for CountWaker {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (_dir, fifo) = private_fifo("coop-and-waker.fifo");
+        let reader = open(
+            &fifo,
+            OFlag::O_RDONLY | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let writer1 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        let reg = OwnedAsyncFd::register(reader).unwrap();
+
+        // Park a real directional read waiter via `poll_read`, then call
+        // `has_latched_hangup()` while idle: it must return `false` WITHOUT
+        // overwriting the registered directional read waker.
+        let mut buf = [0u8; 32];
+        let counter = Arc::new(CountWaker(AtomicUsize::new(0)));
+        let waker = Waker::from(counter.clone());
+        {
+            let mut cx = Context::from_waker(&waker);
+            assert!(reg.poll_read(&mut cx, &mut buf).is_pending());
+        }
+        assert!(!reg.has_latched_hangup());
+
+        nix::unistd::write(&writer1, b"x").unwrap();
+        pump_reactor().await;
+        assert!(
+            counter.0.load(Ordering::SeqCst) >= 1,
+            "has_latched_hangup must not replace an existing directional read waiter"
+        );
+        // Drain the byte and re-park on epoll.
+        let n = poll_fn(|cx| reg.poll_read(cx, &mut buf)).await.unwrap();
+        assert_eq!(&buf[..n], b"x");
+        assert!(
+            poll_fn(|cx| Poll::Ready(reg.poll_read(cx, &mut buf)))
+                .await
+                .is_pending()
+        );
+
+        // Latch real EPOLLHUP via writer1 closing, then clear kernel POLLHUP
+        // with writer2.
+        drop(writer1);
+        pump_reactor().await;
+        let _writer2 = open(&fifo, OFlag::O_WRONLY | OFlag::O_CLOEXEC, Mode::empty()).unwrap();
+        pump_reactor().await;
+
+        // Exhaust the task's entire Tokio cooperative budget inside a single
+        // task poll (verified by `poll_read_checked` returning `Poll::Pending`
+        // despite latched `READ_CLOSED`), then assert `has_latched_hangup()`
+        // STILL returns `true` without being suppressed by coop budget.
+        let (budget_exhausted, detected_under_exhausted_budget) = poll_fn(|cx| {
+            let mut exhausted = false;
+            for _ in 0..512 {
+                if reg.poll_read_checked(cx, &mut buf, || true).is_pending() {
+                    exhausted = true;
+                    break;
+                }
+            }
+            Poll::Ready((exhausted, reg.has_latched_hangup()))
+        })
+        .await;
+        assert!(
+            budget_exhausted,
+            "test must genuinely exhaust Tokio's cooperative budget"
+        );
+        assert!(
+            detected_under_exhausted_budget,
+            "has_latched_hangup must detect cached hangup even when task cooperative budget is exhausted"
         );
     }
 }

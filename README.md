@@ -16,9 +16,9 @@ the guest.
 loop-mounted filesystems, natively on x86-64 and aarch64) and exercised
 against real libvirt in CI under real KVM on GitHub-hosted x86-64
 (`ubuntu-24.04`) and under QEMU's TCG emulator on both architectures.
-Remaining items (aarch64 KVM run on a self-hosted arm64 runner and the
-full release-qualification suite) are tracked in
-[`docs/tasks.md`](docs/tasks.md) §7.
+The remaining release-qualification items (`libvirt-release-v1` suite
+and evidence verifier; native aarch64 KVM is tracked separately as
+optional coverage) are in [`docs/tasks.md`](docs/tasks.md) §7.
 
 ## Commands
 

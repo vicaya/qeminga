@@ -128,17 +128,25 @@ runners on every code-changing push to `main`, pull request, and
   (enabled since 2024-04-02), whereas GitHub-hosted `ubuntu-24.04-arm`
   runners do not expose `/dev/kvm` at any tier (Azure Arm VM SKUs do
   not yet offer nested virtualization).
-- **`/dev/kvm` udev workaround and fail-fast guard:** on `ubuntu-24.04`,
-  the `runner` user is not in the `kvm` group (and `usermod` cannot take
-  effect inside an already-running Actions job). Before installing any
-  packages or booting a guest, the `smoke` job checks `test -c /dev/kvm`,
+- **`/dev/kvm` udev workaround, mode checks, and early-failure result:** on
+  `ubuntu-24.04`, the `runner` user is not in the `kvm` group (and `usermod`
+  cannot take effect inside an already-running Actions job). Before installing
+  any packages or booting a guest, the `smoke` job checks `test -c /dev/kvm`,
   installs `/etc/udev/rules.d/99-kvm4all.rules` with
   `KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"`
-  (the `OPTIONS+="static_node=kvm"` clause prevents later udev reloads
-  or package installs from resetting the mode), runs
-  `udevadm control --reload-rules`, `udevadm trigger --name-match=kvm`,
-  and `udevadm settle`, and fails fast unless `test -r /dev/kvm && test
-  -w /dev/kvm` succeeds as the unprivileged `runner` user.
+  (`OPTIONS+="static_node=kvm"` applies the rule's permissions to the named
+  static device node), runs `udevadm control --reload-rules`,
+  `udevadm trigger --name-match=kvm`, and `udevadm settle`, and checks
+  `test -r /dev/kvm && test -w /dev/kvm` as the unprivileged `runner` user.
+  Because a normal `MODE="0666"` assignment can still be overridden by a later
+  matching udev rule, both that fail-fast check before package installation and
+  `scripts/ci/libvirt-kvm-smoke.sh`'s own `preflight` check after package
+  installation detect any permissions regression. If an early step exits before
+  `libvirt-kvm-smoke.sh run` installs its `EXIT` trap, an `if: always()` step
+  invokes `scripts/ci/libvirt-kvm-smoke.sh result` before the summary and
+  evidence upload to write a structured `libvirt-kvm-smoke-v1` failure
+  `result.json` (`accelerator: "unknown"`, unexecuted checks `"not_run"`,
+  unverified-digest sentinel).
 - **Unprivileged `qemu:///session` reuse:** the `candidate` job builds
   `cargo build --release --locked --features seccomp` on `ubuntu-24.04`
   and reports the binary's SHA-256 as a job output; the `smoke` job has

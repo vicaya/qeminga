@@ -22,7 +22,8 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -809,9 +810,9 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         );
     }
 
-    // The exact udev workaround from GitHub's 2024-04-02 changelog / randax/talos-box#74,
-    // including OPTIONS+="static_node=kvm" so package installs or udev reloads cannot reset
-    // /dev/kvm permissions, plus an explicit fail-fast check BEFORE apt-get or smoke run.
+    // The udev rule from GitHub's 2024-04-02 changelog / randax/talos-box#74 applies
+    // MODE="0666" to the static /dev/kvm node; explicit mode checks before apt-get and
+    // again inside libvirt-kvm-smoke.sh preflight detect any permissions regression.
     let udev_rule = r#"KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm""#;
     let udev_idx = smoke
         .find(udev_rule)
@@ -870,13 +871,110 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         );
     }
 
-    // Cleanup and artifact upload run even on failure.
+    // Cleanup, fallback failure-result generation (for early exits before `run` installs its
+    // EXIT trap), summary, and artifact upload all run under `if: always()` in order.
     let cleanup_idx = smoke.find("libvirt-kvm-smoke.sh cleanup").unwrap();
     let cleanup_step = &smoke[smoke[..cleanup_idx].rfind("- name:").unwrap()..cleanup_idx];
     assert!(cleanup_step.contains("if: always()"), "{cleanup_step}");
+
+    let fallback_idx = smoke
+        .find("libvirt-kvm-smoke.sh result")
+        .unwrap_or_else(|| {
+            panic!("missing early-failure structured result.json fallback step:\n{smoke}")
+        });
+    let fallback_start = smoke[..fallback_idx].rfind("- name:").unwrap();
+    let summary_idx = smoke.find("- name: Result summary").unwrap();
+    let fallback_step = &smoke[fallback_start..summary_idx];
+    assert!(fallback_step.contains("if: always()"), "{fallback_step}");
+    assert!(
+        fallback_step.contains(r#"[ ! -f "$OUT/result.json" ]"#),
+        "fallback must preserve any result.json already written by run:\n{fallback_step}"
+    );
+    assert!(
+        fallback_step.contains("--accelerator unknown"),
+        "{fallback_step}"
+    );
+    assert!(
+        fallback_step.contains(&format!("--binary-sha256 {}", "0".repeat(64))),
+        "fallback must use the unverified-digest sentinel:\n{fallback_step}"
+    );
+    assert!(
+        fallback_step.contains(r#"test -s "$OUT/result.json""#),
+        "fallback must confirm result.json was written:\n{fallback_step}"
+    );
+
     let upload_idx = smoke.find("actions/upload-artifact").unwrap();
     let upload_step = &smoke[smoke[..upload_idx].rfind("- name:").unwrap()..upload_idx];
     assert!(upload_step.contains("if: always()"), "{upload_step}");
+    assert!(
+        cleanup_idx < fallback_idx && fallback_idx < summary_idx && summary_idx < upload_idx,
+        "cleanup -> fallback result -> summary -> upload ordering must hold"
+    );
+}
+
+#[test]
+fn early_failure_fallback_writes_structured_fail_result_json() {
+    require_jq();
+    let dir = tempfile::tempdir().unwrap();
+    let out_dir = dir.path().join("out");
+    std::fs::create_dir(&out_dir).unwrap();
+    let sentinel = "0".repeat(64);
+    let output = lane(&[
+        "result",
+        "--out",
+        out_dir.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--binary-sha256",
+        &sentinel,
+        "--accelerator",
+        "unknown",
+    ]);
+    assert!(
+        !output.status.success(),
+        "fallback result must exit non-zero (fail-closed): {}",
+        text(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
+            .unwrap_or_else(|e| panic!("{e}: {}", text(&output)));
+    assert_eq!(json["schema"], 1);
+    assert_eq!(json["suite"], "libvirt-kvm-smoke-v1");
+    assert_eq!(json["source_repository"], "vicaya/qeminga");
+    assert_eq!(json["source_sha"], SHA);
+    assert_eq!(json["architecture"], "x86_64");
+    assert_eq!(json["candidate_binary_sha256"], sentinel);
+    assert_eq!(json["virtualization"]["hypervisor"], "qemu");
+    assert_eq!(json["virtualization"]["accelerator"], "unknown");
+    assert_eq!(json["virtualization"]["machine"], "q35");
+    for t in MANDATORY {
+        assert_eq!(json["tests"][t], "not_run", "{t}");
+    }
+    assert_eq!(json["result"], "fail");
+}
+
+/// Runs `libvirt-kvm-smoke.sh` guaranteed unprivileged (dropping to uid/gid
+/// 65534 if the test suite itself is invoked as root) so `qemu:///session`'s
+/// root refusal can never satisfy an assertion meant for a later preflight check.
+fn lane_unprivileged(args: &[&str], env: &[(&str, &str)], path_override: Option<&Path>) -> Output {
+    let bash = ["/usr/bin/bash", "/bin/bash"]
+        .iter()
+        .find(|p| Path::new(p).exists())
+        .unwrap();
+    let mut cmd = Command::new(bash);
+    cmd.arg(script()).args(args);
+    if let Some(p) = path_override {
+        cmd.env("PATH", p);
+    }
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    if std::fs::metadata("/proc/self").unwrap().uid() == 0 {
+        cmd.uid(65534).gid(65534);
+    }
+    cmd.output().unwrap()
 }
 
 #[test]
@@ -887,20 +985,56 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
         return;
     }
     let dir = tempfile::tempdir().unwrap();
+    // Ensure traversable/writable if the child drops to uid 65534 under sudo.
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+
+    // Build a real, valid candidate directory and matching digest so the test
+    // cannot accidentally pass because of a missing candidate.
+    let bin_file = dir.path().join("built-qeminga");
+    std::fs::write(&bin_file, b"valid fake candidate\n").unwrap();
+    let cand_dir = dir.path().join("candidate");
+    let m = lane(&[
+        "manifest",
+        "--out",
+        cand_dir.to_str().unwrap(),
+        "--binary",
+        bin_file.to_str().unwrap(),
+        "--arch",
+        arch,
+        "--source-sha",
+        SHA,
+        "--version",
+        "0.1.0",
+        "--run-id",
+        "42",
+        "--run-attempt",
+        "1",
+        "--runner",
+        "ubuntu-24.04",
+    ]);
+    assert!(m.status.success(), "{}", text(&m));
+    let digest = sha256_hex(&cand_dir.join("qeminga"));
+
     let missing = dir.path().join("no-such-kvm");
     let regular = dir.path().join("regular-file-kvm");
     std::fs::write(&regular, b"").unwrap();
     std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o666)).unwrap();
 
+    let images_dir = dir.path().join("images");
+    std::fs::create_dir(&images_dir).unwrap();
+    std::fs::set_permissions(&images_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+
     for (label, kvm_path) in [("missing", &missing), ("regular", &regular)] {
         let out_dir = dir.path().join(format!("out-{label}"));
-        let output = lane_env(
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let output = lane_unprivileged(
             &[
                 "run",
                 "--arch",
                 arch,
                 "--candidate",
-                dir.path().join("candidate").to_str().unwrap(),
+                cand_dir.to_str().unwrap(),
                 "--source-sha",
                 SHA,
                 "--run-id",
@@ -910,25 +1044,38 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
                 "--out",
                 out_dir.to_str().unwrap(),
                 "--expect-sha256",
-                &"a".repeat(64),
+                &digest,
             ],
             &[
                 ("QEMINGA_KVM_DEVICE", kvm_path.to_str().unwrap()),
-                (
-                    "QEMINGA_E2E_IMAGES",
-                    dir.path().join("images").to_str().unwrap(),
-                ),
+                ("QEMINGA_E2E_IMAGES", images_dir.to_str().unwrap()),
             ],
             None,
         );
+        let combined = text(&output);
         assert!(
             !output.status.success(),
-            "{label}: expected failure: {}",
-            text(&output)
+            "{label}: expected failure: {combined}"
+        );
+        let expected_diag = format!(
+            "KVM device {} is missing or not readable/writable by uid ",
+            kvm_path.display()
+        );
+        assert!(
+            combined.contains(&expected_diag),
+            "{label}: failure must name the rejected KVM device path ({expected_diag:?}):\n{combined}"
+        );
+        assert!(
+            !combined.contains("refusing to run qemu:///session as root"),
+            "{label}: must not stop at root-session check:\n{combined}"
+        );
+        assert!(
+            !combined.contains("missing tool:"),
+            "{label}: must fail at the KVM device check before tool checks:\n{combined}"
         );
         let result_json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
-                .unwrap_or_else(|e| panic!("{label}: {e}: {}", text(&output)));
+                .unwrap_or_else(|e| panic!("{label}: {e}: {combined}"));
         assert_eq!(result_json["suite"], "libvirt-kvm-smoke-v1", "{label}");
         assert_eq!(result_json["result"], "fail", "{label}");
         assert_eq!(
@@ -940,4 +1087,59 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
             "{label}"
         );
     }
+
+    // Positive control: a readable/writable char device (/dev/null) gets PAST the KVM device
+    // guard and reaches the subsequent tool check (stopping at `missing tool: virsh` under a
+    // PATH that omits `virsh`), proving the assertions above only pass because of the guard.
+    let minimal_bin = dir.path().join("minimal-bin");
+    std::fs::create_dir(&minimal_bin).unwrap();
+    for tool in [
+        "dirname", "basename", "uname", "id", "mkdir", "rm", "cat", "tr", "jq", "printf", "cut",
+        "cp",
+    ] {
+        if let Some(real) = ["/usr/bin", "/bin"]
+            .iter()
+            .map(|d| Path::new(d).join(tool))
+            .find(|p| p.exists())
+        {
+            std::os::unix::fs::symlink(real, minimal_bin.join(tool)).unwrap();
+        }
+    }
+    let ctrl_out = dir.path().join("out-control");
+    std::fs::create_dir(&ctrl_out).unwrap();
+    std::fs::set_permissions(&ctrl_out, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let ctrl = lane_unprivileged(
+        &[
+            "run",
+            "--arch",
+            arch,
+            "--candidate",
+            cand_dir.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "42",
+            "--run-attempt",
+            "1",
+            "--out",
+            ctrl_out.to_str().unwrap(),
+            "--expect-sha256",
+            &digest,
+        ],
+        &[
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_E2E_IMAGES", images_dir.to_str().unwrap()),
+        ],
+        Some(&minimal_bin),
+    );
+    let ctrl_text = text(&ctrl);
+    assert!(!ctrl.status.success(), "{ctrl_text}");
+    assert!(
+        !ctrl_text.contains("KVM device /dev/null is missing"),
+        "rw char device must pass the KVM device check:\n{ctrl_text}"
+    );
+    assert!(
+        ctrl_text.contains("missing tool: virsh"),
+        "control run should reach the next preflight stage (missing tool: virsh):\n{ctrl_text}"
+    );
 }

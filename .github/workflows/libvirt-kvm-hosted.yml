@@ -5,19 +5,27 @@
 # 2024-04-02), whereas GitHub-hosted arm64 runners (`ubuntu-24.04-arm`) do not
 # expose KVM at any tier. On `ubuntu-24.04`, the `runner` user is not in the
 # `kvm` group (and `usermod` cannot take effect inside the running session), so
-# this workflow installs the 99-kvm4all.rules udev workaround (including
-# `OPTIONS+="static_node=kvm"` so subsequent udev events / package installs
-# cannot reset /dev/kvm permissions) and asserts `test -r /dev/kvm && test -w
-# /dev/kvm` fail-fast before installing packages or booting a VM.
+# this workflow installs `99-kvm4all.rules` with `OPTIONS+="static_node=kvm"`
+# (applying the rule's permissions to the static `/dev/kvm` node). Because a
+# normal `MODE="0666"` assignment can still be overridden by a later matching
+# udev rule, both this workflow (fail-fast `test -r /dev/kvm && test -w
+# /dev/kvm` before package installation) and `scripts/ci/libvirt-kvm-smoke.sh`
+# (`preflight` after package installation) verify `/dev/kvm` permissions and
+# fail closed on any regression.
 #
 # Because GitHub-hosted runners are ephemeral, this workflow safely runs on
 # `push` to `main`, `pull_request`, and `workflow_dispatch` (gated on
 # `scripts/ci/docs-only.sh`). It reuses `scripts/ci/libvirt-kvm-smoke.sh` in
 # unprivileged `qemu:///session` mode (zero `sudo` during the smoke run, no
 # `libvirt-daemon-system`, user-mode networking via libslirp) and anchors the
-# tested binary to the build job's reported SHA-256. Self-hosted x86_64 and
-# aarch64 KVM runners remain in `.github/workflows/libvirt-kvm.yml`
-# (`workflow_dispatch` only). `tests/libvirt_kvm.rs` checks this file's shape.
+# tested binary to the build job's reported SHA-256. If an early step fails
+# before `libvirt-kvm-smoke.sh run` installs its result-writing trap, a
+# fallback `if: always()` step writes a structured `libvirt-kvm-smoke-v1`
+# failure `result.json` (`accelerator: unknown`, unexecuted checks `not_run`,
+# unverified-digest sentinel) before the summary and artifact upload.
+# Self-hosted x86_64 and aarch64 KVM runners remain in
+# `.github/workflows/libvirt-kvm.yml` (`workflow_dispatch` only).
+# `tests/libvirt_kvm.rs` checks this file's shape.
 name: libvirt KVM smoke (hosted x86_64)
 
 on:
@@ -124,8 +132,10 @@ jobs:
           test "$RUNNER_ARCH" = "X64"
       # Fail fast if a runner-image rollout drops /dev/kvm, and grant the
       # unprivileged runner user rw access without a new login session.
-      # OPTIONS+="static_node=kvm" prevents later udev triggers from resetting
-      # the device mode (actions/runner-images#8670).
+      # OPTIONS+="static_node=kvm" applies the rule's permissions to the static
+      # /dev/kvm node; because a later matching udev rule could still override
+      # MODE="0666", both the check below and libvirt-kvm-smoke.sh's preflight
+      # after package installation verify /dev/kvm remains rw for runner.
       - name: Enable /dev/kvm for the runner user
         run: |
           test -c /dev/kvm || { echo "::error::/dev/kvm is absent on this GitHub-hosted runner"; exit 1; }
@@ -172,6 +182,21 @@ jobs:
         run: |
           scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$ARCH" \
             --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      # If an early step (such as the /dev/kvm check or package installation)
+      # failed before `libvirt-kvm-smoke.sh run` installed its EXIT trap, write
+      # a structured `libvirt-kvm-smoke-v1` failure record so the summary and
+      # evidence artifact always identify the failed run.
+      - name: Record structured failure if run did not produce result.json
+        if: always()
+        run: |
+          if [ ! -f "$OUT/result.json" ]; then
+            mkdir -p "$OUT"
+            scripts/ci/libvirt-kvm-smoke.sh result --out "$OUT" \
+              --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+              --binary-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+              --accelerator unknown || true
+            test -s "$OUT/result.json"
+          fi
       - name: Result summary
         if: always()
         run: |

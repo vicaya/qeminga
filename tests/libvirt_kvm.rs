@@ -94,7 +94,7 @@ fn private_tempdir() -> tempfile::TempDir {
 }
 
 fn create_private_dir(path: &Path) {
-    std::fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+    create_dir_mode(path, 0o700);
 }
 
 /// Returns true when `target` is mapped in the current user namespace's
@@ -121,15 +121,7 @@ fn uid_is_mapped(target: u32) -> bool {
 }
 
 fn write_exec(path: &Path, body: &str) {
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o700)
-        .open(path)
-        .unwrap();
-    f.write_all(body.as_bytes()).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_file_mode(path, 0o700, body.as_bytes());
 }
 
 fn sha256_hex(path: &Path) -> String {

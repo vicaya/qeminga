@@ -393,17 +393,21 @@ write_result() {
         printf '%s\n' "$result_json" | sys_fs_ops publish-evidence-stdin "$out" "result.json" || return 1
         printf '%s\n' "$result_json" || return 1
     else
-        local tmp="$out/.result.json.tmp.$$"
-        rm -f "$tmp" || return 1
+        local tmp
+        tmp="$(mktemp -- "$out/.result.json.tmp.XXXXXX")" || return 1
+        if ! chmod 0600 -- "$tmp"; then
+            rm -f -- "$tmp"
+            return 1
+        fi
         if ! printf '%s\n' "$result_json" >"$tmp"; then
-            rm -f "$tmp"
+            rm -f -- "$tmp"
             return 1
         fi
-        if ! mv -f -T "$tmp" "$out/result.json"; then
-            rm -f "$tmp"
+        if ! mv -f -T -- "$tmp" "$out/result.json"; then
+            rm -f -- "$tmp"
             return 1
         fi
-        cat "$out/result.json" || return 1
+        cat -- "$out/result.json" || return 1
     fi
     [ "$overall" = pass ]
 }
@@ -415,33 +419,38 @@ cmd_result() {
     digest="$(need binary_sha256)"; accel="$(need accelerator)"
     check_arch "$arch"; check_sha "$sha"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "bad digest '$digest'"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
     write_result "$out" "$arch" "$sha" "$digest" "$accel" || return 1
 }
 
-# Validates that `$file` contains exactly one JSON object forming a complete
-# `libvirt-kvm-smoke-v1` record bound to this run's architecture and commit
-# SHA. A `"pass"` record additionally must prove the expected candidate digest,
-# KVM acceleration, and all mandatory checks passing. When `$require_pass` is
-# `1`, only a validated `"pass"` record is accepted.
+# Validates that `$out/result.json` contains exactly one JSON object forming a
+# complete `libvirt-kvm-smoke-v1` record bound to this run's architecture and
+# commit SHA. In `qemu:///system` mode, reads through `sys_fs_ops` after
+# verifying the evidence directory and a regular single-link file. A `"pass"`
+# record additionally must prove the expected candidate digest, KVM
+# acceleration, and all mandatory checks passing. When `$require_pass` is `1`,
+# only a validated `"pass"` record is accepted.
 valid_result_json() {
-    local file="$1" arch="$2" sha="$3" expect="$4" require_pass="${5:-0}"
-    [ -f "$file" ] && [ -s "$file" ] || return 1
+    local out="$1" arch="$2" sha="$3" expect="$4" require_pass="${5:-0}"
     local machine image image_sha
     machine="$(machine_of "$arch")" || return 1
     image="$(image_file_of "$arch")" || return 1
     image_sha="$(image_sha_of "$arch")" || return 1
-    jq -s -e \
-        --arg suite "$SUITE" \
-        --arg repo "$SOURCE_REPOSITORY" \
-        --arg sha "$sha" \
-        --arg arch "$arch" \
-        --arg expect "$expect" \
-        --arg machine "$machine" \
-        --arg image "$image" \
-        --arg image_release "$IMAGE_RELEASE" \
-        --arg image_sha "$image_sha" \
-        --arg mandatory "$MANDATORY_TESTS" \
-        --argjson require_pass "$require_pass" \
+    local -a jq_args=(
+        -s -e
+        --arg suite "$SUITE"
+        --arg repo "$SOURCE_REPOSITORY"
+        --arg sha "$sha"
+        --arg arch "$arch"
+        --arg expect "$expect"
+        --arg machine "$machine"
+        --arg image "$image"
+        --arg image_release "$IMAGE_RELEASE"
+        --arg image_sha "$image_sha"
+        --arg mandatory "$MANDATORY_TESTS"
+        --argjson require_pass "$require_pass"
         'length == 1 and (.[0] | (
            type == "object"
            and .schema == 1
@@ -471,7 +480,21 @@ valid_result_json() {
                     and ($req | all(. as $k | $t[$k] == "pass"))
                   )
                 ))
-         ))' "$file" >/dev/null 2>&1
+         ))'
+    )
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        if [ "$require_pass" = 1 ]; then
+            sys_fs_ops read-evidence-stdout "$out" "result.json" \
+                | jq "${jq_args[@]}" >/dev/null 2>&1
+        else
+            sys_fs_ops read-evidence-stdout "$out" "result.json" 2>/dev/null \
+                | jq "${jq_args[@]}" >/dev/null 2>&1
+        fi
+    else
+        local file="$out/result.json"
+        [ ! -L "$file" ] && [ -f "$file" ] && [ -s "$file" ] || return 1
+        jq "${jq_args[@]}" "$file" >/dev/null 2>&1
+    fi
 }
 
 cmd_ensure_result() {
@@ -483,12 +506,19 @@ cmd_ensure_result() {
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     fi
-    if valid_result_json "$out/result.json" "$arch" "$sha" "$expect" 0; then
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
+    if valid_result_json "$out" "$arch" "$sha" "$expect" 0; then
         return 0
     fi
-    mkdir -p "$out"
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        sys_fs_ops prepare-evidence-dir "$out" || return 1
+    else
+        mkdir -p "$out"
+    fi
     write_result "$out" "$arch" "$sha" "$NO_DIGEST" unknown 1 || true
-    valid_result_json "$out/result.json" "$arch" "$sha" "$expect" 0
+    valid_result_json "$out" "$arch" "$sha" "$expect" 0
 }
 
 cmd_verify_pass() {
@@ -498,7 +528,10 @@ cmd_verify_pass() {
     expect="${opt_expect_sha256:-}"
     check_arch "$arch"; check_sha "$sha"
     [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
-    valid_result_json "$out/result.json" "$arch" "$sha" "$expect" 1 \
+    if [ "$CONNECT_URI" = "qemu:///system" ]; then
+        command -v python3 >/dev/null || die "missing tool: python3"
+    fi
+    valid_result_json "$out" "$arch" "$sha" "$expect" 1 \
         || die "no validated passing result.json at $out/result.json for $arch @ $sha (candidate $expect)"
 }
 

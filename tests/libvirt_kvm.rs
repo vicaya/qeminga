@@ -4429,6 +4429,73 @@ exit "$rc""#,
         "failing cat must fail write_result in || rc=1 trap context: {}",
         text(&res3)
     );
+
+    // Case 4: `chmod` fails after `mktemp` creates the exclusive temp file.
+    let dir4 = private_tempdir();
+    assert_eq!(
+        std::fs::metadata(dir4.path()).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double root dir4 must be created 0700"
+    );
+    let out4 = dir4.path().join("out");
+    std::fs::create_dir_all(out4.join("tests")).unwrap();
+    for t in MANDATORY {
+        std::fs::write(out4.join("tests").join(t), "pass\n").unwrap();
+    }
+    let fake_chmod_bin = dir4.path().join("bin");
+    create_dir_mode(&fake_chmod_bin, 0o700);
+    write_exec(
+        &fake_chmod_bin.join("chmod"),
+        "#!/bin/sh\necho 'chmod: simulated failure' >&2\nexit 1\n",
+    );
+    let res4 = run_trap_context(&out4, Some(&fake_chmod_bin));
+    assert!(
+        !res4.status.success(),
+        "failing chmod must fail write_result in || rc=1 trap context: {}",
+        text(&res4)
+    );
+    let leftovers4: Vec<String> = std::fs::read_dir(&out4)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".result.json.tmp"))
+        .collect();
+    assert!(
+        leftovers4.is_empty(),
+        "temp file must be cleaned up after chmod error: {leftovers4:?}"
+    );
+    assert!(
+        !out4.join("result.json").exists(),
+        "result.json must not exist after failed chmod"
+    );
+
+    // Case 5: `mktemp` fails before any temporary file is created.
+    let dir5 = private_tempdir();
+    assert_eq!(
+        std::fs::metadata(dir5.path()).unwrap().mode() & 0o777,
+        0o700,
+        "executable test-double root dir5 must be created 0700"
+    );
+    let out5 = dir5.path().join("out");
+    std::fs::create_dir_all(out5.join("tests")).unwrap();
+    for t in MANDATORY {
+        std::fs::write(out5.join("tests").join(t), "pass\n").unwrap();
+    }
+    let fake_mktemp_bin = dir5.path().join("bin");
+    create_dir_mode(&fake_mktemp_bin, 0o700);
+    write_exec(
+        &fake_mktemp_bin.join("mktemp"),
+        "#!/bin/sh\necho 'mktemp: simulated failure' >&2\nexit 1\n",
+    );
+    let res5 = run_trap_context(&out5, Some(&fake_mktemp_bin));
+    assert!(
+        !res5.status.success(),
+        "failing mktemp must fail write_result in || rc=1 trap context: {}",
+        text(&res5)
+    );
+    assert!(
+        !out5.join("result.json").exists(),
+        "result.json must not exist after failed mktemp"
+    );
 }
 
 #[test]
@@ -4440,7 +4507,8 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
     let other_sha = SHA.replace('0', "f");
 
     // 1. Direct `result` subcommand exits non-zero (fail-closed) and publishes
-    // result.json atomically via a temporary file + `mv -f -T`, leaving no temp files.
+    // result.json atomically via an exclusive `mktemp` file + explicit `0600`
+    // mode + `mv -f -T`, leaving no temp files.
     let direct_dir = tempfile::tempdir().unwrap();
     let direct_out = direct_dir.path().join("out");
     std::fs::create_dir(&direct_out).unwrap();
@@ -4467,14 +4535,25 @@ fn early_failure_fallback_writes_structured_fail_result_json() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert_eq!(entries, vec!["result.json"], "no leftover temp files");
+    assert_eq!(
+        std::fs::metadata(direct_out.join("result.json"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600,
+        "session result.json must be published with explicit private 0600 mode"
+    );
     let script_src = std::fs::read_to_string(script()).unwrap();
     let wr_start = script_src.find("write_result()").unwrap();
     let wr_end = script_src[wr_start..].find("\ncmd_result()").unwrap() + wr_start;
     let write_result_fn = &script_src[wr_start..wr_end];
     assert!(
-        write_result_fn.contains("mv -f -T ")
+        write_result_fn.contains("mktemp ")
+            && write_result_fn.contains("chmod 0600 ")
+            && write_result_fn.contains("mv -f -T ")
+            && !write_result_fn.contains(".result.json.tmp.$$")
             && !write_result_fn.contains(r#">"$out/result.json""#),
-        "write_result must publish atomically via temp file + mv -f -T:\n{write_result_fn}"
+        "write_result must publish atomically via exclusive mktemp + chmod 0600 + mv -f -T:\n{write_result_fn}"
     );
 
     // Helper: produce an authentic writer-generated `result.json` using the
@@ -4943,8 +5022,14 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
             !combined.contains("missing tool:"),
             "{label}: must fail at the KVM device check before tool checks:\n{combined}"
         );
+        let result_path = out_dir.join("result.json");
+        assert_eq!(
+            std::fs::metadata(&result_path).unwrap().mode() & 0o777,
+            0o600,
+            "{label}: published session result.json must have private 0600 mode even under permissive umask"
+        );
         let result_json: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(out_dir.join("result.json")).unwrap())
+            serde_json::from_slice(&std::fs::read(&result_path).unwrap())
                 .unwrap_or_else(|e| panic!("{label}: {e}: {combined}"));
         assert_eq!(result_json["suite"], "libvirt-kvm-smoke-v1", "{label}");
         assert_eq!(result_json["result"], "fail", "{label}");
@@ -4965,7 +5050,7 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
     create_dir_mode(&minimal_bin, 0o755);
     for tool in [
         "dirname", "basename", "uname", "id", "mkdir", "rm", "cat", "tr", "jq", "printf", "cut",
-        "cp", "mv",
+        "cp", "mv", "mktemp", "chmod",
     ] {
         if let Some(real) = ["/usr/bin", "/bin"]
             .iter()
@@ -5020,11 +5105,122 @@ fn run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_de
 }
 
 #[test]
+fn session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask() {
+    require_jq();
+    let dir = private_tempdir();
+    let out_dir = dir.path().join("out");
+    create_dir_mode(&out_dir, 0o700);
+    create_dir_mode(&out_dir.join("tests"), 0o700);
+    for t in MANDATORY {
+        write_file_mode(&out_dir.join("tests").join(t), 0o600, b"pass\n");
+    }
+    let digest = "a".repeat(64);
+
+    // 1. Ordinary session `result` under `umask 000` must publish `result.json`
+    //    with explicit `0600` permissions (never `0666`) and leave no temp files.
+    let res = Command::new("/bin/sh")
+        .args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
+        .arg(script())
+        .args([
+            "result",
+            "--out",
+            out_dir.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--binary-sha256",
+            &digest,
+            "--accelerator",
+            "kvm",
+        ])
+        .output()
+        .unwrap();
+    assert!(res.status.success(), "{}", text(&res));
+    let result_path = out_dir.join("result.json");
+    assert_eq!(
+        std::fs::metadata(&result_path).unwrap().mode() & 0o777,
+        0o600,
+        "session result.json must be mode 0600 under umask 000"
+    );
+    let leftovers: Vec<String> = std::fs::read_dir(&out_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".result.json.tmp"))
+        .collect();
+    assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+    // 2. Session `verify-pass` rejects a symlinked `result.json`, and
+    //    `ensure-result` replaces the symlink atomically with a `0600` regular
+    //    `fail` record without modifying the symlink target.
+    let victim = dir.path().join("foreign-pass.json");
+    let valid_pass_bytes = std::fs::read(&result_path).unwrap();
+    write_file_mode(&victim, 0o600, &valid_pass_bytes);
+    let sym_out = dir.path().join("sym-out");
+    create_dir_mode(&sym_out, 0o700);
+    std::os::unix::fs::symlink(&victim, sym_out.join("result.json")).unwrap();
+
+    let sym_verify = lane(&[
+        "verify-pass",
+        "--out",
+        sym_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !sym_verify.status.success(),
+        "session verify-pass must reject symlinked result.json: {}",
+        text(&sym_verify)
+    );
+
+    let sym_ensure = Command::new("/bin/sh")
+        .args(["-c", r#"umask 000 && exec bash "$@""#, "sh"])
+        .arg(script())
+        .args([
+            "ensure-result",
+            "--out",
+            sym_out.to_str().unwrap(),
+            "--arch",
+            "x86_64",
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ])
+        .output()
+        .unwrap();
+    assert!(sym_ensure.status.success(), "{}", text(&sym_ensure));
+    let sym_lmeta = std::fs::symlink_metadata(sym_out.join("result.json")).unwrap();
+    assert!(
+        sym_lmeta.file_type().is_file(),
+        "ensure-result must replace symlink with a regular file"
+    );
+    assert_eq!(
+        sym_lmeta.mode() & 0o777,
+        0o600,
+        "ensure-result under umask 000 must publish 0600 regular file"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        valid_pass_bytes,
+        "replacing symlinked result.json must never overwrite symlink target"
+    );
+    let replaced: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sym_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(replaced["result"], "fail");
+}
+
+#[test]
 fn kvm_device_fixture_stays_private_under_permissive_umask() {
     let exe = std::env::current_exe().unwrap();
     for test_name in [
         "run_fails_closed_with_result_json_when_kvm_device_is_missing_or_not_a_char_device",
         "write_result_propagates_publish_failure_in_exit_trap_context_and_cleans_temp",
+        "session_result_uses_exclusive_temp_and_private_mode_under_permissive_umask",
     ] {
         let out = Command::new("/bin/sh")
             .args(["-c", r#"umask 000 && exec "$1" --exact "$2""#, "sh"])
@@ -5038,4 +5234,455 @@ fn kvm_device_fixture_stays_private_under_permissive_umask() {
             text(&out)
         );
     }
+}
+
+#[test]
+fn system_mode_ensure_result_and_verify_pass_verify_evidence_dir_and_reject_links() {
+    require_jq();
+    let dir = private_tempdir();
+    let sys_root = dir.path().join("sys-root");
+    create_dir_mode(&sys_root, 0o755);
+    let as_root = std::fs::metadata("/proc/self").unwrap().uid() == 0;
+    let digest = "a".repeat(64);
+    let sentinel = "0".repeat(64);
+
+    let run_sys = |args: &[&str]| -> Output {
+        let mut envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", "qemu:///system")];
+        if !as_root {
+            envs.push(("QEMINGA_TEST_SYSFS_ROOT", sys_root.to_str().unwrap()));
+        }
+        lane_env(args, &envs, None)
+    };
+
+    // Build a genuine passing `result.json` using the script's own `result` subcommand
+    // inside a private verified directory.
+    let priv_out = sys_root.join("private-out");
+    create_dir_mode(&priv_out, 0o755);
+    create_dir_mode(&priv_out.join("tests"), 0o755);
+    for t in MANDATORY {
+        write_file_mode(&priv_out.join("tests").join(t), 0o644, b"pass\n");
+    }
+    let generated = run_sys(&[
+        "result",
+        "--out",
+        priv_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--binary-sha256",
+        &digest,
+        "--accelerator",
+        "kvm",
+    ]);
+    assert!(generated.status.success(), "{}", text(&generated));
+    let valid_pass_bytes = std::fs::read(priv_out.join("result.json")).unwrap();
+
+    // 1. Positive control: private verified directory + regular single-link `result.json`
+    //    is accepted by BOTH `verify-pass` and `ensure-result` (preserving exact bytes).
+    let ok_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        priv_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        ok_verify.status.success(),
+        "private valid result must pass verify-pass: {}",
+        text(&ok_verify)
+    );
+    let ok_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        priv_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        ok_ensure.status.success(),
+        "private valid result must pass ensure-result: {}",
+        text(&ok_ensure)
+    );
+    assert_eq!(
+        std::fs::read(priv_out.join("result.json")).unwrap(),
+        valid_pass_bytes,
+        "ensure-result must preserve a valid result in a verified private directory"
+    );
+
+    // 2. Otherwise identical valid `result.json` under a shared-writable (`0777`) parent:
+    //    BOTH `verify-pass` and `ensure-result` MUST fail closed.
+    let shared_parent = sys_root.join("shared-0777");
+    create_dir_mode(&shared_parent, 0o700);
+    std::fs::set_permissions(&shared_parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let shared_out = shared_parent.join("out");
+    create_dir_mode(&shared_out, 0o755);
+    write_file_mode(&shared_out.join("result.json"), 0o644, &valid_pass_bytes);
+
+    let shared_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        shared_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_verify.status.success(),
+        "system verify-pass must reject valid result under shared-writable parent: {}",
+        text(&shared_verify)
+    );
+    let shared_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        shared_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_ensure.status.success(),
+        "system ensure-result must fail closed on valid result under shared-writable parent: {}",
+        text(&shared_ensure)
+    );
+
+    // 3. Missing output directory under a shared-writable parent: `ensure-result`
+    //    MUST fail closed via `prepare-evidence-dir` BEFORE creating the directory.
+    let shared_missing = shared_parent.join("missing-out");
+    let shared_missing_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        shared_missing.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !shared_missing_ensure.status.success(),
+        "system ensure-result must reject missing out dir under shared-writable parent: {}",
+        text(&shared_missing_ensure)
+    );
+    assert!(
+        !shared_missing.exists(),
+        "system ensure-result must not create directories under a shared-writable parent"
+    );
+
+    // 4. Symlinked `result.json` inside a private verified directory pointing to an
+    //    unrelated passing record: `verify-pass` rejects it, and `ensure-result`
+    //    rejects it and atomically replaces it with a `fail` record without modifying
+    //    the symlink target.
+    let victim_dir = sys_root.join("victims");
+    create_dir_mode(&victim_dir, 0o700);
+    let sym_victim = victim_dir.join("symlink-pass.json");
+    write_file_mode(&sym_victim, 0o600, &valid_pass_bytes);
+
+    let sym_out = sys_root.join("private-sym");
+    create_dir_mode(&sym_out, 0o755);
+    std::os::unix::fs::symlink(&sym_victim, sym_out.join("result.json")).unwrap();
+
+    let sym_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        sym_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !sym_verify.status.success(),
+        "system verify-pass must reject symlinked result.json: {}",
+        text(&sym_verify)
+    );
+    let sym_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        sym_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        sym_ensure.status.success(),
+        "system ensure-result must replace symlinked result.json with a fail record: {}",
+        text(&sym_ensure)
+    );
+    let sym_lmeta = std::fs::symlink_metadata(sym_out.join("result.json")).unwrap();
+    assert!(sym_lmeta.file_type().is_file() && sym_lmeta.nlink() == 1);
+    assert_eq!(sym_lmeta.mode() & 0o777, 0o644);
+    assert_eq!(
+        std::fs::read(&sym_victim).unwrap(),
+        valid_pass_bytes,
+        "symlink target bytes must remain untouched"
+    );
+    assert_eq!(
+        std::fs::metadata(&sym_victim).unwrap().mode() & 0o777,
+        0o600,
+        "symlink target mode must remain 0600"
+    );
+    let sym_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(sym_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(sym_doc["result"], "fail");
+    assert_eq!(sym_doc["candidate_binary_sha256"], sentinel);
+    let sym_post_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        sym_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(!sym_post_verify.status.success());
+
+    // 5. Hard-linked `result.json` (`nlink == 2`) inside a private verified directory:
+    //    `verify-pass` rejects it, and `ensure-result` atomically replaces it with a
+    //    fresh single-link `fail` record without modifying the linked victim inode.
+    let hard_victim = victim_dir.join("hardlink-pass.json");
+    write_file_mode(&hard_victim, 0o644, &valid_pass_bytes);
+    let hard_out = sys_root.join("private-hard");
+    create_dir_mode(&hard_out, 0o755);
+    std::fs::hard_link(&hard_victim, hard_out.join("result.json")).unwrap();
+    assert_eq!(std::fs::metadata(&hard_victim).unwrap().nlink(), 2);
+
+    let hard_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        hard_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !hard_verify.status.success(),
+        "system verify-pass must reject hard-linked result.json (nlink == 2): {}",
+        text(&hard_verify)
+    );
+    let hard_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        hard_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        hard_ensure.status.success(),
+        "system ensure-result must replace hard-linked result.json with a fail record: {}",
+        text(&hard_ensure)
+    );
+    let hard_meta = std::fs::symlink_metadata(hard_out.join("result.json")).unwrap();
+    assert!(hard_meta.file_type().is_file() && hard_meta.nlink() == 1);
+    assert_eq!(std::fs::metadata(&hard_victim).unwrap().nlink(), 1);
+    assert_eq!(
+        std::fs::read(&hard_victim).unwrap(),
+        valid_pass_bytes,
+        "hard-link target bytes must remain untouched"
+    );
+    let hard_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(hard_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(hard_doc["result"], "fail");
+
+    // 6. World-writable `result.json` (`0666`) inside a private verified directory:
+    //    `verify-pass` rejects it and `ensure-result` replaces it with a `0644` `fail` record.
+    let writable_out = sys_root.join("private-writable-file");
+    create_dir_mode(&writable_out, 0o755);
+    write_file_mode(&writable_out.join("result.json"), 0o600, &valid_pass_bytes);
+    std::fs::set_permissions(
+        writable_out.join("result.json"),
+        std::fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let writable_verify = run_sys(&[
+        "verify-pass",
+        "--out",
+        writable_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        !writable_verify.status.success(),
+        "system verify-pass must reject world-writable result.json: {}",
+        text(&writable_verify)
+    );
+    let writable_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        writable_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        writable_ensure.status.success(),
+        "system ensure-result must replace world-writable result.json: {}",
+        text(&writable_ensure)
+    );
+    assert_eq!(
+        std::fs::metadata(writable_out.join("result.json"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    let writable_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(writable_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(writable_doc["result"], "fail");
+
+    // 7. Missing output directory under a trusted private parent: `ensure-result`
+    //    creates it via `prepare-evidence-dir` and publishes a valid `fail` record.
+    let new_priv_out = sys_root.join("private-new/nested-out");
+    let new_ensure = run_sys(&[
+        "ensure-result",
+        "--out",
+        new_priv_out.to_str().unwrap(),
+        "--arch",
+        "x86_64",
+        "--source-sha",
+        SHA,
+        "--expect-sha256",
+        &digest,
+    ]);
+    assert!(
+        new_ensure.status.success(),
+        "system ensure-result must create missing trusted dir via prepare-evidence-dir: {}",
+        text(&new_ensure)
+    );
+    let new_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(new_priv_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(new_doc["result"], "fail");
+
+    // 8. Direct `libvirt_kvm_sysfs.read_evidence_bytes` unit invariants: allowlist,
+    //    same-mount `fd_mnt_id` check (`EXDEV`), size bound (`EFBIG`), and trusted owner (`EACCES`).
+    let py = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import errno, importlib.util, os, sys
+
+spec = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+root_path = sys.argv[2]
+priv_out = sys.argv[3]
+root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
+try:
+    # Disallowed filename rejected with EINVAL.
+    for bad in ("../etc/passwd", "other.json", "tests/production_install"):
+        try:
+            mod.read_evidence_bytes(priv_out, bad, root_fd=root_fd, root_path=root_path)
+            raise AssertionError(f"must reject unexpected filename {bad}")
+        except OSError as exc:
+            assert exc.errno == errno.EINVAL, exc
+
+    # Bind-mounted result.json (different mnt_id) rejected with EXDEV.
+    rpath = os.path.join(priv_out, "result.json")
+    rid = (os.lstat(rpath).st_dev, os.lstat(rpath).st_ino)
+    orig_mnt_id = mod.fd_mnt_id
+    def fake_bind_mnt(fd):
+        st = os.fstat(fd)
+        mid = orig_mnt_id(fd)
+        if (st.st_dev, st.st_ino) == rid:
+            return mid + 55
+        return mid
+    mod.fd_mnt_id = fake_bind_mnt
+    try:
+        try:
+            mod.read_evidence_bytes(priv_out, "result.json", root_fd=root_fd, root_path=root_path)
+            raise AssertionError("must reject cross-mount/bind-mounted result.json")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.fd_mnt_id = orig_mnt_id
+
+    # Oversized result.json rejected with EFBIG.
+    try:
+        mod.read_evidence_bytes(priv_out, "result.json", max_bytes=8, root_fd=root_fd, root_path=root_path)
+        raise AssertionError("must reject oversized result.json")
+    except OSError as exc:
+        assert exc.errno == errno.EFBIG, exc
+
+    # Untrusted owner rejected with EACCES.
+    orig_fstat = mod.os.fstat
+    class UntrustedStat:
+        def __init__(self, st):
+            self._st = st
+            self.st_uid = 64099
+        def __getattr__(self, name):
+            return getattr(self._st, name)
+    def fake_untrusted_fstat(fd):
+        st = orig_fstat(fd)
+        if (st.st_dev, st.st_ino) == rid:
+            return UntrustedStat(st)
+        return st
+    mod.os.fstat = fake_untrusted_fstat
+    try:
+        try:
+            mod.read_evidence_bytes(priv_out, "result.json", root_fd=root_fd, root_path=root_path)
+            raise AssertionError("must reject untrusted-owner result.json")
+        except OSError as exc:
+            assert exc.errno == errno.EACCES, exc
+    finally:
+        mod.os.fstat = orig_fstat
+
+    # Positive control succeeds and returns exact bytes.
+    data = mod.read_evidence_bytes(priv_out, "result.json", root_fd=root_fd, root_path=root_path)
+    assert data == open(rpath, "rb").read()
+finally:
+    os.close(root_fd)
+"#,
+            sysfs_module().to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+            priv_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "read_evidence_bytes invariants failed:\n{}",
+        text(&py)
+    );
+    assert!(
+        !root().join("scripts/ci/__pycache__").exists(),
+        "Python test invocations must pass -B and never leave scripts/ci/__pycache__ behind"
+    );
 }

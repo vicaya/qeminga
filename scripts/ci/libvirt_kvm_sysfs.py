@@ -1132,6 +1132,93 @@ def publish_evidence_bytes(
         os.close(out_fd)
 
 
+MAX_EVIDENCE_READ_BYTES = 1024 * 1024
+
+
+def read_evidence_bytes(
+    out_dir,
+    dest_name,
+    *,
+    max_bytes=MAX_EVIDENCE_READ_BYTES,
+    root_fd=None,
+    root_path="/",
+):
+    """Read a verified regular single-link evidence file from a trusted directory."""
+    if dest_name not in ALLOWED_EVIDENCE_FILES:
+        raise OSError(errno.EINVAL, f"unexpected evidence filename '{dest_name}'")
+    trusted_uids = trusted_owner_uids()
+    out_fd, out_path = _open_verified_evidence_dir(
+        out_dir, create_missing=False, root_fd=root_fd, root_path=root_path
+    )
+    try:
+        out_mnt = fd_mnt_id(out_fd)
+        target_label = os.path.join(out_path, dest_name)
+        lst = os.lstat(dest_name, dir_fd=out_fd)
+        if stat.S_ISLNK(lst.st_mode):
+            raise OSError(
+                errno.ELOOP,
+                f"refusing symlinked evidence file '{target_label}'",
+            )
+        if not stat.S_ISREG(lst.st_mode):
+            raise OSError(
+                errno.EINVAL,
+                f"refusing non-regular evidence file '{target_label}'",
+            )
+        ffd = os.open(
+            dest_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=out_fd
+        )
+        try:
+            fst = os.fstat(ffd)
+            if fst.st_dev != lst.st_dev or fst.st_ino != lst.st_ino:
+                raise OSError(
+                    errno.EXDEV,
+                    f"evidence file '{target_label}' changed during verification",
+                )
+            if fd_mnt_id(ffd) != out_mnt:
+                raise OSError(
+                    errno.EXDEV,
+                    f"refusing cross-mount or bind-mounted evidence file '{target_label}'",
+                )
+            if not stat.S_ISREG(fst.st_mode) or fst.st_nlink != 1:
+                raise OSError(
+                    errno.EINVAL,
+                    f"refusing unsafe evidence file '{target_label}' "
+                    "(must be regular file with nlink == 1)",
+                )
+            trusted_owner, is_writable, reason = dir_trust_info(
+                ffd, fst, trusted_uids
+            )
+            if not trusted_owner or is_writable:
+                raise OSError(
+                    errno.EACCES,
+                    f"refusing untrusted or shared-writable evidence file "
+                    f"'{target_label}' ({reason})",
+                )
+            if fst.st_size > max_bytes:
+                raise OSError(
+                    errno.EFBIG,
+                    f"evidence file '{target_label}' exceeds {max_bytes} bytes",
+                )
+            chunks = []
+            total = 0
+            while True:
+                chunk = os.read(ffd, 65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise OSError(
+                        errno.EFBIG,
+                        f"evidence file '{target_label}' exceeds {max_bytes} bytes",
+                    )
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(ffd)
+    finally:
+        os.close(out_fd)
+
+
 def collect_serial_log(
     images_dir,
     run_name,
@@ -1681,6 +1768,15 @@ def main(argv):
                 root_fd=root_fd,
                 root_path=root_path,
             )
+        elif op == "read-evidence-stdout":
+            data = read_evidence_bytes(
+                argv[1],
+                argv[2],
+                root_fd=root_fd,
+                root_path=root_path,
+            )
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
         elif op == "collect-serial-log":
             collect_serial_log(
                 argv[1],

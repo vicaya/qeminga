@@ -22770,4 +22770,98 @@ esac
         "UPDATE_WAS_ACTIVE=1",
         "forward update MUST durably persist UPDATE_WAS_ACTIVE=1 BEFORE invoking systemctl stop"
     );
+    let post_exit_state = std::fs::read_to_string(&state_file).unwrap();
+    let post_exit_rec = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        post_exit_state.trim() == "active"
+            || (post_exit_rec.contains("RECORD_STATE=updating\n")
+                && post_exit_rec.contains("UPDATE_WAS_ACTIVE=1\n")),
+        "forward update rollback MUST either restart the stopped service or preserve recoverable UPDATE_WAS_ACTIVE=1 (got state={:?}, record:\n{post_exit_rec})",
+        post_exit_state.trim()
+    );
+    assert_eq!(
+        post_exit_state.trim(),
+        "active",
+        "when rollback stop-check and start succeed, forward update rollback must restart the service"
+    );
+
+    // 3. Forward transactional reinstall (`cmd_install` on existing installation):
+    //    Same late-activation + post-stop query failure scenario -> rollback MUST honor the
+    //    newly recorded UPDATE_WAS_ACTIVE=1 and restart the service instead of leaving it
+    //    inactive with RECORD_STATE=installed.
+    std::fs::write(&state_file, "inactive\n").unwrap();
+    let _ = std::fs::remove_file(&sc_count);
+    let _ = std::fs::remove_file(&post_stop_armed);
+    let _ = std::fs::remove_file(&rec_at_stop);
+    let fwd_reinst_fail = run_setup_env(
+        &[
+            "install",
+            "--repo",
+            REPO_URL,
+            "--name",
+            "reconfirm-box",
+            "--service",
+            "qeminga-reconfirm-box",
+            "--install-dir",
+            inst.to_str().unwrap(),
+            "--state-dir",
+            state.to_str().unwrap(),
+            "--hook-dir",
+            hooks.to_str().unwrap(),
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--token-file",
+            reg_file.to_str().unwrap(),
+            "--runner-sha256",
+            &v1_sha,
+            "--skip-packages",
+            "--no-start",
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v1_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("FAKE_SC_COUNT", sc_count.to_str().unwrap()),
+            ("FAKE_FLIP_ACTIVE_ON_CALL", "3"),
+            ("FAKE_REC_PATH", rec_path.to_str().unwrap()),
+            ("FAKE_REC_AT_STOP_OUT", rec_at_stop.to_str().unwrap()),
+            ("FAKE_POST_STOP_ARMED", post_stop_armed.to_str().unwrap()),
+            ("FAKE_FAIL_NEXT_IS_ACTIVE_AFTER_STOP", "1"),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_CGROUP_CONTROLLERS", cg_ctrls.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ("QEMINGA_AAVMF_CODE", aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", aavmf_vars.to_str().unwrap()),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !fwd_reinst_fail.status.success(),
+        "forward reinstall must fail when post-stop check fails: {}",
+        text(&fwd_reinst_fail)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rec_at_stop)
+            .unwrap_or_default()
+            .trim(),
+        "UPDATE_WAS_ACTIVE=1",
+        "forward reinstall MUST durably persist UPDATE_WAS_ACTIVE=1 BEFORE invoking systemctl stop"
+    );
+    let reinst_state = std::fs::read_to_string(&state_file).unwrap();
+    let reinst_rec = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        reinst_state.trim() == "active"
+            || (reinst_rec.contains("RECORD_STATE=updating\n")
+                && reinst_rec.contains("UPDATE_WAS_ACTIVE=1\n")),
+        "forward reinstall rollback MUST either restart the stopped service or preserve recoverable UPDATE_WAS_ACTIVE=1 (got state={:?}, record:\n{reinst_rec})",
+        reinst_state.trim()
+    );
+    assert_eq!(
+        reinst_state.trim(),
+        "active",
+        "when rollback stop-check and start succeed, forward reinstall rollback must restart the service"
+    );
 }

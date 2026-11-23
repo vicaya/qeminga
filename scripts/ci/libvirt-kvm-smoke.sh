@@ -213,7 +213,7 @@ v() { virsh "$CONNECT" "$@"; }
 cmd_stale_check() {
     local names stale
     names="$(v list --all --name)" || die "cannot list libvirt domains on $CONNECT_URI; refusing to proceed on an unknown host state"
-    stale="$(printf '%s\n' "$names" | grep -E '^qeminga-e2e-' || true)"
+    stale="$(grep -E '^qeminga-e2e-' <<<"$names" || true)"
     if [ -n "$stale" ]; then
         echo "libvirt-kvm-smoke: stale qeminga test domain(s) on $CONNECT_URI:" >&2
         printf '  %s\n' "$stale" >&2
@@ -236,7 +236,7 @@ domain_state() {
         *"failed to get domain"* | *"Domain not found"*)
             local refs
             refs="$(v list --all "$list_flag")" || return 1
-            if printf '%s\n' "$refs" | grep -iqx -- "$ref"; then return 1; fi
+            if grep -iqx -- "$ref" <<<"$refs"; then return 1; fi
             echo absent
             ;;
         *) echo "$out" >&2; return 1 ;;
@@ -244,8 +244,11 @@ domain_state() {
 }
 
 collect_diagnostics() {
-    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" domain_owned="${5:-0}" domain_ref="${6:-}" verified_xml="${7:-}" qlog_cursor="${8:-}" qlog
+    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" domain_owned="${5:-0}" domain_ref="${6:-}" verified_xml="${7:-}" qlog_cursor="${8:-}" dir_id="${9:-}" qlog expected_uuid=""
     qlog="$(qemu_log_of "$name")"
+    if [[ "$domain_ref" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        expected_uuid="$domain_ref"
+    fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         sys_fs_ops prepare-evidence-dir "$out" 2>/dev/null || return 0
         if [ "$domain_owned" = "1" ]; then
@@ -260,27 +263,37 @@ collect_diagnostics() {
                 local c_st="" c_dev="" c_ino="" c_off=""
                 IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
                 if [ -n "$c_st" ]; then
-                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" 2>/dev/null || true
+                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
                 fi
             fi
         fi
-        if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
+        if { [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; } && [ -n "$dir_id" ]; then
+            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" "$dir_id" 2>/dev/null || true
         fi
         return 0
     fi
     mkdir -p "$out"
     if [ "$domain_owned" = "1" ]; then
-        v dumpxml "${domain_ref:-$name}" >"$out/domain.xml" 2>/dev/null || true
+        local sess_dom_xml=""
+        sess_dom_xml="$(v dumpxml "${domain_ref:-$name}" 2>/dev/null || true)"
+        if [ -n "$sess_dom_xml" ]; then
+            (
+                umask 0077
+                printf '%s\n' "$sess_dom_xml" >"$out/domain.xml"
+            ) 2>/dev/null || true
+        fi
         if [ -n "$qlog_cursor" ]; then
             if command -v python3 >/dev/null 2>&1; then
                 local c_st="" c_dev="" c_ino="" c_off=""
                 IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
                 if [ -n "$c_st" ]; then
-                    sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" 2>/dev/null || true
+                    sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
                 fi
             elif [ ! -L "$qlog" ] && [ -f "$qlog" ]; then
-                cp -- "$qlog" "$out/qemu.log" || true
+                (
+                    umask 0077
+                    cp -- "$qlog" "$out/qemu.log" && chmod 0600 "$out/qemu.log"
+                ) || true
             fi
         fi
     fi
@@ -288,7 +301,10 @@ collect_diagnostics() {
         if command -v python3 >/dev/null 2>&1; then
             sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
         elif [ ! -L "$dir/serial.log" ] && [ -f "$dir/serial.log" ]; then
-            cp -- "$dir/serial.log" "$out/serial.log" || true
+            (
+                umask 0077
+                cp -- "$dir/serial.log" "$out/serial.log" && chmod 0600 "$out/serial.log"
+            ) || true
         fi
     fi
 }
@@ -351,7 +367,7 @@ cmd_cleanup() {
             local persistent_uuids=""
             persistent_uuids="$(v list --all --persistent --uuid)" \
                 || die "cannot determine whether $name ($dom_uuid) is persistent before cleanup; preserving domain and $dir"
-            if printf '%s\n' "$persistent_uuids" | grep -iqx -- "$dom_uuid"; then
+            if grep -iqx -- "$dom_uuid" <<<"$persistent_uuids"; then
                 dom_is_persistent=1
                 local inactive_xml="" inactive_uuid=""
                 inactive_xml="$(v dumpxml --inactive "$dom_uuid" 2>/dev/null)" \
@@ -368,19 +384,20 @@ cmd_cleanup() {
                 dom_is_persistent=0
             fi
             dom_ref="$dom_uuid"
-            # Omit historical qemu.log during standalone cleanup (no reliable start cursor).
-            [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify 1 "$dom_uuid" "$live_xml" ""
+            # Omit historical qemu.log during standalone cleanup (no reliable start cursor)
+            # and bind serial.log collection to the verified target_dir_id.
+            [ -n "$out" ] && collect_diagnostics "$name" "$dir" "$out" verify 1 "$dom_uuid" "$live_xml" "" "$target_dir_id"
         elif [ -n "$out" ] && [ "$target_status" = "present" ]; then
-            collect_diagnostics "$name" "$dir" "$out" verify 0 "" "" ""
+            collect_diagnostics "$name" "$dir" "$out" verify 0 "" "" "" "$target_dir_id"
         fi
     else
         state="$(domain_state "$name")" \
             || die "the state of $name cannot be established; keeping $dir"
         if [ -n "$out" ]; then
             if [ "$state" != absent ]; then
-                collect_diagnostics "$name" "$dir" "$out" verify 1 "$name" "" ""
+                collect_diagnostics "$name" "$dir" "$out" verify 1 "$name" "" "" ""
             else
-                collect_diagnostics "$name" "$dir" "$out" verify 0 "" "" ""
+                collect_diagnostics "$name" "$dir" "$out" verify 0 "" "" "" ""
             fi
         fi
     fi
@@ -750,8 +767,11 @@ agent() { v qemu-agent-command "$1" "$2"; }
 
 # Proves hardware KVM acceleration is actually active (never a silent TCG fallback).
 prove_kvm() {
-    local dom_ref="$1" name="$2" qlog_cursor="${3:-}" info qemu_log qlog_seg=""
+    local dom_ref="$1" name="$2" qlog_cursor="${3:-}" info qemu_log qlog_seg="" expected_uuid=""
     qemu_log="$(qemu_log_of "$name")"
+    if [[ "$dom_ref" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+        expected_uuid="$dom_ref"
+    fi
     grep -q "<domain type='kvm'" <<<"$(v dumpxml "$dom_ref")" || { echo "domain is not type='kvm'"; return 1; }
     info="$(v qemu-monitor-command "$dom_ref" --hmp 'info kvm' | tr -d '\r')" || return 1
     echo "info kvm: $info"
@@ -763,12 +783,12 @@ prove_kvm() {
         [ -n "$qlog_cursor" ] || { echo "missing QEMU log cursor for $qemu_log"; return 1; }
         local c_st="" c_dev="" c_ino="" c_off=""
         IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
-        qlog_seg="$(sys_fs_ops read-qemu-log-segment "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off")" \
+        qlog_seg="$(sys_fs_ops read-qemu-log-segment "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid")" \
             || { echo "missing current-run QEMU log segment at $qemu_log"; return 1; }
     elif [ -n "$qlog_cursor" ] && command -v python3 >/dev/null 2>&1; then
         local c_st="" c_dev="" c_ino="" c_off=""
         IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
-        qlog_seg="$(sys_fs_ops read-qemu-log-segment-session "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off")" \
+        qlog_seg="$(sys_fs_ops read-qemu-log-segment-session "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid")" \
             || { echo "missing current-run QEMU log segment at $qemu_log"; return 1; }
     else
         [ ! -L "$qemu_log" ] && [ -f "$qemu_log" ] || { echo "missing QEMU log at $qemu_log"; return 1; }
@@ -802,20 +822,23 @@ cmd_run() {
         sys_fs_ops prepare-evidence-dir "$OUT" init-run || exit 1
     else
         mkdir -p "$OUT/tests"
-        rm -f "$OUT"/tests/* "$OUT/result.json"
+        rm -f "$OUT"/tests/* \
+            "$OUT/result.json" "$OUT/versions.txt" "$OUT/domain.xml" \
+            "$OUT/qemu.log" "$OUT/serial.log" "$OUT/e2e-libvirt.log" "$OUT/cleanup.txt"
     fi
     RUN_ARCH="$arch" RUN_SHA="$sha" RUN_DIGEST="$NO_DIGEST" RUN_ACCEL=unknown
     RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$RUN_NAME"
     RUN_DIR="$IMAGES/$RUN_NAME"
     RUN_DIR_VERIFIED=0
+    RUN_DIR_ID=""
     RUN_DOMAIN_OWNED=0
     RUN_DOMAIN_REF=""
     RUN_QLOG_CURSOR=""
     local name="$RUN_NAME" dir="$RUN_DIR" digest
 
     # shellcheck disable=SC2154 # rc is assigned inside the trap
-    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED" "$RUN_DOMAIN_OWNED" "$RUN_DOMAIN_REF" "" "$RUN_QLOG_CURSOR"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
+    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED" "$RUN_DOMAIN_OWNED" "$RUN_DOMAIN_REF" "" "$RUN_QLOG_CURSOR" "$RUN_DIR_ID"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
 
     preflight "$arch"
     local versions_txt=""
@@ -842,7 +865,8 @@ cmd_run() {
 
     say "disposable KVM guest $name in $dir"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        create_system_run_dir "$IMAGES" "$name"
+        RUN_DIR_ID="$(create_system_run_dir "$IMAGES" "$name")"
+        [ -n "$RUN_DIR_ID" ] || die "failed to capture verified run directory identity for $dir"
     else
         create_session_run_dir "$dir"
     fi
@@ -898,8 +922,8 @@ EOF
         target_info="$(sys_fs_ops verify-cleanup-target "$IMAGES" "$name")" \
             || die "cannot verify run directory '$dir' after defining $name; refusing to start"
         IFS=$'\t' read -r t_st t_lex t_res t_dir_id <<<"$target_info"
-        [ "$t_st" = "present" ] && [ -n "$t_dir_id" ] \
-            || die "expected run directory '$t_lex' is absent after defining $name; refusing to start"
+        [ "$t_st" = "present" ] && [ -n "$t_dir_id" ] && [ "$t_dir_id" = "$RUN_DIR_ID" ] \
+            || die "expected run directory '$t_lex' is absent or changed after defining $name; refusing to start"
         def_xml="$(v dumpxml "$name" 2>/dev/null)" \
             || die "cannot inspect defined XML for $name before start; refusing to start"
         [ -n "$def_xml" ] \
@@ -922,7 +946,25 @@ EOF
     v start "$RUN_DOMAIN_REF"
 
     say "accelerator"
-    if prove_kvm "$RUN_DOMAIN_REF" "$name" "$RUN_QLOG_CURSOR"; then RUN_ACCEL=kvm; mark accelerator_kvm pass; else mark accelerator_kvm fail; fi
+    if prove_kvm "$RUN_DOMAIN_REF" "$name" "$RUN_QLOG_CURSOR"; then
+        RUN_ACCEL=kvm
+        mark accelerator_kvm pass
+        if [ -n "$RUN_QLOG_CURSOR" ]; then
+            local p_st="" p_dev="" p_ino="" p_off="" p_pinned="" p_uuid=""
+            IFS=$'\t' read -r p_st p_dev p_ino p_off <<<"$RUN_QLOG_CURSOR"
+            if [[ "$RUN_DOMAIN_REF" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+                p_uuid="$RUN_DOMAIN_REF"
+            fi
+            if [ "$CONNECT_URI" = "qemu:///system" ]; then
+                p_pinned="$(sys_fs_ops pin-qemu-log-cursor "$(qemu_log_of "$name")" "$p_st" "$p_dev" "$p_ino" "$p_off" "$p_uuid" 2>/dev/null || true)"
+            elif command -v python3 >/dev/null 2>&1; then
+                p_pinned="$(sys_fs_ops pin-qemu-log-cursor-session "$(qemu_log_of "$name")" "$p_st" "$p_dev" "$p_ino" "$p_off" "$p_uuid" 2>/dev/null || true)"
+            fi
+            [ -n "$p_pinned" ] && RUN_QLOG_CURSOR="$p_pinned"
+        fi
+    else
+        mark accelerator_kvm fail
+    fi
     [ "$RUN_ACCEL" = kvm ] || exit 1
 
     say "boot and install under KVM (up to ${boot_timeout}s)"

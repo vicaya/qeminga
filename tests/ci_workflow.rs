@@ -273,7 +273,8 @@ fn nul_paths(bytes: &[u8]) -> Vec<OsString> {
 }
 
 /// The scripts `check-shell.sh --list0` reports for `dir` (inside the work
-/// tree `root`), failing the test if the listing fails.
+/// tree `root`), exactly as emitted: the test fails if the listing fails,
+/// or if a record is unterminated, repeated or out of byte order.
 fn linted_shell_scripts(dir: &Path, root: &Path, env: &[(&str, PathBuf)]) -> Vec<OsString> {
     let out = check_shell("--list0", dir, root, env);
     assert!(
@@ -281,7 +282,21 @@ fn linted_shell_scripts(dir: &Path, root: &Path, env: &[(&str, PathBuf)]) -> Vec
         "check-shell.sh --list0: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    nul_paths(&out.stdout)
+    assert!(
+        out.stdout.is_empty() || out.stdout.ends_with(&[0]),
+        "unterminated record: {:?}",
+        out.stdout
+    );
+    let records: Vec<OsString> = out.stdout[..out.stdout.len().saturating_sub(1)]
+        .split(|&b| b == 0)
+        .filter(|_| !out.stdout.is_empty())
+        .map(|p| OsStr::from_bytes(p).to_owned())
+        .collect();
+    assert!(
+        records.windows(2).all(|w| w[0] < w[1]),
+        "records repeated or out of order: {records:?}"
+    );
+    records
 }
 
 /// `paths` as `OsString`s, for comparisons.
@@ -474,6 +489,7 @@ fn the_shell_fixtures_are_discovered_by_name_and_interpreter() {
         "env-split-attached",
         "env-split-long",
         "env-split-quoted",
+        "heredoc-directive",
         "library.sh",
         "plain-sh",
     ]);
@@ -629,7 +645,9 @@ fn a_script_in_merge_conflict_is_listed_once() {
         "run.sh\nrun.sh\nrun.sh\n"
     );
     put(&dir, "run.sh", "#!/bin/sh\necho resolved\n");
-    assert_eq!(linted_shell_scripts(&dir, &dir, &[]), os(&["run.sh"]));
+    let out = check_shell("--list0", &dir, &dir, &[]);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"run.sh\0", "one record, as emitted");
     assert_eq!(shell_scripts_in_inventory(&dir, &dir, &[]), os(&["run.sh"]));
 }
 
@@ -718,6 +736,13 @@ fn the_shellcheck_job_lints_every_script_and_cannot_fail_quietly() {
         !block.contains("continue-on-error"),
         "a shellcheck finding must fail the workflow"
     );
+    // The cases the lint must fail on cannot be checked in; the self-test
+    // builds them and runs them through the same pinned shellcheck.
+    let lint = block.find("run: scripts/check-shell.sh").unwrap();
+    let selftest = block
+        .find("run: scripts/ci/check-shell-selftest.sh")
+        .expect("the shellcheck job runs the linter's end-to-end self-test");
+    assert!(lint < selftest, "the self-test runs after the lint");
 }
 
 /// The shellcheck release `scripts/check-shell.sh` is written against

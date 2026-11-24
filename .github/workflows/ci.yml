@@ -252,6 +252,9 @@ jobs:
           checksum: true
       - run: shellcheck --version
       - run: scripts/check-shell.sh
+      # Cases the lint must fail on, built in throwaway repositories and
+      # run through the same shellcheck.
+      - run: scripts/ci/check-shell-selftest.sh
 
   # Design §8.5: aarch64 is a supported target and the native jobs above
   # and below execute it. This cross-check is kept as the cheap first

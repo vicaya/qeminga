@@ -25,7 +25,8 @@
 #   AI_INSTRUCTIONS        the maintenance instructions (or AI_INSTRUCTIONS_FILE)
 #   AI_PRIVATE_INSTRUCTIONS  true: publish no free-form agent text and no
 #                          transcripts (the instructions stay unpublished)
-#   AI_EXTRA_PROMPT_FILE   optional Markdown appended to the prompt (review feedback)
+#   AI_EXTRA_PROMPT_FILE   optional Markdown appended to the prompt (review feedback);
+#                          when set, a readable file (empty adds nothing)
 #   AI_ROUTING             ordered (default) | round-robin
 #   AI_ROUTING_SEED        rotation seed for round-robin (default GITHUB_RUN_NUMBER)
 #   AI_FALLBACK_ON         exhausted (default) | any
@@ -132,6 +133,13 @@ case "$fallback_on" in exhausted | any) ;; *) ai_log "AI_FALLBACK_ON must be exh
 private=${AI_PRIVATE_INSTRUCTIONS:-false}
 case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be true or false"; exit 2 ;; esac
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
+# Review feedback, when supplied, must be a readable file (an empty one
+# adds nothing): a review round without it would not address the review.
+extra=${AI_EXTRA_PROMPT_FILE:-}
+if [ -n "$extra" ] && { [ ! -f "$extra" ] || [ ! -r "$extra" ]; }; then
+    ai_log "the review feedback file ($extra) is missing or unreadable"
+    exit 2
+fi
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 # The runner's Node.js, for the npm-installed CLIs, as one read-only file,
 # and its npm for the install containers.
@@ -328,14 +336,18 @@ case "$providers_dir/" in "$here/"*) ;; *) providers_args=(-v "$providers_dir:$p
 prompt_dir=$state/prompt
 rm -rf "$prompt_dir" && mkdir -p "$prompt_dir"
 prompt=$prompt_dir/prompt.md
-{
-    cat "$here/preamble.md"
-    printf '\n## Maintenance instructions\n\n%s\n' "$instructions"
-    if [ -n "${AI_EXTRA_PROMPT_FILE:-}" ] && [ -s "$AI_EXTRA_PROMPT_FILE" ]; then
-        printf '\n'
-        cat "$AI_EXTRA_PROMPT_FILE"
-    fi
-} >"$prompt"
+# Every part is checked: a prompt without its preamble (the repository
+# rules), the instructions or the review feedback would send the agent
+# off without them.
+if ! {
+    cat "$here/preamble.md" &&
+        printf '\n## Maintenance instructions\n\n%s\n' "$instructions" &&
+        if [ -n "$extra" ] && [ -s "$extra" ]; then printf '\n' && cat "$extra"; fi
+} >"$prompt"; then
+    ai_log "could not write the prompt; no attempt was made"
+    out status failed
+    exit 2
+fi
 instructions=
 # The agent's user reads it (mounted read-only) whatever the umask was.
 own "$prompt_dir" || exit 2

@@ -23,7 +23,7 @@ inputs:
       wherever the agent quotes them verbatim.
     default: "false"
   extra-prompt-file:
-    description: Optional Markdown file appended to the prompt (the review feedback in review rounds).
+    description: Optional Markdown file appended to the prompt (the review feedback in review rounds). When set, it must be a readable file, or the run stops; an empty one adds nothing.
     default: ""
   routing:
     description: "Routing strategy: ordered (default) or round-robin."

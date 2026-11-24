@@ -650,8 +650,25 @@ refused_under undernpm "$npmpkg" "run: ... or inside the npm mounted for the ins
 # an attempt's options; neither is left behind by a run that stops early.
 # Under a restrictive umask (077), the agent's user can still read the
 # prompt the run wrote for it.
-RUN_UMASK=077 run_case umask077 '[{"claude":["prompt-1"]}]'
+printf 'Review feedback: rename the helper (feedbackmarker)\n' >"$tmp/feedback.md"
+RUN_UMASK=077 run_case umask077 '[{"claude":["prompt-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/feedback.md"
 eq "run: the agent reads its prompt under a restrictive umask too" "0 unchanged" "$rc $(output status)"
+check "run: ... and the prompt holds the preamble, the instructions and the feedback" bash -c \
+    'f=$1/attempt-1/out/final.md; grep -qx "# Unattended repository maintenance" "$f" &&
+     grep -qx "## Maintenance instructions" "$f" && grep -qx "tidy up" "$f" && grep -q feedbackmarker "$f"' _ "$state"
+# A prompt that could not be written whole stops the run before any attempt.
+attempts_started() { if [ -f "$tmp/$1/docker.log" ]; then grep -c '^run .*attempt\.sh' "$tmp/$1/docker.log" || true; else echo 0; fi; }
+cp -a "$action" "$tmp/action-nopreamble" && rm "$tmp/action-nopreamble/preamble.md" && mkdir "$tmp/action-nopreamble/preamble.md"
+action=$tmp/action-nopreamble run_case nopreamble '[{"claude":["ok-1"]}]'
+eq "run: an unreadable preamble stops the run before any attempt" "2 0" "$rc $(attempts_started nopreamble)"
+run_case nofeedback '[{"claude":["ok-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/missing-feedback.md"
+eq "run: ... so does feedback that was supplied but is missing" "2 0" "$rc $(attempts_started nofeedback)"
+mkdir -p "$tmp/feedback-dir"
+run_case dirfeedback '[{"claude":["ok-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/feedback-dir"
+eq "run: ... or cannot be read" "2 0" "$rc $(attempts_started dirfeedback)"
+: >"$tmp/empty-feedback.md"
+run_case emptyfeedback '[{"claude":["ok-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/empty-feedback.md"
+eq "run: empty feedback adds nothing and stops nothing" "0 changed" "$rc $(output status)"
 run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true
 check "run: raw state is kept for debugging, without the key file or the options" bash -c \
     '[ "$2" = 0 ] && [ -d "$1/attempt-1/tree" ] && [ ! -e "$1/secrets.json" ] && ! grep -rqa argvoptionsecret "$1"' _ "$state" "$rc"
@@ -707,14 +724,16 @@ eq "fake docker: opens the closed directories above a mount inside the fixture" 
     "$b/fixture|$b/fixture/in|" "$(closed "$b/fixture" "$b/fixture/in/deep" "$b/fixture/open/x")"
 # A name with a newline stays one name: split at the newline, this one
 # would name $b/outside, a closed directory outside the fixture.
-evil="$b/fixture/nl"$'\n'"$b/outside"
-mkdir -p "$evil/x" && chmod 700 "$evil"
-# The directories between the fixture and $evil are open whatever the
-# umask: only the fixture and $evil are expected.
-d=${evil%/*}
-while [ "$d" != "$b/fixture" ]; do chmod 755 "$d"; d=${d%/*}; done
-eq "fake docker: ... a name with a newline in it stays one name, and nothing changes" "$b/fixture|$evil| 700" \
-    "$(closed "$b/fixture" "$evil/x") $(stat -c %a "$b/outside")"
+# Each name below is one basename directly under the fixture; split at
+# the newline, the first would name "$b/fixture/nl", a separate open
+# directory, and the second would lose its trailing newline.
+mkdir -p "$b/fixture/nl"
+chmod 755 "$b/fixture/nl"
+evil="$b/fixture/nl"$'\n'"x"
+trail="$b/fixture/tr"$'\n'
+mkdir -p "$evil/m" "$trail/m" && chmod 700 "$evil" "$trail"
+eq "fake docker: ... a name with a newline in it stays one name, and nothing changes" "$b/fixture|$evil|$trail| 755" \
+    "$(closed "$b/fixture" "$evil/m" "$trail/m") $(stat -c %a "$b/fixture/nl")"
 eq "fake docker: ... none above a sibling whose name extends the fixture's" "" "$(closed "$b/fixture" "$b/fixture-sibling/x")"
 eq "fake docker: ... none above a mount outside it" "" "$(closed "$b/fixture" "$b/outside/x")"
 eq "fake docker: ... and none without a fixture, or with / as one" "|" \

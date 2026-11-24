@@ -434,21 +434,28 @@ hooks before touching the host with `render-unit` and `render-hooks`.
    retries as well), re-locks permissions, reloads systemd, and preserves
    `UPDATE_WAS_ACTIVE`; and refuses mismatched flags, or opt in to GitHub
    self-updates with `--allow-auto-update`). Deliberate fail-closed
-   exception to automatic container pruning: every stage and backup removal
-   requires a matching `.qeminga-tx-id` marker rather than auto-removing a
-   markerless directory (which cannot be reliably distinguished from
-   filesystem inode reuse after removal). If a crash stops in the window
-   after unlinking `.qeminga-tx-id` and before `rmdir` — or if a markerless
-   directory occupies the recorded path — rollback retains the stage/backup
-   reference in `install.env` (`UPDATE_PHASE=restored`) and a subsequent
-   `update` or `uninstall` stops with
-   `missing transaction identity marker '.qeminga-tx-id' (leaving for inspection)`.
-   In that case, preserve `install.env` untouched, inspect the recorded
-   `.qeminga-extract.*` or `.qeminga-update-backup.*` directory, set it
-   aside (for example `mv` it to an inspection path, or `rmdir` it once
-   confirmed empty), and then re-run `sudo scripts/setup-kvm-runner.sh update`
-   or `uninstall` so recovery syncs the parent directory and finishes
-   cleanly.
+   exception to automatic container verification and pruning: every stage
+   and backup verification or removal requires a matching `.qeminga-tx-id`
+   marker rather than accepting or auto-removing a markerless directory
+   (which cannot be reliably distinguished from filesystem inode reuse
+   after removal). If recovery or cleanup stops with
+   `missing transaction identity marker '.qeminga-tx-id' (leaving for inspection)`,
+   preserve `install.env` untouched and check both `UPDATE_PHASE` in
+   `install.env` and whether the diagnostic names a staging container
+   (`.qeminga-extract.*`) or a backup container
+   (`.qeminga-update-backup.*`). When `UPDATE_PHASE=publishing` and the
+   diagnostic names the backup container, do **not** move or delete it:
+   both `update` and `uninstall` require that backup and its contents at
+   its recorded path to restore the previous installation, so keep the
+   backup intact for restoration. Only when the container's sole remaining
+   operation is pruning — any staging container, or a backup container in
+   `preparing`, `committed`, or `restored` (for example if a crash stopped
+   after unlinking `.qeminga-tx-id` and before `rmdir`, leaving rollback to
+   retain the reference in `UPDATE_PHASE=restored`) — inspect the directory
+   to confirm nothing needs to be kept, set it aside (for example `mv` it
+   to an inspection path, or `rmdir` it once confirmed empty), and then
+   re-run `sudo scripts/setup-kvm-runner.sh update` or `uninstall` so
+   recovery syncs the parent directory and finishes cleanly.
    Operators upgrading legacy empty/4-field or verified root-only `blkid`
    UUID `VOL_*` records, pre-marker managed accounts, pre-phase `updating`
    journals, or preceding `376eed2`-format phased journals (using 7-field

@@ -6769,19 +6769,19 @@ _rollback_runner_package_tx() {
                         local stage_status=""
                         if stage_status="$(fs_ops inspect-path-identity "$sync_stage_dir" "$sync_stage_id")"; then
                             case "$stage_status" in
-                                absent | mismatch)
-                                    # Recorded stage directory is confirmed absent or replaced by an
+                                mismatch)
+                                    # Recorded stage directory is confirmed replaced by an
                                     # unrelated entry left for manual inspection; do not block
                                     # finalizing rollback of the restored runner on it.
                                     sync_stage_dir=""
                                     sync_stage_id=""
                                     ;;
-                                match)
+                                absent | match)
                                     if _prune_verified_stage_dir "$sync_stage_dir" "$sync_stage_id"; then
                                         sync_stage_dir=""
                                         sync_stage_id=""
                                     else
-                                        warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
+                                        warn "rollback restored previous runner files but staging directory '$sync_stage_dir' could not be durably removed/synced; retaining stage reference in restored journal for retry"
                                         restore_ok=0
                                     fi
                                     ;;

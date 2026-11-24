@@ -24295,4 +24295,197 @@ write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "$4" "" "" "$5" "$6
             );
         }
     }
+
+    // Part 7: Absent stage durability in rollback (`_rollback_runner_package_tx` direct call
+    //   AND `cleanup_update_exit` EXIT trap): if `rmdir` removed the stage but parent `fsync`
+    //   failed, `inspect-path-identity` reports `absent`. Rollback MUST STILL route `absent`
+    //   through `_prune_verified_stage_dir` (`safe-rmtree-id` absent-path parent `fsync`),
+    //   retaining `UPDATE_STAGE_DIR`/`UPDATE_STAGE_ID` in `UPDATE_PHASE=restored` on failure
+    //   and clearing them only once the parent sync succeeds!
+    for (p7_label, via_exit_trap) in [("direct-helper", false), ("cleanup-update-exit", true)] {
+        let p7_stage = inst_parent.join(format!(".qeminga-extract.p7-{p7_label}"));
+        let p7_backup = inst_parent.join(format!(".qeminga-update-backup.p7-{p7_label}"));
+        let p7_call_log = dir.path().join(format!("p7-calls-{p7_label}.log"));
+        std::fs::create_dir(&p7_stage).unwrap();
+        std::fs::create_dir(&p7_backup).unwrap();
+        std::fs::set_permissions(&p7_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&p7_backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let p7_sid = String::from_utf8(
+            Command::new("bash")
+                .args([
+                    "-c",
+                    r#"source "$1"; fs_ops path-identity "$2""#,
+                    "_",
+                    script().to_str().unwrap(),
+                    p7_stage.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let p7_bid = String::from_utf8(
+            Command::new("bash")
+                .args([
+                    "-c",
+                    r#"source "$1"; fs_ops path-identity "$2""#,
+                    "_",
+                    script().to_str().unwrap(),
+                    p7_backup.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        if !via_exit_trap {
+            // Direct helper case: stage is already absent before `_rollback_runner_package_tx`
+            // runs, simulating a prior `rmdir` whose parent `fsync` failed.
+            std::fs::remove_dir_all(&p7_stage).unwrap();
+        }
+        std::fs::write(&state_file, "inactive\n").unwrap();
+        let p7_script = if via_exit_trap {
+            r#"
+set -euo pipefail
+source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_SERVICE="qeminga-restored-stage-box"
+read_install_record "$OPT_CONFIG_DIR/install.env"
+write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" "$6" "$7" "$4" "$5" "1"
+eval "$(declare -f fs_ops | sed '1s/^fs_ops/_real_fs_ops/')"
+fs_ops() {
+    if [ "${1:-}" = "safe-rmtree-id" ] && [ "${2:-}" = "$TEST_FAIL_STAGE" ]; then
+        if [ -e "$TEST_FAIL_STAGE" ]; then
+            echo "first-remove-then-eio" >> "$TEST_CALL_LOG"
+            _real_fs_ops "$@"
+        else
+            echo "absent-retry-eio" >> "$TEST_CALL_LOG"
+        fi
+        return 1
+    fi
+    _real_fs_ops "$@"
+}
+_UPDATE_RECORD_PATH="$OPT_CONFIG_DIR/install.env"
+_UPDATE_TMP_STAGE="$6"
+_UPDATE_TMP_STAGE_ID="$7"
+_UPDATE_BACKUP_DIR="$4"
+_UPDATE_BACKUP_ID="$5"
+_UPDATE_WORK_CHILD=""
+_UPDATE_WAS_ACTIVE=1
+_UPDATE_ROLLBACK_ACTIVE=1
+trap cleanup_update_exit EXIT
+exit 1
+"#
+        } else {
+            r#"
+set -euo pipefail
+source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_SERVICE="qeminga-restored-stage-box"
+read_install_record "$OPT_CONFIG_DIR/install.env"
+eval "$(declare -f fs_ops | sed '1s/^fs_ops/_real_fs_ops/')"
+fs_ops() {
+    if [ "${1:-}" = "safe-rmtree-id" ] && [ "${2:-}" = "$TEST_FAIL_STAGE" ]; then
+        echo "absent-retry-eio" >> "$TEST_CALL_LOG"
+        return 1
+    fi
+    _real_fs_ops "$@"
+}
+_rollback_runner_package_tx \
+    "$OPT_CONFIG_DIR/install.env" \
+    "$REC_VOL_INSTALL_DIR" \
+    "$4" "$5" "" "1" "" "" "" "" "" \
+    "$6" "$7"
+"#
+        };
+        let p7_out = Command::new("bash")
+            .args([
+                "-c",
+                p7_script,
+                "_",
+                script().to_str().unwrap(),
+                cfg.to_str().unwrap(),
+                inst.to_str().unwrap(),
+                p7_backup.to_str().unwrap(),
+                &p7_bid,
+                p7_stage.to_str().unwrap(),
+                &p7_sid,
+            ])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("TEST_FAIL_STAGE", &p7_stage)
+            .env("TEST_CALL_LOG", &p7_call_log)
+            .env("FAKE_STATE_FILE", &state_file)
+            .env("FAKE_EXPECTED_FRAG", &unit_file)
+            .env("QEMINGA_RUNTIME_ROOT", &rt_root)
+            .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
+            .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
+            .output()
+            .unwrap();
+        if via_exit_trap {
+            assert!(!p7_out.status.success(), "{p7_label}: {}", text(&p7_out));
+        } else {
+            assert!(p7_out.status.success(), "{p7_label}: {}", text(&p7_out));
+        }
+        let calls = std::fs::read_to_string(&p7_call_log).unwrap_or_default();
+        assert!(
+            !p7_stage.exists() && calls.contains("absent-retry-eio"),
+            "{p7_label}: rollback MUST invoke _prune_verified_stage_dir on absent stage to retry parent fsync (calls:\n{calls}):\n{}",
+            text(&p7_out)
+        );
+        let rec_p7 = std::fs::read_to_string(&rec_path).unwrap();
+        assert!(
+            rec_p7.contains("RECORD_STATE=updating\n")
+                && rec_p7.contains("UPDATE_PHASE=restored\n")
+                && rec_p7.contains(&format!("UPDATE_STAGE_DIR={}\n", p7_stage.display()))
+                && rec_p7.contains(&format!("UPDATE_STAGE_ID={p7_sid}\n"))
+                && rec_p7.contains("UPDATE_WAS_ACTIVE=1\n"),
+            "{p7_label}: failed parent fsync on absent stage MUST retain UPDATE_STAGE_DIR/ID in restored journal (never finalize installed):\n{rec_p7}"
+        );
+
+        // Once parent fsync succeeds, retrying `update` syncs the parent dir on the absent
+        // stage, clears the journal back to `installed`, and restarts the service.
+        let p7_retry = run_setup_env(
+            &[
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            p7_retry.status.success(),
+            "{p7_label}: retry update after parent fsync recovers MUST succeed:\n{}",
+            text(&p7_retry)
+        );
+        let rec_p7_done = std::fs::read_to_string(&rec_path).unwrap();
+        assert!(
+            rec_p7_done.contains("RECORD_STATE=installed\n")
+                && !rec_p7_done.contains("UPDATE_STAGE_DIR="),
+            "{p7_label}: record must return to installed after absent-stage parent fsync succeeds:\n{rec_p7_done}"
+        );
+    }
 }

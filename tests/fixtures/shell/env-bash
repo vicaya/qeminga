@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# bash through env.
+words=(a b)
+echo "${words[@]}"

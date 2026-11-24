@@ -1,0 +1,4 @@
+#!/usr/bin/env -S bash -eu
+# bash through env -S.
+words=(a b)
+echo "${words[1]}"

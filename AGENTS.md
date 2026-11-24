@@ -45,6 +45,7 @@ cargo test --locked                       # default features too
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 scripts/check-unsafe.sh
 scripts/check-shell.sh                    # shellcheck 0.11.0 over every shell script (see below)
+scripts/ci/check-shell-selftest.sh        # cases the shell lint must fail on, through the same shellcheck
 cargo deny check                          # cargo install cargo-deny --locked
 cargo audit --deny warnings              # cargo install cargo-audit --locked
 cargo check --target aarch64-unknown-linux-gnu --all-targets --all-features --locked

@@ -27,15 +27,18 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
                                           done; the nightly schedule carries on
 ```
 
-1. **Agent run** (`action.yml`, job `maintain`). Builds the prompt from
-   [`preamble.md`](preamble.md) and the instructions, then tries the pool's
-   keys in routing order. Each attempt installs the provider's CLI if needed
-   and runs it on the checkout with that single key. If the attempt fails
-   with an exhaustion error (quota, rate limit, billing, overload, or an
-   invalid or revoked key), the working tree is reset and the next key is
-   tried. Any other failure ends the run, unless `fallback-on` is `any`. The
-   agent's changes, both its own commits and anything left uncommitted,
-   leave the job as one patch artifact along with its final message.
+1. **Agent run** (`action.yml`, job `maintain`). Builds the agent's
+   container image (your repository setup on top of `container-image`) and
+   the prompt from [`preamble.md`](preamble.md) and the instructions, then
+   tries the pool's keys in routing order. Each attempt installs the
+   provider's CLI on the runner if needed and runs it in a fresh container,
+   on a fresh copy of the checkout, with that single key. If the attempt
+   fails with an exhaustion error (quota, rate limit, billing, overload, or
+   an invalid or revoked key), the next key is tried. Any other failure ends
+   the run, unless `fallback-on` is `any`. The agent's changes, both its own
+   commits and anything left uncommitted, leave the job as one patch
+   artifact along with its final message, once the patch has been checked
+   for pool keys.
 2. **Publish** (`publish/`, job `publish`). Applies the patch, commits it,
    pushes a new `ai-maintenance/<date>-<run>` branch and opens a pull
    request whose description is the agent's final message.
@@ -46,7 +49,10 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    arrives, the watch waits until 5 minutes pass with nothing newer, so a
    whole review is handled at once. The agent then addresses it, the fix is
    pushed to the PR branch, and the agent's message is posted as a reply.
-   Each push starts a new watch, so the quiet period restarts.
+   Each push starts a new watch, so the quiet period restarts. Feedback is
+   handed over in whole items up to 60,000 bytes per round; whatever does
+   not fit is picked up by the next round, which starts after the last item
+   handed over.
 4. **Back to nightly.** The loop ends after `AI_MAINTENANCE_QUIET_MINUTES`
    (default 90) without feedback, when the pull request is closed or merged,
    or after `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` (default 5) rounds. By
@@ -60,38 +66,69 @@ other workflows post with their `GITHUB_TOKEN`, which trigger no workflow
 
 ### Isolation
 
-An agent with shell access runs as the job's own user, and on hosted
-runners that user has `sudo`. It can therefore read every token the job
-holds, whatever the scripts unset. The design keeps write access out of
-that job:
+The job that holds the API keys runs no agent code on the runner. Each
+attempt runs in its own container:
 
-- The **agent job** gets the API keys and a **read-only** `GITHUB_TOKEN`.
-  The checkout keeps no credentials (`persist-credentials: false`, and
-  `run.sh` strips any that remain). The agent's work leaves the job only as
-  a patch, and it can't push, comment or merge. Its build cache is restored
-  but never saved, so it can't poison other workflows' caches.
+- **Only its own key.** The pool stays with `run.sh` on the runner. The
+  container receives one key, through the environment, and nothing else:
+  no other key, no token, none of the runner's files or processes, and so
+  none of the credentials the runner holds for the job (the cache
+  service's included). A failure or a hostile change in one attempt can't
+  reach the keys of another.
+- **A fresh start.** Every attempt gets a new container from the image built
+  for the run and a new copy of the checkout. The CLIs are installed on the
+  runner and mounted read-only, as is the action itself, so nothing one
+  attempt changes survives into the next.
+- **No privileges.** The agent runs as an unprivileged user (never root,
+  even on a root runner), without capabilities and with `no-new-privileges`.
+  It can't install packages, so the image's setup installs everything the
+  repository needs.
+- **Nothing read on the runner's side.** The agent's tree, git
+  configuration included, is only read inside a container: a second
+  container without a key or network exports the patch. The runner reads
+  only plain files the attempt left, never through a symlink, then checks
+  the patch by applying it to its own copy of the checkout and scanning
+  the patch and every added or modified file's bytes for pool keys. A
+  binary file can't smuggle a key past that scan, and a scan that fails
+  refuses as well.
+- **No cache.** The agent job restores and saves no cache, so nothing it
+  builds can be restored by trusted CI.
+
+Around the agent job:
+
 - The **publish job** has write access but no API keys, and runs no agent.
   It only applies the patch. It runs the action scripts from the workflow's
   own commit (`github.sha`), never the PR branch's, so an agent that edited
-  those scripts gains nothing.
-- Each attempt gets only its own key. The pool and the instructions are
-  removed from the environment the agent inherits, and every key is masked
-  in the job log. Keys are also scrubbed from uploaded logs and from the
-  PR text. If the agent's changes contain a pool key, nothing is published.
+  those scripts gains nothing. Before a review round's push it checks that
+  the pull request is still open, still a maintenance pull request, and
+  still at the commit the agent worked on; the push itself only succeeds
+  while the branch is at that commit, so a closed pull request or a deleted
+  branch is never updated or recreated.
+- Every key and the instructions are masked in the job log, and withheld
+  wherever the agent quotes them verbatim in the PR text or the uploaded
+  logs. A paraphrase can't be detected: if the instructions themselves
+  must stay unpublished, set `AI_MAINTENANCE_PRIVATE_INSTRUCTIONS` to
+  `true`. The PR description and replies are then a fixed text, the
+  agent's output stays off the job log, and no transcripts are uploaded.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.
 
-The agent can still read the API keys and the read-only token, and can make
-network requests. Use keys with spending limits, and keep other secrets out
-of the agent job.
+The agent can still use its own key and make network requests. Use keys
+with spending limits.
 
 ## Setup
 
 1. Copy `.github/actions/ai-maintenance/` and
    `.github/workflows/ai-maintenance.yml` into the repository.
-2. In `ai-maintenance.yml`, adapt the **Repository setup** steps of the
-   `maintain` job to install what the agent needs to build and test (this
-   repository installs its pinned Rust toolchain).
+2. In `ai-maintenance.yml`, adapt the **Repository setup** of the agent
+   step (`container-image`, `container-setup`) to install what the agent
+   needs to build and test. The setup script runs as root while the image
+   is built, in a throwaway copy of the checkout, and can leave variables
+   for the agent in `/etc/ai-maintenance/env` (this repository installs its
+   pinned Rust toolchain that way). The runner needs Docker, which
+   GitHub-hosted Linux runners have. Keep `container-image` on the runner's
+   C library (the default `ubuntu:24.04` matches `ubuntu-24.04` runners):
+   the runner's Node.js and the provider CLIs are mounted into it.
 3. Add the secrets (Settings → Secrets and variables → Actions):
 
    | Secret | Required | Content |
@@ -184,8 +221,15 @@ by provider. A literal value works as well:
 ```
 
 A manual-run override is carried into the review rounds that run starts.
-The attempts table in the run summary shows the model and effort each
-attempt asked for.
+Provider names in `models` resolve through the same aliases as the pool
+(`"openai"` is `gpt`); naming one provider twice is an error. Every
+setting, in the map and in every pool entry, must be a string and is
+checked before the first attempt.
+
+The attempts table in the run summary shows the effort each attempt asked
+for and, when its adapter changed it, the one it ran with
+(`max (used high)`). The result, the PR footer and the commit message report
+the effort the CLI ran with.
 
 | Provider | Model | Effort |
 |---|---|---|
@@ -205,12 +249,13 @@ All optional (Settings → Secrets and variables → Actions → Variables):
 |---|---|---|
 | `AI_MAINTENANCE_ROUTING` | `ordered` | Routing strategy. |
 | `AI_MAINTENANCE_FALLBACK_ON` | `exhausted` | `exhausted` falls back only on exhaustion errors. `any` also falls back after other failures, including timeouts. |
+| `AI_MAINTENANCE_PRIVATE_INSTRUCTIONS` | `false` | `true` publishes none of the agent's own text: the PR description and replies are a fixed text, the agent's output stays off the job log and no transcripts are uploaded ([Isolation](#isolation)). |
 | `AI_MAINTENANCE_MODELS` | | JSON of provider → `"<model> [effort]"`, e.g. `{"claude":"claude-opus-5-5 high","gemini":"high"}` ([Model and effort](#model-and-effort)). A pool entry's `model` wins. Empty means each CLI's defaults. |
 | `AI_MAINTENANCE_ATTEMPT_TIMEOUT` | `60m` | Time limit per attempt (`timeout(1)` duration). |
 | `AI_MAINTENANCE_QUIET_MINUTES` | `90` | The review loop ends after this long without feedback. |
 | `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` | `5` | Most review rounds per pull request. |
 | `AI_MAINTENANCE_TRUSTED_BOTS` | | Comma-separated bot logins whose reviews count, e.g. `copilot-pull-request-reviewer[bot]`. |
-| `AI_MAINTENANCE_MAX_OPEN_PRS` | `1` | The nightly run skips while this many maintenance pull requests are open. `0` never skips. |
+| `AI_MAINTENANCE_MAX_OPEN_PRS` | `1` | The nightly run skips while this many maintenance pull requests (from this repository, on the branch prefix: the same rule the watch uses) are open. `0` never skips. |
 | `AI_MAINTENANCE_BRANCH_PREFIX` | `ai-maintenance/` | Branch prefix of maintenance pull requests. |
 | `AI_MAINTENANCE_DRAFT` | `false` | Open pull requests as drafts. |
 | `AI_MAINTENANCE_LABELS` | | Comma-separated labels for new pull requests. Labels that don't exist are skipped. |
@@ -232,6 +277,13 @@ Copy [`providers/TEMPLATE.sh.example`](providers/TEMPLATE.sh.example) to
   agent headless in the checkout, writes its final message to
   `FINAL_FILE`, and returns 0 only on success.
 
+`provider_install` runs on the runner, with no key, and installs into
+`$AI_TOOLS_DIR`, which attempts see read-only. `provider_run` runs inside
+the attempt's container, where `$AI_ATTEMPT_DIR` is the writable output
+directory and `node` is on `PATH`. If the CLI runs with a different effort
+than the one requested, call `ai_report_effort LEVEL` so the result reports
+it.
+
 Optionally, set `PROVIDER_EXHAUSTED_REGEX` to extra error patterns that mean
 "try the next key". If the CLI is a variant of one already listed, an alias
 in `ai_canonical_provider` (`lib.sh`) is enough.
@@ -240,13 +292,15 @@ in `ai_canonical_provider` (`lib.sh`) is enough.
 
 | File | Role |
 |---|---|
-| `action.yml`, `run.sh` | Agent run: pool, routing, attempts, fallback, the patch artifact. |
-| `lib.sh` | Pool parsing, routing strategies, aliases, failure classification, scrubbing. |
+| `action.yml`, `run.sh` | Agent run: pool, routing, the sandbox image, attempts, fallback, the checked patch artifact. |
+| `attempt.sh`, `export.sh` | Run inside the containers: one attempt with its key; the patch export, without a key. |
+| `gate.sh` | Pauses nightly runs while maintenance pull requests are open. |
+| `lib.sh` | Pool and model parsing, routing strategies, aliases, failure classification, scrubbing, the leak scan. |
 | `providers/*.sh` | One adapter per provider. |
 | `preamble.md` | The fixed part of the prompt (unattended-run rules, PR description format). |
 | `watch/action.yml`, `watch.sh` | Polls a pull request for trusted review feedback. |
 | `publish/action.yml`, `publish.sh` | Applies the patch; opens the pull request or pushes and replies. |
-| `test/selftest.sh` | Offline self-test with fake adapters, a fake `gh` and a local remote. |
+| `test/selftest.sh` | Offline self-test with fake adapters, fake `gh` and `docker` commands and a local remote; `--docker` runs attempts in real containers. |
 
 Run the self-test after changing anything here (it needs bash, git and jq):
 
@@ -254,10 +308,18 @@ Run the self-test after changing anything here (it needs bash, git and jq):
 .github/actions/ai-maintenance/test/selftest.sh
 ```
 
+With a Docker daemon, also run the container check. From inside an attempt,
+it looks for the other attempts' keys in every file and process it can see,
+and for the runner's files:
+
+```bash
+.github/actions/ai-maintenance/test/selftest.sh --docker
+```
+
 ## Limits
 
-- The agent job can read its API keys and its read-only token (see
-  [Isolation](#isolation)).
+- An attempt can use its own API key and the network (see
+  [Isolation](#isolation)). The agent job's runner needs Docker.
 - A review round fails if someone pushes to the PR branch while the agent
   is working, because the patch would no longer apply cleanly. The next
   round (or a human) picks it up.

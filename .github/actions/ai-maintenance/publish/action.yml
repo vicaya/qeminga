@@ -24,7 +24,7 @@ inputs:
     description: "update: the review round."
     default: "1"
   branch-prefix:
-    description: "create: prefix of the new branch."
+    description: "Prefix of maintenance branches: create names the new branch with it; update requires it."
     default: ai-maintenance/
   base-branch:
     description: "create: base branch of the pull request."

@@ -1,9 +1,12 @@
 //! The nightly AI maintenance workflow (`.github/workflows/ai-maintenance.yml`,
 //! `.github/actions/ai-maintenance/`). Runs the action's offline self-test
-//! (key pool, routing, fallback, key isolation, review watch, publishing)
-//! and checks the isolation properties of the workflow text: only the agent
-//! job sees the key pool, it has no write permission and keeps no
-//! credentials, and only the job without keys can write.
+//! (key pool, model settings, routing, fallback, the per-attempt sandbox,
+//! leak checks, review watch, publishing) and checks the isolation
+//! properties of the workflow text: only the agent job sees the key pool,
+//! it has no write permission, keeps no credentials and touches no cache,
+//! and only the job without keys can write. The privileged test runs
+//! attempts in real containers and probes, from inside one, for the other
+//! keys and the runner.
 #![forbid(unsafe_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -95,11 +98,37 @@ fn only_the_agent_job_sees_the_key_pool_and_it_cannot_write() {
         !maintain.contains("AI_MAINTENANCE_TOKEN"),
         "the agent job must not get the publishing token"
     );
-    // A cache saved here would carry the agent's files into other runs.
+    // Trusted builds restore caches of the default branch's scope; the
+    // agent job neither restores nor saves one.
+    for cache in ["rust-cache", "actions/cache", "cache:"] {
+        assert!(
+            !maintain.contains(cache),
+            "the agent job must not use a cache ({cache})"
+        );
+    }
+    // The repository's tools go into the agent's container image.
+    assert!(maintain.contains("container-setup: |"));
+}
+
+/// Runs attempts in real containers (`selftest.sh --docker`): needs a
+/// Docker daemon, which needs root or the docker group, and network access
+/// to build the image.
+#[test]
+#[ignore = "needs a Docker daemon (privileged suite)"]
+fn privileged_ai_maintenance_attempts_see_only_their_own_key() {
+    let script = root().join(".github/actions/ai-maintenance/test/selftest.sh");
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg("--docker")
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        maintain.contains("save-if: false"),
-        "the agent job must not save caches"
+        output.status.success(),
+        "selftest.sh --docker failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
     );
+    assert!(stdout.contains("4 passed, 0 failed"), "{stdout}");
 }
 
 #[test]

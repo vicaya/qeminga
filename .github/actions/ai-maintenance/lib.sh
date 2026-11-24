@@ -35,7 +35,7 @@ ai_log() { printf '[ai-maintenance] %s\n' "$*" >&2; }
 # or fails with a message that never echoes the input (it holds secrets).
 ai_normalize_pool() {
     local out
-    if ! out=$(jq -ce --argjson levels "$(ai_effort_levels_json)" '
+    if ! out=$(jq -ce '
         def entry($p; $v):
             if ($v | type) == "string" then {provider: $p, keys: [$v], options: {}}
             elif ($v | type) == "array" then {provider: $p, keys: $v, options: {}}
@@ -56,10 +56,8 @@ ai_normalize_pool() {
         | map(if .options.effort != null
               then error("POOL: provider \(.provider): write the effort after the model, as \"model\": \"<model> <effort>\"")
               else . end)
-        | map((.options.model // "" | tostring | [splits("\\s+") | select(. != "")]) as $w
-              | if ($w | length) > 2
-                   or (($w | length) == 2 and (([$w[1]] | inside($levels) | not) or ([$w[0]] | inside($levels))))
-              then error("POOL: provider \(.provider): model must be \"<model> [effort]\", effort one of \($levels | join(", "))")
+        | map(if .options.model != null and (.options.model | type) != "string"
+              then error("POOL: provider \(.provider): \"model\" must be a string, \"<model> [effort]\"")
               else . end)
     ' <<<"$1" 2>&1); then
         # jq's own messages can quote the offending value (a key), so only
@@ -70,6 +68,41 @@ ai_normalize_pool() {
         ai_log "expected e.g. [{\"claude\":[\"k1\",\"k2\"]},{\"gpt\":[\"k3\"]},{\"gemini\":[\"k4\"]}]"
         return 2
     fi
+    # Every entry's model setting, parsed exactly as at attempt time, before
+    # any attempt runs.
+    local i provider
+    while IFS=$'\t' read -r i provider; do
+        if ! ai_parse_model_spec "$(jq -r --argjson i "$i" '.[$i].options.model // ""' <<<"$out")" >/dev/null; then
+            ai_log "invalid AI_KEY_POOL: entry $((i + 1)) ($provider) has an invalid \"model\""
+            return 2
+        fi
+    done < <(jq -r 'to_entries[] | [.key, .value.provider] | @tsv' <<<"$out")
+    printf '%s\n' "$out"
+}
+
+# ai_normalize_models JSON -> the models map with canonical provider names
+#   {"gpt": "<model> [effort]", ...}
+# Values must be strings that ai_parse_model_spec accepts; provider names
+# resolve through the same aliases as the pool ("openai" is "gpt"), and two
+# names for one provider are an error rather than a silent choice.
+ai_normalize_models() {
+    local raw=${1:-} out='{}' key canon spec
+    [ -n "$raw" ] || { printf '{}\n'; return 0; }
+    if ! jq -e 'type == "object" and all(.[]; type == "string")
+                and all(keys[]; ascii_downcase | test("^[a-z0-9][a-z0-9_-]*$"))' <<<"$raw" >/dev/null 2>&1; then
+        ai_log "models must be a JSON object of provider name -> \"<model> [effort]\" string"
+        return 2
+    fi
+    while IFS= read -r key; do
+        canon=$(ai_canonical_provider "$(printf '%s' "$key" | tr '[:upper:]' '[:lower:]')")
+        spec=$(jq -r --arg k "$key" '.[$k]' <<<"$raw")
+        ai_parse_model_spec "$spec" >/dev/null || return 2
+        if jq -e --arg c "$canon" 'has($c)' <<<"$out" >/dev/null; then
+            ai_log "models: two names for provider $canon; keep one"
+            return 2
+        fi
+        out=$(jq -c --arg c "$canon" --arg s "$spec" '. + {($c): $s}' <<<"$out")
+    done < <(jq -r 'keys_unsorted[]' <<<"$raw")
     printf '%s\n' "$out"
 }
 
@@ -126,16 +159,56 @@ ai_is_exhausted() {
     [ -f "$1" ] && grep -Eiq -- "$re" "$1"
 }
 
-# ai_scrub KEYS_JSON < in > out: replaces every key with "***".
+# ai_scrub SECRETS_JSON < in > out: replaces every secret (pool keys, the
+# instructions) with "***", longest first.
 ai_scrub() {
     jq -Rjs --argjson keys "$1" \
-        'reduce ($keys[] | select(length > 0)) as $k (.; split($k) | join("***"))'
+        'reduce ($keys | map(select(length > 0)) | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
 }
 
-# ai_contains_key KEYS_JSON < in: success when the input holds any key.
+# ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
+# and also when FILE cannot be scanned (a scan that did not happen is not
+# a clean result).
 ai_contains_key() {
-    jq -Rse --argjson keys "$1" '. as $t | any($keys[] | select(length > 0); . as $k | $t | contains($k))' >/dev/null
+    local patterns rc
+    patterns=$(mktemp) || return 0
+    if ! jq -r '.[] | select(length > 0)' <<<"$1" >"$patterns"; then
+        rm -f "$patterns"
+        return 0
+    fi
+    if [ ! -s "$patterns" ]; then
+        rm -f "$patterns"
+        return 1
+    fi
+    LC_ALL=C grep -qsaF -f "$patterns" -- "$2"
+    rc=$?
+    rm -f "$patterns"
+    [ "$rc" -ne 1 ]
 }
+
+# ai_secret_fragments TEXT -> JSON array of what to withhold from published
+# output: the whole (trimmed) instructions, then each line of 20 or more
+# characters, so a quoted line is caught on its own.
+ai_secret_fragments() {
+    printf '%s' "${1:-}" | jq -Rsc '
+        def trim: gsub("^\\s+|\\s+$"; "");
+        [(trim), (split("\n")[] | trim | select(length >= 20))] | map(select(length > 0))'
+}
+
+# ai_regular_file PATH: success for a regular file that is not a symlink.
+# Files an attempt wrote are read only through this check.
+ai_regular_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
+
+# ai_report_effort LEVEL: for adapters, the effort the CLI actually ran
+# with when it differs from the one requested.
+ai_report_effort() { [ -z "${AI_ATTEMPT_DIR:-}" ] || printf '%s\n' "$1" >"$AI_ATTEMPT_DIR/effort"; }
+
+# The rule for "a maintenance pull request" (watch.sh, gate.sh, publish.sh):
+# its head branch is in this repository and starts with the branch prefix.
+# shellcheck disable=SC2016,SC2034 # jq text, used by the scripts that source this file
+AI_MAINTENANCE_PR_JQ='def maintenance_pr($repo; $prefix):
+    (.head.repo.full_name // "") == $repo and ((.head.ref // "") | startswith($prefix));'
+
 
 ai_effort_levels_json() { printf '%s' "$AI_EFFORT_LEVELS" | jq -Rc 'split(" ")'; }
 
@@ -159,6 +232,12 @@ ai_is_effort() { case " $AI_EFFORT_LEVELS " in *" ${1:-} "*) return 0 ;; esac; r
 # part may come out empty (the CLI's default). Anything else: status 2.
 ai_parse_model_spec() {
     local -a w
+    case "${1:-}" in
+        *[[:cntrl:]]*)
+            ai_log "model '${1//[[:cntrl:]]/?}': one line of '<model> [effort]', separated by spaces"
+            return 2
+            ;;
+    esac
     read -ra w <<<"${1:-}"
     case ${#w[@]} in
         0) printf '\t\n' ;;

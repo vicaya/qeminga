@@ -61,7 +61,7 @@ semantic versioning.
 ### Added
 
 - Nightly AI maintenance workflow (`.github/workflows/ai-maintenance.yml`,
-  `.github/actions/ai-maintenance/`, T6.10): a coding agent (Claude Code,
+  `.github/actions/ai-maintenance/`, T6.12): a coding agent (Claude Code,
   OpenAI Codex or the Antigravity CLI, with room for more providers)
   follows the instructions in the `AI_MAINTENANCE_PROMPT` secret, using
   API keys from the ordered `AI_KEY_POOL` secret and falling back to the
@@ -69,10 +69,13 @@ semantic versioning.
   routing; model and optional reasoning effort as one setting,
   `"<model> [effort]"`, per pool entry or per provider). Its changes are
   opened as a pull request, then review feedback from trusted authors is
-  addressed in rounds until the pull request has
-  been quiet for 90 minutes. The agent runs with a read-only token, and its
-  work leaves its job only as a patch; a job with write access but no keys
-  publishes it. Developer tooling only, with no change to the daemon.
+  addressed in rounds until the pull request has been quiet for 90
+  minutes. Each attempt runs in its own container with only its own key,
+  on a fresh copy of the checkout, out of reach of the runner's files and
+  credentials; the agent job uses no cache. The agent's work leaves its job
+  only as a patch, checked byte for byte for pool keys, and a job with write
+  access but no keys publishes it. Developer tooling only, with no change to
+  the daemon.
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
   part): on GitHub-hosted runners, natively on x86-64 and aarch64, the
   release candidate built in the same run is installed with the shipped

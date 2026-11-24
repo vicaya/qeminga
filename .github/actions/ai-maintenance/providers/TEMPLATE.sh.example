@@ -1,13 +1,18 @@
 # shellcheck shell=bash
 # Template for a new provider. Copy to providers/<name>.sh, where <name> is
-# the provider's name in the key pool (for example "provider2"). run.sh
-# sources the file in a subshell per attempt; it may use the helpers in
-# lib.sh (ai_log, ai_npm_install) and these variables:
+# the provider's name in the key pool (for example "provider2"). It may use
+# the helpers in lib.sh (ai_log, ai_npm_install, ai_report_effort) and
+# these variables:
 #
-#   AI_TOOLS_DIR     install CLIs here (shared across attempts of one run)
-#   AI_ATTEMPT_DIR   scratch space for this attempt (outside the checkout)
+#   AI_TOOLS_DIR     install CLIs here (shared across attempts of one run;
+#                    read-only during attempts)
+#   AI_ATTEMPT_DIR   writable output directory of this attempt (outside the
+#                    checkout)
 #
-# The working directory is the repository checkout.
+# provider_install runs on the runner, without a key. provider_run runs in
+# the attempt's container, as an unprivileged user, in a copy of the
+# repository checkout, with Node.js on PATH; nothing else of the runner is
+# visible there.
 
 # Optional: extra extended regex (case-insensitive) for errors that mean
 # "this key is exhausted, try the next one". The common patterns (429,
@@ -27,7 +32,8 @@ provider_install() {
 #   MODEL         model to use, or empty for the CLI's default
 #   OPTIONS_JSON  the pool entry's options, e.g. {"base_url": "..."}
 #   EFFORT        low | medium | high | xhigh | max, or empty for the CLI's
-#                 default; map it onto the CLI's own levels
+#                 default; map it onto the CLI's own levels, and call
+#                 `ai_report_effort LEVEL` when the CLI runs with another
 # Print progress to stdout/stderr (it becomes the attempt log) and return
 # 0 only when the agent finished its task.
 provider_run() {

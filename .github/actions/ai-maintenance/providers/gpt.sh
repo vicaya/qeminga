@@ -22,7 +22,10 @@ provider_run() {
     local -a args=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check
         --ephemeral --color never -o "$final")
     [ -n "$model" ] && args+=(-m "$model")
-    [ "$effort" = max ] && effort=xhigh
+    if [ "$effort" = max ]; then
+        effort=xhigh
+        ai_report_effort xhigh
+    fi
     [ -n "$effort" ] && args+=(-c "model_reasoning_effort=\"$effort\"")
     base_url=$(jq -r '.base_url // ""' <<<"$options")
     mkdir -p "$AI_ATTEMPT_DIR/codex-home"

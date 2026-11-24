@@ -9,9 +9,12 @@
 #   GH_TOKEN, GITHUB_REPOSITORY, GITHUB_SERVER_URL
 #   RESULT_DIR      meta.json, summary.md and (when changed) changes.patch
 #   MODE            create | update
-#   PR              update: the pull request number
+#   PR              update: the pull request number; it must still be an open
+#                   maintenance pull request whose head is the commit the
+#                   agent worked on
 #   ROUND           update: the review round, for the commit subject
-#   BRANCH_PREFIX   create: new branches are <prefix><date>-<run id>
+#   BRANCH_PREFIX   new branches are <prefix><date>-<run id>; update: the
+#                   pull request's branch must have it
 #   BASE_BRANCH     create: the pull request's base branch
 #   PR_DRAFT        create: "true" opens a draft
 #   PR_LABELS       create: comma-separated labels (missing labels are skipped)
@@ -63,11 +66,34 @@ trap 'rm -f "$body"' EXIT
     printf '</sub>\n%s\n' "$MARKER"
 } >"$body"
 
-push() { # refspec
+# push BRANCH EXPECTED: updates the branch only while it is still at
+# EXPECTED (empty: only while it does not exist), so a branch that moved
+# or was deleted meanwhile is never overwritten or recreated.
+push() {
     local server=${GITHUB_SERVER_URL:-https://github.com} auth
     auth=$(printf 'x-access-token:%s' "${GH_TOKEN:?}" | base64 | tr -d '\n')
     [ "${GITHUB_ACTIONS:-}" = true ] && echo "::add-mask::$auth"
-    git -c "http.$server/.extraheader=AUTHORIZATION: basic $auth" push origin "$1"
+    git -c "http.$server/.extraheader=AUTHORIZATION: basic $auth" \
+        push --force-with-lease="refs/heads/$1:$2" origin "HEAD:refs/heads/$1"
+}
+
+# open_pr_at [SHA]: success while PR is open and a maintenance pull request
+# (lib.sh) on the checked-out branch, with its head at SHA when one is
+# given; status 3 when it is no longer open.
+open_pr_at() {
+    local pr
+    pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" \
+        --jq '{state, head: {ref: .head.ref, sha: .head.sha, repo: {full_name: .head.repo.full_name}}}') || return 1
+    if [ "$(jq -r .state <<<"$pr")" != open ]; then
+        ai_log "PR #$PR is no longer open; not publishing"
+        return 3
+    fi
+    if ! jq -e --arg repo "$GITHUB_REPOSITORY" --arg prefix "${BRANCH_PREFIX:?}" --arg branch "$branch" --arg sha "$1" \
+        "$AI_MAINTENANCE_PR_JQ maintenance_pr(\$repo; \$prefix) and .head.ref == \$branch and (\$sha == \"\" or .head.sha == \$sha)" \
+        <<<"$pr" >/dev/null; then
+        ai_log "PR #$PR is not the maintenance pull request on $branch${1:+ at $1} the agent worked on; not publishing"
+        return 1
+    fi
 }
 
 commit() { # subject
@@ -88,7 +114,7 @@ case "$MODE" in
         branch="${BRANCH_PREFIX}$(date -u +%Y%m%d)-${GITHUB_RUN_ID:-local}"
         git checkout -q -b "$branch"
         commit "$title"
-        push "HEAD:refs/heads/$branch"
+        push "$branch" ""
         args=(--repo "$GITHUB_REPOSITORY" --base "$BASE_BRANCH" --head "$branch"
             --title "$title" --body-file "$body")
         [ "${PR_DRAFT:-false}" = true ] && args+=(--draft)
@@ -109,10 +135,16 @@ case "$MODE" in
     update)
         : "${PR:?}"
         branch=$(git symbolic-ref -q --short HEAD) || { ai_log "update needs the PR branch checked out"; exit 2; }
+        # The pull request may have closed, moved or lost its branch while
+        # the agent ran: check right before publishing, and push only onto
+        # the commit the agent saw.
+        open_pr_at "$base_sha" || { [ $? -eq 3 ] && exit 0; exit 1; }
         if [ "$status" = changed ] && [ -s "$patch" ]; then
             commit "Address review feedback (round ${ROUND:-1})"
-            push "HEAD:refs/heads/$branch"
+            push "$branch" "$base_sha"
             printf '\n<sub>Pushed %s.</sub>\n' "$(git rev-parse --short HEAD)" >>"$body"
+            # GitHub may not show the new head yet; the branch and state must hold.
+            open_pr_at "" || { [ $? -eq 3 ] && exit 0; exit 1; }
         fi
         gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file "$body" >/dev/null
         ai_log "replied on PR #$PR (status $status)"

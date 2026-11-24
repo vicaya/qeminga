@@ -9,11 +9,14 @@
 # AI_MAINTENANCE_QUIET_MINUTES the watch ends and the nightly schedule
 # carries on.
 #
-# Isolation: the agent runs with the API keys and a read-only token; its
-# work leaves its job only as a patch artifact. Pushing, opening and
-# commenting on pull requests happen in a job that has write access but
-# no keys and runs no agent, using the action scripts from this workflow's
-# own commit, never the pull request's.
+# Isolation: the agent job holds the API keys and a read-only token, but
+# the agent itself runs in a container per attempt that receives only that
+# attempt's key and a copy of the checkout: the runner's files, processes
+# and credentials (the cache service's included) stay outside, and the job
+# restores and saves no cache. The agent's work leaves its job only as a
+# patch artifact. Pushing, opening and commenting on pull requests happen
+# in a job that has write access but no keys and runs no agent, using the
+# action scripts from this workflow's own commit, never the pull request's.
 #
 # Portable: copy this file and .github/actions/ai-maintenance/ into another
 # repository, set the secrets, and adapt the "Repository setup" steps.
@@ -33,7 +36,7 @@ on:
         description: "review: pull request number"
         default: ""
       since:
-        description: "review: feedback after this ISO-8601 time is new"
+        description: "review: feedback after this point is new (an ISO-8601 time, or a previous watch's cursor)"
         default: ""
       round:
         description: "review: review round number"
@@ -123,19 +126,6 @@ jobs:
           name: ai-maintenance-feedback
           path: ${{ runner.temp }}/ai-feedback
 
-      # --- Repository setup: the tools the agent needs to build and test.
-      # Adapt these steps when copying the workflow to another repository.
-      - name: Install pinned Rust toolchain (rust-toolchain.toml)
-        working-directory: work
-        run: rustup toolchain install && rustup show active-toolchain
-      # Restore only: a cache saved from this job would carry whatever the
-      # agent left in target/ or ~/.cargo into other workflows' runs.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: work
-          save-if: false
-      # --- End of repository setup.
-
       - id: agent
         uses: ./_ai-maintenance/.github/actions/ai-maintenance
         with:
@@ -150,7 +140,28 @@ jobs:
           # defaults.
           models: ${{ inputs.models || vars.AI_MAINTENANCE_MODELS }}
           attempt-timeout: ${{ vars.AI_MAINTENANCE_ATTEMPT_TIMEOUT || '60m' }}
+          # "true": no free-form agent text or transcripts are published.
+          private-instructions: ${{ vars.AI_MAINTENANCE_PRIVATE_INSTRUCTIONS || 'false' }}
           working-directory: work
+          # --- Repository setup: what the agent needs to build and test,
+          # installed into its container image (as root, in a throwaway
+          # copy of the checkout; the agent itself cannot install anything).
+          # Adapt this when copying the workflow to another repository.
+          container-image: ubuntu:24.04
+          container-setup: |
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential curl >/dev/null
+            export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+            curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
+              "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+            chmod +x /tmp/rustup-init
+            /tmp/rustup-init -y -q --no-modify-path --profile minimal --default-toolchain none
+            rm /tmp/rustup-init
+            /opt/rust/cargo/bin/rustup toolchain install  # rust-toolchain.toml
+            chmod -R a+rwX /opt/rust
+            printf '%s\n' RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo \
+              'PATH=/opt/rust/cargo/bin:$PATH' >>/etc/ai-maintenance/env
+          # --- End of repository setup.
           branch-prefix: ${{ env.BRANCH_PREFIX }}
           # Nightly runs pause while a maintenance pull request is open.
           max-open-prs: ${{ inputs.mode == 'review' && '0' || vars.AI_MAINTENANCE_MAX_OPEN_PRS || '1' }}

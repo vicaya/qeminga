@@ -112,6 +112,7 @@ provider_run() {
             ai_log "agy: effort '$effort' is not available for this model (allowed: $allowed); using '$nearest'"
             gemini_agy "$prompt" "$model" "$nearest" "$stream"
             rc=$?
+            ai_report_effort "$nearest"
         fi
     fi
     GEMINI_KEY=

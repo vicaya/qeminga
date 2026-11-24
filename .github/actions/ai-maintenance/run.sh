@@ -135,10 +135,14 @@ case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be t
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 # Review feedback, when supplied, must be a readable file (an empty one
 # adds nothing): a review round without it would not address the review.
-extra=${AI_EXTRA_PROMPT_FILE:-}
-if [ -n "$extra" ] && { [ ! -f "$extra" ] || [ ! -r "$extra" ]; }; then
-    ai_log "the review feedback file ($extra) is missing or unreadable"
-    exit 2
+# It is read once, here: whatever happens to the file later (during the
+# image build, say), the prompt gets what was read.
+feedback='' feedback_src=${AI_EXTRA_PROMPT_FILE:-}
+if [ -n "$feedback_src" ]; then
+    if [ ! -f "$feedback_src" ] || [ ! -r "$feedback_src" ] || ! feedback=$(cat -- "$feedback_src"); then
+        ai_log "the review feedback file ($feedback_src) is missing or unreadable"
+        exit 2
+    fi
 fi
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 # The runner's Node.js, for the npm-installed CLIs, as one read-only file,
@@ -342,13 +346,13 @@ prompt=$prompt_dir/prompt.md
 if ! {
     cat "$here/preamble.md" &&
         printf '\n## Maintenance instructions\n\n%s\n' "$instructions" &&
-        if [ -n "$extra" ] && [ -s "$extra" ]; then printf '\n' && cat "$extra"; fi
+        if [ -n "$feedback" ]; then printf '\n%s\n' "$feedback"; fi
 } >"$prompt"; then
     ai_log "could not write the prompt; no attempt was made"
     out status failed
     exit 2
 fi
-instructions=
+instructions='' feedback=''
 # The agent's user reads it (mounted read-only) whatever the umask was.
 own "$prompt_dir" || exit 2
 

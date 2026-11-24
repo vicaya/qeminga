@@ -297,7 +297,8 @@ cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:-/dev/null}"
 case "$1" in
-    build) [ -z "${FAKE_DOCKER_BUILD_FAIL:-}" ]; exit ;;
+    build) [ -z "${FAKE_DOCKER_BUILD_RM:-}" ] || rm -f -- "$FAKE_DOCKER_BUILD_RM"
+           [ -z "${FAKE_DOCKER_BUILD_FAIL:-}" ]; exit ;;
     run) shift ;;
     *) exit 0 ;;
 esac
@@ -687,6 +688,13 @@ eq "run: ... or cannot be read" "2 0" "$rc $(attempts_started dirfeedback)"
 : >"$tmp/empty-feedback.md"
 run_case emptyfeedback '[{"claude":["ok-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/empty-feedback.md"
 eq "run: empty feedback adds nothing and stops nothing" "0 changed" "$rc $(output status)"
+# The feedback is read once, before the image builds: removed during the
+# build, it still reaches the prompt whole.
+printf 'Review feedback (latefeedbackmarker)\n' >"$tmp/late-feedback.md"
+run_case latefeedback '[{"claude":["prompt-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/late-feedback.md" \
+    FAKE_DOCKER_BUILD_RM="$tmp/late-feedback.md"
+check "run: feedback removed while the image builds still reaches the prompt" bash -c \
+    '[ "$2" = 0 ] && [ ! -e "$3" ] && grep -q latefeedbackmarker "$1/attempt-1/out/final.md"' _ "$state" "$rc" "$tmp/late-feedback.md"
 run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true
 check "run: raw state is kept for debugging, without the key file or the options" bash -c \
     '[ "$2" = 0 ] && [ -d "$1/attempt-1/tree" ] && [ ! -e "$1/secrets.json" ] && ! grep -rqa argvoptionsecret "$1"' _ "$state" "$rc"

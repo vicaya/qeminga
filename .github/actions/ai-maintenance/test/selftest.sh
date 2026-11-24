@@ -30,7 +30,7 @@ docker_mode='' image_mode=''
 [ "${1:-}" = --docker ] && docker_mode=1
 [ "${1:-}" = --image ] && image_mode=1
 
-tmp=$(mktemp -d)
+tmp=$(mktemp -d) && [ -d "$tmp" ] || { echo "selftest: could not create a temporary directory" >&2; exit 2; }
 export TMPDIR=$tmp
 trap '[ -n "${KEEP:-}" ] || rm -rf "$tmp"' EXIT
 failures=0 passes=0
@@ -244,6 +244,23 @@ fi
 # as the command runs, the fake lets that user search the directories
 # above each mount. With FAKE_DOCKER_ARGV_DIR, each container also gets a
 # recorder of its own, NAME.log there, for the argument-log shims.
+# fake-docker-closed ROOT MOUNT...: the directories above each MOUNT, inside
+# ROOT (ROOT included), that other users cannot search: what the fake
+# docker opens. Nothing without a ROOT, or with / (or a relative path) as one.
+cat >"$bin/fake-docker-closed" <<'EOF'
+#!/usr/bin/env bash
+root=${1:-}
+shift
+case "$root" in /?*) ;; *) exit 0 ;; esac
+root=${root%/}
+for m in "$@"; do
+    d=$m
+    while d=$(dirname "$d") && case "$d/" in "$root"/*) true ;; *) false ;; esac; do
+        if [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ]; then printf '%s\n' "$d"; fi
+    done
+done
+EOF
+chmod +x "$bin/fake-docker-closed"
 cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:-/dev/null}"
@@ -283,15 +300,10 @@ real_env=$(PATH=/usr/bin:/bin command -v env)
 # each logged before it is: a mount elsewhere stays as it is, and the
 # attempt cannot reach it unless it is already searchable.
 opened=()
-root=${FAKE_DOCKER_ROOT:-}
-for m in "${mounts[@]}" "$wd"; do
-    d=$m
-    while [ -n "$root" ] && d=$(dirname "$d") && case "$d/" in "$root"/*) true ;; *) false ;; esac; do
-        if [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ]; then
-            printf '%s\n' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
-            chmod o+x "$d" && opened+=("$d")
-        fi
-    done
+mapfile -t closed < <("$(dirname "$0")/fake-docker-closed" "${FAKE_DOCKER_ROOT:-}" "${mounts[@]}" "$wd" | awk '!seen[$0]++')
+for d in "${closed[@]}"; do
+    printf '%s\n' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
+    chmod o+x "$d" && opened+=("$d")
 done
 (cd "$wd" && "${as[@]}" "$real_env" -i "${envs[@]}" "$@")
 rc=$?
@@ -534,12 +546,27 @@ check "run: no key, instruction or pool option is ever a process argument" bash 
 
 # The fake docker changes permissions only inside the test's own directory:
 # a private directory elsewhere that holds a mount is never opened.
-ext=$(mktemp -d /tmp/ai-selftest-ext.XXXXXX)
+ext=$(mktemp -d /tmp/ai-selftest-ext.XXXXXX) && [ -d "$ext" ] ||
+    { echo "selftest: could not create the external fixture" >&2; exit 2; }
 mkdir -p "$ext/private" && cp -a "$fakes" "$ext/private/providers" && chmod 700 "$ext/private"
 run_case external '[{"claude":["ok-1"]}]' AI_PROVIDERS_DIR="$ext/private/providers"
 check "selftest: a private directory outside the test is never opened, and keeps its mode" bash -c \
-    '! grep -v "^$2/" "$1" && [ "$(stat -c %a "$3")" = 700 ]' _ "$FAKE_DOCKER_OPENED" "$tmp" "$ext/private"
+    '{ [ "$(id -u)" != 0 ] || { [ -r "$1" ] && ! grep -v "^$2/" "$1"; }; } && [ "$(stat -c %a "$3")" = 700 ]' \
+    _ "$FAKE_DOCKER_OPENED" "$tmp" "$ext/private"
 rm -rf "$ext"
+# Which directories the fake opens is decided by fake-docker-closed ROOT
+# MOUNT...; checked here without privileges, so ordinary CI covers it too.
+b=$tmp/boundary
+mkdir -p "$b/fixture/in/deep" "$b/fixture-sibling/x" "$b/outside/x" "$b/fixture/open/x"
+chmod 700 "$b/fixture" "$b/fixture/in" "$b/fixture-sibling" "$b/outside"
+chmod 755 "$b/fixture/open"
+closed() { "$bin/fake-docker-closed" "$@" | sort -u | paste -sd' '; }
+eq "fake docker: opens the closed directories above a mount inside the fixture" \
+    "$b/fixture $b/fixture/in" "$(closed "$b/fixture" "$b/fixture/in/deep" "$b/fixture/open/x")"
+eq "fake docker: ... none above a sibling whose name extends the fixture's" "" "$(closed "$b/fixture" "$b/fixture-sibling/x")"
+eq "fake docker: ... none above a mount outside it" "" "$(closed "$b/fixture" "$b/outside/x")"
+eq "fake docker: ... and none without a fixture, or with / as one" "|" \
+    "$(closed "" "$b/fixture/in/deep")|$(closed / "$b/fixture/in/deep")"
 
 run_case symlink '[{"claude":["symlink-1"]}]'
 check "run: an output file the agent replaced by a symlink is not read" bash -c \
@@ -1172,8 +1199,12 @@ check "publish: a patch touching .github/workflows/ is refused before any push" 
     '[ "$3" = 1 ] && ! git -C "$1" rev-parse -q --verify "refs/heads/ai-maintenance/$2-97" >/dev/null && grep -q "workflows" "$4"' \
     _ "$remote" "$(date -u +%Y%m%d)" "$rc" "$tmp/pub.log"
 
-check "selftest: the fake docker opened directories only inside the test's own" bash -c \
-    '! grep -v "^$2/" "$1"' _ "$FAKE_DOCKER_OPENED" "$tmp"
+# As root, the fake really opens directories (the run's are owner-only):
+# its log must show it did, and only inside the test's own directory.
+if [ "$(id -u)" = 0 ]; then
+    check "selftest: the fake docker opened directories, only inside the test's own" bash -c \
+        '[ -r "$1" ] && grep -q "^$2/" "$1" && ! grep -v "^$2/" "$1"' _ "$FAKE_DOCKER_OPENED" "$tmp"
+fi
 echo
 echo "$passes passed, $failures failed"
 [ "$failures" -eq 0 ]

@@ -188,6 +188,10 @@ check "run: the trailing effort reaches the adapter; a pool entry's model string
     'grep -q "model=big-model effort=xhigh" "$1" && grep -q "model=small effort=low" "$1"' _ "$state/seen"
 check "run: the effort is reported in the summary and result" bash -c \
     'grep -q "| big-model | xhigh |" "$1" && [ "$(jq -r .effort "$2")" = low ]' _ "$tmp/effort-summary.md" "$state/result/meta.json"
+run_case poolonly '[{"claude":{"keys":["noop-1"],"model":"small low"}}]'
+check "run: without a models map, the pool entry's setting applies" contains "$state/seen" "model=small effort=low"
+run_case nomodels '[{"claude":["noop-1"]}]'
+check "run: with neither, each CLI keeps its defaults" contains "$state/seen" "model=default effort=default"
 run_case effortonly '[{"claude":["noop-1"]}]' AI_MODELS='{"claude":"max"}'
 check "run: a lone level keeps the CLI's model" contains "$state/seen" "model=default effort=max"
 run_case badeffort '[{"claude":["ok-1"]}]' AI_MODELS='{"claude":"big-model extreme"}'

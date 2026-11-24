@@ -17909,13 +17909,13 @@ esac
 }
 
 #[test]
-fn safe_rmtree_id_deletes_tx_marker_last_and_retries_after_post_marker_unlink_crash() {
+fn safe_rmtree_id_pins_fd_through_rmdir_deletes_tx_marker_last_and_requires_marker() {
     let dir = private_tempdir();
     let py_root = dir.path().join("py-rmtree");
     std::fs::create_dir_all(&py_root).unwrap();
 
-    // Part 1: Direct fs_ops Python harness verifying deletion ordering, post-marker-unlink
-    // retryability, and fail-closed substitution checks.
+    // Part 1: Direct fs_ops Python harness verifying deletion ordering, open-FD pinning
+    // through `os.rmdir`, and fail-closed marker/substitution checks.
     let py_out = Command::new("python3")
         .args([
             "-I",
@@ -17970,18 +17970,21 @@ rc, ident1, err = exec_fs_op(["path-identity", c1])
 assert rc == 0 and ident1, f"path-identity failed: rc={rc} err={err}"
 c1_ino = os.lstat(c1).st_ino
 
-# Simulate fsync(tfd) failure BEFORE top-level `.qeminga-tx-id` unlink, then normal ordering
-# (payload deletes -> fsync(tfd) -> top-level `.qeminga-tx-id` unlink -> crash before rmdir).
+# Simulate fsync(tfd) failure BEFORE top-level `.qeminga-tx-id` unlink, normal pinned-FD
+# ordering (payload -> fsync(tfd) -> unlink(.qeminga-tx-id) -> rmdir -> close(tfd)), and
+# post-marker-unlink crash fail-closed behavior.
 events = []
 real_unlink = os.unlink
 real_rmdir = os.rmdir
 real_fsync = os.fsync
 real_fstat = os.fstat
+real_close = os.close
 
 class SimulatedCrash(BaseException):
     pass
 
-def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=None):
+def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=None, track_ino=None):
+    target_ino = c1_ino if track_ino is None else track_ino
     def spy_hook(ns):
         orig_os = ns["os"]
         class SpyOs:
@@ -17989,7 +17992,7 @@ def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=N
                 return getattr(orig_os, name)
             def fsync(self, fd):
                 st = real_fstat(fd)
-                if st.st_ino == c1_ino:
+                if st.st_ino == target_ino:
                     events.append(("fsync_top_dir", st.st_ino))
                     if fail_top_fsync:
                         raise OSError(errno.EIO, "simulated dir fsync failure")
@@ -18001,7 +18004,7 @@ def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=N
                 is_top_tx = (
                     path == ".qeminga-tx-id"
                     and dfd is not None
-                    and real_fstat(dfd).st_ino == c1_ino
+                    and real_fstat(dfd).st_ino == target_ino
                 )
                 events.append(("unlink_top_tx" if is_top_tx else "unlink", path))
                 real_unlink(path, *args, **kwargs)
@@ -18010,6 +18013,14 @@ def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=N
             def rmdir(self, path, *args, **kwargs):
                 events.append(("rmdir", path))
                 return real_rmdir(path, *args, **kwargs)
+            def close(self, fd):
+                try:
+                    st = real_fstat(fd)
+                    if st.st_ino == target_ino:
+                        events.append(("close_top_fd", st.st_ino))
+                except OSError:
+                    pass
+                return real_close(fd)
             def fstat(self, fd):
                 st = real_fstat(fd)
                 if fake_uid_ino is not None and st.st_ino == fake_uid_ino:
@@ -18036,7 +18047,36 @@ assert ("unlink_top_tx", ".qeminga-tx-id") not in events, (
     f"marker must NOT be unlinked when fsync(tfd) fails: {events}"
 )
 
-# Re-add payload and verify full ordering: payload unlinks -> fsync(tfd) -> unlink(.qeminga-tx-id).
+# 1a-ii. Normal removal MUST hold `tfd` open across `os.lstat` and `os.rmdir` so the inode
+#        cannot be freed or reused before `os.rmdir` completes!
+c1_pin = os.path.join(root, ".qeminga-update-backup.case1-pin")
+os.makedirs(c1_pin, mode=0o700)
+os.chmod(c1_pin, 0o700)
+open(os.path.join(c1_pin, "pin_payload"), "wb").write(b"p")
+rc_pin, ident_pin, err_pin = exec_fs_op(["path-identity", c1_pin])
+assert rc_pin == 0 and ident_pin, f"path-identity failed: rc={rc_pin} err={err_pin}"
+c1_pin_ino = os.lstat(c1_pin).st_ino
+events.clear()
+rc_pin_rm, _, err_pin_rm = exec_fs_op(
+    ["safe-rmtree-id", c1_pin, ident_pin],
+    hook=make_spy_hook(track_ino=c1_pin_ino),
+)
+assert rc_pin_rm == 0 and not os.path.exists(c1_pin), f"normal safe-rmtree-id failed: rc={rc_pin_rm} err={err_pin_rm}"
+pin_payload_idx = events.index(("unlink", "pin_payload"))
+pin_fsync_idx = events.index(("fsync_top_dir", c1_pin_ino))
+pin_tx_idx = events.index(("unlink_top_tx", ".qeminga-tx-id"))
+pin_rmdir_idx = events.index(("rmdir", os.path.basename(c1_pin)))
+pin_close_indices = [i for i, e in enumerate(events) if e == ("close_top_fd", c1_pin_ino)]
+assert pin_close_indices, f"expected close_top_fd in events: {events}"
+pin_close_idx = pin_close_indices[-1]
+assert (
+    pin_payload_idx < pin_fsync_idx < pin_tx_idx < pin_rmdir_idx < pin_close_idx
+    and ("close_top_fd", c1_pin_ino) not in events[pin_tx_idx:pin_rmdir_idx]
+), (
+    f"safe-rmtree-id MUST hold tfd open through rmdir (payload < fsync < unlink_tx < rmdir < final close_tfd, no close between unlink_tx and rmdir), got {events}"
+)
+
+# 1a-iii. Re-add payload and verify full ordering: payload unlinks -> fsync(tfd) -> unlink(.qeminga-tx-id).
 open(os.path.join(c1, "retry_payload"), "wb").write(b"p")
 events.clear()
 crashed = False
@@ -18048,8 +18088,8 @@ try:
 except SimulatedCrash:
     crashed = True
 assert crashed, f"expected SimulatedCrash right after top-level .qeminga-tx-id unlink; events={events}"
-assert events[-1] == ("unlink_top_tx", ".qeminga-tx-id"), (
-    f"top-level .qeminga-tx-id MUST be unlinked LAST after all payload deletions: {events}"
+assert events[-2] == ("unlink_top_tx", ".qeminga-tx-id") and events[-1] == ("close_top_fd", c1_ino), (
+    f"top-level .qeminga-tx-id MUST be unlinked LAST before finally close(tfd): {events}"
 )
 payload_idx = events.index(("unlink", "retry_payload"))
 fsync_idx = events.index(("fsync_top_dir", c1_ino))
@@ -18061,10 +18101,16 @@ assert os.path.isdir(c1) and os.listdir(c1) == [], (
     f"after post-marker-unlink crash, container must be empty and still exist: {os.listdir(c1) if os.path.isdir(c1) else 'missing'}"
 )
 
-# Retry safe-rmtree-id on the exact same empty container -> MUST succeed!
+# Retry safe-rmtree-id on the markerless empty directory -> MUST fail closed (indistinguishable
+# from an unrelated empty 0700 directory reusing the freed inode); succeeds once absent!
 rc_retry, _, err_retry = exec_fs_op(["safe-rmtree-id", c1, ident1])
-assert rc_retry == 0, f"retry after post-marker-unlink crash MUST succeed: rc={rc_retry} err={err_retry}"
-assert not os.path.exists(c1), "container must be removed after retry"
+assert rc_retry != 0 and "missing transaction identity marker" in err_retry, (
+    f"safe-rmtree-id MUST require positive .qeminga-tx-id ownership on empty dir: rc={rc_retry} err={err_retry}"
+)
+assert os.path.isdir(c1), "markerless empty dir must remain untouched for inspection"
+os.rmdir(c1)
+rc_absent, _, err_absent = exec_fs_op(["safe-rmtree-id", c1, ident1])
+assert rc_absent == 0, f"safe-rmtree-id on absent container must succeed: rc={rc_absent} err={err_absent}"
 
 # 1b. Security: missing `.qeminga-tx-id` on a NON-EMPTY directory (same inode, 0700) MUST fail closed!
 c2 = os.path.join(root, ".qeminga-update-backup.case2")
@@ -18144,7 +18190,7 @@ assert rc_mode != 0 and "must be owned by current user with mode 0700" in err_mo
 assert os.path.isdir(c4), "non-0700 empty dir without marker must not be removed"
 
 # 1f. Security: non-delete op (`restore-runner-backup`) on an empty 0700 dir missing `.qeminga-tx-id`
-#     MUST STILL fail closed (allow_empty_missing_tx is strictly limited to safe-rmtree-id).
+#     MUST ALSO fail closed.
 os.chmod(c4, 0o700)
 fake_runner = os.path.join(root, "runner")
 os.makedirs(fake_runner, mode=0o755)
@@ -18359,6 +18405,36 @@ assert not os.path.exists(st_dir2), "stage dir must be removed after normal reti
     );
     std::fs::write(cfg.join("install.env"), &rec_committed).unwrap();
 
+    // Markerless empty 0700 dir at the recorded backup path (indistinguishable from
+    // immediate inode reuse after rmdir before journal clear) MUST fail closed!
+    let upd_refuse = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !upd_refuse.status.success(),
+        "committed-update recovery MUST refuse to remove a markerless empty backup dir reusing the inode: {}",
+        text(&upd_refuse)
+    );
+    assert!(
+        bk_upd.is_dir() && !bk_upd.join(".qeminga-tx-id").exists(),
+        "markerless empty backup dir must remain untouched"
+    );
+    // Once absent (normal post-rmdir state or operator removal), committed update recovers cleanly.
+    std::fs::remove_dir(&bk_upd).unwrap();
     let upd_out = run_setup_env(
         &[
             "update",
@@ -18378,16 +18454,12 @@ assert not os.path.exists(st_dir2), "stage dir must be removed after normal reti
     );
     assert!(
         upd_out.status.success(),
-        "committed-update recovery must finish pruning an empty post-marker-unlink backup container: {}",
+        "committed-update recovery must succeed once retired backup is absent: {}",
         text(&upd_out)
-    );
-    assert!(
-        !bk_upd.exists(),
-        "post-marker-unlink backup must be removed"
     );
     assert!(inst.join("bin/v2-marker").exists());
 
-    // Now test `uninstall` against an empty post-marker-unlink backup container in `committed` phase.
+    // Now test `uninstall` against a markerless empty 0700 backup dir in `committed` phase.
     let bk_uninst = dir.path().join(".qeminga-update-backup.posttx2");
     std::fs::create_dir(&bk_uninst).unwrap();
     std::fs::set_permissions(&bk_uninst, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -18419,6 +18491,22 @@ assert not os.path.exists(st_dir2), "stage dir must be removed after normal reti
     );
     std::fs::write(cfg.join("install.env"), &rec_uninst).unwrap();
 
+    let uninst_refuse = run_setup_env(
+        &["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        !uninst_refuse.status.success() && bk_uninst.is_dir(),
+        "uninstall MUST refuse to remove a markerless empty backup dir in committed phase: {}",
+        text(&uninst_refuse)
+    );
+    std::fs::remove_dir(&bk_uninst).unwrap();
     let uninst_out = run_setup_env(
         &["uninstall", "--config-dir", cfg.to_str().unwrap()],
         &[
@@ -18431,18 +18519,12 @@ assert not os.path.exists(st_dir2), "stage dir must be removed after normal reti
     );
     assert!(
         uninst_out.status.success(),
-        "uninstall must finish pruning an empty post-marker-unlink backup container: {}",
+        "uninstall must succeed once retired backup is absent: {}",
         text(&uninst_out)
     );
-    assert!(
-        !bk_uninst.exists(),
-        "uninstall must remove empty post-marker-unlink backup container"
-    );
 
-    // Part 3: Stage retirement after publication (`publish-runner-stage` interrupted right after
-    // unlinking `.qeminga-tx-id` inside `sfd` and before `os.rmdir(stage_base)`): the now-empty
-    // 0700 stage container with matching recorded identity MUST also be reclaimed cleanly by
-    // `safe-rmtree-id` during recovery.
+    // Part 3: Markerless empty 0700 stage dir with matching inode MUST ALSO fail closed
+    // under `safe-rmtree-id` (and succeed once absent).
     let stg_empty = dir.path().join(".qeminga-extract.posttx3");
     std::fs::create_dir(&stg_empty).unwrap();
     std::fs::set_permissions(&stg_empty, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -18474,9 +18556,26 @@ assert not os.path.exists(st_dir2), "stage dir must be removed after normal reti
         .output()
         .unwrap();
     assert!(
-        stg_prune.status.success() && !stg_empty.exists(),
-        "empty post-marker-unlink stage dir left by interrupted stage retirement must be reclaimed: {}",
+        !stg_prune.status.success() && stg_empty.is_dir(),
+        "safe-rmtree-id MUST refuse markerless empty stage dir: {}",
         text(&stg_prune)
+    );
+    std::fs::remove_dir(&stg_empty).unwrap();
+    let stg_absent = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops safe-rmtree-id "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stg_empty.to_str().unwrap(),
+            &stg_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        stg_absent.status.success(),
+        "safe-rmtree-id on absent stage dir must succeed: {}",
+        text(&stg_absent)
     );
 }
 
@@ -23979,4 +24078,169 @@ write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" "$4" "
         "active",
         "publishing recovery must honor UPDATE_WAS_ACTIVE=1 and restart service"
     );
+
+    // Part 6: Backup-slot recovery in BOTH `restored` and `publishing` phases MUST ALSO
+    //   require positive `.qeminga-tx-id` ownership (never removing an unrelated empty 0700
+    //   directory that reused the freed backup inode after `safe-rmtree-id` before journal
+    //   clear). Once the retired backup is absent, recovery succeeds cleanly.
+    for bk_phase in ["restored", "publishing"] {
+        let bk_reuse = inst_parent.join(format!(".qeminga-update-backup.{bk_phase}-reuse"));
+        std::fs::create_dir(&bk_reuse).unwrap();
+        std::fs::set_permissions(&bk_reuse, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let bk_reuse_id = String::from_utf8(
+            Command::new("bash")
+                .args([
+                    "-c",
+                    r#"source "$1"; fs_ops path-identity "$2""#,
+                    "_",
+                    script().to_str().unwrap(),
+                    bk_reuse.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Simulate an unrelated empty 0700 directory reusing the recorded backup inode.
+        std::fs::remove_file(bk_reuse.join(".qeminga-tx-id")).unwrap();
+        let save_bk = Command::new("bash")
+            .args([
+                "-c",
+                r#"
+set -euo pipefail
+source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_SERVICE="qeminga-restored-stage-box"
+read_install_record "$OPT_CONFIG_DIR/install.env"
+write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "$4" "" "" "$5" "$6" "1"
+"#,
+                "_",
+                script().to_str().unwrap(),
+                cfg.to_str().unwrap(),
+                inst.to_str().unwrap(),
+                bk_phase,
+                bk_reuse.to_str().unwrap(),
+                &bk_reuse_id,
+            ])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(save_bk.status.success(), "{bk_phase}: {}", text(&save_bk));
+        std::fs::write(&state_file, "inactive\n").unwrap();
+
+        let mut cases: Vec<(&str, bool, Vec<&str>)> = vec![
+            (
+                "update",
+                false,
+                vec![
+                    "update",
+                    "--config-dir",
+                    cfg.to_str().unwrap(),
+                    "--runner-sha256",
+                    &v2_sha,
+                ],
+            ),
+            (
+                "uninstall-live-present",
+                false,
+                vec!["uninstall", "--config-dir", cfg.to_str().unwrap()],
+            ),
+        ];
+        if bk_phase == "publishing" {
+            cases.push((
+                "uninstall-live-absent",
+                true,
+                vec!["uninstall", "--config-dir", cfg.to_str().unwrap()],
+            ));
+        }
+
+        for (case_label, hide_inst, args) in cases {
+            let inst_aside = inst_parent.join("opt-runner-bk-aside");
+            if hide_inst {
+                std::fs::rename(&inst, &inst_aside).unwrap();
+            }
+            let out = run_setup_env(
+                &args,
+                &[
+                    ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                    ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                    ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                    ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                    ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                    ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                    ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+                ],
+                Some(&bin),
+            );
+            if hide_inst {
+                std::fs::rename(&inst_aside, &inst).unwrap();
+            }
+            assert!(
+                !out.status.success(),
+                "{bk_phase}/{case_label}: backup recovery MUST refuse to remove markerless empty dir reusing backup inode:\n{}",
+                text(&out)
+            );
+            let rec_now = std::fs::read_to_string(&rec_path).unwrap();
+            assert!(
+                bk_reuse.is_dir()
+                    && !bk_reuse.join(".qeminga-tx-id").exists()
+                    && inst.is_dir()
+                    && rec_now.contains("RECORD_STATE=updating\n")
+                    && rec_now.contains(&format!("UPDATE_BACKUP_DIR={}\n", bk_reuse.display()))
+                    && rec_now.contains(&format!("UPDATE_BACKUP_ID={bk_reuse_id}\n")),
+                "{bk_phase}/{case_label}: backup recovery MUST leave markerless empty backup dir and updating journal intact:\n{rec_now}"
+            );
+        }
+
+        // For `restored` phase, once the retired backup is absent (`remove_dir`), `update`
+        // recovers cleanly to `RECORD_STATE=installed` and restarts the service.
+        std::fs::remove_dir(&bk_reuse).unwrap();
+        if bk_phase == "restored" {
+            let bk_absent_ok = run_setup_env(
+                &[
+                    "update",
+                    "--config-dir",
+                    cfg.to_str().unwrap(),
+                    "--runner-sha256",
+                    &v2_sha,
+                ],
+                &[
+                    ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                    ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                    ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                    ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                    ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                    ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                    ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+                ],
+                Some(&bin),
+            );
+            assert!(
+                bk_absent_ok.status.success(),
+                "restored recovery with absent retired backup MUST succeed:\n{}",
+                text(&bk_absent_ok)
+            );
+            let rec_done = std::fs::read_to_string(&rec_path).unwrap();
+            assert!(
+                rec_done.contains("RECORD_STATE=installed\n")
+                    && !rec_done.contains("UPDATE_BACKUP_DIR="),
+                "restored recovery with absent backup must return to installed:\n{rec_done}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&state_file).unwrap().trim(),
+                "active",
+                "restored recovery with absent backup must honor UPDATE_WAS_ACTIVE=1"
+            );
+        }
+    }
 }

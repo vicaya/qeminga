@@ -121,6 +121,25 @@ shebang_dialect() {
     esac
 }
 
+# Whether the header of $1, the comments and blank lines before its first
+# command, holds a `# shellcheck shell=` directive. Lines after the first
+# command (a here-document's text, for one) are never read as directives.
+header_names_dialect() {
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=${line#"${line%%[![:space:]]*}"}
+        case "$line" in
+            '') ;;
+            '#'*)
+                if [[ $line =~ ^#[[:space:]]*shellcheck[[:space:]]([^#]*[[:space:]])?shell= ]]; then
+                    return 0
+                fi ;;
+            *) return 1 ;;
+        esac
+    done <"$1"
+    return 1
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -138,29 +157,30 @@ scripts=()
 dialects=()
 while IFS= read -r -d '' file; do
     # A tracked file deleted from the work tree, or a link.
-    if [ -L "$file" ] || [ ! -e "$file" ]; then
+    if [ -L "./$file" ] || [ ! -e "./$file" ]; then
         continue
     fi
     # git lists a directory only for an embedded repository (an untracked
     # nested checkout, `dir/`) or a submodule: separate repositories, each
     # linted by its own checks.
-    if [ -d "$file" ]; then
+    if [ -d "./$file" ]; then
         continue
     fi
-    if [ ! -f "$file" ] || [ ! -r "$file" ]; then
+    if [ ! -f "./$file" ] || [ ! -r "./$file" ]; then
         echo "check-shell: cannot read $file" >&2
         exit 1
     fi
     # A shell script by name (`*.sh`) or by its `#!` interpreter.
-    shebang_dialect "$file"
+    shebang_dialect "./$file"
     case "$file" in
         *.sh) ;;
         *) [ -n "$dialect" ] || continue ;;
     esac
-    # An explicit `# shellcheck shell=` directive names the dialect itself;
-    # otherwise the detected one is passed on, because shellcheck cannot
-    # read every shebang this script recognises (SC1008 for `env -S 'bash'`).
-    if grep -Eq '^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]([^#]*[[:space:]])?shell=' "$file"; then
+    # An explicit `# shellcheck shell=` directive in the header names the
+    # dialect itself; otherwise the detected one is passed on, because not
+    # every shebang recognised here is one the linter can read (SC1008 for
+    # `env -S 'bash'`).
+    if header_names_dialect "./$file"; then
         dialect=""
     fi
     scripts+=("$file")
@@ -203,8 +223,10 @@ status=0
 for want in "" sh bash dash; do
     group=()
     for i in "${!scripts[@]}"; do
+        # Every path is passed as `./path`: a name such as `-helper.sh` or
+        # `-` is then never read as an option or as standard input.
         if [ "${dialects[i]}" = "$want" ]; then
-            group+=("${scripts[i]}")
+            group+=("./${scripts[i]}")
         fi
     done
     [ "${#group[@]}" -gt 0 ] || continue

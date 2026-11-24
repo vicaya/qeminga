@@ -8,7 +8,7 @@ inputs:
     description: Pull request number.
     required: true
   since:
-    description: Feedback up to here is handled - an ISO-8601 time, or the until output of the previous watch.
+    description: Feedback up to here is handled - a UTC time such as 2026-01-31T12:00:00Z, or the until output of the previous watch.
     required: true
   github-token:
     description: Read access to pull requests.
@@ -40,7 +40,7 @@ outputs:
     description: feedback, quiet, closed or ignored.
     value: ${{ steps.watch.outputs.status }}
   until:
-    description: Cursor of the last feedback item handed over (pass it as the next since); items over the size budget wait for the next round.
+    description: The state after this hand-over (pass it as the next since) - the feedback items handed over, by ID and body digest; items over the size budget wait for the next round.
     value: ${{ steps.watch.outputs.until }}
   head-ref:
     description: The pull request's branch.

@@ -74,8 +74,9 @@ semantic versioning.
   on a fresh copy of the checkout, out of reach of the runner's files and
   credentials; CLIs are installed in containers without keys; the agent job
   uses no cache, and container output can't issue workflow commands. The
-  agent's work leaves its job only as a patch, checked byte for byte for
-  pool keys and refused if it touches `.github/workflows/`, and a job with
+  agent's work leaves its job only as a patch, checked byte for byte (file
+  names included) for pool keys and refused if it touches
+  `.github/workflows/`, and a job with
   write access but no keys publishes it. Developer tooling only, with no change to
   the daemon.
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in

@@ -141,7 +141,7 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.result-artifact }}
-        path: ${{ runner.temp }}/ai-maintenance/result
+        path: ${{ steps.run.outputs.result-dir }}
         retention-days: 7
 
     - if: always() && steps.run.outputs.logs-dir != ''

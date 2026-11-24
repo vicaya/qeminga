@@ -36,7 +36,7 @@ on:
         description: "review: pull request number"
         default: ""
       since:
-        description: "review: feedback after this point is new (an ISO-8601 time, or a previous watch's cursor)"
+        description: "review: feedback after this point is new (a UTC time such as 2026-01-31T12:00:00Z, or a previous watch's state)"
         default: ""
       round:
         description: "review: review round number"

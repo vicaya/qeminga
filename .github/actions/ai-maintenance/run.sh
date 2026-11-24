@@ -35,14 +35,15 @@
 #   AI_SANDBOX_IMAGE       base image of the attempt containers (default ubuntu:24.04)
 #   AI_SANDBOX_SETUP       shell script run as root while building the image,
 #                          in a throwaway copy of the checkout (repository tools)
-#   AI_STATE_DIR           scratch directory outside the checkout
+#   AI_STATE_DIR           scratch directory outside the checkout; each
+#                          invocation works in a fresh directory under it
 #   AI_PROVIDERS_DIR       adapter directory (default: providers/ next to this file)
 #
 # Exit status: 0 when an agent finished (with or without changes), 1 when
 # every candidate failed, 2 on a configuration error. Outputs (to
 # GITHUB_OUTPUT when set): status=changed|unchanged|failed, provider,
 # model, effort (the one the CLI used), title, summary-file, result-dir,
-# logs-dir, base-sha.
+# logs-dir, base-sha, state-dir (this invocation's own directory).
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -82,11 +83,16 @@ case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be t
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
-state=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
-mkdir -p "$state" && state=$(cd "$state" && pwd) || exit 2
+# A fresh directory for this invocation: an earlier one in the same job
+# (with the same AI_STATE_DIR) leaves its attempts, private or not, in its
+# own, and nothing of them is read, reused or uploaded here.
+state_root=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
+{ mkdir -p "$state_root" && state=$(mktemp -d "$(cd "$state_root" && pwd)/run.XXXXXX") && chmod 755 "$state"; } ||
+    exit 2
+out state-dir "$state"
 # One tools directory per provider, created by this run.
 tools_root=$state/tools
-{ rm -rf "$tools_root" && mkdir -p "$tools_root"; } || exit 2
+mkdir -p "$tools_root" || exit 2
 image=${AI_SANDBOX_IMAGE:-ubuntu:24.04}
 case "$image" in
     '' | *[!A-Za-z0-9._/:@-]*) ai_log "AI_SANDBOX_IMAGE must be an image reference"; exit 2 ;;
@@ -396,7 +402,8 @@ upload() { # SOURCE DEST: scrubbed, at most 20 MB, cut at a line end
     ai_head_lines "$1" 20000000 | ai_scrub "$secrets" >"$2"
 }
 if [ "$private" = false ]; then
-    for d in "$state"/attempt-*; do
+    for ((i = 1; i <= n; i++)); do
+        d=$state/attempt-$i
         [ -d "$d" ] || continue
         l=$logs/${d##*/}
         mkdir -p "$l"
@@ -483,7 +490,11 @@ if [ -s "$export_dir/changes.patch" ]; then
     # are never part of a maintenance change (README, Limits).
     git -C "$verify" diff --cached --name-only -z --no-renames "$base" >"$state/names" ||
         refuse "could not list the changed files"
-    ai_contains_key "$quoted" "$state/names" && refuse "a changed file's name quotes the private instructions"
+    # The names as published, byte for byte (the patch may quote them):
+    # checked before any of them is logged.
+    ai_contains_key "$keys" "$state/names" && refuse "a changed file's name contains an API key from the pool"
+    { ai_contains_key "$quoted" "$state/names" || ai_contains_text "$quoted_whole" "$state/names"; } &&
+        refuse "a changed file's name quotes the private instructions"
     while IFS= read -r -d '' path; do
         ai_protected_path "$path" && refuse "the changes touch $(ai_printable "$path") (under $AI_PROTECTED_PATHS)"
     done <"$state/names"

@@ -52,12 +52,14 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    pushed to the PR branch, and the agent's message is posted as a reply.
    Each push starts a new watch, so the quiet period restarts. Feedback is
    handed over in whole items up to 60,000 bytes per round; whatever does
-   not fit is picked up by the next round, which starts after the last item
-   handed over. A single item larger than that goes over in pieces, each
-   round continuing where the last stopped (or starting it over, if it was
-   edited meanwhile). A comment edited after it was handed over, or
-   submitted late as part of a pending review, is handed over again, and
-   an edit during the settle period restarts it.
+   not fit is picked up by the next round. A single item larger than that
+   goes over in pieces, each round continuing where the last stopped (or
+   starting it over, if it was edited meanwhile). The watch records every
+   item it hands over by ID with a digest of its body, so an item edited
+   afterwards (a review's body, or a comment within the same second, which
+   GitHub's timestamps miss) is handed over again, whatever else is still
+   waiting; a comment submitted late as part of a pending review is new.
+   An edit during the settle period restarts it.
 4. **Back to nightly.** The loop ends after `AI_MAINTENANCE_QUIET_MINUTES`
    (default 90) without feedback, when the pull request is closed or merged,
    or after `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` (default 5) rounds. By
@@ -101,10 +103,15 @@ nothing it downloads. Each attempt runs in its own container:
   only the plain files it expects the attempt to leave, never through a
   symlink, and uploads them under names it chooses. It then checks the
   patch by applying it to its own copy of the checkout and scanning the
-  patch and every added or modified file's bytes for pool keys. A binary
-  file can't smuggle a key past that scan, and a scan that fails refuses
-  as well. A patch that touches `.github/workflows/` is refused (see
+  patch, the changed files' names as they will be published (the patch may
+  quote them), and every added or modified file's bytes for pool keys. A
+  binary file can't smuggle a key past that scan, and a scan that fails
+  refuses as well. A patch that touches `.github/workflows/` is refused (see
   [Limits](#limits)).
+- **One invocation's files.** Each run of the action works in a fresh
+  directory of its own under `runner.temp`, and uploads only the result
+  and the attempts it made itself, so a later invocation in the same job
+  never publishes an earlier one's (private) output.
 - **No workflow commands.** Everything a container prints is captured in
   files on the runner. When it is shown in the job log, the runner's
   workflow commands (`::add-mask::`, `::set-env::`, ...) are suspended
@@ -379,3 +386,7 @@ minutes):
   describe the change in its final message for a human to make.
 - A watch occupies a runner for up to the quiet period (90 minutes) per
   round.
+- The watch's state travels between rounds as a workflow input, about 30
+  characters per feedback item handed over. Past 30,000 characters (some
+  1,000 items) the watch stops with an error, and further feedback needs a
+  human.

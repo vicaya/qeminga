@@ -128,7 +128,8 @@ running it locally is in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`
 
 - **Shell scripts are shellcheck-clean.** Every `*.sh` file and every file
   with an `sh`/`bash`/`dash` `#!` line is linted at every severity by
-  `scripts/check-shell.sh`. Silence a finding only with a
+  `scripts/check-shell.sh`, as the dialect its `#!` line runs unless a
+  `# shellcheck shell=` directive names one. Silence a finding only with a
   `# shellcheck disable=SCxxxx # reason` directive directly above the
   command it covers, never file-wide or in a config file.
 

@@ -229,17 +229,23 @@ with spending limits.
   is published, and refused in a change. They are:
   - string options, at any depth, whose own name contains `token`,
     `secret`, `passw`, `credential`, `cookie`, `authorization`, `bearer`,
-    `api_key`, `private_key` or `access_key`, or ends in `key` (any case;
-    the names of the objects above them don't count, so
-    `"auth": {"method": "basic"}` stays public);
+    `api_key`, `private_key` or `access_key` (any case), or whose last
+    word is `key` (`signing_key`, `signingKey`, `SIGNING-KEY`; not
+    `hotkeys` or `keyboard`). The names of the objects above them don't
+    count, so `"auth": {"method": "basic"}` stays public;
   - the options an adapter declares in `PROVIDER_SECRET_OPTIONS`;
   - the user-info of a URL (`https://user:pass@…`: both `user:pass` and
-    `pass`, or a lone token before the `@`) and URL query parameters named
-    like a credential (`?api_key=…`), each as written and percent-decoded.
+    `pass`, or a lone token before the `@`) and URL query parameters whose
+    decoded name is a credential's (`?api_key=…`, `?api%5Fkey=…`), each
+    value as written and percent-decoded.
 
-  A multiline value (a PEM key) is masked whole and line by line, matched
-  exactly in a change, and so is each of its lines of 20 or more
-  characters. `model` and other settings stay public.
+  A multiline value (a PEM key) is masked whole and line by line, and
+  matched exactly in a change, as is each of its lines of 20 or more
+  characters other than PEM armor (`-----BEGIN … KEY-----`, the same in
+  every key). Every withheld value is also withheld in the forms it takes
+  inside a JSON string (escaped quotes, backslashes and line breaks), and
+  the uploaded transcripts are scrubbed as JSON, value by value. `model`
+  and other settings stay public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
 - A provider without an adapter is skipped with a note in the run summary,

@@ -89,7 +89,14 @@ provider_run() {
         slow-*) sleep 30 ;;
         leak-*) echo "$key" >>file.txt; printf 'done\n' >"$final" ;;
         optleak-*) jq -r .api_token <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
-        pemprint-*) jq -r .private_key <<<"$5" | tee "$final" "$AI_ATTEMPT_DIR/stream.jsonl" ;;
+        pemprint-*) jq -r .private_key <<<"$5" | tee "$final"
+                    jq -c '{type: "assistant", text: .private_key}' <<<"$5" >"$AI_ATTEMPT_DIR/stream.jsonl" ;;
+        jsonprint-*) # provider events, as JSON lines in the transcript and on stdout
+            jq -c '{type: "assistant", text: "using \(.password)", key: .private_key, tool: {input: {password: .password}}}' <<<"$5" |
+                tee "$AI_ATTEMPT_DIR/stream.jsonl"
+            printf 'done\n' >"$final" ;;
+        docpem-*) printf -- '-----BEGIN TEST KEY-----\nnot the configured key\n-----END TEST KEY-----\n' >parser-fixture.pem
+                  printf 'done\n' >"$final" ;;
         pemleak-*) jq -r '.private_key | split("\n")[1]' <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
         docbasic-*) echo "Connect with basic authentication in eu-west-1" >>file.txt; printf 'done\n' >"$final" ;;
         declprint-*) jq -r '"value \(.auth.value) method \(.auth.method)"' <<<"$5" | tee "$final" ;;
@@ -125,6 +132,8 @@ provider_run() {
 }
 EOF
 cp "$fakes/claude.sh" "$fakes/gpt.sh"
+# An adapter that cannot even be read.
+{ echo 'return 3'; echo 'PROVIDER_SECRET_OPTIONS="x"'; cat "$fakes/claude.sh"; } >"$fakes/badsrc.sh"
 # A custom adapter that names a credential option no heuristic would find.
 { echo 'PROVIDER_SECRET_OPTIONS="auth.value"'; cat "$fakes/claude.sh"; } >"$fakes/custom.sh"
 cat >"$fakes/broken.sh" <<'EOF'
@@ -371,11 +380,14 @@ eq "pool: an adapter can declare its credential options (dotted paths)" '["decla
 eq "pool: URL credentials are kept as written and percent-decoded" \
     '["a%2Bb+c","a+b c","a+b+c","p%40ss%2Fw%C3%A9","p@ss/wé","us%40r:p%40ss%2Fw%C3%A9","us@r:p@ss/wé"]' \
     "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"base_url":"https://us%40r:p%40ss%2Fw%C3%A9@gw.example/v1?api_key=a%2Bb+c"}}]')")"
-pem=$'-----BEGIN TEST KEY-----
-QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq
-xyz=
------END TEST KEY-----
-'
+eq "pool: names whose last word is key count, camel case and upper case included" '["ck-camel-2","sk-camel-1","up-3"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"signingKey":"sk-camel-1","clientKey":"ck-camel-2",
+        "SIGNING_KEY":"up-3","sortkey":"public-sort","hotkeys":"public-hk","keyboard":"public-kb"}}]')")"
+eq "pool: a query parameter's name is decoded before it is classified" '["qv-1"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"base_url":"https://gw.example/v1?api%5Fkey=qv-1&x=1"}}]')")"
+pem=$'-----BEGIN TEST KEY-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq\nxyz=\n-----END TEST KEY-----\n'
+eq "pool: a PEM key's armor lines are not patterns of their own (they are the same in every key)" \
+    '["QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq"]' "$(ai_credential_patterns "$(jq -cn --arg p "$pem" '[$p]')")"
 eq "pool: a multiline credential is kept whole" "$(jq -cn --arg p "$pem" '[$p]')" \
     "$(ai_option_secrets "$(jq -cn --arg p "$pem" '[{claude: {keys: ["k"], private_key: $p}}]' | ai_normalize_pool "$(cat)")")"
 check "pool: a pattern with a line break is never scanned for (the change is refused)" \
@@ -532,12 +544,29 @@ check "run: ... it is masked whole (escaped) and line by line, and withheld from
     '[ "$2" = 0 ] && grep -qxF "::add-mask::-----BEGIN TEST KEY-----%0AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq%0Axyz=%0A-----END TEST KEY-----%0A" "$3" &&
      grep -qxF "::add-mask::QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq" "$3" && grep -qxF "::add-mask::xyz=" "$3" &&
      ! grep -rqa QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq "$1/summary.md" "$1/logs"' _ "$state" "$rc" "$tmp/pemprint/log"
+run_case docpem '[{"claude":'"$(jq -c '. + {keys: ["docpem-1"]}' <<<"$pementry")"'}]'
+eq "run: a change sharing only a PEM key's armor lines is published" "0 changed" "$rc $(output status)"
+# Values a JSON writer escapes (a quote, a backslash, line breaks) are
+# withheld in their escaped form too: transcripts are scrubbed as JSON,
+# value by value, and plain logs that quote provider events are scrubbed
+# of the escaped forms.
+jsonentry=$(jq -cn '{keys: ["jsonprint-1"], password: "pa\"ss\\wd-jsonsecret", private_key: "ab12\ncd34\nef56\n"}')
+run_case jsonprint '[{"claude":'"$jsonentry"'}]'
+check "run: credentials JSON escapes are withheld from the transcript, which stays JSON" bash -c \
+    't=$1/logs/attempt-1/transcript.jsonl; [ "$2" = 0 ] && [ -s "$t" ] &&
+     jq -e "select(.type == \"assistant\") | .text == \"using ***\" and .key == \"***\" and .tool.input.password == \"***\"" "$t" >/dev/null' \
+    _ "$state" "$rc"
+check "run: ... and from the attempt log that printed the events" bash -c \
+    '! grep -qaF -e "jsonsecret" -e "ab12\\ncd34" "$1/logs/attempt-1/attempt.log"' _ "$state"
 run_case docbasic '[{"claude":{"keys":["docbasic-1"],"auth":{"method":"basic"},"region":"eu-west-1"}}]'
 eq "run: public settings never block a change that mentions them" "0 changed" "$rc $(output status)"
 run_case declprint '[{"custom":{"keys":["declprint-1"],"auth":{"value":"decl-optsecret","method":"basic"}}}]' GITHUB_ACTIONS=true
 check "run: an adapter's declared credential options are masked and withheld" bash -c \
     '[ "$2" = 0 ] && grep -qx "::add-mask::decl-optsecret" "$3" && ! grep -rqa decl-optsecret "$1/summary.md" "$1/logs" &&
      grep -q "method basic" "$1/summary.md"' _ "$state" "$rc" "$tmp/declprint/log"
+run_case badsrc '[{"badsrc":["ok-1"]}]'
+eq "run: an adapter that cannot be read stops the run before docker (its declarations are unknown)" "2 0" \
+    "$rc $(wc -l <"$tmp/badsrc/docker.log" 2>/dev/null || echo 0)"
 # A producer of the withheld values that fails stops the run before any
 # attempt: an incomplete list must not look like a complete one.
 failjq=$tmp/failjq
@@ -549,7 +578,7 @@ exec %s "$@"
     "$(PATH=/usr/local/bin:/usr/bin:/bin command -v jq)" >"$failjq/jq"
 chmod +x "$failjq/jq"
 i=0
-for on in '[.[].keys[]]' 'paths(strings)' 'def trim'; do
+for on in '[.[].keys[]]' 'paths(strings)' 'def trim' '[.[].provider]' 'splits('; do
     i=$((i + 1))
     run_case "failjq$i" '[{"claude":{"keys":["ok-1"],"api_token":"tok-1"}}]' PATH="$failjq:$bin:$PATH" FAIL_JQ_ON="$on"
     eq "run: a failed producer of the withheld values ($on) stops the run before docker" "2 0" \

@@ -74,40 +74,51 @@ pool=$(ai_normalize_pool "$pool_raw") || exit 2
 pool_raw=
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
 
-# adapter_var ADAPTER NAME -> a setting the adapter declares.
+# adapter_var ADAPTER NAME -> a setting the adapter declares; fails when
+# the adapter cannot be read.
 adapter_var() (
     # shellcheck source=/dev/null
-    . "$1" >/dev/null 2>&1
+    . "$1" >/dev/null 2>&1 || exit 1
     printf '%s' "${!2:-}"
 )
-# The option paths each pool provider's adapter declares as credentials.
-declared='{}'
-while IFS= read -r p; do
-    a=$providers_dir/$(ai_canonical_provider "$p").sh
-    [ -f "$a" ] || continue
-    declared=$(adapter_var "$a" PROVIDER_SECRET_OPTIONS | jq -Rsc --arg p "$p" --argjson d "$declared" \
-        '$d + {($p): [splits("\\s+") | select(length > 0)]}') || exit 2
-done < <(jq -r '[.[].provider] | unique[]' <<<"$pool")
 
 # Withheld from everything published, and refused in a change: the keys
 # and the credentials in the entries' options (lib.sh, ai_option_secrets).
 # Withheld too: the instructions. Every producer must have delivered a
 # list: a failed one would leave a valid-looking list without its values.
 withheld_failed() { ai_log "could not list the values to withhold ($1); nothing was run"; exit 2; }
+# The option paths each pool provider's adapter declares as credentials;
+# an adapter that is there but cannot be read stops the run.
+pool_providers=$(jq -r '[.[].provider] | unique[]' <<<"$pool") || withheld_failed "the pool's providers"
+declared='{}'
+while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    a=$providers_dir/$(ai_canonical_provider "$p").sh
+    [ -f "$a" ] || continue
+    names=$(adapter_var "$a" PROVIDER_SECRET_OPTIONS) || withheld_failed "the adapter $a could not be read"
+    declared=$(jq -Rsc --arg p "$p" --argjson d "$declared" '$d + {($p): [splits("\\s+") | select(length > 0)]}' <<<"$names") ||
+        withheld_failed "the credential options $a declares"
+done <<<"$pool_providers"
 { pool_keys=$(ai_all_keys "$pool") && ai_string_array "$pool_keys"; } || withheld_failed "the pool's keys"
 { option_secrets=$(ai_option_secrets "$pool" "$declared") && ai_string_array "$option_secrets"; } ||
     withheld_failed "the credentials in the pool's options"
 { fragments=$(ai_secret_fragments "$instructions") && ai_string_array "$fragments"; } || withheld_failed "the instructions"
 { credentials=$(printf '%s\n%s\n' "$pool_keys" "$option_secrets" | jq -cs '.[0] + .[1] | unique') &&
     ai_string_array "$credentials"; } || withheld_failed "the credentials"
-# The change checks scan for one-line patterns (keys) and match multiline
-# credentials exactly (credential_texts).
+# The change checks scan for one-line patterns (keys: with the forms the
+# credentials take inside JSON strings) and match multiline credentials
+# exactly (credential_texts).
+{ credential_json=$(ai_json_forms "$credentials") && ai_string_array "$credential_json"; } ||
+    withheld_failed "the credentials' JSON forms"
 { keys=$(ai_credential_patterns "$credentials") && ai_string_array "$keys"; } || withheld_failed "the credential patterns"
+keys=$(printf '%s\n%s\n' "$keys" "$credential_json" | jq -cs 'add | unique') || withheld_failed "the credential patterns"
 credential_texts=$(jq -c '[.[] | select(test("\n"))]' <<<"$credentials") || withheld_failed "the multiline credentials"
 # Secrets reach the commands that handle them through standard input or an
 # owner-only file, never through their arguments, which every account on
 # the runner can read.
-{ secrets=$(printf '%s\n%s\n%s\n' "$credentials" "$keys" "$fragments" | jq -cs 'add | unique') &&
+{ fragment_json=$(ai_json_forms "$fragments") && ai_string_array "$fragment_json"; } ||
+    withheld_failed "the instructions' JSON forms"
+{ secrets=$(printf '%s\n%s\n%s\n%s\n' "$credentials" "$keys" "$fragments" "$fragment_json" | jq -cs 'add | unique') &&
     ai_string_array "$secrets"; } || withheld_failed "the secrets"
 # Keys inside the pool secret are not masked individually by GitHub.
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
@@ -516,6 +527,10 @@ upload() { # SOURCE DEST: scrubbed, at most 20 MB, cut at a line end
     ai_regular_file "$1" || return 0
     ai_head_lines "$1" 20000000 | ai_scrub "$secrets_file" >"$2"
 }
+upload_jsonl() { # SOURCE DEST: the same, scrubbed value by value (JSON lines)
+    ai_regular_file "$1" || return 0
+    ai_head_lines "$1" 20000000 | ai_scrub_jsonl "$secrets_file" >"$2"
+}
 if [ "$private" = false ]; then
     for ((i = 1; i <= n; i++)); do
         d=$state/attempt-$i
@@ -527,7 +542,7 @@ if [ "$private" = false ]; then
         upload "$d/out/final.md" "$l/final.md"
         upload "$d/out/error.txt" "$l/error.txt"
         t=$(head -n 1 "$d/transcript-name" 2>/dev/null)
-        [ -z "$t" ] || upload "$d/out/$t" "$l/transcript.jsonl"
+        [ -z "$t" ] || upload_jsonl "$d/out/$t" "$l/transcript.jsonl"
     done
 fi
 out logs-dir "$logs"

@@ -371,17 +371,19 @@ ai_sandbox_env() {
 # entries' options, withheld like keys (masked, scrubbed, refused in a
 # change):
 #   - every string option, at any depth, whose own name looks like a
-#     credential (AI_CREDENTIAL_NAME; the names of the objects above it do
-#     not count, so an "auth" object's "method" stays public);
+#     credential (AI_CREDENTIAL_NAME, or a last word "key": signing_key,
+#     signingKey, SIGNING-KEY; the names of the objects above it do not
+#     count, so an "auth" object's "method" stays public);
 #   - every option an adapter declares (DECLARED, {"provider": ["a.b", ...]},
 #     from PROVIDER_SECRET_OPTIONS: dotted paths, array indices left out);
 #   - the user-info of any URL value ("user:pass" and the password alone,
-#     or a lone token), and URL query parameters named like credentials,
-#     each as written and percent-decoded (query values also with "+" as a
-#     space), since a client sends, and may print, the decoded form.
+#     or a lone token), and URL query parameters whose decoded name looks
+#     like a credential, each as written and percent-decoded (query values
+#     also with "+" as a space), since a client sends, and may print, the
+#     decoded form.
 # Values are whole, line breaks included. The model and every other
 # setting stay public.
-AI_CREDENTIAL_NAME='token|secret|passw|credential|cookie|authorization|bearer|api[_-]?key|private[_-]?key|access[_-]?key|(^|[_-])key$'
+AI_CREDENTIAL_NAME='token|secret|passw|credential|cookie|authorization|bearer|api[_-]?key|private[_-]?key|access[_-]?key'
 ai_option_secrets() {
     local declared=${2:-}
     [ -n "$declared" ] || declared='{}'
@@ -408,10 +410,13 @@ ai_option_secrets() {
             | .s + (.b | utf8);
         def decoded: try pct_decode catch empty;
         def url: test("^[A-Za-z][A-Za-z0-9+.-]*://");
+        # A credential name: the list, or a last word "key" (snake, kebab,
+        # camel or upper case).
+        def credname: test($re; "i") or test("(^|[_-])key$"; "i") or test("[a-z0-9]Key$");
         [ .[] | ($declared[.provider] // []) as $decl
           | .options | del(.model) | paths(strings) as $p | getpath($p) as $v
           | [$p[] | strings] as $names
-          | (if (($names | last // "") | test($re; "i")) or any($decl[]; . == ($names | join(".")))
+          | (if (($names | last // "") | credname) or any($decl[]; . == ($names | join(".")))
              then $v else empty end),
             ($v | select(url) | capture("^[^:]+://(?<u>[^/?#@]*)@")? | .u
                 | ., decoded,
@@ -419,7 +424,8 @@ ai_option_secrets() {
                       (sub("^[^:]*:"; "") | ., decoded),
                       ((sub(":.*$"; "") | decoded) as $user | sub("^[^:]*:"; "") | decoded | "\($user):\(.)")
                    else empty end)),
-            ($v | select(url) | scan("[?&]([^=&#]+)=([^&#]*)") | select(.[0] | test($re; "i")) | .[1]
+            ($v | select(url) | scan("[?&]([^=&#]+)=([^&#]*)")
+                | select(.[0] | ., (gsub("\\+"; " ") | decoded) | credname) | .[1]
                 | ., decoded, (gsub("\\+"; " ") | decoded))
         ] | map(select(type == "string" and length > 0)) | unique' <<<"$1"
 }
@@ -431,10 +437,45 @@ ai_string_array() { jq -e 'type == "array" and all(.[]; type == "string")' <<<"$
 # ai_credential_patterns CREDENTIALS -> the single-line patterns the change
 # checks scan for (ai_contains_key): each one-line credential, and each
 # line of 20 or more characters of a multiline one (the whole of which is
-# matched exactly with ai_contains_text).
+# matched exactly with ai_contains_text), except PEM armor lines
+# ("-----BEGIN ... KEY-----"), which are the same in every key.
 ai_credential_patterns() {
-    jq -c '[.[] | if test("\n") then (split("\n")[] | gsub("^\\s+|\\s+$"; "") | select(length >= 20)) else . end]
+    jq -c '[.[] | if test("\n") then (split("\n")[] | gsub("^\\s+|\\s+$"; "")
+                    | select(length >= 20 and (test("^-----[A-Z0-9 ]+-----$") | not)))
+                  else . end]
         | map(select(length > 0)) | unique' <<<"$1"
+}
+
+# ai_json_forms VALUES -> the forms the values take inside a JSON string
+# when they differ from the value itself (a quote, a backslash, a line
+# break, other control characters): as jq and Node write them, with "/" as
+# "\/", with "<", ">" and "&" as \u escapes (Go), and with everything past
+# ASCII as \u escapes (Python). All are single lines.
+ai_json_forms() {
+    jq -c '
+        def hex4: [(. / 4096 | floor) % 16, (. / 256 | floor) % 16, (. / 16 | floor) % 16, . % 16]
+            | map("0123456789abcdef"[. : . + 1]) | join("");
+        def uesc: "\\u" + hex4;
+        def ascii: explode | map(if . < 128 then [.] | implode
+                                 elif . > 65535 then (. - 65536) as $c
+                                     | ((55296 + ($c / 1024 | floor)) | uesc) + ((56320 + $c % 1024) | uesc)
+                                 else uesc end) | join("");
+        [ .[] | . as $v | tojson[1:-1]
+          | ., gsub("/"; "\\/"), (gsub("<"; "\\u003c") | gsub(">"; "\\u003e") | gsub("&"; "\\u0026")), ascii
+          | select(. != $v) ] | unique' <<<"$1"
+}
+
+# ai_scrub_jsonl SECRETS_FILE: ai_scrub for JSON lines (transcripts). A
+# line that is JSON is scrubbed value by value, on the decoded strings
+# (keys included), and written back as JSON; any other line as text.
+ai_scrub_jsonl() {
+    jq -Rr --slurpfile keys "$1" '
+        ($keys[0] | map(select(length > 0)) | sort_by(-length)) as $ks
+        | def scrub: reduce $ks[] as $k (.; split($k) | join("***"));
+          def deep: if type == "string" then scrub
+                    elif type == "object" then with_entries(.key |= scrub | .value |= deep)
+                    elif type == "array" then map(deep) else . end;
+          . as $line | try (fromjson | deep | tojson) catch ($line | scrub)'
 }
 
 # ai_mask_lines CREDENTIALS SECRETS -> the runner's ::add-mask:: values, in

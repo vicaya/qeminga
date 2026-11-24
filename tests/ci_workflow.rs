@@ -214,6 +214,40 @@ fn no_native_job_is_allowed_to_fail_quietly() {
     }
 }
 
+/// git's repository-local environment variables (`GIT_INDEX_FILE`,
+/// `GIT_DIR`, `GIT_COMMON_DIR`, ...), as git itself names them.
+fn git_local_env_vars() -> &'static [String] {
+    static VARS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    VARS.get_or_init(|| {
+        let out = std::process::Command::new("git")
+            .args(["rev-parse", "--local-env-vars"])
+            .output()
+            .expect("git is needed by this test");
+        assert!(out.status.success(), "git rev-parse --local-env-vars");
+        let vars: Vec<String> = String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert!(vars.iter().any(|v| v == "GIT_INDEX_FILE"), "{vars:?}");
+        vars
+    })
+}
+
+/// Nothing of the caller's repository or configuration reaches a git
+/// command of these tests: every repository-local variable a hook or
+/// another git tool may have left set is cleared (an inherited
+/// `GIT_INDEX_FILE` would make a fixture's `git add` rewrite the caller's
+/// index), and the global and system configuration are not read. A test's
+/// own overrides are set after this.
+fn isolate_git(cmd: &mut std::process::Command) {
+    for var in git_local_env_vars() {
+        cmd.env_remove(var);
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1");
+}
+
 /// The git environment for listing the files of `root`: none when it is
 /// a checkout; otherwise (an unpacked source archive) a throwaway
 /// repository, kept alive by the returned guard, whose work tree is `root`.
@@ -223,7 +257,9 @@ fn git_inventory_env(root: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static s
     }
     let meta = tempfile::tempdir().unwrap();
     let git_dir = meta.path().join("meta.git");
-    let status = std::process::Command::new("git")
+    let mut init = std::process::Command::new("git");
+    isolate_git(&mut init);
+    let status = init
         .args(["init", "-q", "--bare"])
         .arg(&git_dir)
         .status()
@@ -234,11 +270,11 @@ fn git_inventory_env(root: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static s
 }
 
 /// Where git looks for a repository: from `dir` up to the work tree
-/// `root`, never into a repository enclosing `root`, plus `env`.
+/// `root`, never into a repository enclosing `root` or the caller's (see
+/// `isolate_git`), plus `env`.
 fn git_env(cmd: &mut std::process::Command, root: &Path, env: &[(&str, PathBuf)]) {
-    cmd.env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env("GIT_CEILING_DIRECTORIES", root.parent().unwrap());
+    isolate_git(cmd);
+    cmd.env("GIT_CEILING_DIRECTORIES", root.parent().unwrap());
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -509,25 +545,95 @@ fn put(dir: &Path, rel: &str, text: &str) {
     put_bytes(dir, rel.as_bytes(), text.as_bytes());
 }
 
-fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new("git")
-        .arg("-C")
+/// `git -C dir` with a fixture identity, as variables a caller (a hook,
+/// another git tool) left set as `inherited` would reach it.
+fn git_command(dir: &Path, inherited: &[(&str, &Path)]) -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for (key, value) in inherited {
+        cmd.env(key, value);
+    }
+    isolate_git(&mut cmd);
+    cmd.arg("-C")
         .arg(dir)
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"]);
+    cmd
+}
+
+/// Runs a fixture git command in `dir`, with `inherited` as in
+/// `git_command`.
+fn git_output_with(dir: &Path, args: &[&str], inherited: &[(&str, &Path)]) -> std::process::Output {
+    if args.first() != Some(&"init") {
+        // Before anything is written: the index is `dir`'s own.
+        let out = git_command(dir, inherited)
+            .args(["rev-parse", "--path-format=absolute", "--git-path", "index"])
+            .output()
+            .expect("git is needed by this test");
+        assert!(out.status.success(), "git rev-parse in {}", dir.display());
+        let index = PathBuf::from(OsStr::from_bytes(out.stdout.trim_ascii_end()));
+        assert_eq!(
+            index,
+            dir.canonicalize().unwrap().join(".git/index"),
+            "a fixture git command would use an index outside {}",
+            dir.display()
+        );
+    }
+    git_command(dir, inherited)
         .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
         .output()
         .expect("git is needed by this test")
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = git_output(dir, args);
+fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+    git_output_with(dir, args, &[])
+}
+
+fn git_with(dir: &Path, args: &[&str], inherited: &[(&str, &Path)]) {
+    let out = git_output_with(dir, args, inherited);
     assert!(
         out.status.success(),
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    git_with(dir, args, &[]);
+}
+
+#[test]
+fn fixture_git_writes_never_reach_a_callers_repository() {
+    // A caller with a staged change, and the repository-local variables a
+    // hook or another git tool would leave set, pointing at it.
+    let tmp = tempfile::tempdir().unwrap();
+    let caller = tmp.path().join("caller");
+    std::fs::create_dir(&caller).unwrap();
+    git(&caller, &["init", "-q"]);
+    put(&caller, "staged.txt", "keep\n");
+    git(&caller, &["add", "staged.txt"]);
+    let index = caller.join(".git/index");
+    let before = std::fs::read(&index).unwrap();
+    let git_dir = caller.join(".git");
+    let leaked: [(&str, &Path); 3] = [
+        ("GIT_INDEX_FILE", &index),
+        ("GIT_DIR", &git_dir),
+        ("GIT_COMMON_DIR", &git_dir),
+    ];
+    // The fixture writes the listing tests make: init, add, commit.
+    let fixture = tmp.path().join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    git_with(&fixture, &["init", "-q"], &leaked);
+    put(&fixture, "a.sh", "#!/bin/sh\necho\n");
+    git_with(&fixture, &["add", "a.sh"], &leaked);
+    git_with(&fixture, &["commit", "-q", "-m", "fixture"], &leaked);
+    assert_eq!(
+        std::fs::read(&index).unwrap(),
+        before,
+        "the caller's index changed"
+    );
+    let listed = git_output(&caller, &["ls-files", "--cached"]).stdout;
+    assert_eq!(listed, b"staged.txt\n");
+    let listed = git_output(&fixture, &["ls-files", "--cached"]).stdout;
+    assert_eq!(listed, b"a.sh\n");
 }
 
 /// The fixture repository of the listing tests, and the scripts it holds.

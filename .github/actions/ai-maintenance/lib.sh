@@ -322,13 +322,14 @@ ai_parse_model_spec() {
 
 # ai_model MODELS_JSON OPTIONS_JSON PROVIDER -> the model spec for this
 # attempt (see ai_parse_model_spec): the pool entry's "model", else
-# MODELS_JSON[provider], else empty (the CLI's defaults).
+# MODELS_JSON[provider], else empty (the CLI's defaults). The options go in
+# on standard input: they may hold credentials.
 ai_model() {
     local models=${1:-} options=${2:-}
     [ -n "$models" ] || models='{}'
     [ -n "$options" ] || options='{}'
-    jq -nr --argjson m "$models" --argjson o "$options" --arg p "$3" \
-        '$o.model // ($m | if type == "object" then .[$p] else null end) // ""'
+    jq -r --argjson m "$models" --arg p "$3" \
+        '.model // ($m | if type == "object" then .[$p] else null end) // ""' <<<"$options"
 }
 
 # ai_npm_install DIR SPEC: installs an npm CLI (SPEC = package@version)

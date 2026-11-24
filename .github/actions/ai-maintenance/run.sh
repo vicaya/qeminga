@@ -91,6 +91,22 @@ case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be t
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { ai_log "not inside a git checkout"; exit 2; }
+top=$(git rev-parse --show-toplevel)
+# Every copy of the checkout must be self-contained. The .git of a linked
+# worktree or a submodule is a file naming a repository elsewhere, which a
+# copy would share: the credential cleanup below would edit the original,
+# and the container would not see it.
+if [ ! -d "$top/.git" ] || [ -L "$top/.git" ] || [ -e "$top/.git/commondir" ]; then
+    ai_log "$top is a linked worktree or a submodule (its .git is not a repository directory); run on a plain clone"
+    exit 2
+fi
+subdir=$(git rev-parse --show-prefix)
+base=$(git rev-parse HEAD)
+out base-sha "$base"
+top_phys=$(cd "$top" && pwd -P) || exit 2
+
 # A fresh, owner-only directory for this invocation: an earlier one in the
 # same job (with the same AI_STATE_DIR) leaves its attempts, private or
 # not, in its own, and nothing of them is read, reused or uploaded here.
@@ -99,6 +115,14 @@ providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
 # rename it in: the runner's own, or a sticky one such as /tmp.
 state_root=${AI_STATE_DIR:-${RUNNER_TEMP:+$RUNNER_TEMP/ai-maintenance}}
 state_root=${state_root:-${TMPDIR:-/tmp}}
+# Never at or under the checkout, which the image build and every attempt
+# copy whole: the keys written below would go with it. Checked on the path
+# as the kernel will resolve it, before anything is made there.
+inside_checkout() { case "$1/" in "$top_phys"/*) true ;; *) false ;; esac; }
+if want=$(realpath -m -- "$state_root") && inside_checkout "$want"; then
+    ai_log "the state directory ($state_root) is inside the checkout ($top); set AI_STATE_DIR to a directory outside it"
+    exit 2
+fi
 mkdir -p "$state_root" || exit 2
 # trusted_dir DIR: owned by this user or root, and not writable by anyone
 # else unless sticky (then no one else can rename what is in it).
@@ -119,6 +143,10 @@ if [ ! -L "$state_root" ] && root_phys=$(cd "$state_root" && pwd -P); then
         d=$(dirname "$d")
     done
 fi
+if [ "$state_ok" = true ] && inside_checkout "$root_phys"; then
+    ai_log "the state directory ($state_root) is inside the checkout ($top); set AI_STATE_DIR to a directory outside it"
+    exit 2
+fi
 if [ "$state_ok" != true ]; then
     ai_log "the state directory ($state_root) and every directory above it must belong to this user or root and be writable by no one else (unless sticky, like /tmp); it may not be a symlink"
     exit 2
@@ -126,15 +154,18 @@ fi
 state=$(mktemp -d "$root_phys/ai-maintenance-run.XXXXXX") || exit 2
 out state-dir "$state"
 secrets_file=$state/secrets.json
-(umask 077 && printf '%s' "$secrets" >"$secrets_file") || exit 2
 # When the invocation ends, however it ends, only the sanitized output is
 # left: the result, the uploaded logs, the scrubbed summary and the
 # attempts table. The rest (the prompt, the agent's trees and raw output,
-# the tools) is removed, write-protected files included.
+# the tools) is removed, write-protected files included. AI_KEEP_RAW_STATE
+# keeps that rest for debugging, but never the file listing every key nor
+# an attempt's pool options, which no diagnosis needs.
 image_tag='' image_built=''
 # shellcheck disable=SC2329 # invoked by the EXIT trap
 cleanup() {
     [ -z "$image_built" ] || docker image rm -f "$image_tag" >/dev/null 2>&1
+    rm -f "$secrets_file"
+    rm -rf "$state"/attempt-*/in
     [ "${AI_KEEP_RAW_STATE:-}" != true ] || return 0
     local p
     for p in "$state"/* "$state"/.[!.]*; do
@@ -145,6 +176,7 @@ cleanup() {
     done
 }
 trap cleanup EXIT
+(umask 077 && printf '%s' "$secrets" >"$secrets_file") || exit 2
 # One tools directory per provider, created by this run.
 tools_root=$state/tools
 mkdir -p "$tools_root" || exit 2
@@ -155,20 +187,6 @@ esac
 command -v docker >/dev/null || { ai_log "docker is required: every attempt runs in a container"; exit 2; }
 
 candidates=$(ai_route "$pool" "$routing" "${AI_ROUTING_SEED:-${GITHUB_RUN_NUMBER:-0}}") || exit 2
-
-git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { ai_log "not inside a git checkout"; exit 2; }
-top=$(git rev-parse --show-toplevel)
-# Every copy of the checkout must be self-contained. The .git of a linked
-# worktree or a submodule is a file naming a repository elsewhere, which a
-# copy would share: the credential cleanup below would edit the original,
-# and the container would not see it.
-if [ ! -d "$top/.git" ] || [ -L "$top/.git" ] || [ -e "$top/.git/commondir" ]; then
-    ai_log "$top is a linked worktree or a submodule (its .git is not a repository directory); run on a plain clone"
-    exit 2
-fi
-subdir=$(git rev-parse --show-prefix)
-base=$(git rev-parse HEAD)
-out base-sha "$base"
 
 attempts=$state/attempts.jsonl
 : >"$attempts"
@@ -340,6 +358,10 @@ while IFS=$'\t' read -r entry keyidx provider; do
     model=${pair%%$'\t'*} effort=${pair#*$'\t'}
     dir=$state/attempt-$n
     rm -rf "$dir" && mkdir -p "$dir/out/home"
+    # The entry's options (a gateway URL with credentials, a custom
+    # adapter's token) reach the attempt in an owner-only file, mounted
+    # read-only, never as an argument; it is removed once the attempt ends.
+    { (umask 077 && mkdir "$dir/in" && printf '%s' "$options" >"$dir/in/options.json") && own "$dir/in"; } || exit 2
 
     # The adapter's transcript, uploaded under a fixed name.
     transcript=$(adapter_var "$adapter" PROVIDER_TRANSCRIPT)
@@ -369,9 +391,9 @@ while IFS=$'\t' read -r entry keyidx provider; do
     container_args "$cname" "$dir/tree/$subdir"
     docker_args+=(-e AI_ATTEMPT_KEY -e "AI_ATTEMPT_DIR=$dir/out" -e "AI_TOOLS_DIR=$tools"
         -e "HOME=$dir/out/home" -v "$dir/tree:$dir/tree" -v "$dir/out:$dir/out"
-        -v "$tools:$tools:ro" -v "$prompt_dir:$prompt_dir:ro"
+        -v "$tools:$tools:ro" -v "$prompt_dir:$prompt_dir:ro" -v "$dir/in:$dir/in:ro"
         "${providers_args[@]}" "${node_args[@]}" "$image_tag"
-        bash "$here/attempt.sh" "$adapter" "$prompt" "$model" "$options" "$effort")
+        bash "$here/attempt.sh" "$adapter" "$prompt" "$model" "$dir/in/options.json" "$effort")
     # The key reaches docker through its environment, never its arguments.
     # Both output streams go to the attempt log, a file of the runner, and
     # are shown with workflow commands suspended; with private
@@ -389,6 +411,7 @@ while IFS=$'\t' read -r entry keyidx provider; do
         resume_commands
     fi
     docker rm -f "$cname" >/dev/null 2>&1
+    rm -rf "$dir/in"
     endgroup
 
     # The effort the CLI ran with, when the adapter had to change it.

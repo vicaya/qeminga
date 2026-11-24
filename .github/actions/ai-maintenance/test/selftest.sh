@@ -71,6 +71,8 @@ provider_run() {
     local key=$1 prompt=$2 final=$3 model=$4 effort=${6:-}
     printf 'pool=%s instructions=%s model=%s effort=%s\n' "${AI_KEY_POOL:-unset}" "${AI_INSTRUCTIONS:-unset}" \
         "${model:-default}" "${effort:-default}" >>"$AI_ATTEMPT_DIR/seen"
+    # The entry's options reach the adapter (a token is only compared).
+    [ "$(jq -r '.token // ""' <<<"${5:-}")" != tok-argvoptionsecret ] || echo "options-ok" >>"$AI_ATTEMPT_DIR/seen"
     case "$key" in
         ok-*) echo "change by ${key%%-*} agent" >>file.txt
               printf '# Fix things\n\nUsed %s; pool %s\n' "$key" "${AI_KEY_POOL:-unset}" >"$final" ;;
@@ -240,7 +242,8 @@ fi
 # is logged to $FAKE_DOCKER_LOG. The run's directories are their owner's
 # alone and real docker reaches the mounts through its daemon: for as long
 # as the command runs, the fake lets that user search the directories
-# above each mount.
+# above each mount. With FAKE_DOCKER_ARGV_DIR, each container also gets a
+# recorder of its own, NAME.log there, for the argument-log shims.
 cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:-/dev/null}"
@@ -249,21 +252,28 @@ case "$1" in
     run) shift ;;
     *) exit 0 ;;
 esac
-envs=("PATH=$PATH") wd=. as=() mounts=()
+envs=("PATH=$PATH") wd=. as=() mounts=() name='' user=''
 while [ $# -gt 0 ]; do
     case "$1" in
         -e) case "$2" in *=*) envs+=("$2") ;; *) [ -n "${!2+x}" ] && envs+=("$2=${!2}") ;; esac; shift ;;
         -w) wd=$2; shift ;;
-        --user) [ "$(id -u)" = 0 ] &&
+        --user) [ "$(id -u)" = 0 ] && user=$2 &&
                     as=("$(PATH=/usr/bin:/bin command -v setpriv)" --reuid "${2%%:*}" --regid "${2##*:}" --clear-groups); shift ;;
         -v) mounts+=("${2%%:*}"); shift ;;
-        --name | --cap-drop | --security-opt | --network | --pids-limit) shift ;;
+        --name) name=$2; shift ;;
+        --cap-drop | --security-opt | --network | --pids-limit) shift ;;
         -*) ;;
         *) break ;;
     esac
     shift
 done
 shift # the image
+if [ -n "${FAKE_DOCKER_ARGV_DIR:-}" ] && [ -n "$name" ]; then
+    rec=$FAKE_DOCKER_ARGV_DIR/$name.log
+    { mkdir -p "$FAKE_DOCKER_ARGV_DIR" && : >>"$rec"; } || exit 125
+    [ -z "$user" ] || chown "$user" "$rec" || exit 125
+    envs+=("ARGV_LOG=$rec")
+fi
 # The real env (and setpriv): the variables are the container's
 # environment, not arguments of a command the run started (the argument-log
 # shims below see only what the run itself starts).
@@ -474,6 +484,28 @@ eq "run: ... RUNNER_TEMP included" 2 "$rc"
 ln -s "$tmp/shared" "$tmp/shared-link"
 run_case statelink '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared-link"
 eq "run: ... and a symlink is refused" 2 "$rc"
+# Never inside the checkout, which the image build and every attempt copy
+# whole: the run's secrets would go with it. Refused before anything is
+# written there or docker starts, however the path reaches it.
+in_checkout() { # NAME: refused, nothing made in the checkout, docker never called
+    eq "$2" "2 0 0" "$rc $(find "$repo" -name 'ai-maintenance-run.*' | wc -l) $(wc -l <"$tmp/$1/docker.log" 2>/dev/null || echo 0)"
+}
+run_case incheckout '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/incheckout/repo/.scratch"
+in_checkout incheckout "run: a state directory inside the checkout is refused"
+run_case attop '[{"claude":["ok-1"]}]' AI_STATE_DIR= RUNNER_TEMP= TMPDIR="$tmp/attop/repo"
+in_checkout attop "run: ... the checkout itself too (a TMPDIR there included)"
+mkdir -p "$tmp/vialink" && ln -s "$tmp/vialink/repo" "$tmp/repo-link"
+run_case vialink '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/repo-link/sub"
+in_checkout vialink "run: ... and through a symlink above it"
+# Debugging keeps the raw files, but never the file listing every key, nor
+# an attempt's options; neither is left behind by a run that stops early.
+run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true
+check "run: raw state is kept for debugging, without the key file or the options" bash -c \
+    '[ "$2" = 0 ] && [ -d "$1/attempt-1/tree" ] && [ ! -e "$1/secrets.json" ] && ! grep -rqa argvoptionsecret "$1"' _ "$state" "$rc"
+check "run: ... the options still reached the adapter" contains <(seen) "options-ok"
+run_case keeprawerr '[{"claude":["ok-1"]}]' AI_KEEP_RAW_STATE=true AI_SANDBOX_IMAGE='not an image!'
+check "run: ... nor by a run stopped by a configuration error" bash -c \
+    '[ "$2" = 2 ] && [ -d "$1" ] && [ ! -e "$1/secrets.json" ]' _ "$state" "$rc"
 
 # Keys and instructions never reach a process's arguments, which other
 # accounts on the runner can read: every command the run starts is logged
@@ -488,11 +520,17 @@ for c in jq grep sed cut tr head tail cat sha256sum git timeout mktemp rm cp chm
     chmod +x "$argv_bin/$c"
 done
 : >"$tmp/argv.log"
-run_case argv '[{"claude":["quota-argvkeyone"]},{"gpt":["ok-argvkeytwo"]}]' PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv.log" \
+# Each container gets a recorder of its own (FAKE_DOCKER_ARGV_DIR), so what
+# runs inside an attempt is logged too.
+argv_secrets='argvkey\|argvinstructionmarker\|argvoptionsecret\|argvgatewaysecret\|argvcodexkey\|argvclaudekey\|g-argvagykey\|agyinstructionmarker'
+run_case argv '[{"claude":{"keys":["quota-argvkeyone"],"token":"tok-argvoptionsecret","base_url":"https://u:argvgatewaysecret@gw.invalid","model":"m high"}},{"gpt":["ok-argvkeytwo"]}]' \
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv.log" FAKE_DOCKER_ARGV_DIR="$tmp/argv-ctr" \
     AI_INSTRUCTIONS="Keep the argvinstructionmarker out of every process argument"
-check "run: (the shims saw the run's commands)" bash -c '[ "$1" = 0 ] && grep -qa "ai_scrub\|jq" "$2"' _ "$rc" "$tmp/argv.log"
-check "run: no key or instruction is ever a process argument" bash -c \
-    '! grep -qa "argvkey\|argvinstructionmarker" "$1" "$2"' _ "$tmp/argv.log" "$tmp/argv/docker.log"
+check "run: (the shims saw the run's commands, in the attempts too)" bash -c \
+    '[ "$1" = 0 ] && grep -qa "ai_scrub\|jq" "$2" && grep -qla "attempt.sh" "$3"/*' _ "$rc" "$tmp/argv.log" "$tmp/argv-ctr"
+check "run: (the entry's options reached the adapter)" contains <(seen) "options-ok"
+check "run: no key, instruction or pool option is ever a process argument" bash -c \
+    '! grep -qa "$1" "$2" "$3" "$4"/*' _ "$argv_secrets" "$tmp/argv.log" "$tmp/argv/docker.log" "$tmp/argv-ctr"
 
 # The fake docker changes permissions only inside the test's own directory:
 # a private directory elsewhere that holds a mount is never opened.
@@ -589,11 +627,13 @@ EOF
 chmod +x "$bin/npm" "$bin/curl"
 cat >"$pkgs/codex" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\0' "$0" "$@" >>"$ARGV_LOG"
 printf '%s\n' "$@" >"$AI_ATTEMPT_DIR/codex.args"
 while [ $# -gt 0 ]; do [ "$1" = -o ] && printf 'Codex done\n' >"$2"; shift; done
 EOF
 cat >"$pkgs/agy" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\0' "$0" "$@" >>"$ARGV_LOG"
 printf '%s\n' "$@" >>"$AI_ATTEMPT_DIR/agy.args"
 cat >>"$AI_ATTEMPT_DIR/agy.stdin"
 effort=
@@ -603,19 +643,20 @@ printf '{"event":"result","result":{"status":"OK","response":"Gemini done at %s"
 EOF
 cat >"$pkgs/claude-code" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\0' "$0" "$@" >>"$ARGV_LOG"
 printf '%s\n' "$@" >"$AI_ATTEMPT_DIR/claude.args"
 [ -n "${ANTHROPIC_API_KEY:-}" ] && printf '{"type":"result","is_error":false,"result":"Claude done"}\n'
 EOF
 chmod +x "$pkgs/codex" "$pkgs/agy" "$pkgs/claude-code"
 agy_sha=$(sha512sum "$pkgs/agy" | cut -d' ' -f1)
 run_case codex '[{"gpt":{"keys":["sk-argvcodexkey"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" \
-    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log" FAKE_DOCKER_ARGV_DIR="$tmp/codex-ctr"
 check "codex: max is passed as xhigh, and reported as used" bash -c \
     'grep -qx "model_reasoning_effort=\"xhigh\"" "$1/attempt-1/out/codex.args" && [ "$(jq -r .effort "$1/result/meta.json")" = xhigh ] &&
      [ "$(jq -r "[.effort, .effort_used] | join(\" \")" "$1/attempts.jsonl")" = "max xhigh" ]' _ "$state"
 run_case agy '[{"gemini":{"keys":["g-argvagykey"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" GITHUB_STEP_SUMMARY="$tmp/agy-summary.md" \
     AGY_DOWNLOAD_URL=https://example.invalid/dl/agy AGY_SHA512="$agy_sha" AI_INSTRUCTIONS="Keep agyinstructionmarker off argv" \
-    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log" FAKE_DOCKER_ARGV_DIR="$tmp/agy-ctr"
 check "agy: the prompt goes in on standard input, never in the arguments" bash -c \
     '! grep -q agyinstructionmarker "$1/attempt-1/out/agy.args" &&
      jq -e "select(.event == \"user\") | .message.content | contains(\"agyinstructionmarker\")" "$1/attempt-1/out/agy.stdin" >/dev/null' _ "$state"
@@ -623,10 +664,16 @@ check "agy: an effort the model lacks steps down, and the step is reported" bash
     '[ "$(jq -r .effort "$1/result/meta.json")" = high ] && grep -q "Gemini done at high" "$1/result/summary.md" &&
      grep -q "| max (used high) |" "$2"' _ "$state" "$tmp/agy-summary.md"
 run_case realclaude '[{"claude":["sk-ant-argvclaudekey"]}]' AI_PROVIDERS_DIR="$real" \
-    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log" FAKE_DOCKER_ARGV_DIR="$tmp/claude-ctr"
 eq "claude: the real adapter completes with a fake CLI" "0 Claude done" "$rc $(head -n1 "$state/result/summary.md")"
+# The recorder inside each attempt saw that adapter's CLI start (a flag only
+# it is given), so the absence check below has something to look at.
+for pair in "codex --dangerously-bypass-approvals-and-sandbox" "agy --disable-slash-commands" "claude --verbose"; do
+    check "adapters: the recorder in the ${pair%% *} attempt saw its CLI start" bash -c \
+        'grep -qlaF -- "$2" "$1"/*' _ "$tmp/${pair%% *}-ctr" "${pair#* }"
+done
 check "adapters: the CLIs get their keys in the environment, never in a command's arguments" bash -c \
-    '[ -s "$1" ] && ! grep -qa "argvcodexkey\|argvclaudekey\|g-argvagykey\|agyinstructionmarker" "$1"' _ "$tmp/argv-real.log"
+    '! grep -qa "$1" "$2" "$3"/* "$4"/* "$5"/*' _ "$argv_secrets" "$tmp/argv-real.log" "$tmp/codex-ctr" "$tmp/agy-ctr" "$tmp/claude-ctr"
 run_case effortfile '[{"claude":["effort-1"]}]' AI_MODELS='{"claude":"m max"}'
 eq "run: the effort an adapter reports wins over the one requested" "low" "$(jq -r .effort "$state/result/meta.json")"
 

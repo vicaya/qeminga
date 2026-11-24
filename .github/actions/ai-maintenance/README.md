@@ -116,20 +116,26 @@ nothing it downloads. Each attempt runs in its own container:
   owner-only directory of its own under `runner.temp` (or under
   `AI_STATE_DIR`; either way, every directory on the path must belong to the
   runner's user or root and be writable by no one else, unless sticky like
-  `/tmp`), and uploads only the result and the attempts it
+  `/tmp`, and it may not be inside the checkout, which the image build and
+  every attempt copy whole), and uploads only the result and the attempts it
   made itself, so a later invocation in the same job never publishes an
   earlier one's (private) output. When it ends, however it ends, only the
   sanitized output is left there: the prompt, the agent's trees, raw logs
-  and the CLIs are removed. No other account on a shared runner can read
+  and the CLIs are removed. `AI_KEEP_RAW_STATE=true` keeps them for
+  debugging, but never the file listing every key or an attempt's pool
+  options. No other account on a shared runner can read
   them meanwhile: the containers reach their mounts through the Docker
   daemon.
 - **No secrets in process arguments.** Every account on a runner can read
   the command lines of its processes, those inside containers included.
-  The keys and the instructions reach the commands that handle them
-  through standard input, an owner-only file or exported variables, never
-  as arguments: the scrubber reads the secrets from a file, the CLIs get
-  their keys from the environment, and the Antigravity CLI reads its prompt
-  from standard input (`--input-format stream-json`).
+  The keys, the instructions and the pool entries' options (which may hold
+  a gateway URL with credentials, or a custom adapter's token) reach the
+  commands that handle them through standard input, an owner-only file or
+  exported variables, never as arguments: the scrubber reads the secrets
+  from a file, each attempt reads its entry's options from a read-only,
+  owner-only file, the CLIs get their keys from the environment, and the
+  Antigravity CLI reads its prompt from standard input
+  (`--input-format stream-json`).
 - **No workflow commands.** Everything a container prints is captured in
   files on the runner. When it is shown in the job log, the runner's
   workflow commands (`::add-mask::`, `::set-env::`, ...) are suspended

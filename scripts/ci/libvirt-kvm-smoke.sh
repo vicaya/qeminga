@@ -276,18 +276,18 @@ collect_diagnostics() {
                 dom_xml="$(v dumpxml "$domain_ref" 2>/dev/null || true)"
             fi
             if [ -n "$dom_xml" ]; then
-                printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" "" "$run_token" 2>/dev/null || true
+                printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" "" "$run_token" "$name" 2>/dev/null || true
             fi
             if [ -n "$qlog_cursor" ]; then
                 local c_st="" c_dev="" c_ino="" c_off=""
                 IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
                 if [ -n "$c_st" ]; then
-                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" 2>/dev/null || true
+                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" "$name" 2>/dev/null || true
                 fi
             fi
         fi
         if { [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; } && [ -n "$dir_id" ]; then
-            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" "$dir_id" "$run_token" 2>/dev/null || true
+            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" "$dir_id" "$run_token" "$name" 2>/dev/null || true
         fi
         return 0
     fi
@@ -303,18 +303,18 @@ collect_diagnostics() {
             dom_xml="$(v dumpxml "${domain_ref:-$name}" 2>/dev/null || true)"
         fi
         if [ -n "$dom_xml" ]; then
-            printf '%s\n' "$dom_xml" | sys_fs_ops publish-session-evidence-stdin "$out" "domain.xml" "" "$run_token" 2>/dev/null || true
+            printf '%s\n' "$dom_xml" | sys_fs_ops publish-session-evidence-stdin "$out" "domain.xml" "" "$run_token" "$name" 2>/dev/null || true
         fi
         if [ -n "$qlog_cursor" ]; then
             local c_st="" c_dev="" c_ino="" c_off=""
             IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
             if [ -n "$c_st" ]; then
-                sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" 2>/dev/null || true
+                sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" "$name" 2>/dev/null || true
             fi
         fi
     fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" "$run_token" 2>/dev/null || true
+        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" "$run_token" "$name" 2>/dev/null || true
     fi
 }
 
@@ -350,9 +350,9 @@ cmd_cleanup() {
         echo "$note"
         if [ -n "$out" ]; then
             if [ "$CONNECT_URI" = "qemu:///system" ]; then
-                printf '%s\n' "$note" | sys_fs_ops publish-evidence-stdin "$out" "cleanup.txt"
+                printf '%s\n' "$note" | sys_fs_ops publish-evidence-stdin "$out" "cleanup.txt" "" "" "$name" 2>/dev/null || true
             elif command -v python3 >/dev/null 2>&1; then
-                printf '%s\n' "$note" | sys_fs_ops publish-session-evidence-stdin "$out" "cleanup.txt"
+                printf '%s\n' "$note" | sys_fs_ops publish-session-evidence-stdin "$out" "cleanup.txt" "" "" "$name" 2>/dev/null || true
             fi
         fi
         return 0
@@ -902,17 +902,17 @@ cmd_run() {
     check_number QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS "$shutdown_timeout"
 
     command -v python3 >/dev/null || die "missing tool: python3"
+    RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
+    check_name "$RUN_NAME"
     RUN_TOKEN=""
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         [ "$(id -u)" -eq 0 ] || die "qemu:///system requires root"
-        RUN_TOKEN="$(sys_fs_ops prepare-evidence-dir "$OUT" init-run)" || exit 1
+        RUN_TOKEN="$(sys_fs_ops prepare-evidence-dir "$OUT" init-run "$RUN_NAME")" || exit 1
     else
-        RUN_TOKEN="$(sys_fs_ops prepare-session-evidence-dir "$OUT" init-run)" || exit 1
+        RUN_TOKEN="$(sys_fs_ops prepare-session-evidence-dir "$OUT" init-run "$RUN_NAME")" || exit 1
     fi
     [ -n "$RUN_TOKEN" ] || die "failed to initialize run attempt token for $OUT"
     RUN_ARCH="$arch" RUN_SHA="$sha" RUN_DIGEST="$NO_DIGEST" RUN_ACCEL=unknown
-    RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
-    check_name "$RUN_NAME"
     RUN_DIR="$IMAGES/$RUN_NAME"
     RUN_DIR_VERIFIED=0
     RUN_DIR_ID=""

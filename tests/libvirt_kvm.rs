@@ -9994,14 +9994,16 @@ try:
         assert proc_init.returncode == 0, f"init-run failed: {out_i!r} {err_i!r}"
         wait_pipe_msg(b_aft_r, b"ACQUIRED\n", label="write-session-result LOCK_EX after init-run")
         out_w, err_w = proc_write.communicate(timeout=10)
-        assert proc_write.returncode == 1, (
-            f"write-session-result after init-run must fail (all not_run), got rc={proc_write.returncode}: "
+        assert proc_write.returncode != 0, (
+            f"unfenced write-session-result after init-run must fail closed (ESTALE), got rc={proc_write.returncode}: "
             f"{out_w!r} {err_w!r}"
         )
-        doc_a = json.loads(open(os.path.join(dir_a, "result.json"), "rb").read().decode("utf-8"))
-        assert doc_a["result"] == "fail", f"stale pass survived reset: {doc_a}"
-        for t in result_spec["mandatory_tests"]:
-            assert doc_a["tests"][t] == "not_run", f"marker {t} survived reset: {doc_a}"
+        assert b"active run attempt" in err_w, (
+            f"expected ESTALE active-run-attempt error from unfenced write-session-result, got: {err_w!r}"
+        )
+        assert not os.path.exists(os.path.join(dir_a, "result.json")), (
+            "unfenced write-session-result after init-run must not write result.json"
+        )
     finally:
         for fd_tmp in (mid_r, mid_w, go_r, go_w, b_bef_r, b_bef_w, b_aft_r, b_aft_w):
             if fd_tmp >= 0:
@@ -10069,11 +10071,13 @@ try:
             if fd_tmp >= 0:
                 os.close(fd_tmp)
 
-    # 3h (Review #22 P2): Bind marker writes and final publication to a per-attempt
+    # 3h (Review #22 & #25 P2): Bind marker writes and final publication to a per-attempt
     #     run token created by `init-run`. After Run 2 resets the same `--out`, a
     #     delayed Run 1 `mark` (with Run 1's stale token OR with no token) and a
-    #     delayed Run 1 `write-session-result` MUST both fail closed (ESTALE), so
-    #     Run 2 never inherits or credits Run 1's checks!
+    #     delayed Run 1 `write-session-result` / public `result` command (with stale
+    #     tok1 OR with no token!) MUST all fail closed (ESTALE), so Run 2 never
+    #     inherits Run 1's checks or has its passing markers published under another
+    #     caller's SHA/digest!
     fenced_dir = os.path.join(root_path, "fenced-run-attempt")
     tok1 = mod.prepare_evidence_dir(
         fenced_dir, init_run=True, session=True, root_fd=root_fd, root_path=root_path
@@ -10092,7 +10096,7 @@ try:
     assert isinstance(tok2, str) and len(tok2) == 32 and tok2 != tok1, (
         f"second init-run must rotate run token: tok1={tok1!r}, tok2={tok2!r}"
     )
-    # Delayed Run 1 `mark` with stale tok1 MUST fail with ESTALE and leave tests/ empty!
+    # Delayed Run 1 `mark` with stale tok1 or no token MUST fail with ESTALE and leave tests/ empty!
     for stale_tok in (tok1, None):
         try:
             mod.publish_evidence_bytes(
@@ -10105,15 +10109,16 @@ try:
             assert exc.errno == errno.ESTALE, f"expected ESTALE for stale_tok={stale_tok!r}, got {exc}"
     assert not os.path.exists(os.path.join(fenced_dir, "tests", "production_install"))
     assert not os.path.exists(os.path.join(fenced_dir, "tests", "accelerator_kvm"))
-    # Delayed Run 1 `write_result_file` with stale tok1 MUST fail with ESTALE and write no report!
-    try:
-        mod.write_result_file(
-            fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
-            session=True, run_token=tok1, root_fd=root_fd, root_path=root_path,
-        )
-        raise AssertionError("late write_result_file with stale tok1 must be refused after reset")
-    except OSError as exc:
-        assert exc.errno == errno.ESTALE, exc
+    # Delayed Run 1 `write_result_file` with stale tok1 OR no token MUST fail with ESTALE!
+    for stale_tok in (tok1, None):
+        try:
+            mod.write_result_file(
+                fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
+                session=True, run_token=stale_tok, root_fd=root_fd, root_path=root_path,
+            )
+            raise AssertionError(f"late write_result_file with run_token={stale_tok!r} must be refused after reset")
+        except OSError as exc:
+            assert exc.errno == errno.ESTALE, f"expected ESTALE for stale_tok={stale_tok!r}, got {exc}"
     assert not os.path.exists(os.path.join(fenced_dir, "result.json"))
     # Run 2's own `write_result_file` with tok2 succeeds in writing `"fail"` (all `not_run`),
     # proving ZERO checks from Run 1 leaked into Run 2!
@@ -10126,24 +10131,84 @@ try:
     assert doc2["result"] == "fail"
     for t in result_spec["mandatory_tests"]:
         assert doc2["tests"][t] == "not_run", f"stale marker {t} leaked into Run 2: {doc2}"
-    # Run 2 marking all 4 checks with tok2 and publishing with tok2 succeeds and certifies pass!
+    # Run 2 marks all 4 passing checks with tok2!
     for t in result_spec["mandatory_tests"]:
         mod.publish_evidence_bytes(
             fenced_dir, t, b"pass\n",
             subdir="tests", session=True, run_token=tok2,
             root_fd=root_fd, root_path=root_path,
         )
-    payload2_pass, passed2_pass = mod.write_result_file(
-        fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
-        session=True, run_token=tok2, root_fd=root_fd, root_path=root_path,
+    # Now a delayed caller invokes the PUBLIC `libvirt-kvm-smoke.sh result` command WITHOUT
+    # `--run-token` using a DIFFERENT source SHA & binary digest -> MUST fail closed (ESTALE)
+    # and MUST NOT publish Run 2's passing markers under Caller 1's SHA/digest!
+    smoke_script = sys.argv[4]
+    env_pub = os.environ.copy()
+    env_pub["QEMINGA_E2E_CONNECT"] = "qemu:///session"
+    env_pub["QEMINGA_TEST_SYSFS_ROOT"] = root_path
+    bad_sha = "0" * 40
+    bad_digest = "1" * 64
+    tokenless_res = subprocess.run(
+        [
+            "bash", smoke_script, "result",
+            "--out", fenced_dir,
+            "--arch", result_spec["arch"],
+            "--source-sha", bad_sha,
+            "--binary-sha256", bad_digest,
+            "--accelerator", "kvm",
+        ],
+        env=env_pub,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
-    assert passed2_pass and json.loads(payload2_pass.decode("utf-8"))["result"] == "pass"
+    assert tokenless_res.returncode != 0, (
+        f"tokenless public `result` MUST be refused on an initialized dir:\n"
+        f"stdout={tokenless_res.stdout!r}\nstderr={tokenless_res.stderr!r}"
+    )
+    after_tokenless = json.loads(open(os.path.join(fenced_dir, "result.json"), "rb").read().decode("utf-8"))
+    assert after_tokenless["source_sha"] == result_spec["source_sha"], (
+        f"tokenless `result` overwrote Run 2's report with caller 1's SHA: {after_tokenless}"
+    )
+    assert after_tokenless["candidate_binary_sha256"] == result_spec["expect_sha256"], (
+        f"tokenless `result` overwrote Run 2's report digest: {after_tokenless}"
+    )
+    assert after_tokenless["result"] == "fail", (
+        f"tokenless `result` must not have published a passing report: {after_tokenless}"
+    )
+    # Public `libvirt-kvm-smoke.sh result` WITH Run 2's valid `--run-token` succeeds and certifies pass!
+    fenced_pub = subprocess.run(
+        [
+            "bash", smoke_script, "result",
+            "--out", fenced_dir,
+            "--arch", result_spec["arch"],
+            "--source-sha", result_spec["source_sha"],
+            "--binary-sha256", result_spec["expect_sha256"],
+            "--accelerator", "kvm",
+            "--run-token", tok2,
+        ],
+        env=env_pub,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert fenced_pub.returncode == 0, (
+        f"public `result` with matching --run-token must succeed:\n"
+        f"stdout={fenced_pub.stdout!r}\nstderr={fenced_pub.stderr!r}"
+    )
+    doc2_pass = json.loads(open(os.path.join(fenced_dir, "result.json"), "rb").read().decode("utf-8"))
+    assert (
+        doc2_pass["result"] == "pass"
+        and doc2_pass["source_sha"] == result_spec["source_sha"]
+        and doc2_pass["candidate_binary_sha256"] == result_spec["expect_sha256"]
+    )
 finally:
     os.close(root_fd)
 "#,
             py_mod_copy.to_str().unwrap(),
             sys_root.to_str().unwrap(),
             valid_pass_path.to_str().unwrap(),
+            root()
+                .join("scripts/ci/libvirt-kvm-smoke.sh")
+                .to_str()
+                .unwrap(),
         ])
         .output()
         .unwrap();
@@ -10795,6 +10860,121 @@ try:
     finally:
         mod.os.open = orig_open
     assert not os.path.exists(perm_pass_dst)
+
+    # 4d (Review #25 P2): `e2e-libvirt.fallback.log` MUST be published with private `0600`
+    #     mode in BOTH session AND system modes (even inside an existing `0755` directory!),
+    #     and `stage_evidence_dir` MUST refuse/omit any non-private (`0644`) fallback log
+    #     before staging while staging a private `0600` fallback log!
+    sys_fb_out = os.path.join(root_path, "sys-fallback-0755")
+    os.mkdir(sys_fb_out, 0o755)
+    os.chmod(sys_fb_out, 0o755)
+    mod.publish_evidence_bytes(
+        sys_fb_out,
+        "e2e-libvirt.fallback.log",
+        b"PRIVATE_SYSTEM_FALLBACK_TRANSCRIPT\n",
+        session=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    sys_fb_mode = os.lstat(os.path.join(sys_fb_out, "e2e-libvirt.fallback.log")).st_mode & 0o777
+    assert sys_fb_mode == 0o600, (
+        f"system-mode e2e-libvirt.fallback.log MUST be private 0600 (not 0644), got {sys_fb_mode:04o}"
+    )
+
+    fb_stage_src = os.path.join(root_path, "fb-stage-src")
+    os.mkdir(fb_stage_src, 0o755)
+    os.chmod(fb_stage_src, 0o755)
+    with open(os.path.join(fail_src, "result.json"), "rb") as fh:
+        fail_res_bytes = fh.read()
+    mod.publish_evidence_bytes(
+        fb_stage_src, "result.json", fail_res_bytes,
+        session=False, root_fd=root_fd, root_path=root_path,
+    )
+    # Plant a non-private 0644 fallback log -> stage_evidence_dir MUST omit it!
+    fb_file = os.path.join(fb_stage_src, "e2e-libvirt.fallback.log")
+    with open(fb_file, "wb") as fh:
+        fh.write(b"LEAKED_WORLD_READABLE_FALLBACK\n")
+    os.chmod(fb_file, 0o644)
+    fb_nonpriv_stage = os.path.join(root_path, "fb-stage-nonpriv")
+    mod.stage_evidence_dir(
+        fb_stage_src, fb_nonpriv_stage, result_spec,
+        session=False, root_fd=root_fd, root_path=root_path,
+    )
+    assert os.path.isfile(os.path.join(fb_nonpriv_stage, "result.json"))
+    assert not os.path.exists(os.path.join(fb_nonpriv_stage, "e2e-libvirt.fallback.log")), (
+        "stage_evidence_dir MUST refuse/omit non-private 0644 e2e-libvirt.fallback.log"
+    )
+    # Re-publish via system-mode atomic publisher (0600) -> stage_evidence_dir stages it as 0600!
+    mod.publish_evidence_bytes(
+        fb_stage_src,
+        "e2e-libvirt.fallback.log",
+        b"PRIVATE_SYSTEM_FALLBACK_TRANSCRIPT\n",
+        session=False,
+        root_fd=root_fd,
+        root_path=root_path,
+    )
+    assert (os.lstat(fb_file).st_mode & 0o777) == 0o600
+    fb_priv_stage = os.path.join(root_path, "fb-stage-priv")
+    mod.stage_evidence_dir(
+        fb_stage_src, fb_priv_stage, result_spec,
+        session=False, root_fd=root_fd, root_path=root_path,
+    )
+    staged_fb = os.path.join(fb_priv_stage, "e2e-libvirt.fallback.log")
+    assert os.path.isfile(staged_fb) and (os.lstat(staged_fb).st_mode & 0o777) == 0o600
+    assert b"PRIVATE_SYSTEM_FALLBACK_TRANSCRIPT" in open(staged_fb, "rb").read()
+
+    # 4e (Review #25 P3): Track each staging file immediately after exclusive create
+    #     so a write or fsync I/O failure on either a top-level file OR a `tests/*`
+    #     marker still removes the partial file and `.qeminga-stage.*` cleanly!
+    orig_write_all = mod._write_all_fd
+    for fail_mode in ("top_write_eio", "tests_fsync_eio"):
+        io_parent = os.path.join(root_path, f"stage-io-{fail_mode}")
+        os.mkdir(io_parent, 0o700)
+        io_dst = os.path.join(io_parent, "final")
+        write_calls = [0]
+        fsync_reg_calls = [0]
+
+        def fail_top_write(fd, data):
+            write_calls[0] += 1
+            if write_calls[0] == 1:
+                os.write(fd, data[:4])
+                raise OSError(errno.EIO, "simulated EIO during top-level stage write")
+            return orig_write_all(fd, data)
+
+        def fail_tests_fsync(fd):
+            st_f = os.fstat(fd)
+            if stat.S_ISREG(st_f.st_mode):
+                fsync_reg_calls[0] += 1
+                # pass_src has result.json + e2e-libvirt.log (+ optional files) before tests/*
+                # Fail on the first marker written under tests/ (when tests dir exists).
+                for entry in os.listdir(io_parent):
+                    if entry.startswith(".qeminga-stage.") and os.path.isdir(
+                        os.path.join(io_parent, entry, "tests")
+                    ):
+                        raise OSError(errno.EIO, "simulated EIO during tests/* fsync")
+            return orig_fsync(fd)
+
+        if fail_mode == "top_write_eio":
+            mod._write_all_fd = fail_top_write
+        else:
+            mod.os.fsync = fail_tests_fsync
+        try:
+            try:
+                mod.stage_evidence_dir(
+                    pass_src, io_dst, result_spec,
+                    session=True, root_fd=root_fd, root_path=root_path,
+                )
+                raise AssertionError(f"expected simulated EIO for {fail_mode}")
+            except OSError as exc:
+                assert exc.errno == errno.EIO, f"{fail_mode}: {exc}"
+        finally:
+            mod._write_all_fd = orig_write_all
+            mod.os.fsync = orig_fsync
+        assert not os.path.exists(io_dst), f"{fail_mode}: stage_dir must not be published"
+        leftovers = os.listdir(io_parent)
+        assert leftovers == [], (
+            f"{fail_mode}: partial file/staging directory leaked after post-open I/O error: {leftovers!r}"
+        )
 finally:
     os.close(root_fd)
 "#,
@@ -10814,4 +10994,277 @@ finally:
         !py_fixture_dir.join("__pycache__").exists(),
         "Python -IB test invocation must not create __pycache__ in the test-owned module directory"
     );
+}
+
+#[test]
+fn standalone_cleanup_skips_diagnostics_when_out_belongs_to_another_run() {
+    let fx = SystemMockLibvirtFixture::new();
+    let as_root = running_as_root();
+    let dom_uuid1 = "11111111-2222-3333-4444-555555555555";
+    let dom_uuid2 = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+    for is_session in [true, false] {
+        let mode = if is_session { "session" } else { "system" };
+        let connect = if is_session {
+            "qemu:///session"
+        } else {
+            "qemu:///system"
+        };
+        let bin_dir = if is_session { &fx.session_bin } else { &fx.bin };
+        let images = if is_session {
+            let p = fx.dir.path().join("cleanup-fence-sess-images");
+            create_private_dir(&p);
+            p
+        } else {
+            fx.good_images.clone()
+        };
+        let qlogs = if is_session {
+            let p = fx.dir.path().join("cleanup-fence-sess-qlogs");
+            create_private_dir(&p);
+            p
+        } else {
+            fx.qlog_dir.clone()
+        };
+        let shared_out = if is_session {
+            fx.dir.path().join("cleanup-fence-sess-out")
+        } else {
+            fx.sys_root.join("cleanup-fence-sys-out")
+        };
+        let root_base = if is_session {
+            fx.dir.path()
+        } else {
+            &fx.sys_root
+        };
+
+        let run1_name = fx.run_name("201");
+        let run2_name = fx.run_name("202");
+        let run1_dir = images.join(&run1_name);
+        let run2_dir = images.join(&run2_name);
+
+        let run1_xml = format!(
+            "<domain type='kvm'><name>{run1_name}</name><uuid>{dom_uuid1}</uuid><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+            run1_dir.display(),
+            run1_dir.display(),
+        );
+        let run2_xml = format!(
+            "<domain type='kvm'><name>{run2_name}</name><uuid>{dom_uuid2}</uuid><devices><disk type='file'><source file='{}/root.qcow2'/></disk><serial type='file'><source path='{}/serial.log'/></serial></devices></domain>",
+            run2_dir.display(),
+            run2_dir.display(),
+        );
+
+        // 1. Run 2 initializes `$shared_out` via `cmd_run` (binding `.run-token` to `run2_name`),
+        //    and leaves Run 2's `domain.xml` and `serial.log` in `$shared_out`.
+        std::fs::write(&fx.dom_state_file, "absent\n").unwrap();
+        let run2_serial = run2_dir.join("serial.log");
+        let mut run2_envs: Vec<(&str, &str)> = vec![
+            ("QEMINGA_E2E_CONNECT", connect),
+            ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qlogs.to_str().unwrap()),
+            ("QEMINGA_KVM_DEVICE", "/dev/null"),
+            ("QEMINGA_AAVMF_CODE", fx.aavmf_code.to_str().unwrap()),
+            ("QEMINGA_AAVMF_VARS", fx.aavmf_vars.to_str().unwrap()),
+            ("FAKE_IMAGE_SHA", &fx.pinned_image_sha),
+            ("FAKE_VIRSH_LOG", fx.virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run2_name),
+            ("FAKE_DOM_UUID", dom_uuid2),
+            ("FAKE_DUMPXML_CONTENT", &run2_xml),
+            ("FAKE_PLANT_SERIAL_DEST", run2_serial.to_str().unwrap()),
+            ("FAKE_PLANT_SERIAL_CONTENT", "RUN2_CURRENT_SERIAL"),
+        ];
+        if is_session {
+            push_test_sysfs_root(&mut run2_envs, root_base, as_root);
+        } else {
+            run2_envs.push(("QEMINGA_TEST_SYSFS_ROOT", root_base.to_str().unwrap()));
+        }
+        let run2 = lane_env(
+            &[
+                "run",
+                "--arch",
+                fx.arch,
+                "--candidate",
+                fx.candidate.to_str().unwrap(),
+                "--source-sha",
+                SHA,
+                "--run-id",
+                "202",
+                "--run-attempt",
+                "1",
+                "--out",
+                shared_out.to_str().unwrap(),
+                "--expect-sha256",
+                &fx.digest,
+            ],
+            &run2_envs,
+            Some(bin_dir),
+        );
+        assert!(!run2.status.success(), "{mode}: {}", text(&run2));
+        assert!(
+            std::fs::read_to_string(shared_out.join("domain.xml"))
+                .unwrap_or_default()
+                .contains(&run2_name),
+            "{mode}: Run 2 must have published its domain.xml"
+        );
+        assert!(
+            std::fs::read_to_string(shared_out.join("serial.log"))
+                .unwrap_or_default()
+                .contains("RUN2_CURRENT_SERIAL"),
+            "{mode}: Run 2 must have published its serial.log"
+        );
+
+        // 2. Now Run 1's delayed standalone `cleanup --run-id 201 --run-attempt 1 --out $shared_out`
+        //    runs while Run 1's VM and run directory (holding `RUN1_DELAYED_SERIAL`) still exist!
+        //    Cleanup MUST still tear down Run 1's VM and remove `run1_dir`, while REFUSING to
+        //    overwrite Run 2's `domain.xml` or `serial.log`!
+        create_private_dir(&run1_dir);
+        std::fs::write(run1_dir.join("serial.log"), b"RUN1_DELAYED_SERIAL\n").unwrap();
+        std::fs::write(&fx.dom_state_file, "running\n").unwrap();
+        let mut clean1_envs: Vec<(&str, &str)> = vec![
+            ("QEMINGA_E2E_CONNECT", connect),
+            ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qlogs.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", fx.virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run1_name),
+            ("FAKE_DOM_UUID", dom_uuid1),
+            ("FAKE_DUMPXML_CONTENT", &run1_xml),
+            ("FAKE_DUMPXML_INACTIVE_CONTENT", &run1_xml),
+        ];
+        if is_session {
+            push_test_sysfs_root(&mut clean1_envs, root_base, as_root);
+        } else {
+            clean1_envs.push(("QEMINGA_TEST_SYSFS_ROOT", root_base.to_str().unwrap()));
+        }
+        let clean1 = lane_env(
+            &[
+                "cleanup",
+                "--arch",
+                fx.arch,
+                "--run-id",
+                "201",
+                "--run-attempt",
+                "1",
+                "--out",
+                shared_out.to_str().unwrap(),
+            ],
+            &clean1_envs,
+            Some(bin_dir),
+        );
+        assert!(
+            clean1.status.success(),
+            "{mode}: delayed Run 1 cleanup must still succeed in tearing down Run 1:\n{}",
+            text(&clean1)
+        );
+        assert!(
+            !run1_dir.exists(),
+            "{mode}: delayed Run 1 cleanup must still remove Run 1's run directory"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fx.dom_state_file).unwrap().trim(),
+            "absent",
+            "{mode}: delayed Run 1 cleanup must still destroy/undefine Run 1's VM"
+        );
+        let dom_after_clean1 = std::fs::read_to_string(shared_out.join("domain.xml")).unwrap();
+        assert!(
+            dom_after_clean1.contains(&run2_name) && !dom_after_clean1.contains(&run1_name),
+            "{mode}: delayed Run 1 cleanup MUST NOT overwrite Run 2's domain.xml, got:\n{dom_after_clean1}"
+        );
+        let ser_after_clean1 = std::fs::read_to_string(shared_out.join("serial.log")).unwrap();
+        assert!(
+            ser_after_clean1.contains("RUN2_CURRENT_SERIAL")
+                && !ser_after_clean1.contains("RUN1_DELAYED_SERIAL"),
+            "{mode}: delayed Run 1 cleanup MUST NOT overwrite Run 2's serial.log, got:\n{ser_after_clean1}"
+        );
+
+        // 3. Matching Run 2 standalone `cleanup --run-id 202 --run-attempt 1 --out $shared_out`
+        //    owns `$shared_out` and MUST publish Run 2's updated serial.log & domain.xml!
+        if !run2_dir.exists() {
+            create_private_dir(&run2_dir);
+        }
+        std::fs::write(run2_dir.join("serial.log"), b"RUN2_UPDATED_FINAL_SERIAL\n").unwrap();
+        std::fs::write(&fx.dom_state_file, "running\n").unwrap();
+        let mut clean2_envs: Vec<(&str, &str)> = vec![
+            ("QEMINGA_E2E_CONNECT", connect),
+            ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+            ("QEMINGA_E2E_QEMU_LOG_DIR", qlogs.to_str().unwrap()),
+            ("FAKE_VIRSH_LOG", fx.virsh_log.to_str().unwrap()),
+            ("FAKE_DOM_STATE_FILE", fx.dom_state_file.to_str().unwrap()),
+            ("FAKE_DOM_NAME", &run2_name),
+            ("FAKE_DOM_UUID", dom_uuid2),
+            ("FAKE_DUMPXML_CONTENT", &run2_xml),
+            ("FAKE_DUMPXML_INACTIVE_CONTENT", &run2_xml),
+        ];
+        if is_session {
+            push_test_sysfs_root(&mut clean2_envs, root_base, as_root);
+        } else {
+            clean2_envs.push(("QEMINGA_TEST_SYSFS_ROOT", root_base.to_str().unwrap()));
+        }
+        let clean2 = lane_env(
+            &[
+                "cleanup",
+                "--arch",
+                fx.arch,
+                "--run-id",
+                "202",
+                "--run-attempt",
+                "1",
+                "--out",
+                shared_out.to_str().unwrap(),
+            ],
+            &clean2_envs,
+            Some(bin_dir),
+        );
+        assert!(
+            clean2.status.success(),
+            "{mode}: Run 2 cleanup failed:\n{}",
+            text(&clean2)
+        );
+        assert!(!run2_dir.exists());
+        assert!(
+            std::fs::read_to_string(shared_out.join("serial.log"))
+                .unwrap_or_default()
+                .contains("RUN2_UPDATED_FINAL_SERIAL"),
+            "{mode}: owning Run 2 cleanup MUST publish its own updated serial.log"
+        );
+
+        // 4. Ownerless `.run-token` (1-line token without recorded run owner):
+        //    ownership cannot be established, so standalone cleanup MUST still remove its
+        //    VM/dir while skipping diagnostic publication!
+        let _ = std::fs::remove_file(shared_out.join("domain.xml"));
+        let _ = std::fs::remove_file(shared_out.join("serial.log"));
+        let _ = std::fs::remove_file(shared_out.join(".run-token"));
+        write_file_mode(
+            &shared_out.join(".run-token"),
+            0o600,
+            b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+        );
+        create_private_dir(&run1_dir);
+        std::fs::write(run1_dir.join("serial.log"), b"UNVERIFIED_OWNER_SERIAL\n").unwrap();
+        std::fs::write(&fx.dom_state_file, "running\n").unwrap();
+        let clean_unowned = lane_env(
+            &[
+                "cleanup",
+                "--arch",
+                fx.arch,
+                "--run-id",
+                "201",
+                "--run-attempt",
+                "1",
+                "--out",
+                shared_out.to_str().unwrap(),
+            ],
+            &clean1_envs,
+            Some(bin_dir),
+        );
+        assert!(
+            clean_unowned.status.success(),
+            "{mode}: cleanup against ownerless .run-token must still succeed:\n{}",
+            text(&clean_unowned)
+        );
+        assert!(!run1_dir.exists());
+        assert!(
+            !shared_out.join("domain.xml").exists() && !shared_out.join("serial.log").exists(),
+            "{mode}: when .run-token lacks owner identity, standalone cleanup must skip publishing diagnostics"
+        );
+    }
 }

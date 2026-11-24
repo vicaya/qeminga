@@ -46,6 +46,7 @@ ALLOWED_EVIDENCE_FILES = frozenset(
         "cleanup.txt",
     }
 )
+PRIVATE_EVIDENCE_FILES = frozenset({"e2e-libvirt.fallback.log"})
 ALLOWED_TEST_FILES = frozenset(
     {
         "production_install",
@@ -56,6 +57,7 @@ ALLOWED_TEST_FILES = frozenset(
 )
 RUN_TOKEN_NAME = ".run-token"
 RUN_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+MAX_RUN_TOKEN_BYTES = 256
 
 # Dedicated exit codes for evidence read/verification ops so callers can
 # distinguish confirmed missing/unsafe/invalid evidence from indeterminate
@@ -258,6 +260,29 @@ def dir_trust_info(fd, st, trusted_uids):
     if st.st_mode & 0o020:
         return True, True, f"group-writable (mode {oct(st.st_mode & 0o7777)})"
     return True, False, ""
+
+
+def _file_is_private_fd(fd, st):
+    """Return ``(is_private, reason)`` confirming no group, other, or ACL access is granted."""
+    entries = decode_acl_fd(fd, b"system.posix_acl_access")
+    if entries:
+        mask = 7
+        for tag, perm, _ in entries:
+            if tag == 0x10:
+                mask = perm
+        for tag, perm, eid in entries:
+            if tag == 0x20 and perm != 0:
+                return False, "other access granted via POSIX ACL"
+            if tag == 0x02 and eid != st.st_uid and (perm & mask) != 0:
+                return False, f"named uid {eid} access granted via POSIX ACL"
+            if tag == 0x04 and (perm & mask) != 0:
+                return False, f"group (gid {st.st_gid}) access granted via POSIX ACL"
+            if tag == 0x08 and (perm & mask) != 0:
+                return False, f"named gid {eid} access granted via POSIX ACL"
+        return True, ""
+    if st.st_mode & 0o077:
+        return False, f"mode {oct(st.st_mode & 0o7777)}"
+    return True, ""
 
 
 def kernel_verdict_traversal(original_path, qemu_uid, qemu_gid, qemu_groups):
@@ -1184,33 +1209,73 @@ def verify_evidence_dir(out_dir, *, session=False, root_fd=None, root_path="/"):
     os.close(out_fd)
 
 
+def _read_run_token_record(out_fd, out_path, owner_uids):
+    """Read and parse ``.run-token`` returning ``(token, owner_or_None)``."""
+    raw = _read_evidence_bytes_from_open_dir(
+        out_fd,
+        out_path,
+        RUN_TOKEN_NAME,
+        bound=MAX_RUN_TOKEN_BYTES,
+        owner_uids=owner_uids,
+    )
+    lines = [
+        line.strip()
+        for line in raw.decode("ascii", errors="replace").splitlines()
+        if line.strip()
+    ]
+    if not lines or len(lines) > 2:
+        raise EvidenceUnsafeError(
+            errno.EINVAL,
+            f"evidence directory '{out_path}' has malformed run token record",
+        )
+    actual_token = lines[0]
+    if not RUN_TOKEN_RE.fullmatch(actual_token):
+        raise EvidenceUnsafeError(
+            errno.EINVAL,
+            f"evidence directory '{out_path}' has invalid run token value",
+        )
+    actual_owner = None
+    if len(lines) == 2:
+        if not RUN_NAME_RE.fullmatch(lines[1]):
+            raise EvidenceUnsafeError(
+                errno.EINVAL,
+                f"evidence directory '{out_path}' has invalid run owner value",
+            )
+        actual_owner = lines[1]
+    return actual_token, actual_owner
+
+
 def _verify_expected_run_token(
     out_fd,
     out_path,
     run_token,
     owner_uids,
     *,
+    run_owner=None,
     reject_unfenced_if_initialized=False,
 ):
-    """Verify per-attempt ``.run-token`` inside an already-locked ``out_fd``.
+    """Verify per-attempt ``.run-token`` (and optional owner) inside an already-locked ``out_fd``.
 
-    When ``run_token`` is supplied, ``.run-token`` must exist as a verified
-    regular single-link file matching ``run_token`` (else raises ``ESTALE``).
-    When ``run_token`` is ``None`` and ``reject_unfenced_if_initialized`` is
-    ``True``, any existing ``.run-token`` refuses the unfenced write with
-    ``ESTALE`` so a delayed or unfenced marker writer cannot pollute a live
-    fenced run attempt.
+    - When ``run_token`` is supplied, ``.run-token`` must exist as a verified
+      regular single-link file matching ``run_token`` (and matching ``run_owner``
+      if both are present), else raises ``ESTALE``.
+    - Else when ``run_owner`` is supplied (standalone ``cleanup --out``), if
+      ``.run-token`` exists it must be valid and record the exact matching
+      ``run_owner`` (else raises ``ESTALE``); directories without ``.run-token``
+      keep standalone pre-token behavior.
+    - Else when ``reject_unfenced_if_initialized`` is ``True``, any existing
+      ``.run-token`` refuses the unfenced write with ``ESTALE`` so a delayed or
+      unfenced writer cannot publish against a live fenced run attempt.
     """
+    if run_owner is not None:
+        if not isinstance(run_owner, str) or not RUN_NAME_RE.fullmatch(run_owner):
+            raise OSError(errno.EINVAL, f"invalid run attempt owner '{run_owner}'")
     if run_token is not None:
         if not isinstance(run_token, str) or not RUN_TOKEN_RE.fullmatch(run_token):
             raise OSError(errno.EINVAL, f"invalid run attempt token '{run_token}'")
         try:
-            raw = _read_evidence_bytes_from_open_dir(
-                out_fd,
-                out_path,
-                RUN_TOKEN_NAME,
-                bound=MAX_TEST_MARKER_BYTES,
-                owner_uids=owner_uids,
+            actual_token, actual_owner = _read_run_token_record(
+                out_fd, out_path, owner_uids
             )
         except (EvidenceMissingError, EvidenceUnsafeError):
             raise OSError(
@@ -1218,12 +1283,33 @@ def _verify_expected_run_token(
                 f"evidence directory '{out_path}' run token is missing or invalid; "
                 "refusing stale attempt write",
             )
-        actual = re.sub(rb"[ \t\r\n\v\f]+", b"", raw).decode("ascii", errors="replace")
-        if actual != run_token:
+        if actual_token != run_token or (
+            run_owner is not None
+            and actual_owner is not None
+            and actual_owner != run_owner
+        ):
             raise OSError(
                 errno.ESTALE,
                 f"evidence directory '{out_path}' was reset by another run attempt; "
                 "refusing stale write",
+            )
+        return
+    if run_owner is not None:
+        try:
+            _, actual_owner = _read_run_token_record(out_fd, out_path, owner_uids)
+        except EvidenceMissingError:
+            return
+        except EvidenceUnsafeError:
+            raise OSError(
+                errno.ESTALE,
+                f"evidence directory '{out_path}' run token is invalid; "
+                "refusing unverified cleanup diagnostic write",
+            )
+        if actual_owner != run_owner:
+            raise OSError(
+                errno.ESTALE,
+                f"evidence directory '{out_path}' belongs to run attempt "
+                f"'{actual_owner or 'unknown'}', not '{run_owner}'; refusing stale write",
             )
         return
     if reject_unfenced_if_initialized:
@@ -1234,17 +1320,26 @@ def _verify_expected_run_token(
         raise OSError(
             errno.ESTALE,
             f"evidence directory '{out_path}' is bound to an active run attempt; "
-            "refusing unfenced test marker write",
+            "refusing unfenced write",
         )
 
 
 def prepare_evidence_dir(
-    out_dir, *, init_run=False, session=False, root_fd=None, root_path="/"
+    out_dir,
+    *,
+    init_run=False,
+    run_owner=None,
+    session=False,
+    root_fd=None,
+    root_path="/",
 ):
     """Validate/create a trusted evidence directory; optionally reset outputs and rotate ``.run-token``."""
+    if run_owner is not None and (
+        not isinstance(run_owner, str) or not RUN_NAME_RE.fullmatch(run_owner)
+    ):
+        raise OSError(errno.EINVAL, f"invalid run attempt owner '{run_owner}'")
     owner_uids = _evidence_owner_uids(session)
     dir_mode = 0o700 if session else 0o755
-    file_mode = 0o600 if session else 0o644
     out_fd, out_path = _open_verified_evidence_dir(
         out_dir,
         create_missing=True,
@@ -1285,11 +1380,16 @@ def prepare_evidence_dir(
                 finally:
                     os.close(tests_fd)
                 run_token = os.urandom(16).hex()
+                token_body = (
+                    f"{run_token}\n{run_owner}\n"
+                    if run_owner is not None
+                    else f"{run_token}\n"
+                ).encode("ascii")
                 _publish_evidence_stream(
                     out_fd,
                     RUN_TOKEN_NAME,
-                    lambda fd: _write_all_fd(fd, (run_token + "\n").encode("ascii")),
-                    mode=file_mode,
+                    lambda fd: _write_all_fd(fd, token_body),
+                    mode=0o600,
                 )
                 return run_token
             finally:
@@ -1310,12 +1410,17 @@ def publish_evidence_bytes(
     subdir=None,
     session=False,
     run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
 ):
     owner_uids = _evidence_owner_uids(session)
     dir_mode = 0o700 if session else 0o755
-    file_mode = 0o600 if session else 0o644
+    file_mode = (
+        0o600
+        if (session or (subdir is None and dest_name in PRIVATE_EVIDENCE_FILES))
+        else 0o644
+    )
     if subdir == "tests":
         if dest_name not in ALLOWED_TEST_FILES:
             raise OSError(errno.EINVAL, f"unexpected test result filename '{dest_name}'")
@@ -1333,22 +1438,16 @@ def publish_evidence_bytes(
         root_path=root_path,
     )
     try:
-        lock_out = (
-            subdir == "tests"
-            or run_token is not None
-            or (subdir is None and dest_name == "result.json")
-        )
-        if lock_out:
-            fcntl.flock(out_fd, fcntl.LOCK_EX)
+        fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
-            if lock_out:
-                _verify_expected_run_token(
-                    out_fd,
-                    out_path,
-                    run_token,
-                    owner_uids,
-                    reject_unfenced_if_initialized=(subdir == "tests"),
-                )
+            _verify_expected_run_token(
+                out_fd,
+                out_path,
+                run_token,
+                owner_uids,
+                run_owner=run_owner,
+                reject_unfenced_if_initialized=True,
+            )
             if subdir is not None:
                 out_st = os.fstat(out_fd)
                 out_mnt = fd_mnt_id(out_fd)
@@ -1378,11 +1477,10 @@ def publish_evidence_bytes(
                     mode=file_mode,
                 )
         finally:
-            if lock_out:
-                try:
-                    fcntl.flock(out_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
+            try:
+                fcntl.flock(out_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
     finally:
         os.close(out_fd)
 
@@ -1403,6 +1501,7 @@ def _read_evidence_bytes_from_open_dir(
     owner_uids,
     max_identity_retries=MAX_IDENTITY_RETRIES,
     return_identity=False,
+    require_private=False,
 ):
     sub_fd = None
     try:
@@ -1570,6 +1669,14 @@ def _read_evidence_bytes_from_open_dir(
                         f"'{target_label}' ({reason})",
                         observed_id=fst_id,
                     )
+                if require_private:
+                    is_priv, priv_reason = _file_is_private_fd(ffd, fst)
+                    if not is_priv:
+                        raise EvidenceUnsafeError(
+                            errno.EACCES,
+                            f"refusing non-private evidence file '{target_label}' ({priv_reason})",
+                            observed_id=fst_id,
+                        )
                 if fst.st_size > bound:
                     raise EvidenceUnsafeError(
                         errno.EFBIG,
@@ -1653,6 +1760,7 @@ def read_evidence_bytes(
             bound=bound,
             owner_uids=owner_uids,
             max_identity_retries=max_identity_retries,
+            require_private=(subdir is None and dest_name in PRIVATE_EVIDENCE_FILES),
         )
     finally:
         os.close(out_fd)
@@ -1978,7 +2086,13 @@ def write_result_file(
     try:
         fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
-            _verify_expected_run_token(out_fd, out_path, run_token, owner_uids)
+            _verify_expected_run_token(
+                out_fd,
+                out_path,
+                run_token,
+                owner_uids,
+                reject_unfenced_if_initialized=True,
+            )
             tests = {}
             overall = "pass"
             for name in mandatory_tests:
@@ -2031,7 +2145,7 @@ def write_result_file(
         os.close(out_fd)
 
 
-def _write_stage_file(dir_fd, name, data, mode=0o600):
+def _write_stage_file(dir_fd, name, data, created_log, mode=0o600):
     fd = os.open(
         name,
         os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -2039,12 +2153,14 @@ def _write_stage_file(dir_fd, name, data, mode=0o600):
         dir_fd=dir_fd,
     )
     try:
+        fst = os.fstat(fd)
+        created_id = (fst.st_dev, fst.st_ino)
+        created_log.append((name, created_id))
         _write_all_fd(fd, data)
         remove_xattr_if_present(fd, b"system.posix_acl_access")
         os.fchmod(fd, mode)
         os.fsync(fd)
-        fst = os.fstat(fd)
-        return (fst.st_dev, fst.st_ino)
+        return created_id
     finally:
         os.close(fd)
 
@@ -2231,20 +2347,16 @@ def stage_evidence_dir(
                     remove_xattr_if_present(tmp_fd, b"system.posix_acl_access")
                     os.fchmod(tmp_fd, 0o700)
 
-                    created_files.append(
-                        (
-                            "result.json",
-                            _write_stage_file(tmp_fd, "result.json", result_data, mode=0o600),
-                        )
+                    _write_stage_file(
+                        tmp_fd, "result.json", result_data, created_files, mode=0o600
                     )
                     if required_ac16 is not None:
-                        created_files.append(
-                            (
-                                "e2e-libvirt.log",
-                                _write_stage_file(
-                                    tmp_fd, "e2e-libvirt.log", required_ac16, mode=0o600
-                                ),
-                            )
+                        _write_stage_file(
+                            tmp_fd,
+                            "e2e-libvirt.log",
+                            required_ac16,
+                            created_files,
+                            mode=0o600,
                         )
 
                     skip_names = (
@@ -2260,6 +2372,7 @@ def stage_evidence_dir(
                                 name,
                                 bound=MAX_EVIDENCE_STAGE_BYTES,
                                 owner_uids=owner_uids,
+                                require_private=(name in PRIVATE_EVIDENCE_FILES),
                             )
                         except EvidenceMissingError:
                             continue
@@ -2269,8 +2382,8 @@ def stage_evidence_dir(
                                 f"libvirt-kvm-smoke: skipping unreadable or unsafe optional evidence file '{name}': {msg}\n"
                             )
                             continue
-                        created_files.append(
-                            (name, _write_stage_file(tmp_fd, name, data, mode=0o600))
+                        _write_stage_file(
+                            tmp_fd, name, data, created_files, mode=0o600
                         )
 
                     staged_markers = []
@@ -2315,13 +2428,12 @@ def stage_evidence_dir(
                         )
                         os.fchmod(st_tests_fd, 0o700)
                         for tname, mdata in staged_markers:
-                            created_tests_files.append(
-                                (
-                                    tname,
-                                    _write_stage_file(
-                                        st_tests_fd, tname, mdata, mode=0o600
-                                    ),
-                                )
+                            _write_stage_file(
+                                st_tests_fd,
+                                tname,
+                                mdata,
+                                created_tests_files,
+                                mode=0o600,
                             )
                         os.fsync(st_tests_fd)
 
@@ -2527,6 +2639,7 @@ def collect_serial_log(
     *,
     expected_dir_id=None,
     run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2570,13 +2683,16 @@ def collect_serial_log(
                 out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
             )
             try:
-                if run_token is not None:
-                    fcntl.flock(out_fd, fcntl.LOCK_EX)
+                fcntl.flock(out_fd, fcntl.LOCK_EX)
                 try:
-                    if run_token is not None:
-                        _verify_expected_run_token(
-                            out_fd, out_path, run_token, _evidence_owner_uids(False)
-                        )
+                    _verify_expected_run_token(
+                        out_fd,
+                        out_path,
+                        run_token,
+                        _evidence_owner_uids(False),
+                        run_owner=run_owner,
+                        reject_unfenced_if_initialized=True,
+                    )
                     _publish_evidence_stream(
                         out_fd,
                         dest_name,
@@ -2584,11 +2700,10 @@ def collect_serial_log(
                         mode=0o644,
                     )
                 finally:
-                    if run_token is not None:
-                        try:
-                            fcntl.flock(out_fd, fcntl.LOCK_UN)
-                        except OSError:
-                            pass
+                    try:
+                        fcntl.flock(out_fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
             finally:
                 os.close(out_fd)
         finally:
@@ -2872,6 +2987,7 @@ def collect_qemu_log(
     expected_uuid=None,
     session=False,
     run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2896,13 +3012,16 @@ def collect_qemu_log(
         root_path=root_path,
     )
     try:
-        if run_token is not None:
-            fcntl.flock(out_fd, fcntl.LOCK_EX)
+        fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
-            if run_token is not None:
-                _verify_expected_run_token(
-                    out_fd, out_path, run_token, _evidence_owner_uids(session)
-                )
+            _verify_expected_run_token(
+                out_fd,
+                out_path,
+                run_token,
+                _evidence_owner_uids(session),
+                run_owner=run_owner,
+                reject_unfenced_if_initialized=True,
+            )
             _publish_evidence_stream(
                 out_fd,
                 dest_name,
@@ -2910,11 +3029,10 @@ def collect_qemu_log(
                 mode=0o600 if session else 0o644,
             )
         finally:
-            if run_token is not None:
-                try:
-                    fcntl.flock(out_fd, fcntl.LOCK_UN)
-                except OSError:
-                    pass
+            try:
+                fcntl.flock(out_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
     finally:
         os.close(out_fd)
     return True
@@ -2927,6 +3045,7 @@ def collect_serial_log_session(
     dest_name="serial.log",
     *,
     run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2969,13 +3088,16 @@ def collect_serial_log_session(
                     root_path=root_path,
                 )
                 try:
-                    if run_token is not None:
-                        fcntl.flock(out_fd, fcntl.LOCK_EX)
+                    fcntl.flock(out_fd, fcntl.LOCK_EX)
                     try:
-                        if run_token is not None:
-                            _verify_expected_run_token(
-                                out_fd, out_path, run_token, _evidence_owner_uids(True)
-                            )
+                        _verify_expected_run_token(
+                            out_fd,
+                            out_path,
+                            run_token,
+                            _evidence_owner_uids(True),
+                            run_owner=run_owner,
+                            reject_unfenced_if_initialized=True,
+                        )
                         _publish_evidence_stream(
                             out_fd,
                             dest_name,
@@ -2983,11 +3105,10 @@ def collect_serial_log_session(
                             mode=0o600,
                         )
                     finally:
-                        if run_token is not None:
-                            try:
-                                fcntl.flock(out_fd, fcntl.LOCK_UN)
-                            except OSError:
-                                pass
+                        try:
+                            fcntl.flock(out_fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
                 finally:
                     os.close(out_fd)
             finally:
@@ -3338,9 +3459,11 @@ def main(argv):
         elif op in ("prepare-evidence-dir", "prepare-session-evidence-dir"):
             is_session = op == "prepare-session-evidence-dir"
             init_run = len(argv) > 2 and argv[2] == "init-run"
+            run_owner = argv[3] if len(argv) > 3 and argv[3] else None
             run_token = prepare_evidence_dir(
                 argv[1],
                 init_run=init_run,
+                run_owner=run_owner,
                 session=is_session,
                 root_fd=root_fd,
                 root_path=root_path,
@@ -3359,6 +3482,7 @@ def main(argv):
             is_session = op == "publish-session-evidence-stdin"
             subdir = argv[3] if len(argv) > 3 and argv[3] else None
             run_token = argv[4] if len(argv) > 4 and argv[4] else None
+            run_owner = argv[5] if len(argv) > 5 and argv[5] else None
             data = sys.stdin.buffer.read()
             publish_evidence_bytes(
                 argv[1],
@@ -3367,6 +3491,7 @@ def main(argv):
                 subdir=subdir,
                 session=is_session,
                 run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -3461,6 +3586,7 @@ def main(argv):
         elif op == "collect-serial-log":
             expected_dir_id = argv[5] if len(argv) > 5 and argv[5] else None
             run_token = argv[6] if len(argv) > 6 and argv[6] else None
+            run_owner = argv[7] if len(argv) > 7 and argv[7] else None
             collect_serial_log(
                 argv[1],
                 argv[2],
@@ -3468,17 +3594,20 @@ def main(argv):
                 argv[4] if len(argv) > 4 else "serial.log",
                 expected_dir_id=expected_dir_id,
                 run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )
         elif op == "collect-serial-log-session":
             run_token = argv[5] if len(argv) > 5 and argv[5] else None
+            run_owner = argv[6] if len(argv) > 6 and argv[6] else None
             collect_serial_log_session(
                 argv[1],
                 argv[2],
                 argv[3],
                 argv[4] if len(argv) > 4 else "serial.log",
                 run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -3506,6 +3635,7 @@ def main(argv):
             cursor = (argv[4], int(argv[5]), int(argv[6]), int(argv[7]))
             expected_uuid = argv[8] if len(argv) > 8 and argv[8] else None
             run_token = argv[9] if len(argv) > 9 and argv[9] else None
+            run_owner = argv[10] if len(argv) > 10 and argv[10] else None
             collect_qemu_log(
                 argv[1],
                 argv[2],
@@ -3514,6 +3644,7 @@ def main(argv):
                 expected_uuid=expected_uuid,
                 session=is_session,
                 run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )

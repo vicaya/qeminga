@@ -6652,11 +6652,20 @@ ensure_owned_service_disabled() {
     esac
 }
 
+# Remove a recorded or live staging directory only with positive
+# `.qeminga-tx-id` transaction ownership (`--require-tx`); an absent stage
+# already succeeds. Never enables `allow_empty_missing_tx` so an unrelated
+# empty directory reusing a freed stage inode is never removed automatically.
+_prune_verified_stage_dir() {
+    local stage_dir="$1" stage_id="$2"
+    fs_ops safe-rmtree-id "$stage_dir" "$stage_id" --require-tx
+}
+
 # Shared recovery helper: validate recorded stage/backup paths (and volumes in
 # uninstall mode), durably persist `$pre_phase` while the containers still
-# exist on disk, prune verified stage and/or backup containers via
-# `safe-rmtree-id`, and then durably persist `$post_state` / `$post_phase` with
-# empty container fields. Any pre-prune journal write failure leaves the
+# exist on disk, prune verified stage (`--require-tx`) and/or backup containers
+# via `safe-rmtree-id`, and then durably persist `$post_state` / `$post_phase`
+# with empty container fields. Any pre-prune journal write failure leaves the
 # containers and journal as a consistent recoverable pair.
 _sync_and_prune_update_containers() {
     local mode="$1" rec_path="$2" pre_phase="$3" post_state="$4" post_phase="$5" was_active="$6"
@@ -6678,13 +6687,8 @@ _sync_and_prune_update_containers() {
             "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
     fi
     if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-        if [ "$pre_phase" = "restored" ]; then
-            fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" --require-tx \
-                || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
-        else
-            fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-                || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
-        fi
+        _prune_verified_stage_dir "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+            || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
         REC_UPDATE_STAGE_DIR=""
         REC_UPDATE_STAGE_ID=""
     fi
@@ -6782,7 +6786,7 @@ _rollback_runner_package_tx() {
                                     sync_stage_id=""
                                     ;;
                                 match)
-                                    if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id" --require-tx; then
+                                    if _prune_verified_stage_dir "$sync_stage_dir" "$sync_stage_id"; then
                                         sync_stage_dir=""
                                         sync_stage_id=""
                                     else
@@ -6925,7 +6929,7 @@ cleanup_install_exit() {
             local prep_clean=1
             if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
                 if [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
-                    if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
+                    if ! _prune_verified_stage_dir "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
                         warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
                         prep_clean=0
                     fi
@@ -6970,7 +6974,7 @@ cleanup_install_exit() {
             local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
                 if [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
-                    if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID" --require-tx; then
+                    if ! _prune_verified_stage_dir "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
                         warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
                         stage_remaining_dir="$_INSTALL_BOOTSTRAP_STAGE"
                         stage_remaining_id="$_INSTALL_BOOTSTRAP_STAGE_ID"
@@ -7012,7 +7016,7 @@ cleanup_install_exit() {
             elif [ "$st_rc" -ne 1 ]; then
                 warn "unable to read journal '$_INSTALL_REINSTALL_RECORD_PATH'; preserving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual recovery"
             elif [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
-                if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
+                if ! _prune_verified_stage_dir "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
                     warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
                 fi
             else
@@ -8096,7 +8100,7 @@ cleanup_update_exit() {
             local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_UPDATE_TMP_STAGE:-}" ]; then
                 if [ -n "${_UPDATE_TMP_STAGE_ID:-}" ]; then
-                    if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID" --require-tx; then
+                    if ! _prune_verified_stage_dir "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
                         warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection because its identity or backing volume changed"
                         stage_remaining_dir="$_UPDATE_TMP_STAGE"
                         stage_remaining_id="$_UPDATE_TMP_STAGE_ID"
@@ -8130,7 +8134,7 @@ cleanup_update_exit() {
             elif [ "$st_rc" -ne 1 ]; then
                 warn "unable to read journal '$_UPDATE_RECORD_PATH'; preserving update staging directory '$_UPDATE_TMP_STAGE' for manual recovery"
             elif [ -n "${_UPDATE_TMP_STAGE_ID:-}" ]; then
-                if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
+                if ! _prune_verified_stage_dir "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
                     warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection because its identity or backing volume changed"
                 fi
             else
@@ -8244,7 +8248,7 @@ cmd_update() {
             if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                 validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
                 say "reclaiming leftover stage directory from interrupted update (${REC_UPDATE_STAGE_DIR})"
-                fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                _prune_verified_stage_dir "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                     || die "update: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
                 REC_UPDATE_STAGE_DIR=""
                 REC_UPDATE_STAGE_ID=""
@@ -9071,7 +9075,7 @@ cmd_uninstall() {
                 if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
                     validate_update_stage_path "$OPT_INSTALL_DIR" "$REC_UPDATE_STAGE_DIR"
                     verify_resource_volume install "update stage directory" "$REC_UPDATE_STAGE_DIR"
-                    fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                    _prune_verified_stage_dir "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                         || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
                     REC_UPDATE_STAGE_DIR=""
                     REC_UPDATE_STAGE_ID=""
@@ -9102,7 +9106,7 @@ cmd_uninstall() {
                     write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" \
                         "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                         "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$REC_UPDATE_WAS_ACTIVE"
-                    fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                    _prune_verified_stage_dir "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
                         || die "uninstall: failed to reclaim interrupted update stage '$REC_UPDATE_STAGE_DIR'; preserving $OPT_CONFIG_DIR/install.env for retry"
                     REC_UPDATE_STAGE_DIR=""
                     REC_UPDATE_STAGE_ID=""

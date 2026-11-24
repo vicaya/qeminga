@@ -5408,14 +5408,13 @@ fn system_mode_cleanup_detects_persistence_with_large_domain_lists_and_handles_t
     // 2. `domain_state` absence check with 5,001 UUIDs where the queried UUID is FIRST:
     //    `domstate` returns "Domain not found" while `list --all --uuid` still includes it ->
     //    `domain_state` MUST fail (return non-zero), NEVER misreport `absent` due to SIGPIPE!
+    let _ = std::fs::remove_file(&fx.virsh_log);
     let ds_probe = Command::new("bash")
         .args([
             "-c",
             r#"
 set -euo pipefail
-source_script="$1"
-# Source only the helpers up to the subcommand dispatch guard.
-eval "$(sed '/^# ---- dispatch/,$d' "$source_script")"
+source "$1"
 domain_state "$2"
 "#,
             "_",
@@ -5434,6 +5433,49 @@ domain_state "$2"
             ),
         )
         .env("QEMINGA_E2E_CONNECT", "qemu:///system")
+        .env("FAKE_VIRSH_LOG", &fx.virsh_log)
+        .env("FAKE_DOM_STATE_FILE", &fx.dom_state_file)
+        .env("FAKE_DOM_UUID", dom_uuid)
+        .env("FAKE_DOMSTATE_NOT_FOUND", "1")
+        .env("FAKE_EXTRA_LIST_UUIDS_FILE", &extra_uuids_file)
+        .output()
+        .unwrap();
+    let ds_vlog = std::fs::read_to_string(&fx.virsh_log).unwrap_or_default();
+    assert!(
+        !ds_probe.status.success()
+            && ds_probe.stdout.is_empty()
+            && ds_probe.stderr.is_empty()
+            && ds_vlog.contains(&format!("domstate {dom_uuid}"))
+            && ds_vlog.contains("list --all --uuid"),
+        "domain_state MUST execute cleanly and fail (not report `absent` or script error) when UUID is first in 5,001-UUID list (virsh_log:\n{ds_vlog}): {}",
+        text(&ds_probe)
+    );
+    // Positive control: a genuinely unlisted UUID returns 0 and prints `absent`.
+    let absent_uuid = "99999999-8888-7777-6666-555555555555";
+    let ds_absent = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+domain_state "$2"
+"#,
+            "_",
+            root()
+                .join("scripts/ci/libvirt-kvm-smoke.sh")
+                .to_str()
+                .unwrap(),
+            absent_uuid,
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                fx.bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .env("QEMINGA_E2E_CONNECT", "qemu:///system")
         .env("FAKE_DOM_STATE_FILE", &fx.dom_state_file)
         .env("FAKE_DOM_UUID", dom_uuid)
         .env("FAKE_DOMSTATE_NOT_FOUND", "1")
@@ -5441,9 +5483,9 @@ domain_state "$2"
         .output()
         .unwrap();
     assert!(
-        !ds_probe.status.success() && !String::from_utf8_lossy(&ds_probe.stdout).contains("absent"),
-        "domain_state MUST NOT misreport `absent` via SIGPIPE on a 5,000-UUID list: {}",
-        text(&ds_probe)
+        ds_absent.status.success() && String::from_utf8_lossy(&ds_absent.stdout).trim() == "absent",
+        "domain_state positive control for genuinely absent UUID must succeed with `absent`: {}",
+        text(&ds_absent)
     );
 
     // 3. Transient domain where `dumpxml --inactive` STILL SUCCEEDS (Libvirt 10 behavior):
@@ -6026,9 +6068,13 @@ fn session_mode_captures_uuid_for_rotated_logs_and_atomically_replaces_domain_xm
 
     // Direct `prove_kvm` in session mode MUST ALSO fail closed when cursor is empty or
     // python3 is unavailable, NEVER falling back to reading the entire historical log.
-    for (probe_label, cursor_arg) in [
-        ("empty_cursor", ""),
-        ("present_cursor_no_python3", "present\t1\t2\t0"),
+    for (probe_label, cursor_arg, expected_diag) in [
+        ("empty_cursor", "", "missing QEMU log cursor"),
+        (
+            "present_cursor_no_python3",
+            "present\t1\t2\t0",
+            "current-run QEMU log evidence unavailable (python3 missing)",
+        ),
     ] {
         let prove_out = Command::new("/usr/bin/env")
             .args([
@@ -6044,7 +6090,7 @@ fn session_mode_captures_uuid_for_rotated_logs_and_atomically_replaces_domain_xm
                 &format!("FAKE_DUMPXML_CONTENT={nopy_run_xml}"),
                 "bash",
                 "-c",
-                r#"set -euo pipefail; eval "$(sed '/^# ---- dispatch/,$d' "$1")"; prove_kvm "$2" "$3" "$4""#,
+                r#"set -euo pipefail; source "$1"; prove_kvm "$2" "$3" "$4""#,
                 "_",
                 root()
                     .join("scripts/ci/libvirt-kvm-smoke.sh")
@@ -6056,10 +6102,12 @@ fn session_mode_captures_uuid_for_rotated_logs_and_atomically_replaces_domain_xm
             ])
             .output()
             .unwrap();
+        let prove_txt = text(&prove_out);
         assert!(
-            !prove_out.status.success(),
-            "session prove_kvm ({probe_label}) MUST fail closed rather than reading historical qemu.log:\n{}",
-            text(&prove_out)
+            !prove_out.status.success()
+                && prove_txt.contains("info kvm: kvm support: enabled")
+                && prove_txt.contains(expected_diag),
+            "session prove_kvm ({probe_label}) MUST reach prove_kvm and fail closed with `{expected_diag}` rather than reading historical qemu.log:\n{prove_txt}"
         );
     }
 }

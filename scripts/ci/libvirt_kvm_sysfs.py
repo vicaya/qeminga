@@ -42,6 +42,7 @@ ALLOWED_EVIDENCE_FILES = frozenset(
         "result.json",
         "versions.txt",
         "e2e-libvirt.log",
+        "e2e-libvirt.fallback.log",
         "cleanup.txt",
     }
 )
@@ -53,6 +54,8 @@ ALLOWED_TEST_FILES = frozenset(
         "agent_shutdown",
     }
 )
+RUN_TOKEN_NAME = ".run-token"
+RUN_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # Dedicated exit codes for evidence read/verification ops so callers can
 # distinguish confirmed missing/unsafe/invalid evidence from indeterminate
@@ -1181,12 +1184,67 @@ def verify_evidence_dir(out_dir, *, session=False, root_fd=None, root_path="/"):
     os.close(out_fd)
 
 
+def _verify_expected_run_token(
+    out_fd,
+    out_path,
+    run_token,
+    owner_uids,
+    *,
+    reject_unfenced_if_initialized=False,
+):
+    """Verify per-attempt ``.run-token`` inside an already-locked ``out_fd``.
+
+    When ``run_token`` is supplied, ``.run-token`` must exist as a verified
+    regular single-link file matching ``run_token`` (else raises ``ESTALE``).
+    When ``run_token`` is ``None`` and ``reject_unfenced_if_initialized`` is
+    ``True``, any existing ``.run-token`` refuses the unfenced write with
+    ``ESTALE`` so a delayed or unfenced marker writer cannot pollute a live
+    fenced run attempt.
+    """
+    if run_token is not None:
+        if not isinstance(run_token, str) or not RUN_TOKEN_RE.fullmatch(run_token):
+            raise OSError(errno.EINVAL, f"invalid run attempt token '{run_token}'")
+        try:
+            raw = _read_evidence_bytes_from_open_dir(
+                out_fd,
+                out_path,
+                RUN_TOKEN_NAME,
+                bound=MAX_TEST_MARKER_BYTES,
+                owner_uids=owner_uids,
+            )
+        except (EvidenceMissingError, EvidenceUnsafeError):
+            raise OSError(
+                errno.ESTALE,
+                f"evidence directory '{out_path}' run token is missing or invalid; "
+                "refusing stale attempt write",
+            )
+        actual = re.sub(rb"[ \t\r\n\v\f]+", b"", raw).decode("ascii", errors="replace")
+        if actual != run_token:
+            raise OSError(
+                errno.ESTALE,
+                f"evidence directory '{out_path}' was reset by another run attempt; "
+                "refusing stale write",
+            )
+        return
+    if reject_unfenced_if_initialized:
+        try:
+            os.lstat(RUN_TOKEN_NAME, dir_fd=out_fd)
+        except FileNotFoundError:
+            return
+        raise OSError(
+            errno.ESTALE,
+            f"evidence directory '{out_path}' is bound to an active run attempt; "
+            "refusing unfenced test marker write",
+        )
+
+
 def prepare_evidence_dir(
     out_dir, *, init_run=False, session=False, root_fd=None, root_path="/"
 ):
-    """Validate/create a trusted evidence directory; optionally reset known run outputs."""
+    """Validate/create a trusted evidence directory; optionally reset outputs and rotate ``.run-token``."""
     owner_uids = _evidence_owner_uids(session)
     dir_mode = 0o700 if session else 0o755
+    file_mode = 0o600 if session else 0o644
     out_fd, out_path = _open_verified_evidence_dir(
         out_dir,
         create_missing=True,
@@ -1226,11 +1284,20 @@ def prepare_evidence_dir(
                             pass
                 finally:
                     os.close(tests_fd)
+                run_token = os.urandom(16).hex()
+                _publish_evidence_stream(
+                    out_fd,
+                    RUN_TOKEN_NAME,
+                    lambda fd: _write_all_fd(fd, (run_token + "\n").encode("ascii")),
+                    mode=file_mode,
+                )
+                return run_token
             finally:
                 try:
                     fcntl.flock(out_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
+        return None
     finally:
         os.close(out_fd)
 
@@ -1242,6 +1309,7 @@ def publish_evidence_bytes(
     *,
     subdir=None,
     session=False,
+    run_token=None,
     root_fd=None,
     root_path="/",
 ):
@@ -1265,10 +1333,22 @@ def publish_evidence_bytes(
         root_path=root_path,
     )
     try:
-        lock_out = subdir == "tests" or (subdir is None and dest_name == "result.json")
+        lock_out = (
+            subdir == "tests"
+            or run_token is not None
+            or (subdir is None and dest_name == "result.json")
+        )
         if lock_out:
             fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
+            if lock_out:
+                _verify_expected_run_token(
+                    out_fd,
+                    out_path,
+                    run_token,
+                    owner_uids,
+                    reject_unfenced_if_initialized=(subdir == "tests"),
+                )
             if subdir is not None:
                 out_st = os.fstat(out_fd)
                 out_mnt = fd_mnt_id(out_fd)
@@ -1654,18 +1734,18 @@ def validate_result_bytes(
     )
 
 
-def build_fallback_result_bytes(spec, no_digest):
-    """Build the canonical all-not_run failure ``result.json`` payload."""
+def _build_result_bytes(spec, *, digest, accel, tests, result):
+    """Build a canonical ``libvirt-kvm-smoke-v1`` ``result.json`` payload."""
     doc = {
         "schema": 1,
         "suite": spec["suite"],
         "source_repository": spec["source_repository"],
         "source_sha": spec["source_sha"],
         "architecture": spec["arch"],
-        "candidate_binary_sha256": no_digest,
+        "candidate_binary_sha256": digest,
         "virtualization": {
             "hypervisor": "qemu",
-            "accelerator": "unknown",
+            "accelerator": accel,
             "machine": spec["machine"],
         },
         "guest": {
@@ -1673,10 +1753,43 @@ def build_fallback_result_bytes(spec, no_digest):
             "image_release": spec["image_release"],
             "image_sha256": spec["image_sha"],
         },
-        "tests": {key: "not_run" for key in spec["mandatory_tests"]},
-        "result": "fail",
+        "tests": tests,
+        "result": result,
     }
     return (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+
+
+def build_fallback_result_bytes(spec, no_digest):
+    """Build the canonical all-not_run failure ``result.json`` payload."""
+    return _build_result_bytes(
+        spec,
+        digest=no_digest,
+        accel="unknown",
+        tests={key: "not_run" for key in spec["mandatory_tests"]},
+        result="fail",
+    )
+
+
+def _raise_result_invalid_error(data, spec, out_dir):
+    expect = spec.get("expect_sha256")
+    has_valid_expect = isinstance(expect, str) and bool(SHA256_RE.fullmatch(expect))
+    if not has_valid_expect:
+        try:
+            obj = json.loads(
+                data.decode("utf-8"), parse_constant=_reject_json_constant
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
+            obj = None
+        if isinstance(obj, dict) and obj.get("result") == "pass":
+            raise EvidenceInvalidError(
+                errno.EINVAL,
+                f"passing result.json in '{out_dir}' requires --expect-sha256 "
+                "(omission supports failure reports only)",
+            )
+    raise EvidenceInvalidError(
+        errno.EINVAL,
+        f"result.json in '{out_dir}' is malformed or does not match run binding",
+    )
 
 
 def verify_result_file(
@@ -1697,10 +1810,7 @@ def verify_result_file(
         root_path=root_path,
     )
     if not validate_result_bytes(data, **spec, require_pass=require_pass):
-        raise EvidenceInvalidError(
-            errno.EINVAL,
-            f"result.json in '{out_dir}' is malformed or does not match run binding",
-        )
+        _raise_result_invalid_error(data, spec, out_dir)
     return True
 
 
@@ -1831,6 +1941,7 @@ def write_result_file(
     *,
     all_not_run=False,
     session=False,
+    run_token=None,
     root_fd=None,
     root_path="/",
 ):
@@ -1840,7 +1951,9 @@ def write_result_file(
     publication serializes ``write-result`` against ``prepare_evidence_dir(...,
     init_run=True)``, ``mark`` (``publish_evidence_bytes(..., subdir="tests")``),
     ``ensure_result_file``, and ``stage_evidence_dir`` so an overlapping reset
-    can never leave a passing report synthesized from previous markers.
+    can never leave a passing report synthesized from previous markers. When
+    ``run_token`` is supplied, ``.run-token`` must still match it (else
+    ``ESTALE``) so a delayed run attempt cannot publish after a reset.
 
     Returns ``(payload_bytes, overall_passed)``.
     """
@@ -1865,6 +1978,7 @@ def write_result_file(
     try:
         fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
+            _verify_expected_run_token(out_fd, out_path, run_token, owner_uids)
             tests = {}
             overall = "pass"
             for name in mandatory_tests:
@@ -1894,27 +2008,13 @@ def write_result_file(
                 tests[name] = status
             if accel != "kvm":
                 overall = "fail"
-            doc = {
-                "schema": 1,
-                "suite": spec["suite"],
-                "source_repository": spec["source_repository"],
-                "source_sha": spec["source_sha"],
-                "architecture": spec["arch"],
-                "candidate_binary_sha256": digest,
-                "virtualization": {
-                    "hypervisor": "qemu",
-                    "accelerator": accel,
-                    "machine": spec["machine"],
-                },
-                "guest": {
-                    "image": spec["image"],
-                    "image_release": spec["image_release"],
-                    "image_sha256": spec["image_sha"],
-                },
-                "tests": tests,
-                "result": overall,
-            }
-            payload = (json.dumps(doc, indent=2) + "\n").encode("utf-8")
+            payload = _build_result_bytes(
+                spec,
+                digest=digest,
+                accel=accel,
+                tests=tests,
+                result=overall,
+            )
             _publish_evidence_stream(
                 out_fd,
                 "result.json",
@@ -1943,6 +2043,8 @@ def _write_stage_file(dir_fd, name, data, mode=0o600):
         remove_xattr_if_present(fd, b"system.posix_acl_access")
         os.fchmod(fd, mode)
         os.fsync(fd)
+        fst = os.fstat(fd)
+        return (fst.st_dev, fst.st_ino)
     finally:
         os.close(fd)
 
@@ -2005,12 +2107,17 @@ def stage_evidence_dir(
     """Copy ONLY verified allowlisted regular files from ``out_dir`` into a fresh ``0700`` ``stage_dir``.
 
     Requires ``out_dir`` to be verified and ``result.json`` to exist, pass
-    regular single-link verification, and match ``spec``. Optional allowlisted
-    logs and ``tests/*`` markers that are unsafe (e.g. symlinked or oversized)
-    are skipped with a stderr warning so a valid structured failure report can
-    still be published; any non-allowlisted files, symlinks, or subdirectories
-    under ``out_dir`` are ignored completely. Fails with ``EEXIST`` if
-    ``stage_dir`` already exists (published atomically via ``renameat2_noreplace``).
+    regular single-link verification, and match ``spec`` (passing reports
+    additionally require ``--expect-sha256`` and a verified non-empty
+    ``e2e-libvirt.log`` AC16 transcript). Optional allowlisted diagnostics and
+    ``tests/*`` markers that are unsafe or unreadable (e.g. symlinked,
+    oversized, or write-only ``0200``) are skipped with a stderr warning so a
+    valid structured failure report can still be published; any non-allowlisted
+    files, symlinks, or subdirectories under ``out_dir`` are ignored completely.
+    Keeps the original staging directory descriptor and identity through both
+    atomic ``renameat2_noreplace`` publication and error cleanup (removing only
+    entries created by this invocation and stopping on any name, inode, or
+    mount mismatch).
     """
     _reject_dot_segments(out_dir, "evidence directory")
     _reject_dot_segments(stage_dir, "evidence staging directory")
@@ -2040,10 +2147,28 @@ def stage_evidence_dir(
                 owner_uids=owner_uids,
             )
             if not validate_result_bytes(result_data, **spec, require_pass=False):
-                raise EvidenceInvalidError(
-                    errno.EINVAL,
-                    f"result.json in '{out_dir}' is malformed or does not match run binding",
+                _raise_result_invalid_error(result_data, spec, out_dir)
+            result_doc = json.loads(
+                result_data.decode("utf-8"), parse_constant=_reject_json_constant
+            )
+            is_pass = result_doc.get("result") == "pass"
+
+            # Passing verdicts certify AC16 interop and therefore REQUIRE a
+            # verified non-empty `e2e-libvirt.log` transcript before staging.
+            required_ac16 = None
+            if is_pass:
+                required_ac16 = _read_evidence_bytes_from_open_dir(
+                    out_fd,
+                    out_path,
+                    "e2e-libvirt.log",
+                    bound=MAX_EVIDENCE_STAGE_BYTES,
+                    owner_uids=owner_uids,
                 )
+                if not required_ac16.strip():
+                    raise EvidenceInvalidError(
+                        errno.EINVAL,
+                        f"passing result.json in '{out_dir}' requires non-empty verified 'e2e-libvirt.log'",
+                    )
 
             parent_fd, parent_path, stage_base = _open_verified_stage_parent(
                 stage_dir,
@@ -2052,6 +2177,8 @@ def stage_evidence_dir(
                 root_path=root_path,
             )
             try:
+                parent_st = os.fstat(parent_fd)
+                parent_mnt = fd_mnt_id(parent_fd)
                 resolved_stage = os.path.join(parent_path, stage_base)
                 if resolved_stage == out_path or resolved_stage.startswith(out_prefix):
                     raise EvidenceDirUnsafeError(
@@ -2071,16 +2198,61 @@ def stage_evidence_dir(
                 tmp_stage = f".qeminga-stage.{os.urandom(8).hex()}"
                 os.mkdir(tmp_stage, 0o700, dir_fd=parent_fd)
                 published = False
+                tmp_verified = False
                 tmp_fd = None
+                tmp_st = None
+                tmp_mnt = None
+                st_tests_fd = None
+                st_tests_st = None
+                created_files = []
+                created_tests_files = []
                 try:
                     tmp_fd = os.open(tmp_stage, READ_DIR_FLAGS, dir_fd=parent_fd)
+                    tmp_st = os.fstat(tmp_fd)
+                    tmp_mnt = fd_mnt_id(tmp_fd)
+                    if tmp_st.st_dev != parent_st.st_dev or tmp_mnt != parent_mnt:
+                        raise OSError(
+                            errno.EXDEV,
+                            f"staging directory '{os.path.join(parent_path, tmp_stage)}' "
+                            "crossed mount boundary",
+                        )
+                    init_lst = os.lstat(tmp_stage, dir_fd=parent_fd)
+                    if (init_lst.st_dev, init_lst.st_ino) != (
+                        tmp_st.st_dev,
+                        tmp_st.st_ino,
+                    ):
+                        raise OSError(
+                            errno.EXDEV,
+                            f"staging directory '{os.path.join(parent_path, tmp_stage)}' "
+                            "changed during creation",
+                        )
+                    tmp_verified = True
                     remove_xattr_if_present(tmp_fd, b"system.posix_acl_default")
                     remove_xattr_if_present(tmp_fd, b"system.posix_acl_access")
                     os.fchmod(tmp_fd, 0o700)
 
-                    _write_stage_file(tmp_fd, "result.json", result_data, mode=0o600)
+                    created_files.append(
+                        (
+                            "result.json",
+                            _write_stage_file(tmp_fd, "result.json", result_data, mode=0o600),
+                        )
+                    )
+                    if required_ac16 is not None:
+                        created_files.append(
+                            (
+                                "e2e-libvirt.log",
+                                _write_stage_file(
+                                    tmp_fd, "e2e-libvirt.log", required_ac16, mode=0o600
+                                ),
+                            )
+                        )
 
-                    for name in sorted(ALLOWED_EVIDENCE_FILES - {"result.json"}):
+                    skip_names = (
+                        {"result.json", "e2e-libvirt.log"}
+                        if required_ac16 is not None
+                        else {"result.json"}
+                    )
+                    for name in sorted(ALLOWED_EVIDENCE_FILES - skip_names):
                         try:
                             data = _read_evidence_bytes_from_open_dir(
                                 out_fd,
@@ -2091,13 +2263,15 @@ def stage_evidence_dir(
                             )
                         except EvidenceMissingError:
                             continue
-                        except EvidenceUnsafeError as exc:
+                        except (EvidenceUnsafeError, PermissionError) as exc:
                             msg = exc.strerror if exc.strerror else str(exc)
                             sys.stderr.write(
-                                f"libvirt-kvm-smoke: skipping unsafe optional evidence file '{name}': {msg}\n"
+                                f"libvirt-kvm-smoke: skipping unreadable or unsafe optional evidence file '{name}': {msg}\n"
                             )
                             continue
-                        _write_stage_file(tmp_fd, name, data, mode=0o600)
+                        created_files.append(
+                            (name, _write_stage_file(tmp_fd, name, data, mode=0o600))
+                        )
 
                     staged_markers = []
                     for tname in sorted(ALLOWED_TEST_FILES):
@@ -2112,10 +2286,10 @@ def stage_evidence_dir(
                             )
                         except EvidenceMissingError:
                             continue
-                        except EvidenceUnsafeError as exc:
+                        except (EvidenceUnsafeError, PermissionError) as exc:
                             msg = exc.strerror if exc.strerror else str(exc)
                             sys.stderr.write(
-                                f"libvirt-kvm-smoke: skipping unsafe optional test marker 'tests/{tname}': {msg}\n"
+                                f"libvirt-kvm-smoke: skipping unreadable or unsafe optional test marker 'tests/{tname}': {msg}\n"
                             )
                             continue
                         staged_markers.append((tname, mdata))
@@ -2123,45 +2297,146 @@ def stage_evidence_dir(
                     if staged_markers:
                         os.mkdir("tests", 0o700, dir_fd=tmp_fd)
                         st_tests_fd = os.open("tests", READ_DIR_FLAGS, dir_fd=tmp_fd)
-                        try:
-                            remove_xattr_if_present(
-                                st_tests_fd, b"system.posix_acl_default"
+                        st_tests_st = os.fstat(st_tests_fd)
+                        if (
+                            st_tests_st.st_dev != tmp_st.st_dev
+                            or fd_mnt_id(st_tests_fd) != tmp_mnt
+                        ):
+                            raise OSError(
+                                errno.EXDEV,
+                                f"staging tests subdirectory '{os.path.join(parent_path, tmp_stage, 'tests')}' "
+                                "crossed mount boundary",
                             )
-                            remove_xattr_if_present(
-                                st_tests_fd, b"system.posix_acl_access"
+                        remove_xattr_if_present(
+                            st_tests_fd, b"system.posix_acl_default"
+                        )
+                        remove_xattr_if_present(
+                            st_tests_fd, b"system.posix_acl_access"
+                        )
+                        os.fchmod(st_tests_fd, 0o700)
+                        for tname, mdata in staged_markers:
+                            created_tests_files.append(
+                                (
+                                    tname,
+                                    _write_stage_file(
+                                        st_tests_fd, tname, mdata, mode=0o600
+                                    ),
+                                )
                             )
-                            os.fchmod(st_tests_fd, 0o700)
-                            for tname, mdata in staged_markers:
-                                _write_stage_file(st_tests_fd, tname, mdata, mode=0o600)
-                            os.fsync(st_tests_fd)
-                        finally:
-                            os.close(st_tests_fd)
+                        os.fsync(st_tests_fd)
 
                     os.fsync(tmp_fd)
-                    os.close(tmp_fd)
-                    tmp_fd = None
+
+                    # Keep original `tmp_fd` (and `st_tests_fd`) open through
+                    # publication and verify name, inode, and mount identity
+                    # before calling `renameat2_noreplace`.
+                    cur_parent_st = os.fstat(parent_fd)
+                    if (
+                        cur_parent_st.st_dev != parent_st.st_dev
+                        or fd_mnt_id(parent_fd) != parent_mnt
+                    ):
+                        raise OSError(
+                            errno.EXDEV,
+                            f"staging parent directory '{parent_path}' mount changed before publication",
+                        )
+                    cur_tmp_st = os.fstat(tmp_fd)
+                    if (
+                        (cur_tmp_st.st_dev, cur_tmp_st.st_ino)
+                        != (tmp_st.st_dev, tmp_st.st_ino)
+                        or fd_mnt_id(tmp_fd) != tmp_mnt
+                    ):
+                        raise OSError(
+                            errno.EXDEV,
+                            f"staging directory '{os.path.join(parent_path, tmp_stage)}' "
+                            "identity changed before publication",
+                        )
+                    cur_lst = os.lstat(tmp_stage, dir_fd=parent_fd)
+                    if (cur_lst.st_dev, cur_lst.st_ino) != (
+                        tmp_st.st_dev,
+                        tmp_st.st_ino,
+                    ):
+                        raise OSError(
+                            errno.EXDEV,
+                            f"staging directory '{os.path.join(parent_path, tmp_stage)}' "
+                            "was replaced before publication",
+                        )
+                    if st_tests_fd is not None and st_tests_st is not None:
+                        cur_t_lst = os.lstat("tests", dir_fd=tmp_fd)
+                        if (
+                            (cur_t_lst.st_dev, cur_t_lst.st_ino)
+                            != (st_tests_st.st_dev, st_tests_st.st_ino)
+                            or fd_mnt_id(st_tests_fd) != tmp_mnt
+                        ):
+                            raise OSError(
+                                errno.EXDEV,
+                                "staging tests subdirectory identity changed before publication",
+                            )
+
                     renameat2_noreplace(parent_fd, tmp_stage, parent_fd, stage_base)
                     published = True
                     os.fsync(parent_fd)
                 finally:
-                    if tmp_fd is not None:
-                        os.close(tmp_fd)
-                    if not published:
-                        try:
-                            cfd = os.open(tmp_stage, READ_DIR_FLAGS, dir_fd=parent_fd)
+                    try:
+                        if (
+                            not published
+                            and tmp_verified
+                            and tmp_fd is not None
+                            and tmp_st is not None
+                        ):
                             try:
-                                cst = os.fstat(cfd)
-                                rmtree_same_mount(
-                                    cfd,
-                                    cst.st_dev,
-                                    fd_mnt_id(cfd),
-                                    os.path.join(parent_path, tmp_stage),
-                                )
-                            finally:
-                                os.close(cfd)
-                            os.rmdir(tmp_stage, dir_fd=parent_fd)
-                        except OSError:
-                            pass
+                                # Clean ONLY entries created by this invocation through
+                                # the original descriptors; stop on any inode or mount mismatch.
+                                cur_tmp_st = os.fstat(tmp_fd)
+                                if (
+                                    (cur_tmp_st.st_dev, cur_tmp_st.st_ino)
+                                    == (tmp_st.st_dev, tmp_st.st_ino)
+                                    and fd_mnt_id(tmp_fd) == tmp_mnt
+                                ):
+                                    if st_tests_fd is not None and st_tests_st is not None:
+                                        cur_ts = os.fstat(st_tests_fd)
+                                        cur_tlst = os.lstat("tests", dir_fd=tmp_fd)
+                                        if (
+                                            (cur_ts.st_dev, cur_ts.st_ino)
+                                            == (st_tests_st.st_dev, st_tests_st.st_ino)
+                                            and (cur_tlst.st_dev, cur_tlst.st_ino)
+                                            == (st_tests_st.st_dev, st_tests_st.st_ino)
+                                            and fd_mnt_id(st_tests_fd) == tmp_mnt
+                                        ):
+                                            for tname, exp_id in created_tests_files:
+                                                try:
+                                                    elst = os.lstat(tname, dir_fd=st_tests_fd)
+                                                    if (elst.st_dev, elst.st_ino) == exp_id:
+                                                        os.unlink(tname, dir_fd=st_tests_fd)
+                                                except FileNotFoundError:
+                                                    pass
+                                            recheck_tlst = os.lstat("tests", dir_fd=tmp_fd)
+                                            if (
+                                                recheck_tlst.st_dev,
+                                                recheck_tlst.st_ino,
+                                            ) == (st_tests_st.st_dev, st_tests_st.st_ino):
+                                                os.rmdir("tests", dir_fd=tmp_fd)
+                                    for fname, exp_id in created_files:
+                                        try:
+                                            elst = os.lstat(fname, dir_fd=tmp_fd)
+                                            if (elst.st_dev, elst.st_ino) == exp_id:
+                                                os.unlink(fname, dir_fd=tmp_fd)
+                                        except FileNotFoundError:
+                                            pass
+                                    cur_plst = os.lstat(tmp_stage, dir_fd=parent_fd)
+                                    if (
+                                        (cur_plst.st_dev, cur_plst.st_ino)
+                                        == (tmp_st.st_dev, tmp_st.st_ino)
+                                        and fd_mnt_id(parent_fd) == parent_mnt
+                                        and fd_mnt_id(tmp_fd) == tmp_mnt
+                                    ):
+                                        os.rmdir(tmp_stage, dir_fd=parent_fd)
+                            except OSError:
+                                pass
+                    finally:
+                        if st_tests_fd is not None:
+                            os.close(st_tests_fd)
+                        if tmp_fd is not None:
+                            os.close(tmp_fd)
             finally:
                 os.close(parent_fd)
         finally:
@@ -2251,6 +2526,7 @@ def collect_serial_log(
     dest_name="serial.log",
     *,
     expected_dir_id=None,
+    run_token=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2290,16 +2566,29 @@ def collect_serial_log(
                     "refusing unsafe diagnostic file 'serial.log' "
                     "(must be regular file with nlink == 1)",
                 )
-            out_fd, _ = _open_verified_evidence_dir(
+            out_fd, out_path = _open_verified_evidence_dir(
                 out_dir, create_missing=True, root_fd=root_fd, root_path=root_path
             )
             try:
-                _publish_evidence_stream(
-                    out_fd,
-                    dest_name,
-                    lambda dst: _copy_fd_to_fd(ffd, dst),
-                    mode=0o644,
-                )
+                if run_token is not None:
+                    fcntl.flock(out_fd, fcntl.LOCK_EX)
+                try:
+                    if run_token is not None:
+                        _verify_expected_run_token(
+                            out_fd, out_path, run_token, _evidence_owner_uids(False)
+                        )
+                    _publish_evidence_stream(
+                        out_fd,
+                        dest_name,
+                        lambda dst: _copy_fd_to_fd(ffd, dst),
+                        mode=0o644,
+                    )
+                finally:
+                    if run_token is not None:
+                        try:
+                            fcntl.flock(out_fd, fcntl.LOCK_UN)
+                        except OSError:
+                            pass
             finally:
                 os.close(out_fd)
         finally:
@@ -2539,6 +2828,7 @@ def collect_qemu_log(
     cursor=None,
     expected_uuid=None,
     session=False,
+    run_token=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2555,7 +2845,7 @@ def collect_qemu_log(
     )
     if not data:
         return False
-    out_fd, _ = _open_verified_evidence_dir(
+    out_fd, out_path = _open_verified_evidence_dir(
         out_dir,
         create_missing=True,
         session=session,
@@ -2563,12 +2853,25 @@ def collect_qemu_log(
         root_path=root_path,
     )
     try:
-        _publish_evidence_stream(
-            out_fd,
-            dest_name,
-            lambda dst: _write_all_fd(dst, data),
-            mode=0o600 if session else 0o644,
-        )
+        if run_token is not None:
+            fcntl.flock(out_fd, fcntl.LOCK_EX)
+        try:
+            if run_token is not None:
+                _verify_expected_run_token(
+                    out_fd, out_path, run_token, _evidence_owner_uids(session)
+                )
+            _publish_evidence_stream(
+                out_fd,
+                dest_name,
+                lambda dst: _write_all_fd(dst, data),
+                mode=0o600 if session else 0o644,
+            )
+        finally:
+            if run_token is not None:
+                try:
+                    fcntl.flock(out_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
     finally:
         os.close(out_fd)
     return True
@@ -2580,6 +2883,7 @@ def collect_serial_log_session(
     out_dir,
     dest_name="serial.log",
     *,
+    run_token=None,
     root_fd=None,
     root_path="/",
 ):
@@ -2614,7 +2918,7 @@ def collect_serial_log_session(
                         "refusing unsafe diagnostic file 'serial.log' "
                         "(must be regular file with nlink == 1)",
                     )
-                out_fd, _ = _open_verified_evidence_dir(
+                out_fd, out_path = _open_verified_evidence_dir(
                     out_dir,
                     create_missing=True,
                     session=True,
@@ -2622,12 +2926,25 @@ def collect_serial_log_session(
                     root_path=root_path,
                 )
                 try:
-                    _publish_evidence_stream(
-                        out_fd,
-                        dest_name,
-                        lambda dst: _copy_fd_to_fd(ffd, dst),
-                        mode=0o600,
-                    )
+                    if run_token is not None:
+                        fcntl.flock(out_fd, fcntl.LOCK_EX)
+                    try:
+                        if run_token is not None:
+                            _verify_expected_run_token(
+                                out_fd, out_path, run_token, _evidence_owner_uids(True)
+                            )
+                        _publish_evidence_stream(
+                            out_fd,
+                            dest_name,
+                            lambda dst: _copy_fd_to_fd(ffd, dst),
+                            mode=0o600,
+                        )
+                    finally:
+                        if run_token is not None:
+                            try:
+                                fcntl.flock(out_fd, fcntl.LOCK_UN)
+                            except OSError:
+                                pass
                 finally:
                     os.close(out_fd)
             finally:
@@ -2978,13 +3295,15 @@ def main(argv):
         elif op in ("prepare-evidence-dir", "prepare-session-evidence-dir"):
             is_session = op == "prepare-session-evidence-dir"
             init_run = len(argv) > 2 and argv[2] == "init-run"
-            prepare_evidence_dir(
+            run_token = prepare_evidence_dir(
                 argv[1],
                 init_run=init_run,
                 session=is_session,
                 root_fd=root_fd,
                 root_path=root_path,
             )
+            if run_token is not None:
+                print(run_token)
         elif op in ("verify-evidence-dir", "verify-session-evidence-dir"):
             is_session = op == "verify-session-evidence-dir"
             verify_evidence_dir(
@@ -2996,6 +3315,7 @@ def main(argv):
         elif op in ("publish-evidence-stdin", "publish-session-evidence-stdin"):
             is_session = op == "publish-session-evidence-stdin"
             subdir = argv[3] if len(argv) > 3 and argv[3] else None
+            run_token = argv[4] if len(argv) > 4 and argv[4] else None
             data = sys.stdin.buffer.read()
             publish_evidence_bytes(
                 argv[1],
@@ -3003,6 +3323,7 @@ def main(argv):
                 data,
                 subdir=subdir,
                 session=is_session,
+                run_token=run_token,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -3066,6 +3387,7 @@ def main(argv):
             digest = argv[12]
             accel = argv[13]
             all_not_run = len(argv) > 14 and argv[14] == "1"
+            run_token = argv[15] if len(argv) > 15 and argv[15] else None
             payload, passed = write_result_file(
                 argv[1],
                 spec,
@@ -3073,6 +3395,7 @@ def main(argv):
                 accel,
                 all_not_run=all_not_run,
                 session=is_session,
+                run_token=run_token,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -3094,21 +3417,25 @@ def main(argv):
             )
         elif op == "collect-serial-log":
             expected_dir_id = argv[5] if len(argv) > 5 and argv[5] else None
+            run_token = argv[6] if len(argv) > 6 and argv[6] else None
             collect_serial_log(
                 argv[1],
                 argv[2],
                 argv[3],
                 argv[4] if len(argv) > 4 else "serial.log",
                 expected_dir_id=expected_dir_id,
+                run_token=run_token,
                 root_fd=root_fd,
                 root_path=root_path,
             )
         elif op == "collect-serial-log-session":
+            run_token = argv[5] if len(argv) > 5 and argv[5] else None
             collect_serial_log_session(
                 argv[1],
                 argv[2],
                 argv[3],
                 argv[4] if len(argv) > 4 else "serial.log",
+                run_token=run_token,
                 root_fd=root_fd,
                 root_path=root_path,
             )
@@ -3135,6 +3462,7 @@ def main(argv):
             is_session = op == "collect-qemu-log-session"
             cursor = (argv[4], int(argv[5]), int(argv[6]), int(argv[7]))
             expected_uuid = argv[8] if len(argv) > 8 and argv[8] else None
+            run_token = argv[9] if len(argv) > 9 and argv[9] else None
             collect_qemu_log(
                 argv[1],
                 argv[2],
@@ -3142,6 +3470,7 @@ def main(argv):
                 cursor=cursor,
                 expected_uuid=expected_uuid,
                 session=is_session,
+                run_token=run_token,
                 root_fd=root_fd,
                 root_path=root_path,
             )

@@ -8553,7 +8553,16 @@ case "$cmd" in
     domifaddr) echo "lo ipv4 127.0.0.1/8"; exit 0 ;;
     domfsinfo) echo "/ ext4"; exit 0 ;;
     shutdown) echo "shut off" > "${FAKE_STATE_FILE:?}"; exit 0 ;;
-    domstate) cat "${FAKE_STATE_FILE:?}" 2>/dev/null || echo "shut off"; exit 0 ;;
+    undefine) rm -f "${FAKE_STATE_FILE:?}"; exit 0 ;;
+    domstate)
+        if [ -f "${FAKE_STATE_FILE:?}" ]; then
+            cat "${FAKE_STATE_FILE:?}"
+            exit 0
+        else
+            echo "error: failed to get domain '$1'" >&2
+            exit 1
+        fi
+        ;;
     *) exit 0 ;;
 esac
 "#,
@@ -8757,8 +8766,9 @@ esac
     );
     let blocked_stderr = String::from_utf8_lossy(&out_blocked.stderr);
     assert!(
-        blocked_stderr.contains("e2e-libvirt.log") && blocked_stderr.contains("retaining"),
-        "expected diagnostic noting failed e2e-libvirt.log publish and retained transcript:\n{blocked_stderr}"
+        blocked_stderr.contains("e2e-libvirt.log")
+            && blocked_stderr.contains("e2e-libvirt.fallback.log"),
+        "expected diagnostic noting failed e2e-libvirt.log publish and fallback transcript:\n{blocked_stderr}"
     );
     let blocked_doc: serde_json::Value =
         serde_json::from_slice(&std::fs::read(blocked_out.join("result.json")).unwrap()).unwrap();
@@ -8767,36 +8777,113 @@ esac
     assert_eq!(blocked_doc["tests"]["production_install"], "pass");
     assert_eq!(blocked_doc["tests"]["accelerator_kvm"], "pass");
     assert_eq!(blocked_doc["tests"]["agent_shutdown"], "pass");
-    let retained_logs: Vec<PathBuf> = std::fs::read_dir(&run_dir_blocked)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.ok()?.path();
-            let name = p.file_name()?.to_string_lossy();
-            if name.starts_with("e2e-libvirt.") && name.ends_with(".log") {
-                Some(p)
-            } else {
-                None
-            }
-        })
-        .collect();
-    assert_eq!(
-        retained_logs.len(),
-        1,
-        "captured AC16 transcript must be retained in run dir when publish fails: {retained_logs:?}"
-    );
-    let retained_meta = std::fs::symlink_metadata(&retained_logs[0]).unwrap();
-    assert!(retained_meta.file_type().is_file() && retained_meta.nlink() == 1);
-    assert_eq!(
-        retained_meta.mode() & 0o777,
-        0o600,
-        "retained transcript must keep private 0600 permissions"
+
+    // Continue through the full hosted workflow tail: `cleanup` (which removes
+    // `$run_dir_blocked`), `ensure-result`, and `stage-evidence`. The captured
+    // AC16 transcript MUST survive guest-disk cleanup in private `0600`
+    // `e2e-libvirt.fallback.log` and be copied into the staged upload directory!
+    let mut blocked_tail_envs: Vec<(&str, &str)> = vec![
+        ("QEMINGA_E2E_CONNECT", "qemu:///session"),
+        ("QEMINGA_E2E_IMAGES", images.to_str().unwrap()),
+        ("QEMINGA_E2E_QEMU_LOG_DIR", qlog_dir.to_str().unwrap()),
+        ("FAKE_STATE_FILE", state_file_blocked.to_str().unwrap()),
+    ];
+    push_test_sysfs_root(&mut blocked_tail_envs, &sys_root, as_root);
+
+    let cleanup_blocked = lane_env(
+        &[
+            "cleanup",
+            "--arch",
+            arch,
+            "--run-id",
+            "89",
+            "--run-attempt",
+            "1",
+            "--out",
+            blocked_out.to_str().unwrap(),
+        ],
+        &blocked_tail_envs,
+        Some(&bin),
     );
     assert!(
-        std::fs::read_to_string(&retained_logs[0])
+        cleanup_blocked.status.success(),
+        "cleanup after failed e2e-libvirt.log publish failed:\n{}",
+        text(&cleanup_blocked)
+    );
+    assert!(
+        !run_dir_blocked.exists(),
+        "cleanup must have removed guest run directory {}",
+        run_dir_blocked.display()
+    );
+
+    let ensured_blocked = lane_env(
+        &[
+            "ensure-result",
+            "--out",
+            blocked_out.to_str().unwrap(),
+            "--arch",
+            arch,
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &blocked_tail_envs,
+        None,
+    );
+    assert!(
+        ensured_blocked.status.success(),
+        "ensure-result must preserve the 3-pass/1-fail report:\n{}",
+        text(&ensured_blocked)
+    );
+
+    let blocked_stage = sys_root.join("blocked-e2e-log-stage");
+    let staged_blocked = lane_env(
+        &[
+            "stage-evidence",
+            "--out",
+            blocked_out.to_str().unwrap(),
+            "--stage",
+            blocked_stage.to_str().unwrap(),
+            "--arch",
+            arch,
+            "--source-sha",
+            SHA,
+            "--expect-sha256",
+            &digest,
+        ],
+        &blocked_tail_envs,
+        None,
+    );
+    assert!(
+        staged_blocked.status.success(),
+        "stage-evidence must succeed on failure report and stage fallback transcript:\n{}",
+        text(&staged_blocked)
+    );
+    assert!(
+        !blocked_stage.join("e2e-libvirt.log").exists(),
+        "blocking directory at e2e-libvirt.log must not be staged"
+    );
+    let staged_fallback = blocked_stage.join("e2e-libvirt.fallback.log");
+    let fb_meta = std::fs::symlink_metadata(&staged_fallback).unwrap_or_else(|e| {
+        panic!("preserved AC16 fallback transcript missing from staged upload dir: {e}")
+    });
+    assert!(fb_meta.file_type().is_file() && fb_meta.nlink() == 1);
+    assert_eq!(
+        fb_meta.mode() & 0o777,
+        0o600,
+        "staged fallback transcript must have private 0600 permissions"
+    );
+    assert!(
+        std::fs::read_to_string(&staged_fallback)
             .unwrap()
             .contains("guest-ping"),
-        "retained transcript must contain captured AC16 output"
+        "staged fallback transcript must contain captured AC16 output"
     );
+    let staged_doc: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(blocked_stage.join("result.json")).unwrap()).unwrap();
+    assert_eq!(staged_doc["result"], "fail");
+    assert_eq!(staged_doc["tests"]["libvirt_interop"], "fail");
 }
 
 #[test]
@@ -9502,6 +9589,76 @@ try:
         for fd_tmp in (in_r, in_w, go2_r, go2_w, i_bef_r, i_bef_w, i_aft_r, i_aft_w):
             if fd_tmp >= 0:
                 os.close(fd_tmp)
+
+    # 3h (Review #22 P2): Bind marker writes and final publication to a per-attempt
+    #     run token created by `init-run`. After Run 2 resets the same `--out`, a
+    #     delayed Run 1 `mark` (with Run 1's stale token OR with no token) and a
+    #     delayed Run 1 `write-session-result` MUST both fail closed (ESTALE), so
+    #     Run 2 never inherits or credits Run 1's checks!
+    fenced_dir = os.path.join(root_path, "fenced-run-attempt")
+    tok1 = mod.prepare_evidence_dir(
+        fenced_dir, init_run=True, session=True, root_fd=root_fd, root_path=root_path
+    )
+    assert isinstance(tok1, str) and len(tok1) == 32, f"expected 32-hex run token from init-run, got {tok1!r}"
+    # Run 1 writes a marker using its valid token -> succeeds.
+    mod.publish_evidence_bytes(
+        fenced_dir, "accelerator_kvm", b"pass\n",
+        subdir="tests", session=True, run_token=tok1,
+        root_fd=root_fd, root_path=root_path,
+    )
+    # Run 2 resets the SAME `--out` directory -> clears markers and rotates run token.
+    tok2 = mod.prepare_evidence_dir(
+        fenced_dir, init_run=True, session=True, root_fd=root_fd, root_path=root_path
+    )
+    assert isinstance(tok2, str) and len(tok2) == 32 and tok2 != tok1, (
+        f"second init-run must rotate run token: tok1={tok1!r}, tok2={tok2!r}"
+    )
+    # Delayed Run 1 `mark` with stale tok1 MUST fail with ESTALE and leave tests/ empty!
+    for stale_tok in (tok1, None):
+        try:
+            mod.publish_evidence_bytes(
+                fenced_dir, "production_install", b"pass\n",
+                subdir="tests", session=True, run_token=stale_tok,
+                root_fd=root_fd, root_path=root_path,
+            )
+            raise AssertionError(f"late mark with run_token={stale_tok!r} must be refused after reset")
+        except OSError as exc:
+            assert exc.errno == errno.ESTALE, f"expected ESTALE for stale_tok={stale_tok!r}, got {exc}"
+    assert not os.path.exists(os.path.join(fenced_dir, "tests", "production_install"))
+    assert not os.path.exists(os.path.join(fenced_dir, "tests", "accelerator_kvm"))
+    # Delayed Run 1 `write_result_file` with stale tok1 MUST fail with ESTALE and write no report!
+    try:
+        mod.write_result_file(
+            fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
+            session=True, run_token=tok1, root_fd=root_fd, root_path=root_path,
+        )
+        raise AssertionError("late write_result_file with stale tok1 must be refused after reset")
+    except OSError as exc:
+        assert exc.errno == errno.ESTALE, exc
+    assert not os.path.exists(os.path.join(fenced_dir, "result.json"))
+    # Run 2's own `write_result_file` with tok2 succeeds in writing `"fail"` (all `not_run`),
+    # proving ZERO checks from Run 1 leaked into Run 2!
+    payload2, passed2 = mod.write_result_file(
+        fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
+        session=True, run_token=tok2, root_fd=root_fd, root_path=root_path,
+    )
+    assert not passed2
+    doc2 = json.loads(payload2.decode("utf-8"))
+    assert doc2["result"] == "fail"
+    for t in result_spec["mandatory_tests"]:
+        assert doc2["tests"][t] == "not_run", f"stale marker {t} leaked into Run 2: {doc2}"
+    # Run 2 marking all 4 checks with tok2 and publishing with tok2 succeeds and certifies pass!
+    for t in result_spec["mandatory_tests"]:
+        mod.publish_evidence_bytes(
+            fenced_dir, t, b"pass\n",
+            subdir="tests", session=True, run_token=tok2,
+            root_fd=root_fd, root_path=root_path,
+        )
+    payload2_pass, passed2_pass = mod.write_result_file(
+        fenced_dir, result_spec, result_spec["expect_sha256"], "kvm",
+        session=True, run_token=tok2, root_fd=root_fd, root_path=root_path,
+    )
+    assert passed2_pass and json.loads(payload2_pass.decode("utf-8"))["result"] == "pass"
 finally:
     os.close(root_fd)
 "#,
@@ -9592,6 +9749,100 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
         std::os::unix::fs::symlink(&outside_secret, out_dir.join("tests").join("evil-marker"))
             .unwrap();
 
+        // Review #22 P2 (4673719166): passing report WITHOUT `e2e-libvirt.log`
+        // MUST fail closed and publish no staging directory!
+        let missing_ac16_stage = sys_root.join(format!("stage-no-ac16-{tag}"));
+        let missing_ac16 = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--stage",
+                missing_ac16_stage.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            !missing_ac16.status.success(),
+            "{mode}: staging a passing report without e2e-libvirt.log must fail closed:\n{}",
+            text(&missing_ac16)
+        );
+        assert!(!missing_ac16_stage.exists());
+
+        // Passing report with empty `e2e-libvirt.log` MUST also fail closed.
+        write_file_mode(&out_dir.join("e2e-libvirt.log"), file_mode, b"");
+        let empty_ac16_stage = sys_root.join(format!("stage-empty-ac16-{tag}"));
+        let empty_ac16 = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--stage",
+                empty_ac16_stage.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+                "--expect-sha256",
+                &digest,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            !empty_ac16.status.success(),
+            "{mode}: staging a passing report with empty e2e-libvirt.log must fail closed:\n{}",
+            text(&empty_ac16)
+        );
+        assert!(!empty_ac16_stage.exists());
+
+        // Install valid non-empty AC16 transcript -> passing report stages cleanly!
+        std::fs::remove_file(out_dir.join("e2e-libvirt.log")).unwrap();
+        write_file_mode(
+            &out_dir.join("e2e-libvirt.log"),
+            file_mode,
+            b"RESULT: PASS (AC16)\n",
+        );
+
+        // Review #22 P3 (4673719201): passing report staged WITHOUT `--expect-sha256`
+        // MUST fail with an explicit diagnostic explaining that omission supports
+        // failure reports only.
+        let no_expect_stage = sys_root.join(format!("stage-no-expect-{tag}"));
+        let no_expect = lane_env(
+            &[
+                "stage-evidence",
+                "--out",
+                out_dir.to_str().unwrap(),
+                "--stage",
+                no_expect_stage.to_str().unwrap(),
+                "--arch",
+                "x86_64",
+                "--source-sha",
+                SHA,
+            ],
+            &envs,
+            None,
+        );
+        assert!(
+            !no_expect.status.success(),
+            "{mode}: staging a passing report without --expect-sha256 must fail:\n{}",
+            text(&no_expect)
+        );
+        let no_expect_stderr = String::from_utf8_lossy(&no_expect.stderr);
+        assert!(
+            no_expect_stderr.contains("--expect-sha256")
+                && no_expect_stderr.contains("failure reports only"),
+            "{mode}: expected explicit missing --expect-sha256 diagnostic:\n{no_expect_stderr}"
+        );
+        assert!(!no_expect_stage.exists());
+
         let stage_dir = sys_root.join(format!("stage-dst-{tag}"));
         let staged = lane_env(
             &[
@@ -9627,10 +9878,21 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
         top_entries.sort();
         assert_eq!(
             top_entries,
-            vec!["result.json", "serial.log", "tests", "versions.txt"],
+            vec![
+                "e2e-libvirt.log",
+                "result.json",
+                "serial.log",
+                "tests",
+                "versions.txt"
+            ],
             "{mode}: only allowlisted regular files and tests/ may be staged"
         );
-        for fname in ["result.json", "serial.log", "versions.txt"] {
+        for fname in [
+            "e2e-libvirt.log",
+            "result.json",
+            "serial.log",
+            "versions.txt",
+        ] {
             let meta = std::fs::symlink_metadata(stage_dir.join(fname)).unwrap();
             assert!(meta.file_type().is_file() && meta.nlink() == 1);
             assert_eq!(
@@ -9679,10 +9941,12 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
     }
 
     // 2. Valid structured failure `result.json` alongside a symlinked optional log
-    //    (`serial.log`) and symlinked optional test marker (`tests/agent_shutdown`):
+    //    (`serial.log`), a caller-owned write-only `0200` optional log (`versions.txt`),
+    //    and a symlinked optional test marker (`tests/agent_shutdown`), staged WITHOUT
+    //    `--expect-sha256` (failure-report omission):
     //    `stage-evidence` MUST still succeed so the valid structured failure report
-    //    can be uploaded, warn about skipping the unsafe optional files, and NEVER
-    //    stage those symlinks!
+    //    can be uploaded, warn about skipping the unsafe/unreadable optional files,
+    //    and NEVER stage symlinks or fail on write-only optional diagnostics!
     let mut sess_envs: Vec<(&str, &str)> = vec![("QEMINGA_E2E_CONNECT", "qemu:///session")];
     push_test_sysfs_root(&mut sess_envs, &sys_root, as_root);
 
@@ -9711,7 +9975,8 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
         fail_out.join("tests").join("agent_shutdown"),
     )
     .unwrap();
-    write_file_mode(&fail_out.join("versions.txt"), 0o600, b"qemu 8.2\n");
+    write_file_mode(&fail_out.join("versions.txt"), 0o200, b"write-only\n");
+    write_file_mode(&fail_out.join("cleanup.txt"), 0o600, b"cleaned\n");
 
     let fail_stage = sys_root.join("stage-fail-dst");
     let staged_fail = lane_env(
@@ -9725,24 +9990,32 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
             "x86_64",
             "--source-sha",
             SHA,
-            "--expect-sha256",
-            &digest,
         ],
         &sess_envs,
         None,
     );
     assert!(
         staged_fail.status.success(),
-        "valid structured fail result.json must still stage when optional log is unsafe:\n{}",
+        "valid structured fail result.json must still stage without --expect-sha256 even when optional logs are symlinked or 0200 write-only:\n{}",
         text(&staged_fail)
     );
+    let fail_stderr = String::from_utf8_lossy(&staged_fail.stderr);
     assert!(
-        String::from_utf8_lossy(&staged_fail.stderr).contains("serial.log"),
-        "expected warning on stderr about skipped unsafe serial.log:\n{}",
-        text(&staged_fail)
+        fail_stderr.contains("serial.log"),
+        "expected warning on stderr about skipped unsafe serial.log:\n{fail_stderr}"
     );
+    if !as_root {
+        assert!(
+            fail_stderr.contains("versions.txt"),
+            "expected warning on stderr about skipped unreadable 0200 versions.txt:\n{fail_stderr}"
+        );
+        assert!(
+            !fail_stage.join("versions.txt").exists(),
+            "unreadable 0200 versions.txt must be omitted"
+        );
+    }
     assert!(fail_stage.join("result.json").is_file());
-    assert!(fail_stage.join("versions.txt").is_file());
+    assert!(fail_stage.join("cleanup.txt").is_file());
     assert!(
         !fail_stage.join("serial.log").exists(),
         "symlinked optional serial.log must NOT be staged"
@@ -9876,5 +10149,190 @@ fn stage_evidence_copies_only_allowlisted_regular_files_and_rejects_unverified_d
             .unwrap()
             .file_type()
             .is_symlink()
+    );
+
+    // 4. Direct Python invariants for `stage_evidence_dir` (Review #22 P2 4673719154 & 4673719166):
+    //    - Replacing `tmp_stage` by name before publication MUST abort with EXDEV and
+    //      NEVER reopen `tmp_stage` by name or delete the replacement directory's contents!
+    //    - A mount-ID mismatch on `tmp_fd` during error cleanup MUST stop without unlinking
+    //      entries or calling `rmdir`!
+    //    - Simulated `PermissionError` on optional `versions.txt` under a failure report
+    //      omits `versions.txt` cleanly (even when running as root), while simulated
+    //      `PermissionError` on `e2e-libvirt.log` under a passing report fails closed!
+    let (py_fixture_dir, py_mod_copy) = copy_sysfs_fixture(dir.path());
+    let pass_src = sys_root.join("stage-src-qemu____session");
+    let py = Command::new("python3")
+        .args([
+            "-IB",
+            "-c",
+            r#"
+import errno, importlib.util, json, os, stat, sys
+
+spec_loader = importlib.util.spec_from_file_location("libvirt_kvm_sysfs", sys.argv[1])
+mod = importlib.util.module_from_spec(spec_loader)
+spec_loader.loader.exec_module(mod)
+
+root_path = sys.argv[2]
+pass_src = sys.argv[3]
+fail_src = sys.argv[4]
+pass_doc = json.loads(open(os.path.join(pass_src, "result.json"), "rb").read().decode("utf-8"))
+result_spec = {
+    "suite": pass_doc["suite"],
+    "source_repository": pass_doc["source_repository"],
+    "source_sha": pass_doc["source_sha"],
+    "arch": pass_doc["architecture"],
+    "expect_sha256": pass_doc["candidate_binary_sha256"],
+    "machine": pass_doc["virtualization"]["machine"],
+    "image": pass_doc["guest"]["image"],
+    "image_release": pass_doc["guest"]["image_release"],
+    "image_sha": pass_doc["guest"]["image_sha256"],
+    "mandatory_tests": ("production_install", "accelerator_kvm", "libvirt_interop", "agent_shutdown"),
+}
+
+root_fd = os.open(root_path, mod.READ_DIR_FLAGS)
+try:
+    # 4a. Name-swap on `tmp_stage` right before publish: MUST raise EXDEV, refuse
+    #     publication, and preserve the replacement directory + its sentinel file!
+    swap_parent = os.path.join(root_path, "stage-swap-parent")
+    os.mkdir(swap_parent, 0o700)
+    swap_dst = os.path.join(swap_parent, "final")
+    orig_fsync = mod.os.fsync
+    swapped_tmp = [None]
+    moved_orig = [None]
+    def swap_before_publish(fd):
+        res = orig_fsync(fd)
+        if swapped_tmp[0] is None and stat.S_ISDIR(os.fstat(fd).st_mode):
+            for entry in os.listdir(swap_parent):
+                if entry.startswith(".qeminga-stage."):
+                    full = os.path.join(swap_parent, entry)
+                    st = os.lstat(full)
+                    fst = os.fstat(fd)
+                    if (st.st_dev, st.st_ino) == (fst.st_dev, fst.st_ino):
+                        parked = os.path.join(swap_parent, "parked-orig-tmp")
+                        os.rename(full, parked)
+                        os.mkdir(full, 0o700)
+                        with open(os.path.join(full, "SENTINEL"), "wb") as fh:
+                            fh.write(b"DO_NOT_DELETE\n")
+                        swapped_tmp[0] = full
+                        moved_orig[0] = parked
+                        break
+        return res
+    mod.os.fsync = swap_before_publish
+    try:
+        try:
+            mod.stage_evidence_dir(
+                pass_src, swap_dst, result_spec,
+                session=True, root_fd=root_fd, root_path=root_path,
+            )
+            raise AssertionError("stage_evidence_dir must fail EXDEV when tmp_stage identity changes")
+        except OSError as exc:
+            assert exc.errno == errno.EXDEV, exc
+    finally:
+        mod.os.fsync = orig_fsync
+    assert not os.path.exists(swap_dst), "swapped tmp_stage must never be published"
+    assert swapped_tmp[0] is not None
+    assert open(os.path.join(swapped_tmp[0], "SENTINEL"), "rb").read() == b"DO_NOT_DELETE\n", (
+        "cleanup must NEVER remove entries from a replacement directory at tmp_stage's name"
+    )
+    # The original directory (which we parked aside) should have had ONLY the files
+    # created by this invocation cleaned via the kept tmp_fd, leaving it empty!
+    assert os.listdir(moved_orig[0]) == [], (
+        f"original tmp_fd entries should be cleaned via original fd, remaining: {os.listdir(moved_orig[0])}"
+    )
+
+    # 4b. Mount-ID mismatch on `tmp_fd` during cleanup after renameat2 failure:
+    #     MUST stop without unlinking or removing the mismatched directory!
+    mnt_parent = os.path.join(root_path, "stage-mnt-parent")
+    os.mkdir(mnt_parent, 0o700)
+    mnt_dst = os.path.join(mnt_parent, "final")
+    orig_rename = mod.renameat2_noreplace
+    orig_fd_mnt_id = mod.fd_mnt_id
+    fail_triggered = [False]
+    captured_tmp_name = [None]
+    def boom_rename(sfd, sname, dfd, dname):
+        captured_tmp_name[0] = sname
+        fail_triggered[0] = True
+        raise OSError(errno.EIO, "simulated rename failure")
+    def shifted_mnt_id(fd):
+        mid = orig_fd_mnt_id(fd)
+        if fail_triggered[0]:
+            return mid + 99
+        return mid
+    mod.renameat2_noreplace = boom_rename
+    mod.fd_mnt_id = shifted_mnt_id
+    try:
+        try:
+            mod.stage_evidence_dir(
+                pass_src, mnt_dst, result_spec,
+                session=True, root_fd=root_fd, root_path=root_path,
+            )
+            raise AssertionError("expected simulated EIO")
+        except OSError as exc:
+            assert exc.errno == errno.EIO, exc
+    finally:
+        mod.renameat2_noreplace = orig_rename
+        mod.fd_mnt_id = orig_fd_mnt_id
+    assert captured_tmp_name[0] is not None
+    # Because mount ID shifted before cleanup, cleanup stopped safely without unlinking!
+    assert os.path.exists(os.path.join(mnt_parent, captured_tmp_name[0], "result.json")), (
+        "mount mismatch during cleanup must halt cleanup without unlinking entries"
+    )
+
+    # 4c. Simulated PermissionError on optional `versions.txt` during failure staging
+    #     succeeds and omits `versions.txt`; simulated PermissionError on `e2e-libvirt.log`
+    #     during passing staging fails closed!
+    orig_open = mod.os.open
+    def deny_versions(path, flags, *args, **kwargs):
+        if path == "versions.txt":
+            raise PermissionError(errno.EACCES, "simulated write-only versions.txt")
+        return orig_open(path, flags, *args, **kwargs)
+    perm_fail_dst = os.path.join(root_path, "stage-perm-fail")
+    mod.os.open = deny_versions
+    try:
+        mod.stage_evidence_dir(
+            fail_src, perm_fail_dst, result_spec,
+            session=True, root_fd=root_fd, root_path=root_path,
+        )
+    finally:
+        mod.os.open = orig_open
+    assert os.path.isfile(os.path.join(perm_fail_dst, "result.json"))
+    assert not os.path.exists(os.path.join(perm_fail_dst, "versions.txt"))
+
+    def deny_ac16(path, flags, *args, **kwargs):
+        if path == "e2e-libvirt.log":
+            raise PermissionError(errno.EACCES, "simulated unreadable e2e-libvirt.log")
+        return orig_open(path, flags, *args, **kwargs)
+    perm_pass_dst = os.path.join(root_path, "stage-perm-pass")
+    mod.os.open = deny_ac16
+    try:
+        try:
+            mod.stage_evidence_dir(
+                pass_src, perm_pass_dst, result_spec,
+                session=True, root_fd=root_fd, root_path=root_path,
+            )
+            raise AssertionError("unreadable e2e-libvirt.log must fail passing stage_evidence_dir")
+        except PermissionError:
+            pass
+    finally:
+        mod.os.open = orig_open
+    assert not os.path.exists(perm_pass_dst)
+finally:
+    os.close(root_fd)
+"#,
+            py_mod_copy.to_str().unwrap(),
+            sys_root.to_str().unwrap(),
+            pass_src.to_str().unwrap(),
+            fail_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        py.status.success(),
+        "stage_evidence_dir fd-identity / cleanup / permission invariants failed:\n{}",
+        text(&py)
+    );
+    assert!(
+        !py_fixture_dir.join("__pycache__").exists(),
+        "Python -IB test invocation must not create __pycache__ in the test-owned module directory"
     );
 }

@@ -29,9 +29,9 @@
 #   libvirt-kvm-smoke.sh result --out DIR --arch ARCH --source-sha SHA
 #       --binary-sha256 HEX --accelerator ACCEL
 #   libvirt-kvm-smoke.sh ensure-result --out DIR --arch ARCH --source-sha SHA
-#       [--expect-sha256 HEX]
+#       [--expect-sha256 HEX]                               # required to preserve a passing report
 #   libvirt-kvm-smoke.sh stage-evidence --out DIR --stage DIR --arch ARCH
-#       --source-sha SHA [--expect-sha256 HEX]
+#       --source-sha SHA [--expect-sha256 HEX]              # required for passing reports (omission supports failure reports only)
 #   libvirt-kvm-smoke.sh verify-pass --out DIR --arch ARCH --source-sha SHA
 #       --expect-sha256 HEX
 #   libvirt-kvm-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
@@ -263,7 +263,7 @@ domain_state() {
 }
 
 collect_diagnostics() {
-    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" domain_owned="${5:-0}" domain_ref="${6:-}" verified_xml="${7:-}" qlog_cursor="${8:-}" dir_id="${9:-}" qlog expected_uuid=""
+    local name="$1" dir="$2" out="$3" dir_verified="${4:-0}" domain_owned="${5:-0}" domain_ref="${6:-}" verified_xml="${7:-}" qlog_cursor="${8:-}" dir_id="${9:-}" run_token="${10:-}" qlog expected_uuid=""
     qlog="$(qemu_log_of "$name")"
     if [[ "$domain_ref" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
         expected_uuid="$domain_ref"
@@ -276,18 +276,18 @@ collect_diagnostics() {
                 dom_xml="$(v dumpxml "$domain_ref" 2>/dev/null || true)"
             fi
             if [ -n "$dom_xml" ]; then
-                printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+                printf '%s\n' "$dom_xml" | sys_fs_ops publish-evidence-stdin "$out" "domain.xml" "" "$run_token" 2>/dev/null || true
             fi
             if [ -n "$qlog_cursor" ]; then
                 local c_st="" c_dev="" c_ino="" c_off=""
                 IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
                 if [ -n "$c_st" ]; then
-                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
+                    sys_fs_ops collect-qemu-log "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" 2>/dev/null || true
                 fi
             fi
         fi
         if { [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; } && [ -n "$dir_id" ]; then
-            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" "$dir_id" 2>/dev/null || true
+            sys_fs_ops collect-serial-log "$IMAGES" "$name" "$out" "serial.log" "$dir_id" "$run_token" 2>/dev/null || true
         fi
         return 0
     fi
@@ -298,18 +298,18 @@ collect_diagnostics() {
             dom_xml="$(v dumpxml "${domain_ref:-$name}" 2>/dev/null || true)"
         fi
         if [ -n "$dom_xml" ]; then
-            printf '%s\n' "$dom_xml" | sys_fs_ops publish-session-evidence-stdin "$out" "domain.xml" 2>/dev/null || true
+            printf '%s\n' "$dom_xml" | sys_fs_ops publish-session-evidence-stdin "$out" "domain.xml" "" "$run_token" 2>/dev/null || true
         fi
         if [ -n "$qlog_cursor" ]; then
             local c_st="" c_dev="" c_ino="" c_off=""
             IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
             if [ -n "$c_st" ]; then
-                sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" 2>/dev/null || true
+                sys_fs_ops collect-qemu-log-session "$qlog" "$out" "qemu.log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid" "$run_token" 2>/dev/null || true
             fi
         fi
     fi
     if [ "$dir_verified" = "1" ] || [ "$dir_verified" = "verify" ]; then
-        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" 2>/dev/null || true
+        sys_fs_ops collect-serial-log-session "$IMAGES" "$name" "$out" "serial.log" "$run_token" 2>/dev/null || true
     fi
 }
 
@@ -457,7 +457,7 @@ cmd_cleanup() {
 # ---- result ---------------------------------------------------------------
 
 write_result() {
-    local out="$1" arch="$2" sha="$3" digest="$4" accel="$5" all_not_run="${6:-0}"
+    local out="$1" arch="$2" sha="$3" digest="$4" accel="$5" all_not_run="${6:-0}" run_token="${7:-}"
     local machine image image_sha write_op="write-session-result"
     machine="$(machine_of "$arch")" || return 1
     image="$(image_file_of "$arch")" || return 1
@@ -468,19 +468,20 @@ write_result() {
     sys_fs_ops "$write_op" \
         "$out" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "" \
         "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" \
-        "$digest" "$accel" "$all_not_run"
+        "$digest" "$accel" "$all_not_run" "$run_token"
 }
 
 cmd_result() {
     parse_opts "$@"
-    local out arch sha digest accel
+    local out arch sha digest accel run_token
     out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
     digest="$(need binary_sha256)"; accel="$(need accelerator)"
+    run_token="${opt_run_token:-}"
     check_out_path "$out"
     check_arch "$arch"; check_sha "$sha"
     [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "bad digest '$digest'"
     command -v python3 >/dev/null || die "missing tool: python3"
-    write_result "$out" "$arch" "$sha" "$digest" "$accel" || return 1
+    write_result "$out" "$arch" "$sha" "$digest" "$accel" 0 "$run_token" || return 1
 }
 
 # Validates that `$out/result.json` contains exactly one JSON object forming a
@@ -582,9 +583,9 @@ cmd_verify_pass() {
 
 mark() {
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        printf '%s\n' "$2" | sys_fs_ops publish-evidence-stdin "$OUT" "$1" "tests"
+        printf '%s\n' "$2" | sys_fs_ops publish-evidence-stdin "$OUT" "$1" "tests" "${RUN_TOKEN:-}"
     else
-        printf '%s\n' "$2" | sys_fs_ops publish-session-evidence-stdin "$OUT" "$1" "tests"
+        printf '%s\n' "$2" | sys_fs_ops publish-session-evidence-stdin "$OUT" "$1" "tests" "${RUN_TOKEN:-}"
     fi
     echo "-- $1: $2"
 }
@@ -902,12 +903,14 @@ cmd_run() {
     check_number QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS "$shutdown_timeout"
 
     command -v python3 >/dev/null || die "missing tool: python3"
+    RUN_TOKEN=""
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         [ "$(id -u)" -eq 0 ] || die "qemu:///system requires root"
-        sys_fs_ops prepare-evidence-dir "$OUT" init-run || exit 1
+        RUN_TOKEN="$(sys_fs_ops prepare-evidence-dir "$OUT" init-run)" || exit 1
     else
-        sys_fs_ops prepare-session-evidence-dir "$OUT" init-run || exit 1
+        RUN_TOKEN="$(sys_fs_ops prepare-session-evidence-dir "$OUT" init-run)" || exit 1
     fi
+    [ -n "$RUN_TOKEN" ] || die "failed to initialize run attempt token for $OUT"
     RUN_ARCH="$arch" RUN_SHA="$sha" RUN_DIGEST="$NO_DIGEST" RUN_ACCEL=unknown
     RUN_NAME="$(domain_name "$run_id" "$attempt" "$arch")"
     check_name "$RUN_NAME"
@@ -920,7 +923,7 @@ cmd_run() {
     local name="$RUN_NAME" dir="$RUN_DIR" digest
 
     # shellcheck disable=SC2154 # rc is assigned inside the trap
-    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED" "$RUN_DOMAIN_OWNED" "$RUN_DOMAIN_REF" "" "$RUN_QLOG_CURSOR" "$RUN_DIR_ID"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" || rc=1; exit $rc' EXIT
+    trap 'rc=$?; collect_diagnostics "$RUN_NAME" "$RUN_DIR" "$OUT" "$RUN_DIR_VERIFIED" "$RUN_DOMAIN_OWNED" "$RUN_DOMAIN_REF" "" "$RUN_QLOG_CURSOR" "$RUN_DIR_ID" "$RUN_TOKEN"; write_result "$OUT" "$RUN_ARCH" "$RUN_SHA" "$RUN_DIGEST" "$RUN_ACCEL" 0 "$RUN_TOKEN" || rc=1; exit $rc' EXIT
 
     preflight "$arch"
     local versions_txt=""
@@ -930,9 +933,9 @@ cmd_run() {
         "qemu-system-$arch" --version | head -n 1
     } 2>&1)"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        printf '%s\n' "$versions_txt" | sys_fs_ops publish-evidence-stdin "$OUT" "versions.txt"
+        printf '%s\n' "$versions_txt" | sys_fs_ops publish-evidence-stdin "$OUT" "versions.txt" "" "$RUN_TOKEN"
     else
-        printf '%s\n' "$versions_txt" | sys_fs_ops publish-session-evidence-stdin "$OUT" "versions.txt"
+        printf '%s\n' "$versions_txt" | sys_fs_ops publish-session-evidence-stdin "$OUT" "versions.txt" "" "$RUN_TOKEN"
     fi
     printf '%s\n' "$versions_txt"
 
@@ -1081,12 +1084,32 @@ EOF
     else
         e2e_rc=$?
     fi
-    if sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.log" <"$e2e_tmp"; then
+    if sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.log" "" "$RUN_TOKEN" <"$e2e_tmp"; then
         e2e_pub_rc=0
         rm -f "$e2e_tmp"
     else
         e2e_pub_rc=$?
-        echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); retaining transcript at $e2e_tmp" >&2
+        if sys_fs_ops "$e2e_publish_op" "$OUT" "e2e-libvirt.fallback.log" "" "$RUN_TOKEN" <"$e2e_tmp"; then
+            rm -f "$e2e_tmp"
+            echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); preserved private transcript at $OUT/e2e-libvirt.fallback.log" >&2
+        else
+            local e2e_saved=""
+            if e2e_saved="$(
+                umask 0077
+                mktemp "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/${name}.e2e-libvirt.XXXXXX.log"
+            )"; then
+                if cp -- "$e2e_tmp" "$e2e_saved"; then
+                    chmod 0600 "$e2e_saved" || true
+                    rm -f "$e2e_tmp"
+                    echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); preserved private transcript at $e2e_saved" >&2
+                else
+                    rm -f "$e2e_saved" || true
+                    echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); retaining transcript at $e2e_tmp" >&2
+                fi
+            else
+                echo "libvirt-kvm-smoke: failed to publish e2e-libvirt.log into $OUT (exit $e2e_pub_rc); retaining transcript at $e2e_tmp" >&2
+            fi
+        fi
     fi
     if [ "$e2e_rc" -eq 0 ] && [ "$e2e_pub_rc" -eq 0 ]; then
         mark libvirt_interop pass

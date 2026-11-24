@@ -132,6 +132,9 @@ fallback_on=${AI_FALLBACK_ON:-exhausted}
 case "$fallback_on" in exhausted | any) ;; *) ai_log "AI_FALLBACK_ON must be exhausted or any"; exit 2 ;; esac
 private=${AI_PRIVATE_INSTRUCTIONS:-false}
 case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be true or false"; exit 2 ;; esac
+# The most of each attempt log and transcript that is uploaded, in bytes.
+upload_limit=${AI_UPLOAD_LIMIT:-20000000}
+[[ $upload_limit =~ ^[1-9][0-9]{0,9}$ ]] || { ai_log "AI_UPLOAD_LIMIT must be a number of bytes"; exit 2; }
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 # Review feedback, when supplied, must be a readable file (an empty one
 # adds nothing): a review round without it would not address the review.
@@ -303,7 +306,7 @@ suspend_commands() {
 resume_commands() { [ "${GITHUB_ACTIONS:-}" != true ] || printf '\n::%s::\n' "$command_token"; }
 show_capture() { # FILE: the end of a captured output, scrubbed
     suspend_commands
-    ai_tail_lines "$1" 100000 | ai_scrub "$secrets_file"
+    ai_cut_lines "$1" 100000 tail "$secrets_file" | ai_scrub "$secrets_file"
     resume_commands
 }
 
@@ -526,7 +529,7 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
     if [ "$private" = true ]; then
         printf '%s\n' "$private_summary"
     elif [ -n "$winner_dir" ] && ai_regular_file "$final" && [ -s "$final" ]; then
-        head -c 200000 "$final"
+        ai_cut_lines "$final" 200000 head "$secrets_file"
     else
         echo "Nightly maintenance"
     fi
@@ -539,13 +542,13 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 logs=$state/logs
 rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
-upload() { # SOURCE DEST: scrubbed, at most 20 MB, cut at a line end
+upload() { # SOURCE DEST: scrubbed, at most AI_UPLOAD_LIMIT bytes, cut at a line end
     ai_regular_file "$1" || return 0
-    ai_head_lines "$1" 20000000 | ai_scrub "$secrets_file" >"$2"
+    ai_cut_lines "$1" "$upload_limit" head "$secrets_file" | ai_scrub "$secrets_file" >"$2"
 }
 upload_jsonl() { # SOURCE DEST: the same, scrubbed value by value (JSON lines)
     ai_regular_file "$1" || return 0
-    ai_head_lines "$1" 20000000 | ai_scrub_jsonl "$secrets_file" >"$2"
+    ai_cut_lines "$1" "$upload_limit" head "$secrets_file" | ai_scrub_jsonl "$secrets_file" >"$2"
 }
 if [ "$private" = false ]; then
     for ((i = 1; i <= n; i++)); do

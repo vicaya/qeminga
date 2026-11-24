@@ -166,9 +166,11 @@ Around the agent job:
   agent's output stays off the job log, and no transcripts are uploaded.
   A change that quotes a line of the instructions (20 or more characters)
   in a file's contents or name, or the whole instructions in a file, is
-  refused. Uploaded logs and log excerpts are cut to size at line ends,
-  so a key or a line of the instructions is never cut in two before it is
-  withheld. What the instructions ask for
+  refused. Uploaded logs and log excerpts are cut to size (20 MB per
+  uploaded file; the step's `AI_UPLOAD_LIMIT` environment variable, in
+  bytes, changes it) at line ends that fall outside every withheld value,
+  so no key, multiline credential or line of the instructions is cut in
+  two before it is withheld. What the instructions ask for
   can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.

@@ -44,6 +44,8 @@ failures=0 passes=0
 # under $tmp, whose removal undoes it.
 action_src=$action
 cp -a "$action" "$tmp/action" && action=$tmp/action
+# The fakes take their settings from the test alone, never from the caller.
+unset "${!FAKE_@}"
 export FAKE_DOCKER_ROOT=$tmp FAKE_DOCKER_OPENED=$tmp/opened.log
 
 ok() { passes=$((passes + 1)); printf 'ok   %s\n' "$1"; }
@@ -302,7 +304,8 @@ cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:-/dev/null}"
 case "$1" in
-    build) [ -z "${FAKE_DOCKER_BUILD_RM:-}" ] || rm -f -- "$FAKE_DOCKER_BUILD_RM"
+    build) [ "${FAKE_DOCKER_BUILD_RM_FEEDBACK:-}" != 1 ] || [ -z "${FAKE_DOCKER_ROOT:-}" ] ||
+               rm -f -- "$FAKE_DOCKER_ROOT/late-feedback.md"
            [ -z "${FAKE_DOCKER_BUILD_FAIL:-}" ]; exit ;;
     run) shift ;;
     *) exit 0 ;;
@@ -477,13 +480,30 @@ eq "secrets: the instructions and each long line are withheld" \
 
 # Cutting a log to size happens at line ends: a key or a line of the
 # instructions cut in two would escape the exact-match scrubber.
+printf '[]' >"$tmp/no-keys.json"
 { head -c 90 /dev/zero | tr '\0' x; printf '\nyyyyyKEYSECRET123 more\n'; } >"$tmp/cut"
 check "cut: the head of a long log ends at a line end" bash -c \
-    '. "$1/lib.sh"; out=$(ai_head_lines "$2" 100); ! grep -q KEY <<<"$out" && grep -q xxx <<<"$out"' _ "$action" "$tmp/cut"
+    '. "$1/lib.sh"; out=$(ai_cut_lines "$2" 100 head "$3"); ! grep -q KEY <<<"$out" && grep -q xxx <<<"$out"' _ "$action" "$tmp/cut" "$tmp/no-keys.json"
 { printf 'pre KEYSECRET123zzzzz\n'; head -c 90 /dev/zero | tr '\0' w; printf '\n'; } >"$tmp/cut2"
 check "cut: the tail of a long log starts at a line start" bash -c \
-    '. "$1/lib.sh"; out=$(ai_tail_lines "$2" 100); ! grep -q "123" <<<"$out" && grep -q www <<<"$out"' _ "$action" "$tmp/cut2"
-eq "cut: a short log is kept whole" "$(cat "$tmp/cut")" "$(ai_head_lines "$tmp/cut" 1000)"
+    '. "$1/lib.sh"; out=$(ai_cut_lines "$2" 100 tail "$3"); ! grep -q "123" <<<"$out" && grep -q www <<<"$out"' _ "$action" "$tmp/cut2" "$tmp/no-keys.json"
+eq "cut: a short log is kept whole" "$(cat "$tmp/cut")" "$(ai_cut_lines "$tmp/cut" 1000 head "$tmp/no-keys.json")"
+# A cut at a line end can still fall between two lines of a multiline
+# credential: the scrubber would then see only part of it. The cut
+# avoids every withheld value; what it keeps is the same.
+jq -cn '["ab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n", "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph"]' >"$tmp/cut-keys.json"
+printf 'start line\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\nend line\n' >"$tmp/cut3"
+x60=$(head -c 60 /dev/zero | tr '\0' x)
+printf 'start line\n%s\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n%s\nend line\n' "$x60" "$x60" >"$tmp/cut5"
+eq "cut: the head of a log never ends inside a multiline credential (here, after its long line)" "start line" \
+    "$(ai_cut_lines "$tmp/cut5" 115 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
+eq "cut: ... nor does its tail start inside one (here, inside its long line)" "end line" \
+    "$(ai_cut_lines "$tmp/cut5" 89 tail "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
+eq "cut: a credential wholly inside the limit is kept for the scrubber, and its line break" "start line|***|end line" \
+    "$(ai_cut_lines "$tmp/cut3" 1000 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
+{ cat "$tmp/cut3"; printf '%s\nlast\n' "$x60"; } >"$tmp/cut4"
+eq "cut: ... also in a log over the limit, which keeps its whole lines" "start line|***|end line" \
+    "$(ai_cut_lines "$tmp/cut4" 120 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
 
 printf 'Error: 429 Too Many Requests\n' >"$tmp/l1"
 printf 'test failed at line 4290\n' >"$tmp/l2"
@@ -599,6 +619,14 @@ check "run: a key of long and short lines is withheld whole, and the next event 
      ! grep -qE "ab12|cd34|QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" "$t" &&
      [ "$(jq -Rc "fromjson? | select(type == \"object\") | .type" "$t" | paste -sd" ")" = "\"assistant\" \"result\"" ]' \
     _ "$state" "$rc"
+# Uploads are cut to AI_UPLOAD_LIMIT before they are scrubbed: never
+# between two lines of a credential.
+run_case mix2cut '[{"claude":'"$(jq -c '.keys = ["mix2print-2"]' <<<"$mix2entry")"'}]' AI_UPLOAD_LIMIT=80
+check "run: an upload cut to its limit keeps no part of a multiline credential" bash -c \
+    't=$1/logs/attempt-1/transcript.jsonl; [ "$2" = 0 ] && [ -f "$t" ] && ! grep -qE "ab12|cd34|QUJDREVG" "$t"' _ "$state" "$rc"
+run_case badlimit '[{"claude":["ok-1"]}]' AI_UPLOAD_LIMIT=20MB
+eq "run: an upload limit that is not a number of bytes is a configuration error" "2 0" \
+    "$rc $(cat "$tmp/badlimit/docker.log" 2>/dev/null | grep -c '^run ')"
 run_case docbasic '[{"claude":{"keys":["docbasic-1"],"auth":{"method":"basic"},"region":"eu-west-1"}}]'
 eq "run: public settings never block a change that mentions them" "0 changed" "$rc $(output status)"
 run_case declprint '[{"custom":{"keys":["declprint-1"],"auth":{"value":"decl-optsecret","method":"basic"}}}]' GITHUB_ACTIONS=true
@@ -714,9 +742,14 @@ eq "run: empty feedback adds nothing and stops nothing" "0 changed" "$rc $(outpu
 # build, it still reaches the prompt whole.
 printf 'Review feedback (latefeedbackmarker)\n' >"$tmp/late-feedback.md"
 run_case latefeedback '[{"claude":["prompt-1"]}]' AI_EXTRA_PROMPT_FILE="$tmp/late-feedback.md" \
-    FAKE_DOCKER_BUILD_RM="$tmp/late-feedback.md"
+    FAKE_DOCKER_BUILD_RM_FEEDBACK=1
 check "run: feedback removed while the image builds still reaches the prompt" bash -c \
     '[ "$2" = 0 ] && [ ! -e "$3" ] && grep -q latefeedbackmarker "$1/attempt-1/out/final.md"' _ "$state" "$rc" "$tmp/late-feedback.md"
+# The fake build removes only that fixture: a path in the environment is
+# never removed.
+printf 'keep\n' >"$tmp/host-file"
+run_case buildrmpath '[{"claude":["ok-1"]}]' FAKE_DOCKER_BUILD_RM="$tmp/host-file"
+check "fake docker: a build never removes a path named in the environment" test -f "$tmp/host-file"
 run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true
 check "run: raw state is kept for debugging, without the key file or the options" bash -c \
     '[ "$2" = 0 ] && [ -d "$1/attempt-1/tree" ] && [ ! -e "$1/secrets.json" ] && ! grep -rqa argvoptionsecret "$1"' _ "$state" "$rc"

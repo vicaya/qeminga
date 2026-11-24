@@ -168,11 +168,14 @@ ai_is_exhausted() {
 }
 
 # ai_scrub SECRETS_FILE < in > out: replaces every secret (pool keys, the
-# instructions) with "***", longest first. The secrets come from a file
-# (a JSON array), never from an argument, which other accounts can read.
+# instructions) with "***", longest first. A multiline one is matched
+# without its leading and trailing white space, so the line break after it
+# stays. The secrets come from a file (a JSON array), never from an
+# argument, which other accounts can read.
 ai_scrub() {
-    jq -Rjs --slurpfile keys "$1" \
-        'reduce ($keys[0] | map(select(length > 0)) | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
+    jq -Rjs --slurpfile keys "$1" '
+        reduce ($keys[0] | map(if test("\n") then gsub("^\\s+|\\s+$"; "") else . end) | map(select(length > 0))
+                | unique | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
 }
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
@@ -248,15 +251,32 @@ ai_contains_text() {
     [ "$rc" -ne 1 ]
 }
 
-# ai_head_lines FILE LIMIT, ai_tail_lines FILE LIMIT: at most LIMIT bytes
-# from the start (end) of FILE. When FILE is longer, the cut falls at a
-# line end, so that no key (which has no whitespace) or line of the
-# instructions is cut in two and escapes the exact-match scrubber.
-ai_head_lines() {
-    if [ "$(wc -c <"$1")" -le "$2" ]; then cat "$1"; else head -c "$2" "$1" | sed '$d'; fi
-}
-ai_tail_lines() {
-    if [ "$(wc -c <"$1")" -le "$2" ]; then cat "$1"; else tail -c "$2" "$1" | sed '1d'; fi
+# ai_cut_lines FILE LIMIT head|tail SECRETS_FILE: at most LIMIT bytes from
+# the start (head) or end (tail) of FILE, for the scrubber. When FILE is
+# longer, the cut falls at a line end, and never inside a withheld value
+# (a multiline credential has line ends of its own): cut in two, the value
+# would escape the exact-match scrubber. The cut is chosen on a copy in
+# which every value is overwritten, character for character, and keeps a
+# lookahead of the longest value: a value running past the LIMIT bytes
+# lies wholly beyond the cut. What precedes (follows) the cut is
+# then kept as it was.
+ai_cut_lines() {
+    local size
+    size=$(wc -c <"$1") || return 1
+    if [ "$size" -le "$2" ]; then cat -- "$1"; return; fi
+    if [ "$3" = head ]; then head -c "$2" -- "$1"; else tail -c "$2" -- "$1"; fi |
+        jq -Rjs --arg end "$3" --slurpfile keys "$4" '
+            ($keys[0] | map(select(length > 0)) | unique | sort_by(-length)) as $ks
+            | ($ks | map(length) | max // 0) as $l
+            | . as $raw
+            | (reduce $ks[] as $k (.; split($k) | join("*" * ($k | length)))) as $m
+            | if $end == "head" then
+                ($m[: ([($m | length) - $l, 0] | max)] | split("\n")) as $p
+                | $raw[: (if ($p | length) > 1 then ($p[:-1] | map(length + 1) | add) else 0 end)]
+              else
+                ($m[([$l, ($m | length)] | min):] | split("\n")) as $p
+                | $raw[(if ($p | length) > 1 then $l + ($p[0] | length) + 1 else ($m | length) end):]
+              end'
 }
 
 # ai_regular_file PATH: success for a regular file that is not a symlink.

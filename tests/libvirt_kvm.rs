@@ -6651,6 +6651,11 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
         "{fallback_step}"
     );
     assert!(
+        fallback_step.contains(r#"--run-id "$GITHUB_RUN_ID""#)
+            && fallback_step.contains(r#"--run-attempt "$GITHUB_RUN_ATTEMPT""#),
+        "ensure-result step must pass --run-id and --run-attempt to bind fallback publication to the active attempt:\n{fallback_step}"
+    );
+    assert!(
         fallback_step.contains(r#"--expect-sha256 "${{ needs.candidate.outputs.sha256 }}""#),
         "fallback must bind any preserved pass record to the candidate digest:\n{fallback_step}"
     );
@@ -9352,6 +9357,10 @@ esac
             arch,
             "--source-sha",
             SHA,
+            "--run-id",
+            "89",
+            "--run-attempt",
+            "1",
             "--expect-sha256",
             &digest,
         ],
@@ -10127,8 +10136,10 @@ try:
     #     inherits Run 1's checks or has its passing markers published under another
     #     caller's SHA/digest!
     fenced_dir = os.path.join(root_path, "fenced-run-attempt")
+    run1_owner = f"qeminga-e2e-201-1-{result_spec['arch']}"
+    run2_owner = f"qeminga-e2e-202-1-{result_spec['arch']}"
     tok1 = mod.prepare_evidence_dir(
-        fenced_dir, init_run=True, session=True, root_fd=root_fd, root_path=root_path
+        fenced_dir, init_run=True, run_owner=run1_owner, session=True, root_fd=root_fd, root_path=root_path
     )
     assert isinstance(tok1, str) and len(tok1) == 32, f"expected 32-hex run token from init-run, got {tok1!r}"
     # Run 1 writes a marker using its valid token -> succeeds.
@@ -10137,9 +10148,9 @@ try:
         subdir="tests", session=True, run_token=tok1,
         root_fd=root_fd, root_path=root_path,
     )
-    # Run 2 resets the SAME `--out` directory -> clears markers and rotates run token.
+    # Run 2 resets the SAME `--out` directory -> clears markers and rotates run token + owner.
     tok2 = mod.prepare_evidence_dir(
-        fenced_dir, init_run=True, session=True, root_fd=root_fd, root_path=root_path
+        fenced_dir, init_run=True, run_owner=run2_owner, session=True, root_fd=root_fd, root_path=root_path
     )
     assert isinstance(tok2, str) and len(tok2) == 32 and tok2 != tok1, (
         f"second init-run must rotate run token: tok1={tok1!r}, tok2={tok2!r}"
@@ -10241,11 +10252,109 @@ try:
         f"public `result` with matching --run-token must succeed:\n"
         f"stdout={fenced_pub.stdout!r}\nstderr={fenced_pub.stderr!r}"
     )
-    doc2_pass = json.loads(open(os.path.join(fenced_dir, "result.json"), "rb").read().decode("utf-8"))
+    pass_bytes_run2 = open(os.path.join(fenced_dir, "result.json"), "rb").read()
+    doc2_pass = json.loads(pass_bytes_run2.decode("utf-8"))
     assert (
         doc2_pass["result"] == "pass"
         and doc2_pass["source_sha"] == result_spec["source_sha"]
         and doc2_pass["candidate_binary_sha256"] == result_spec["expect_sha256"]
+    )
+
+    # 3i (Review #27 P2): Delayed `ensure-result` from Run 1 (with Run 1's SHA/digest) MUST NOT
+    #     replace Run 2's valid passing `result.json` whether invoked with Run 1's `--run-id`/
+    #     `--run-attempt`, Run 1's stale `--run-token`, or without ownership flags!
+    for label, extra_args in (
+        ("stale_owner", ["--run-id", "201", "--run-attempt", "1"]),
+        ("stale_token", ["--run-token", tok1]),
+        ("unfenced", []),
+    ):
+        late_ensure = subprocess.run(
+            [
+                "bash", smoke_script, "ensure-result",
+                "--out", fenced_dir,
+                "--arch", result_spec["arch"],
+                "--source-sha", bad_sha,
+                "--expect-sha256", bad_digest,
+                *extra_args,
+            ],
+            env=env_pub,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert late_ensure.returncode != 0, (
+            f"late Run 1 ensure-result ({label}) must fail closed rather than replacing Run 2's report:\n"
+            f"stdout={late_ensure.stdout!r}\nstderr={late_ensure.stderr!r}"
+        )
+        assert open(os.path.join(fenced_dir, "result.json"), "rb").read() == pass_bytes_run2, (
+            f"late Run 1 ensure-result ({label}) MUST leave Run 2's passing result.json byte-for-byte intact"
+        )
+
+    # Matching Run 2 `ensure-result` (by `--run-id`/`--run-attempt` OR `--run-token`) succeeds
+    # and preserves Run 2's passing report byte-for-byte.
+    for label, extra_args in (
+        ("matching_owner", ["--run-id", "202", "--run-attempt", "1"]),
+        ("matching_token", ["--run-token", tok2]),
+    ):
+        ok_ensure = subprocess.run(
+            [
+                "bash", smoke_script, "ensure-result",
+                "--out", fenced_dir,
+                "--arch", result_spec["arch"],
+                "--source-sha", result_spec["source_sha"],
+                "--expect-sha256", result_spec["expect_sha256"],
+                *extra_args,
+            ],
+            env=env_pub,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert ok_ensure.returncode == 0, (
+            f"owning Run 2 ensure-result ({label}) must succeed:\n"
+            f"stdout={ok_ensure.stdout!r}\nstderr={ok_ensure.stderr!r}"
+        )
+        assert open(os.path.join(fenced_dir, "result.json"), "rb").read() == pass_bytes_run2
+
+    # Early-failure fallback on a directory where `run` NEVER initialized an attempt (no `.run-token`)
+    # MUST still succeed and publish a structured failure report even when `--run-id`/`--run-attempt`
+    # are provided!
+    early_dir = os.path.join(root_path, "early-uninitialized-out")
+    os.mkdir(early_dir, 0o700)
+    early_ensure = subprocess.run(
+        [
+            "bash", smoke_script, "ensure-result",
+            "--out", early_dir,
+            "--arch", result_spec["arch"],
+            "--source-sha", result_spec["source_sha"],
+            "--run-id", "203",
+            "--run-attempt", "1",
+            "--expect-sha256", result_spec["expect_sha256"],
+        ],
+        env=env_pub,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert early_ensure.returncode == 0, (
+        f"early-failure ensure-result on uninitialized dir must succeed:\n"
+        f"stdout={early_ensure.stdout!r}\nstderr={early_ensure.stderr!r}"
+    )
+    early_doc = json.loads(open(os.path.join(early_dir, "result.json"), "rb").read().decode("utf-8"))
+    assert early_doc["result"] == "fail" and early_doc["source_sha"] == result_spec["source_sha"]
+
+    # 3j (Review #27 P3): `--help` usage text MUST document `--run-token` on `result`
+    #     (explaining when it is required vs omitted) and attempt-ownership flags on `ensure-result`.
+    help_proc = subprocess.run(
+        ["bash", smoke_script, "--help"],
+        env=env_pub,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert help_proc.returncode == 0
+    help_txt = help_proc.stdout.decode("utf-8", errors="replace")
+    assert "--run-token" in help_txt and "initialized" in help_txt, (
+        f"--help must document --run-token and when it is required:\n{help_txt}"
+    )
+    assert "--run-id N --run-attempt N" in help_txt and "ensure-result" in help_txt, (
+        f"--help must document attempt ownership flags on ensure-result:\n{help_txt}"
     )
 finally:
     os.close(root_fd)

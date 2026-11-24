@@ -1928,6 +1928,8 @@ def ensure_result_file(
     fallback_bytes,
     *,
     session=False,
+    run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
     max_publish_retries=MAX_IDENTITY_RETRIES,
@@ -1937,13 +1939,19 @@ def ensure_result_file(
     Coordinated suite operations (``prepare_evidence_dir(..., init_run=True)``,
     ``publish_evidence_bytes`` for ``result.json`` and ``tests/*``,
     ``write_result_file``, ``ensure_result_file``, and ``stage_evidence_dir``)
-    serialize on ``flock(out_fd)``. When ``result.json`` is absent, publication
-    uses kernel-atomic ``renameat2(RENAME_NOREPLACE)`` so a newly created report
-    is never clobbered even by an uncoordinated writer. When an existing
-    destination is invalid or unsafe, the rejected inode identity observed during
-    validation (``EvidenceUnsafeError.observed_id`` or ``existing_id``) is carried
-    directly into the pre-replace identity recheck and retried on change (without
-    a second ``lstat`` after rejection); because POSIX/Linux has no single atomic
+    serialize on ``flock(out_fd)``. When ``out_dir`` has been initialized by a
+    run attempt (``.run-token`` exists), verifies ``run_token`` or ``run_owner``
+    under ``LOCK_EX`` before reading or replacing ``result.json`` (failing with
+    ``ESTALE`` on mismatch or unfenced call so a delayed ``ensure-result``
+    cannot replace a newer attempt's report); directories where ``run`` never
+    initialized an attempt keep early-failure fallback behavior. When
+    ``result.json`` is absent, publication uses kernel-atomic
+    ``renameat2(RENAME_NOREPLACE)`` so a newly created report is never clobbered
+    even by an uncoordinated writer. When an existing destination is invalid or
+    unsafe, the rejected inode identity observed during validation
+    (``EvidenceUnsafeError.observed_id`` or ``existing_id``) is carried directly
+    into the pre-replace identity recheck and retried on change (without a
+    second ``lstat`` after rejection); because POSIX/Linux has no single atomic
     inode-compare-and-replace syscall, the final ``lstat`` and ``os.replace``
     remain distinct operations with respect to writers outside the ``flock``
     protocol.
@@ -1965,6 +1973,14 @@ def ensure_result_file(
     try:
         fcntl.flock(out_fd, fcntl.LOCK_EX)
         try:
+            _verify_expected_run_token(
+                out_fd,
+                out_path,
+                run_token,
+                owner_uids,
+                run_owner=run_owner,
+                reject_unfenced_if_initialized=True,
+            )
             for attempt in range(max_publish_retries + 1):
                 try:
                     data, existing_id = _read_evidence_bytes_from_open_dir(
@@ -3536,11 +3552,15 @@ def main(argv):
             is_session = op == "ensure-session-result"
             spec = _result_spec_from_argv(argv[2:12])
             fallback_bytes = build_fallback_result_bytes(spec, argv[12])
+            run_token = argv[13] if len(argv) > 13 and argv[13] else None
+            run_owner = argv[14] if len(argv) > 14 and argv[14] else None
             published = ensure_result_file(
                 argv[1],
                 spec,
                 fallback_bytes,
                 session=is_session,
+                run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )

@@ -202,6 +202,7 @@ jobs:
         run: |
           scripts/ci/libvirt-kvm-smoke.sh ensure-result --out "$OUT" \
             --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
       # Copy only verified allowlisted regular files (plus verified `tests/*`
       # markers) into a fresh per-run `0700` staging directory so neither the

@@ -251,6 +251,8 @@ fi
 # fake-docker-closed ROOT MOUNT...: the directories above each MOUNT, inside
 # ROOT (ROOT included), that other users cannot search: what the fake
 # docker opens. Nothing without a ROOT, or with / (or a relative path) as one.
+# Each name is printed NUL-terminated and derived without a command
+# substitution: a newline in a name (valid) never splits or trims it.
 cat >"$bin/fake-docker-closed" <<'EOF'
 #!/usr/bin/env bash
 root=${1:-}
@@ -259,8 +261,9 @@ case "$root" in /?*) ;; *) exit 0 ;; esac
 root=${root%/}
 for m in "$@"; do
     d=$m
-    while d=$(dirname "$d") && case "$d/" in "$root"/*) true ;; *) false ;; esac; do
-        if [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ]; then printf '%s\n' "$d"; fi
+    while [ "${d%/}" != "$d" ]; do d=${d%/}; done
+    while d=${d%/*} && case "$d/" in "$root"/*) true ;; *) false ;; esac; do
+        if [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ]; then printf '%s\0' "$d"; fi
     done
 done
 EOF
@@ -303,12 +306,16 @@ real_env=$(PATH=/usr/bin:/bin command -v env)
 # Only directories inside FAKE_DOCKER_ROOT (the test's own) are opened,
 # each logged before it is: a mount elsewhere stays as it is, and the
 # attempt cannot reach it unless it is already searchable.
+# Names travel NUL-terminated from the helper to chmod, each one whole;
+# the log is NUL-terminated too (read it with grep -z).
 opened=()
-mapfile -t closed < <("$(dirname "$0")/fake-docker-closed" "${FAKE_DOCKER_ROOT:-}" "${mounts[@]}" "$wd" | awk '!seen[$0]++')
-for d in "${closed[@]}"; do
-    printf '%s\n' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
+declare -A seen=()
+while IFS= read -r -d '' d; do
+    [ -z "${seen[$d]+x}" ] || continue
+    seen[$d]=1
+    printf '%s\0' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
     chmod o+x "$d" && opened+=("$d")
-done
+done < <("${0%/*}/fake-docker-closed" "${FAKE_DOCKER_ROOT:-}" "${mounts[@]}" "$wd")
 (cd "$wd" && "${as[@]}" "$real_env" -i "${envs[@]}" "$@")
 rc=$?
 [ "${#opened[@]}" -eq 0 ] || chmod o-x "${opened[@]}"
@@ -591,7 +598,7 @@ ext=$(mktemp -d /tmp/ai-selftest-ext.XXXXXX) && [ -d "$ext" ] ||
 mkdir -p "$ext/private" && cp -a "$fakes" "$ext/private/providers" && chmod 700 "$ext/private"
 run_case external '[{"claude":["ok-1"]}]' AI_PROVIDERS_DIR="$ext/private/providers"
 check "selftest: a private directory outside the test is never opened, and keeps its mode" bash -c \
-    '{ [ "$(id -u)" != 0 ] || { [ -r "$1" ] && ! grep -v "^$2/" "$1"; }; } && [ "$(stat -c %a "$3")" = 700 ]' \
+    '{ [ "$(id -u)" != 0 ] || { [ -r "$1" ] && ! grep -zv "^$2/" "$1"; }; } && [ "$(stat -c %a "$3")" = 700 ]' \
     _ "$FAKE_DOCKER_OPENED" "$tmp" "$ext/private"
 rm -rf "$ext"
 # Which directories the fake opens is decided by fake-docker-closed ROOT
@@ -600,9 +607,16 @@ b=$tmp/boundary
 mkdir -p "$b/fixture/in/deep" "$b/fixture-sibling/x" "$b/outside/x" "$b/fixture/open/x"
 chmod 700 "$b/fixture" "$b/fixture/in" "$b/fixture-sibling" "$b/outside"
 chmod 755 "$b/fixture/open"
-closed() { "$bin/fake-docker-closed" "$@" | sort -u | paste -sd' '; }
+# The helper prints NUL-terminated names (a newline is valid in one).
+closed() { "$bin/fake-docker-closed" "$@" | sort -zu | tr '\0' '|'; }
 eq "fake docker: opens the closed directories above a mount inside the fixture" \
-    "$b/fixture $b/fixture/in" "$(closed "$b/fixture" "$b/fixture/in/deep" "$b/fixture/open/x")"
+    "$b/fixture|$b/fixture/in|" "$(closed "$b/fixture" "$b/fixture/in/deep" "$b/fixture/open/x")"
+# A name with a newline stays one name: split at the newline, this one
+# would name $b/outside, a closed directory outside the fixture.
+evil="$b/fixture/nl"$'\n'"$b/outside"
+mkdir -p "$evil/x" && chmod 700 "$evil"
+eq "fake docker: ... a name with a newline in it stays one name, and nothing changes" "$b/fixture|$evil| 700" \
+    "$(closed "$b/fixture" "$evil/x") $(stat -c %a "$b/outside")"
 eq "fake docker: ... none above a sibling whose name extends the fixture's" "" "$(closed "$b/fixture" "$b/fixture-sibling/x")"
 eq "fake docker: ... none above a mount outside it" "" "$(closed "$b/fixture" "$b/outside/x")"
 eq "fake docker: ... and none without a fixture, or with / as one" "|" \
@@ -1243,7 +1257,7 @@ check "publish: a patch touching .github/workflows/ is refused before any push" 
 # its log must show it did, and only inside the test's own directory.
 if [ "$(id -u)" = 0 ]; then
     check "selftest: the fake docker opened directories, only inside the test's own" bash -c \
-        '[ -r "$1" ] && grep -q "^$2/" "$1" && ! grep -v "^$2/" "$1"' _ "$FAKE_DOCKER_OPENED" "$tmp"
+        '[ -r "$1" ] && grep -zq "^$2/" "$1" && ! grep -zv "^$2/" "$1"' _ "$FAKE_DOCKER_OPENED" "$tmp"
 fi
 echo
 echo "$passes passed, $failures failed"

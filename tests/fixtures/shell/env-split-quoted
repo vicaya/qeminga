@@ -1,0 +1,5 @@
+#!/usr/bin/env -S 'bash' -eu
+# bash through env -S with a quoted interpreter (shellcheck reports SC1008
+# for this shebang unless it is told the shell).
+words=(a b)
+echo "${words[0]}"

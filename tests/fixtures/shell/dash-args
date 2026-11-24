@@ -1,0 +1,3 @@
+#!/bin/dash -e
+# dash with interpreter arguments.
+printf "%s\n" "${1:-dash}"

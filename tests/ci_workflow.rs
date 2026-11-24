@@ -9,6 +9,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 /// The jobs that must run natively on every supported architecture.
@@ -212,11 +214,11 @@ fn no_native_job_is_allowed_to_fail_quietly() {
     }
 }
 
-/// The git environment for listing the files of `dir`: none when `dir` is
+/// The git environment for listing the files of `root`: none when it is
 /// a checkout; otherwise (an unpacked source archive) a throwaway
-/// repository, kept alive by the returned guard, whose work tree is `dir`.
-fn git_inventory_env(dir: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static str, PathBuf)>) {
-    if dir.join(".git").exists() {
+/// repository, kept alive by the returned guard, whose work tree is `root`.
+fn git_inventory_env(root: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static str, PathBuf)>) {
+    if root.join(".git").exists() {
         return (None, Vec::new());
     }
     let meta = tempfile::tempdir().unwrap();
@@ -227,44 +229,64 @@ fn git_inventory_env(dir: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static st
         .status()
         .expect("git is needed by this test");
     assert!(status.success(), "git init --bare");
-    let env = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", dir.to_owned())];
+    let env = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", root.to_owned())];
     (Some(meta), env)
 }
 
-/// Runs `scripts/check-shell.sh --list DIR` (no shellcheck is needed for
-/// the listing) with `env` added to a git environment that never reaches
-/// a repository enclosing `dir`.
-fn check_shell_list(dir: &Path, env: &[(&str, PathBuf)]) -> std::process::Output {
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh");
-    let mut cmd = std::process::Command::new(&script);
-    cmd.arg("--list")
-        .arg(dir)
-        .env_remove("GIT_DIR")
+/// Where git looks for a repository: from `dir` up to the work tree
+/// `root`, never into a repository enclosing `root`, plus `env`.
+fn git_env(cmd: &mut std::process::Command, root: &Path, env: &[(&str, PathBuf)]) {
+    cmd.env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap());
+        .env("GIT_CEILING_DIRECTORIES", root.parent().unwrap());
     for (key, value) in env {
         cmd.env(key, value);
     }
+}
+
+/// Runs `scripts/check-shell.sh MODE DIR` (no shellcheck is needed for a
+/// listing) for `dir` inside the work tree `root`.
+fn check_shell(
+    mode: &str,
+    dir: &Path,
+    root: &Path,
+    env: &[(&str, PathBuf)],
+) -> std::process::Output {
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh");
+    let mut cmd = std::process::Command::new(&script);
+    cmd.arg(mode).arg(dir);
+    git_env(&mut cmd, root, env);
     cmd.output()
         .unwrap_or_else(|e| panic!("{}: {e}", script.display()))
 }
 
-/// The scripts `check_shell_list` reports, sorted, failing the test if
-/// the listing fails.
-fn linted_shell_scripts(dir: &Path, env: &[(&str, PathBuf)]) -> Vec<String> {
-    let out = check_shell_list(dir, env);
+/// Splits NUL-terminated paths, as raw bytes, sorted and unique.
+fn nul_paths(bytes: &[u8]) -> Vec<OsString> {
+    let mut paths: Vec<OsString> = bytes
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| OsStr::from_bytes(p).to_owned())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// The scripts `check-shell.sh --list0` reports for `dir` (inside the work
+/// tree `root`), failing the test if the listing fails.
+fn linted_shell_scripts(dir: &Path, root: &Path, env: &[(&str, PathBuf)]) -> Vec<OsString> {
+    let out = check_shell("--list0", dir, root, env);
     assert!(
         out.status.success(),
-        "check-shell.sh --list: {}",
+        "check-shell.sh --list0: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut listed: Vec<String> = String::from_utf8(out.stdout)
-        .unwrap()
-        .lines()
-        .map(str::to_owned)
-        .collect();
-    listed.sort();
-    listed
+    nul_paths(&out.stdout)
+}
+
+/// `paths` as `OsString`s, for comparisons.
+fn os(paths: &[&str]) -> Vec<OsString> {
+    paths.iter().map(OsString::from).collect()
 }
 
 /// Splits `text` into words as `env -S` does: whitespace separates, and
@@ -386,40 +408,31 @@ fn shebang_interpreters_are_matched_as_words_with_their_arguments() {
     }
 }
 
-/// The shell scripts among the files git lists for `dir` (tracked and
-/// untracked, never ignored), classified here independently of the
-/// script: regular files only, so links and the directories git reports
-/// for embedded repositories and submodules are left out.
-fn shell_scripts_in_inventory(dir: &Path, env: &[(&str, PathBuf)]) -> Vec<String> {
+/// The shell scripts among the files git lists for `dir` inside the work
+/// tree `root` (tracked and untracked, never ignored; each path once, even
+/// with several index stages during a merge), classified here
+/// independently of the script: regular files only, so links and the
+/// directories git reports for embedded repositories and submodules are
+/// left out. Paths are kept as raw bytes.
+fn shell_scripts_in_inventory(dir: &Path, root: &Path, env: &[(&str, PathBuf)]) -> Vec<OsString> {
     let mut cmd = std::process::Command::new("git");
-    cmd.current_dir(dir)
-        .args([
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap());
-    for (key, value) in env {
-        cmd.env(key, value);
-    }
+    cmd.current_dir(dir).args([
+        "ls-files",
+        "-z",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+    ]);
+    git_env(&mut cmd, root, env);
     let out = cmd.output().expect("git is needed by this test");
     assert!(out.status.success(), "git ls-files");
-    let mut found: Vec<String> = out
-        .stdout
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8(p.to_vec()).unwrap())
+    nul_paths(&out.stdout)
+        .into_iter()
         .filter(|p| {
-            std::fs::symlink_metadata(dir.join(p)).is_ok_and(|m| m.is_file())
-                && is_shell_script(&dir.join(p))
+            let path = dir.join(p);
+            std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) && is_shell_script(&path)
         })
-        .collect();
-    found.sort();
-    found
+        .collect()
 }
 
 #[test]
@@ -428,27 +441,60 @@ fn shellcheck_covers_every_shell_script_in_the_repository() {
     // archive (no .git), the same inventory through a throwaway repository.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let (_meta, env) = git_inventory_env(root);
-    let linted = linted_shell_scripts(root, &env);
-    assert_eq!(linted, shell_scripts_in_inventory(root, &env));
+    let linted = linted_shell_scripts(root, root, &env);
+    assert_eq!(linted, shell_scripts_in_inventory(root, root, &env));
     assert!(
         linted.len() >= 11,
         "only {} shell scripts listed",
         linted.len()
     );
     for must in ["scripts/check-unsafe.sh", "scripts/e2e-libvirt.sh"] {
-        assert!(linted.iter().any(|s| s == must), "{must} is not linted");
+        assert!(
+            linted.contains(&OsString::from(must)),
+            "{must} is not linted"
+        );
     }
+}
+
+#[test]
+fn the_shell_fixtures_are_discovered_by_name_and_interpreter() {
+    // tests/fixtures/shell is linted with the repository, so CI's pinned
+    // shellcheck runs every listed fixture end to end; the others are not
+    // valid shell and would fail it if they were listed.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = root.join("tests/fixtures/shell");
+    let (_meta, env) = git_inventory_env(root);
+    let expected = os(&[
+        "bash-args",
+        "dash-args",
+        "directive-wins",
+        "env-assign",
+        "env-bash",
+        "env-split",
+        "env-split-attached",
+        "env-split-long",
+        "env-split-quoted",
+        "library.sh",
+        "plain-sh",
+    ]);
+    assert_eq!(linted_shell_scripts(&dir, root, &env), expected);
+    assert_eq!(shell_scripts_in_inventory(&dir, root, &env), expected);
+}
+
+/// Writes `bytes` to `dir/rel`, creating its parent directories.
+fn put_bytes(dir: &Path, rel: &[u8], bytes: &[u8]) {
+    let path = dir.join(OsStr::from_bytes(rel));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
 }
 
 /// Writes `text` to `dir/rel`, creating its parent directories.
 fn put(dir: &Path, rel: &str, text: &str) {
-    let path = dir.join(rel);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, text).unwrap();
+    put_bytes(dir, rel.as_bytes(), text.as_bytes());
 }
 
-fn git(dir: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
+fn git_output(dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
@@ -456,7 +502,11 @@ fn git(dir: &Path, args: &[&str]) {
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .output()
-        .expect("git is needed by this test");
+        .expect("git is needed by this test")
+}
+
+fn git(dir: &Path, args: &[&str]) {
+    let out = git_output(dir, args);
     assert!(
         out.status.success(),
         "git {args:?}: {}",
@@ -465,9 +515,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 /// The fixture repository of the listing tests, and the scripts it holds.
-fn fixture_repository(dir: &Path) -> Vec<&'static str> {
+fn fixture_repository(dir: &Path) -> Vec<OsString> {
     git(dir, &["init", "-q"]);
-    // Shell scripts, tracked and untracked, inside and outside scripts/.
+    // Shell scripts, tracked and untracked, inside and outside scripts/,
+    // with names that are not UTF-8 or hold a newline.
     put(dir, "lib.sh", "echo no shebang, named .sh\n");
     put(dir, "-helper.sh", "echo a name that looks like an option\n");
     put(dir, "bash-eu", "#!/bin/bash -eu\necho\n");
@@ -485,10 +536,13 @@ fn fixture_repository(dir: &Path) -> Vec<&'static str> {
     );
     put(dir, "deep/er/plain", "#!/bin/sh\necho\n");
     put(dir, "untracked-env-sh", "#!/usr/bin/env sh\necho\n");
+    put(dir, "new\nline.sh", "#!/bin/sh\necho\n");
+    put_bytes(dir, b"r\xe9sum\xe9", b"#!/bin/sh\necho\n");
     // Not shell scripts.
     put(dir, "tool.py", "#!/usr/bin/env python3\nprint()\n");
     put(dir, "bashful", "#!/usr/bin/bashful\n");
     put(dir, "notes.txt", "run it with /bin/bash\n");
+    put_bytes(dir, b"caf\xe9.txt", b"text\n");
     std::fs::write(dir.join("blob"), [0u8, 0xff, b'\n', 0]).unwrap();
     // Ignored output (by .gitignore and by the repository-local excludes)
     // and links to linted scripts are not linted.
@@ -520,19 +574,24 @@ fn fixture_repository(dir: &Path) -> Vec<&'static str> {
             "lint-alias",
             "alias.sh",
             "sub",
+            "new\nline.sh",
         ],
     );
-    vec![
+    let mut expected = os(&[
         "-helper.sh",
         "bash-eu",
         "deep/er/plain",
         "lib.sh",
+        "new\nline.sh",
         "tools/dash-e",
         "tools/env-split",
         "tools/env-split-long",
         "tools/env-split-quoted",
         "untracked-env-sh",
-    ]
+    ]);
+    expected.push(OsStr::from_bytes(b"r\xe9sum\xe9").to_owned());
+    expected.sort();
+    expected
 }
 
 #[test]
@@ -542,9 +601,36 @@ fn the_listing_finds_scripts_by_name_and_interpreter_and_skips_links_ignored_fil
     let dir = tmp.path().join("repo");
     std::fs::create_dir(&dir).unwrap();
     let expected = fixture_repository(&dir);
-    assert_eq!(linted_shell_scripts(&dir, &[]), expected);
+    assert_eq!(linted_shell_scripts(&dir, &dir, &[]), expected);
     // The independent classification of the coverage test agrees.
-    assert_eq!(shell_scripts_in_inventory(&dir, &[]), expected);
+    assert_eq!(shell_scripts_in_inventory(&dir, &dir, &[]), expected);
+}
+
+#[test]
+fn a_script_in_merge_conflict_is_listed_once() {
+    // git lists a conflicted path once per index stage (three here).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    std::fs::create_dir(&dir).unwrap();
+    git(&dir, &["init", "-q", "-b", "main"]);
+    put(&dir, "run.sh", "#!/bin/sh\necho base\n");
+    git(&dir, &["add", "run.sh"]);
+    git(&dir, &["commit", "-q", "-m", "base"]);
+    git(&dir, &["checkout", "-q", "-b", "other"]);
+    put(&dir, "run.sh", "#!/bin/sh\necho other\n");
+    git(&dir, &["commit", "-q", "-am", "other"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    put(&dir, "run.sh", "#!/bin/sh\necho main\n");
+    git(&dir, &["commit", "-q", "-am", "main"]);
+    assert!(!git_output(&dir, &["merge", "-q", "other"]).status.success());
+    let stages = git_output(&dir, &["ls-files", "--cached"]).stdout;
+    assert_eq!(
+        String::from_utf8(stages).unwrap(),
+        "run.sh\nrun.sh\nrun.sh\n"
+    );
+    put(&dir, "run.sh", "#!/bin/sh\necho resolved\n");
+    assert_eq!(linted_shell_scripts(&dir, &dir, &[]), os(&["run.sh"]));
+    assert_eq!(shell_scripts_in_inventory(&dir, &dir, &[]), os(&["run.sh"]));
 }
 
 #[test]
@@ -558,8 +644,18 @@ fn an_unpacked_source_archive_is_listed_through_a_throwaway_repository() {
     put(&dir, "target/b.sh", "#!/bin/sh\necho\n");
     let (meta, env) = git_inventory_env(&dir);
     assert!(meta.is_some());
-    assert_eq!(linted_shell_scripts(&dir, &env), ["scripts/a.sh"]);
-    assert_eq!(shell_scripts_in_inventory(&dir, &env), ["scripts/a.sh"]);
+    assert_eq!(
+        linted_shell_scripts(&dir, &dir, &env),
+        os(&["scripts/a.sh"])
+    );
+    assert_eq!(
+        shell_scripts_in_inventory(&dir, &dir, &env),
+        os(&["scripts/a.sh"])
+    );
+    // The human-readable listing names the same scripts, one per line.
+    let out = check_shell("--list", &dir, &dir, &env);
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"scripts/a.sh\n");
 }
 
 #[test]
@@ -569,9 +665,17 @@ fn a_listing_that_cannot_be_established_fails() {
     let dir = tmp.path().join("plain");
     std::fs::create_dir(&dir).unwrap();
     put(&dir, "x.sh", "#!/bin/sh\necho\n");
-    let out = check_shell_list(&dir, &[]);
-    assert!(!out.status.success(), "listed {:?}", out.stdout);
-    assert!(out.stdout.is_empty());
+    for mode in ["--list", "--list0"] {
+        let out = check_shell(mode, &dir, &dir, &[]);
+        assert!(!out.status.success(), "{mode} listed {:?}", out.stdout);
+        assert!(out.stdout.is_empty());
+    }
+}
+
+/// The text of `scripts/check-shell.sh`.
+fn check_shell_script() -> String {
+    std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh"))
+        .unwrap()
 }
 
 #[test]
@@ -579,10 +683,7 @@ fn the_linter_ignores_caller_configuration() {
     // AGENTS.md: a finding is silenced only by a directive at the command
     // it covers, so no .shellcheckrc (`--norc`) and no SHELLCHECK_OPTS may
     // apply, and a file name is never read as an option (`--`).
-    let script = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh"),
-    )
-    .unwrap();
+    let script = check_shell_script();
     let lines: Vec<&str> = script.lines().map(str::trim).collect();
     let unset = lines
         .iter()
@@ -596,10 +697,8 @@ fn the_linter_ignores_caller_configuration() {
     assert!(!runs.is_empty(), "check-shell.sh never runs shellcheck");
     for (at, run) in runs {
         assert!(at > unset, "{run} runs before SHELLCHECK_OPTS is cleared");
-        assert!(
-            run.starts_with("shellcheck --norc -- "),
-            "{run}: not `shellcheck --norc -- FILES`"
-        );
+        assert!(run.starts_with("shellcheck --norc "), "{run}: no --norc");
+        assert!(run.contains(" -- \""), "{run}: files not after --");
     }
 }
 
@@ -609,7 +708,7 @@ fn the_shellcheck_job_lints_every_script_and_cannot_fail_quietly() {
     let block = job(&text, "shellcheck");
     assert!(
         block.contains("scripts/check-shell.sh"),
-        "the shellcheck job runs the script the test above covers"
+        "the shellcheck job runs the script the tests above cover"
     );
     assert!(
         block.contains("shellcheck --version"),
@@ -624,21 +723,34 @@ fn the_shellcheck_job_lints_every_script_and_cannot_fail_quietly() {
 /// The shellcheck release `scripts/check-shell.sh` is written against
 /// (`SHELLCHECK_VERSION=` in the script).
 fn pinned_shellcheck_version() -> String {
-    let script = std::fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh"),
-    )
-    .unwrap();
-    script
+    check_shell_script()
         .lines()
         .find_map(|l| l.strip_prefix("SHELLCHECK_VERSION="))
         .expect("check-shell.sh pins SHELLCHECK_VERSION")
         .to_owned()
 }
 
+/// The steps of a job, each from its `- ` line to the next one.
+fn steps(job: &str) -> Vec<String> {
+    let mut steps: Vec<String> = Vec::new();
+    for line in job.lines() {
+        if line.starts_with("      - ") {
+            steps.push(String::new());
+        }
+        if let Some(step) = steps.last_mut() {
+            step.push_str(line);
+            step.push('\n');
+        }
+    }
+    steps
+}
+
 #[test]
 fn ci_installs_the_shellcheck_release_the_script_pins() {
     // Releases differ in what they report (0.11 added SC2329), so CI must
-    // not judge with whatever the runner image happens to ship.
+    // not judge with whatever the runner image happens to ship; and the
+    // installer that verifies the download is itself pinned to a reviewed
+    // commit, with checksum verification stated, not defaulted.
     let version = pinned_shellcheck_version();
     let parts: Vec<&str> = version.split('.').collect();
     assert!(
@@ -647,9 +759,25 @@ fn ci_installs_the_shellcheck_release_the_script_pins() {
     );
     let text = workflow();
     let block = job(&text, "shellcheck");
+    let tool = format!("tool: shellcheck@{version}");
+    let install: Vec<String> = steps(block)
+        .into_iter()
+        .filter(|s| s.contains(&tool))
+        .collect();
+    assert_eq!(install.len(), 1, "one step installs shellcheck {version}");
+    let step = &install[0];
+    let pinned = step.lines().any(|l| {
+        l.trim()
+            .strip_prefix("- uses: taiki-e/install-action@")
+            .and_then(|rest| rest.split_whitespace().next())
+            .is_some_and(|sha| sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+    });
     assert!(
-        block.contains("uses: taiki-e/install-action@v2")
-            && block.contains(&format!("tool: shellcheck@{version}")),
-        "the shellcheck job installs shellcheck {version} (checksum-verified)"
+        pinned,
+        "the installer is not pinned to a full commit SHA:\n{step}"
+    );
+    assert!(
+        step.lines().any(|l| l.trim() == "checksum: true"),
+        "the install step does not state checksum: true:\n{step}"
     );
 }

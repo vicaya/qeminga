@@ -1,0 +1,4 @@
+#!/bin/sh
+# shellcheck shell=bash
+# The directive, not the shebang, names the dialect shellcheck applies.
+if [[ -n "${1:-}" ]]; then echo "$1"; fi

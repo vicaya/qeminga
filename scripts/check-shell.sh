@@ -19,8 +19,13 @@
 # exactly it): releases differ in what they report. Another version prints
 # a warning, and fails the run under CI (CI=true).
 #
-# Usage: scripts/check-shell.sh [DIR]          (exit 0 = clean, 1 = findings)
-#        scripts/check-shell.sh --list [DIR]   (print the scripts it would lint)
+# Each script is linted as the dialect its `#!` line runs (`--shell`),
+# because shellcheck cannot read every shebang recognised here, unless the
+# file names its dialect with a `# shellcheck shell=` directive.
+#
+# Usage: scripts/check-shell.sh [DIR]           (exit 0 = clean, else findings)
+#        scripts/check-shell.sh --list [DIR]    (the scripts it would lint, one per line)
+#        scripts/check-shell.sh --list0 [DIR]   (the same, NUL-terminated, for machines)
 # DIR defaults to the repository root.
 #
 # tests/ci_workflow.rs checks the listing against the repository and
@@ -33,11 +38,11 @@ unset SHELLCHECK_OPTS
 
 SHELLCHECK_VERSION=0.11.0
 
-list=0
-if [ "${1:-}" = --list ]; then
-    list=1
-    shift
-fi
+mode=lint
+case "${1:-}" in
+    --list) mode=list; shift ;;
+    --list0) mode=list0; shift ;;
+esac
 cd "${1:-$(dirname "$0")/..}"
 
 # Splits $1 into the array `words` as `env -S` does: whitespace separates,
@@ -76,23 +81,21 @@ split_words() {
     fi
 }
 
-# Whether $1 is a shell script by name or by its `#!` line's interpreter:
-# the first word, or for `env` the first word after its options (a split
-# string, `-S STRING`, `-SSTRING` or `--split-string=STRING`, is split
-# again) and NAME=value assignments.
-is_shell_script() {
+# Sets `dialect` to the shell $1's `#!` line runs (sh, bash or dash), or
+# to "" when it runs none of them: the first word, or for `env` the first
+# word after its options (a split string, `-S STRING`, `-SSTRING` or
+# `--split-string=STRING`, is split again) and NAME=value assignments.
+shebang_dialect() {
     local first="" interpreter="" word
     local -a words args
-    case "$1" in
-        *.sh) return 0 ;;
-    esac
-    IFS= read -r first < "$1" 2>/dev/null || [ -n "$first" ] || return 1
+    dialect=""
+    IFS= read -r first < "$1" 2>/dev/null || [ -n "$first" ] || return 0
     case "$first" in
         '#!'*) ;;
-        *) return 1 ;;
+        *) return 0 ;;
     esac
     split_words "${first#'#!'}"
-    [ "${#words[@]}" -gt 0 ] || return 1
+    [ "${#words[@]}" -gt 0 ] || return 0
     interpreter=${words[0]##*/}
     if [ "$interpreter" = env ]; then
         interpreter=""
@@ -114,9 +117,8 @@ is_shell_script() {
         done
     fi
     case "$interpreter" in
-        sh | bash | dash) return 0 ;;
+        sh | bash | dash) dialect=$interpreter ;;
     esac
-    return 1
 }
 
 tmp=$(mktemp -d)
@@ -133,6 +135,7 @@ fi
 sort -z -u "$tmp/paths" >"$tmp/sorted"
 
 scripts=()
+dialects=()
 while IFS= read -r -d '' file; do
     # A tracked file deleted from the work tree, or a link.
     if [ -L "$file" ] || [ ! -e "$file" ]; then
@@ -148,17 +151,34 @@ while IFS= read -r -d '' file; do
         echo "check-shell: cannot read $file" >&2
         exit 1
     fi
-    if is_shell_script "$file"; then
-        scripts+=("$file")
+    # A shell script by name (`*.sh`) or by its `#!` interpreter.
+    shebang_dialect "$file"
+    case "$file" in
+        *.sh) ;;
+        *) [ -n "$dialect" ] || continue ;;
+    esac
+    # An explicit `# shellcheck shell=` directive names the dialect itself;
+    # otherwise the detected one is passed on, because shellcheck cannot
+    # read every shebang this script recognises (SC1008 for `env -S 'bash'`).
+    if grep -Eq '^[[:space:]]*#[[:space:]]*shellcheck[[:space:]]([^#]*[[:space:]])?shell=' "$file"; then
+        dialect=""
     fi
+    scripts+=("$file")
+    dialects+=("$dialect")
 done <"$tmp/sorted"
 
-if [ "$list" -eq 1 ]; then
-    if [ "${#scripts[@]}" -gt 0 ]; then
-        printf '%s\n' "${scripts[@]}"
-    fi
-    exit 0
-fi
+case "$mode" in
+    list)
+        if [ "${#scripts[@]}" -gt 0 ]; then
+            printf '%s\n' "${scripts[@]}"
+        fi
+        exit 0 ;;
+    list0)
+        if [ "${#scripts[@]}" -gt 0 ]; then
+            printf '%s\0' "${scripts[@]}"
+        fi
+        exit 0 ;;
+esac
 
 if [ "${#scripts[@]}" -eq 0 ]; then
     echo "check-shell: no shell scripts found" >&2
@@ -176,4 +196,26 @@ if [ "$found" != "$SHELLCHECK_VERSION" ]; then
     fi
 fi
 echo "check-shell: shellcheck $found, ${#scripts[@]} scripts"
-shellcheck --norc -- "${scripts[@]}"
+
+# One shellcheck run per dialect; every run happens and the worst status
+# is the result.
+status=0
+for want in "" sh bash dash; do
+    group=()
+    for i in "${!scripts[@]}"; do
+        if [ "${dialects[i]}" = "$want" ]; then
+            group+=("${scripts[i]}")
+        fi
+    done
+    [ "${#group[@]}" -gt 0 ] || continue
+    rc=0
+    if [ -z "$want" ]; then
+        shellcheck --norc -- "${group[@]}" || rc=$?
+    else
+        shellcheck --norc --shell="$want" -- "${group[@]}" || rc=$?
+    fi
+    if [ "$rc" -gt "$status" ]; then
+        status=$rc
+    fi
+done
+exit "$status"

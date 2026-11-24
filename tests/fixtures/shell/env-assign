@@ -1,0 +1,3 @@
+#!/usr/bin/env -S -u HOME LC_ALL=C sh -e
+# sh through env -S with options and an assignment.
+printf "%s\n" "${LC_ALL:-}"

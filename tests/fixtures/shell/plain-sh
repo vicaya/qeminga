@@ -1,0 +1,4 @@
+#!/bin/sh
+# POSIX sh.
+set -eu
+printf "%s\n" "${1:-plain}"

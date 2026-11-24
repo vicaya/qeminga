@@ -243,9 +243,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@v2
+      # The installer holds the expected SHA-256 of the download, so it is
+      # pinned to a reviewed commit (v2.90.3) rather than the movable v2
+      # tag, and its checksum verification is stated, not defaulted.
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: shellcheck@0.11.0
+          checksum: true
       - run: shellcheck --version
       - run: scripts/check-shell.sh
 

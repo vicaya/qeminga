@@ -15,17 +15,36 @@ set -euo pipefail
 linter="$(cd "$(dirname "$0")/.." && pwd)/check-shell.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+work=$(cd "$work" && pwd -P)
 failed=0
 
-# The cases must not depend on the caller's git configuration (a global
-# core.excludesFile, for one): only the repositories' own state counts.
+# Nothing of the caller's repository may reach the scratch repositories:
+# git's repository-local variables (GIT_INDEX_FILE above all, which would
+# make `git add` below rewrite the caller's staged changes, but also
+# GIT_DIR, GIT_OBJECT_DIRECTORY, ...) are cleared, and the cases must not
+# depend on the caller's configuration (a global core.excludesFile, for
+# one) either.
+while IFS= read -r var; do
+    unset "$var"
+done < <(git rev-parse --local-env-vars)
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-unset GIT_DIR GIT_WORK_TREE
+
+# in_scratch DIR: refuses (exit 2) unless DIR's index is its own, inside
+# the scratch area; checked before every git write.
+in_scratch() {
+    local index
+    index=$(git -C "$1" rev-parse --path-format=absolute --git-path index)
+    if [ "$index" != "$1/.git/index" ]; then
+        echo "check-shell-selftest: refusing to write the index $index for $1" >&2
+        exit 2
+    fi
+}
 
 # repo NAME: a fresh repository; the caller writes its files.
 repo() {
     mkdir "$work/$1"
     git -C "$work/$1" init -q
+    in_scratch "$work/$1"
 }
 
 # A case passes only for the reason it states, never because discovery or
@@ -36,6 +55,7 @@ repo() {
 check() {
     local name=$1 expected=$2 log="$work/$1.log" rc=0 why=""
     # Every fixture is tracked, so no exclude rule can hide it.
+    in_scratch "$work/$name"
     git -C "$work/$name" add -f -A
     "$linter" "$work/$name" >"$log" 2>&1 </dev/null || rc=$?
     case "$expected" in

@@ -5202,6 +5202,12 @@ try:
     elif op == "safe-rmtree-id":
         target = norm_abs(sys.argv[2])
         ident = parse_path_identity(sys.argv[3], target)
+        require_tx = False
+        if len(sys.argv) > 4:
+            if sys.argv[4] == "--require-tx" and len(sys.argv) == 5:
+                require_tx = True
+            else:
+                raise OSError(errno.EINVAL, f"unexpected safe-rmtree-id argument(s): {sys.argv[4:]}")
         parent = os.path.dirname(target) or "/"
         base = os.path.basename(target)
         pfd, p_sync = open_chain_rdir_or_opath(parent)
@@ -5232,7 +5238,7 @@ try:
                     ident,
                     entries,
                     "delete",
-                    allow_empty_missing_tx=True,
+                    allow_empty_missing_tx=not require_tx,
                 )
                 if tst.st_dev != pst.st_dev or t_mnt != p_mnt:
                     raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
@@ -6672,8 +6678,13 @@ _sync_and_prune_update_containers() {
             "$REC_UPDATE_BACKUP_DIR" "$REC_UPDATE_BACKUP_ID" "$was_active"
     fi
     if [ -n "$REC_UPDATE_STAGE_DIR" ]; then
-        fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
-            || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
+        if [ "$pre_phase" = "restored" ]; then
+            fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" --require-tx \
+                || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
+        else
+            fs_ops safe-rmtree-id "$REC_UPDATE_STAGE_DIR" "$REC_UPDATE_STAGE_ID" \
+                || die "${mode}: failed to prune ${pre_phase} stage '$REC_UPDATE_STAGE_DIR'; preserving updating record for inspection"
+        fi
         REC_UPDATE_STAGE_DIR=""
         REC_UPDATE_STAGE_ID=""
     fi
@@ -6771,7 +6782,7 @@ _rollback_runner_package_tx() {
                                     sync_stage_id=""
                                     ;;
                                 match)
-                                    if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id"; then
+                                    if fs_ops safe-rmtree-id "$sync_stage_dir" "$sync_stage_id" --require-tx; then
                                         sync_stage_dir=""
                                         sync_stage_id=""
                                     else
@@ -6959,7 +6970,7 @@ cleanup_install_exit() {
             local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_INSTALL_BOOTSTRAP_STAGE:-}" ]; then
                 if [ -n "${_INSTALL_BOOTSTRAP_STAGE_ID:-}" ]; then
-                    if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID"; then
+                    if ! fs_ops safe-rmtree-id "$_INSTALL_BOOTSTRAP_STAGE" "$_INSTALL_BOOTSTRAP_STAGE_ID" --require-tx; then
                         warn "leaving staging directory '$_INSTALL_BOOTSTRAP_STAGE' for manual inspection because its identity or backing volume changed"
                         stage_remaining_dir="$_INSTALL_BOOTSTRAP_STAGE"
                         stage_remaining_id="$_INSTALL_BOOTSTRAP_STAGE_ID"
@@ -8085,7 +8096,7 @@ cleanup_update_exit() {
             local stage_remaining_dir="" stage_remaining_id=""
             if [ -n "${_UPDATE_TMP_STAGE:-}" ]; then
                 if [ -n "${_UPDATE_TMP_STAGE_ID:-}" ]; then
-                    if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID"; then
+                    if ! fs_ops safe-rmtree-id "$_UPDATE_TMP_STAGE" "$_UPDATE_TMP_STAGE_ID" --require-tx; then
                         warn "leaving update staging directory '$_UPDATE_TMP_STAGE' for manual inspection because its identity or backing volume changed"
                         stage_remaining_dir="$_UPDATE_TMP_STAGE"
                         stage_remaining_id="$_UPDATE_TMP_STAGE_ID"

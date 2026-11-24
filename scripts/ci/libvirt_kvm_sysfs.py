@@ -2682,8 +2682,9 @@ def _extract_uuid_launch_blocks(data, expected_uuid, *, require_uuid):
 
     Returns ``(out_bytes, first_match_offset, matched_uuid)`` or ``(None, 0, False)``.
     When ``require_uuid`` is True (rotated inode or pinned verified cursor), ONLY
-    launch blocks that explicitly declare ``expected_uuid`` (and no conflicting
-    domain UUID) are accepted; unverified or foreign logs return ``(None, 0, False)``.
+    blocks beginning at a recognized ``starting up`` launch header that explicitly
+    declare ``expected_uuid`` (and no conflicting domain UUID) are accepted;
+    headerless continuations, unverified, or foreign logs return ``(None, 0, False)``.
     """
     if not data:
         return (None, 0, False)
@@ -2698,52 +2699,39 @@ def _extract_uuid_launch_blocks(data, expected_uuid, *, require_uuid):
     blocks = []
     current = []
     cur_start = 0
+    cur_has_header = False
     pos = 0
     for line in data.splitlines(keepends=True):
-        if QEMU_LOG_LAUNCH_HEADER_RE.match(line) and current:
-            blocks.append((cur_start, b"".join(current)))
+        is_header = bool(QEMU_LOG_LAUNCH_HEADER_RE.match(line))
+        if is_header and current:
+            blocks.append((cur_start, cur_has_header, b"".join(current)))
             current = [line]
             cur_start = pos
+            cur_has_header = True
         else:
             if not current:
                 cur_start = pos
+                cur_has_header = is_header
             current.append(line)
         pos += len(line)
     if current:
-        blocks.append((cur_start, b"".join(current)))
+        blocks.append((cur_start, cur_has_header, b"".join(current)))
 
-    kept = []
-    uuid_kept = []
-    first_off = None
-    first_uuid_off = None
-    matched_uuid = False
-    for blk_off, block in blocks:
+    verified = []
+    unverified = []
+    for blk_off, has_header, block in blocks:
         uuids = {m.group(1).lower() for m in QEMU_LOG_UUID_RE.finditer(block)}
-        if require_uuid:
-            if uuids == {exp_bytes}:
-                if first_off is None:
-                    first_off = blk_off
-                if first_uuid_off is None:
-                    first_uuid_off = blk_off
-                matched_uuid = True
-                kept.append(block)
-                uuid_kept.append(block)
-        else:
+        if has_header and exp_bytes is not None and uuids == {exp_bytes}:
+            verified.append((blk_off, block))
+        elif not require_uuid:
             if exp_bytes is not None and uuids and uuids != {exp_bytes}:
                 continue
-            if first_off is None:
-                first_off = blk_off
-            if exp_bytes is not None and uuids == {exp_bytes}:
-                if first_uuid_off is None:
-                    first_uuid_off = blk_off
-                matched_uuid = True
-                uuid_kept.append(block)
-            kept.append(block)
-    out = b"".join(uuid_kept if matched_uuid else kept)
-    pin_off = first_uuid_off if matched_uuid else first_off
-    if not out or pin_off is None:
-        return (None, 0, False)
-    return (out, pin_off, matched_uuid)
+            unverified.append((blk_off, block))
+    if verified:
+        return (b"".join(block for _, block in verified), verified[0][0], True)
+    if not require_uuid and unverified:
+        return (b"".join(block for _, block in unverified), unverified[0][0], False)
+    return (None, 0, False)
 
 
 def _read_verified_qemu_log_segment(

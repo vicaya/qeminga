@@ -33,8 +33,11 @@ provider_run() {
     mkdir -p "$AI_ATTEMPT_DIR/codex-home"
     local -a extra=()
     [ -n "$base_url" ] && extra+=(OPENAI_BASE_URL="$base_url")
-    env -u OPENAI_BASE_URL -u OPENAI_ORG_ID -u OPENAI_PROJECT_ID "${extra[@]}" \
-        OPENAI_API_KEY="$key" CODEX_API_KEY="$key" \
-        CODEX_HOME="$AI_ATTEMPT_DIR/codex-home" \
-        "$(gpt_dir)/node_modules/.bin/codex" "${args[@]}" - <"$prompt"
+    # The key is exported, never an argument (see claude.sh).
+    (
+        unset OPENAI_BASE_URL OPENAI_ORG_ID OPENAI_PROJECT_ID
+        [ "${#extra[@]}" -eq 0 ] || export "${extra[@]}"
+        export OPENAI_API_KEY="$key" CODEX_API_KEY="$key" CODEX_HOME="$AI_ATTEMPT_DIR/codex-home"
+        exec "$(gpt_dir)/node_modules/.bin/codex" "${args[@]}" - <"$prompt"
+    )
 }

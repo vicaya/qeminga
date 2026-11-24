@@ -167,11 +167,12 @@ ai_is_exhausted() {
     [ -f "$1" ] && grep -Eiq -- "$re" "$1"
 }
 
-# ai_scrub SECRETS_JSON < in > out: replaces every secret (pool keys, the
-# instructions) with "***", longest first.
+# ai_scrub SECRETS_FILE < in > out: replaces every secret (pool keys, the
+# instructions) with "***", longest first. The secrets come from a file
+# (a JSON array), never from an argument, which other accounts can read.
 ai_scrub() {
-    jq -Rjs --argjson keys "$1" \
-        'reduce ($keys | map(select(length > 0)) | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
+    jq -Rjs --slurpfile keys "$1" \
+        'reduce ($keys[0] | map(select(length > 0)) | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
 }
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,

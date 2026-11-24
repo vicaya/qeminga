@@ -32,14 +32,18 @@ provider_run() {
     # a root self-hosted runner is the sandbox here.
     [ "$(id -u)" = 0 ] && extra+=(IS_SANDBOX=1)
     # Only the pool key may authenticate: drop any other Anthropic
-    # credential or endpoint the runner's environment might carry. The
-    # JSON stream is kept for the log; a readable trace goes to stdout.
-    env -u ANTHROPIC_AUTH_TOKEN -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_BASE_URL \
-        -u CLAUDE_CODE_USE_BEDROCK -u CLAUDE_CODE_USE_VERTEX "${extra[@]}" \
-        ANTHROPIC_API_KEY="$key" \
-        CLAUDE_CONFIG_DIR="$AI_ATTEMPT_DIR/claude-config" \
-        DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-        "$(claude_dir)/node_modules/.bin/claude" "${args[@]}" <"$prompt" |
+    # credential or endpoint the runner's environment might carry. The key
+    # is exported, never an argument (`env KEY=...` would show it to every
+    # account on the host). The JSON stream is kept for the log; a readable
+    # trace goes to stdout.
+    (
+        unset ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_BASE_URL \
+            CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX
+        [ "${#extra[@]}" -eq 0 ] || export "${extra[@]}"
+        export ANTHROPIC_API_KEY="$key" CLAUDE_CONFIG_DIR="$AI_ATTEMPT_DIR/claude-config" \
+            DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+        exec "$(claude_dir)/node_modules/.bin/claude" "${args[@]}" <"$prompt"
+    ) |
         tee "$stream" |
         jq --unbuffered -Rr 'fromjson? |
             if .type == "assistant" then .message.content[]?

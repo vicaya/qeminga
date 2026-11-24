@@ -73,18 +73,25 @@ provider_install() {
 }
 
 # gemini_agy PROMPT_FILE MODEL EFFORT STREAM -> runs agy once; stderr is
-# kept in $AI_ATTEMPT_DIR/agy.err and echoed.
+# kept in $AI_ATTEMPT_DIR/agy.err and echoed. The prompt goes in on
+# standard input, as one stream-json "user" message, never as an argument:
+# the container's processes, arguments included, are visible on the host.
 gemini_agy() {
     local prompt=$1 model=$2 effort=$3 stream=$4 rc
     # Headless: Gemini API key, never wait for an artifact review.
     local settings='{"modelProvider":"gemini","artifactReviewPolicy":"always-proceed","showTips":false,"showFeedbackSurvey":false}'
-    local -a args=(-p "$(cat "$prompt")" --settings "$settings" --dangerously-skip-permissions
-        --disable-slash-commands --output-format stream-json)
+    local -a args=(--input-format stream-json --output-format stream-json --settings "$settings"
+        --dangerously-skip-permissions --disable-slash-commands -p '')
     [ -n "$model" ] && args+=(--model "$model")
     [ -n "$effort" ] && args+=(--effort "$effort")
-    env -u GOOGLE_API_KEY -u GOOGLE_GEMINI_BASE_URL -u AGY_ADC_AUTH "${GEMINI_EXTRA_ENV[@]}" \
-        GEMINI_API_KEY="$GEMINI_KEY" \
-        "$(gemini_dir)/agy" "${args[@]}" </dev/null 2>"$AI_ATTEMPT_DIR/agy.err" |
+    # The key is exported, never an argument (see claude.sh).
+    (
+        unset GOOGLE_API_KEY GOOGLE_GEMINI_BASE_URL AGY_ADC_AUTH
+        [ "${#GEMINI_EXTRA_ENV[@]}" -eq 0 ] || export "${GEMINI_EXTRA_ENV[@]}"
+        export GEMINI_API_KEY="$GEMINI_KEY"
+        exec "$(gemini_dir)/agy" "${args[@]}" 2>"$AI_ATTEMPT_DIR/agy.err" \
+            < <(jq -Rsc '{event: "user", message: {role: "user", content: .}}' <"$prompt")
+    ) |
         tee "$stream" |
         jq --unbuffered -Rr 'fromjson? |
             if .event == "step_update" then "· \(.step_update.step_type) \(.step_update.state)"

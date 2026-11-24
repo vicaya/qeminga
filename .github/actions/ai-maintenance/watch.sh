@@ -15,14 +15,16 @@
 #                                    time such as 2026-01-31T12:00:00Z, or
 #                                    the state this script wrote last time
 #   SINCE_FILE                       a file holding that state (wins over SINCE)
-#   STATE_FILE                       where to write the next state
+#   STATE_FILE                       where to write the next state (default:
+#                                    a fresh directory under RUNNER_TEMP)
 #   BRANCH_PREFIX                    the PR must come from this repository on
 #                                    a branch with this prefix
 #   QUIET_MINUTES (90)  POLL_SECONDS (300)  SETTLE_SECONDS (300)
 #   TRUSTED_ASSOCIATIONS ("OWNER,MEMBER,COLLABORATOR")
 #   TRUSTED_BOTS                     comma-separated bot logins whose
 #                                    reviews count (e.g. "copilot-pull-request-reviewer[bot]")
-#   FEEDBACK_FILE                    where to write the feedback (Markdown)
+#   FEEDBACK_FILE                    where to write the feedback (Markdown;
+#                                    default: next to the state)
 #   FEEDBACK_BUDGET (60000)          most bytes of feedback handed over at once
 #
 # Outputs (GITHUB_OUTPUT): status=feedback|quiet|closed|ignored, state-file
@@ -42,10 +44,17 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 out() { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; return 0; }
 
 : "${PR:?PR is required}" "${BRANCH_PREFIX:?BRANCH_PREFIX is required}"
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+# The state stays in files: a long history would not fit an argument or an
+# environment variable of the commands below.
 if [ -n "${SINCE_FILE:-}" ]; then
-    SINCE=$(head -c 50000000 "$SINCE_FILE") || { ai_log "SINCE_FILE: cannot read $SINCE_FILE"; exit 2; }
+    size=$(wc -c <"$SINCE_FILE") || { ai_log "SINCE_FILE: cannot read $SINCE_FILE"; exit 2; }
+    [ "$size" -le 10000000 ] || { ai_log "SINCE_FILE: too large ($size bytes, at most 10 MB)"; exit 2; }
+    cp "$SINCE_FILE" "$work/since"
+else
+    printf '%s' "${SINCE:?SINCE or SINCE_FILE is required}" >"$work/since"
 fi
-: "${SINCE:?SINCE or SINCE_FILE is required}"
 case "$PR" in '' | *[!0-9]*) ai_log "PR must be a number"; exit 2 ;; esac
 repo=${GITHUB_REPOSITORY:?}
 quiet=$((${QUIET_MINUTES:-90} * 60))
@@ -54,8 +63,6 @@ settle=${SETTLE_SECONDS:-300}
 budget=${FEEDBACK_BUDGET:-60000}
 associations=${TRUSTED_ASSOCIATIONS:-OWNER,MEMBER,COLLABORATOR}
 bots=${TRUSTED_BOTS:-}
-feedback_file=${FEEDBACK_FILE:-${RUNNER_TEMP:-/tmp}/ai-maintenance-feedback.md}
-state_file=${STATE_FILE:-${RUNNER_TEMP:-/tmp}/ai-maintenance-watch-state.txt}
 # Marks the workflow's own comments, which are never feedback.
 MARKER='<!-- ai-maintenance -->'
 # Every item has a key "<kind><id>" (kind r, c or i: review, inline
@@ -78,22 +85,25 @@ MARKER='<!-- ai-maintenance -->'
 # because GitHub's timestamps miss some: they have one-second resolution,
 # and a review's body can change without any. A bare time is a state with
 # nothing handed over.
-case "$SINCE" in *'|'*'|'*) ai_log "SINCE: not a state this script wrote"; exit 2 ;; esac
-IFS='|' read -r floor handed <<<"$SINCE"
-if ! [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
-    ai_log "SINCE: the state must start with a UTC time such as 2026-01-31T12:00:00Z"
+# Parsed into $work/handed.json ({key: {digest, offset?}}), which the jq
+# programs below read with --slurpfile.
+jq -Rsc '
+    rtrimstr("\n") | split("|") as $p | ($p[1] // "") as $h
+    | if ($p | length) > 2 then {error: "not a state this script wrote"}
+      elif ($p[0] | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$") | not) then
+          {error: "the state must start with a UTC time such as 2026-01-31T12:00:00Z"}
+      elif $h != "" and any($h | split(",")[]; test("^[rci][0-9]+=[0-9a-f]{16}(\\+[0-9]+)?$") | not) then
+          {error: "not a state this script wrote"}
+      else {floor: $p[0], handed: ($h | split(",") | map(select(length > 0)
+          | capture("^(?<k>[^=]+)=(?<d>[0-9a-f]+)(\\+(?<o>[0-9]+))?$")
+          | {key: .k, value: ({digest: .d} + (if .o then {offset: (.o | tonumber)} else {} end))}) | from_entries)}
+      end' "$work/since" >"$work/state.json"
+if [ "$(jq -r '.error // ""' "$work/state.json")" != "" ]; then
+    ai_log "SINCE: $(jq -r .error "$work/state.json")"
     exit 2
 fi
-entry='[rci][0-9]+=[0-9a-f]{16}(\+[0-9]+)?'
-if [ -n "$handed" ] && ! [[ "$handed" =~ ^$entry(,$entry)*$ ]]; then
-    ai_log "SINCE: not a state this script wrote"
-    exit 2
-fi
-handed=$(jq -cn --arg h "$handed" '$h | split(",") | map(select(length > 0)
-    | capture("^(?<k>[^=]+)=(?<d>[0-9a-f]+)(\\+(?<o>[0-9]+))?$")
-    | {key: .k, value: ({digest: .d} + (if .o then {offset: (.o | tonumber)} else {} end))}) | from_entries')
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+floor=$(jq -r .floor "$work/state.json")
+jq -c .handed "$work/state.json" >"$work/handed.json"
 
 pr_state() {
     gh api "repos/$repo/pulls/$PR" --jq '{state, head: {ref: .head.ref, sha: .head.sha, repo: {full_name: .head.repo.full_name}}}' \
@@ -135,8 +145,9 @@ collect() {
     done >"$work/digests"
     jq --rawfile d "$work/digests" '($d | split("\n")) as $d | to_entries | map(.value + {digest: $d[.key]})' \
         "$work/items.json" >"$work/all.json"
-    jq --arg floor "$floor" --argjson handed "$handed" '
-        [.[] | $handed[.key] as $h
+    jq --arg floor "$floor" --slurpfile hs "$work/handed.json" '
+        $hs[0] as $handed
+        | [.[] | $handed[.key] as $h
          | if $h == null then
                select(.at > $floor or .updated > $floor) | .offset = 0 | .class = "new"
                | if .at > $floor then . else .kind += ", updated" end
@@ -223,8 +234,9 @@ while :; do
         # next round continues it. Each item handed over is recorded with
         # the digest of its body; the others keep what was recorded for them.
         jq --arg intro "$intro" --arg note "$note" --arg marker "$marker" --argjson budget "$budget" \
-            --argjson handed "$handed" --slurpfile all "$work/all.json" '
+            --slurpfile hs "$work/handed.json" --slurpfile all "$work/all.json" '
             def bytes: utf8bytelength;
+            $hs[0] as $handed |
             def cut($n): if $n <= 0 then "" elif bytes <= $n then . else .[: (length * $n / bytes | floor)] | cut($n) end;
             def md: "### \(.kind) by @\(.author | tostring | cut(64)) at \(.at | tostring | cut(32))"
                 + (if .path then "\n\nOn `\(.path | tostring | cut(200))`"
@@ -256,7 +268,14 @@ while :; do
                delivered: $n, remaining: $left,
                markdown: (([$intro] + .parts | join("\n")) + (if $left > 0 then $note else "" end))}
         ' "$work/found.json" >"$work/handover.json"
-        printf '%s|%s\n' "$floor" "$(jq -r .handed "$work/handover.json")" >"$state_file"
+        # Unless told where, each invocation writes to a fresh directory of
+        # its own, so two in one job never share (or overwrite) a file.
+        feedback_file=${FEEDBACK_FILE:-} state_file=${STATE_FILE:-}
+        if [ -z "$feedback_file" ] || [ -z "$state_file" ]; then
+            out_dir=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ai-maintenance-watch.XXXXXX")
+            feedback_file=${feedback_file:-$out_dir/feedback.md} state_file=${state_file:-$out_dir/state.txt}
+        fi
+        jq -r --arg floor "$floor" '"\($floor)|\(.handed)"' "$work/handover.json" >"$state_file"
         jq -r .markdown "$work/handover.json" >"$feedback_file"
         ai_log "PR #$PR: $(jq .delivered "$work/handover.json") feedback item(s) handed over, $(jq .remaining "$work/handover.json") left for the next round"
         out status feedback

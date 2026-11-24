@@ -45,6 +45,9 @@ outputs:
   status:
     description: feedback, quiet, closed or ignored.
     value: ${{ steps.watch.outputs.status }}
+  feedback-file:
+    description: The feedback handed over (Markdown), also uploaded as the feedback artifact.
+    value: ${{ steps.watch.outputs.feedback-file }}
   state-file:
     description: The state after this hand-over (the feedback items handed over, by ID and body digest), also uploaded as the state artifact; items over the size budget wait for the next round.
     value: ${{ steps.watch.outputs.state-file }}
@@ -65,23 +68,21 @@ runs:
         PR: ${{ inputs.pr }}
         SINCE: ${{ inputs.since }}
         SINCE_FILE: ${{ inputs.since-file }}
-        STATE_FILE: ${{ runner.temp }}/ai-watch-state-out/state.txt
         BRANCH_PREFIX: ${{ inputs.branch-prefix }}
         QUIET_MINUTES: ${{ inputs.quiet-minutes }}
         POLL_SECONDS: ${{ inputs.poll-seconds }}
         SETTLE_SECONDS: ${{ inputs.settle-seconds }}
         TRUSTED_ASSOCIATIONS: ${{ inputs.trusted-associations }}
         TRUSTED_BOTS: ${{ inputs.trusted-bots }}
-        FEEDBACK_FILE: ${{ runner.temp }}/ai-feedback/feedback.md
-      run: |
-        mkdir -p "$(dirname "$FEEDBACK_FILE")" "$(dirname "$STATE_FILE")"
-        "$GITHUB_ACTION_PATH/../watch.sh"
+      # The feedback and the state go to a fresh directory of this
+      # invocation's own (the feedback-file and state-file outputs).
+      run: '"$GITHUB_ACTION_PATH/../watch.sh"'
 
     - if: steps.watch.outputs.status == 'feedback'
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.feedback-artifact }}
-        path: ${{ runner.temp }}/ai-feedback
+        path: ${{ steps.watch.outputs.feedback-file }}
         retention-days: 7
 
     # The state grows with every item handed over: it travels to the next
@@ -90,5 +91,5 @@ runs:
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.state-artifact }}
-        path: ${{ runner.temp }}/ai-watch-state-out
+        path: ${{ steps.watch.outputs.state-file }}
         retention-days: 7

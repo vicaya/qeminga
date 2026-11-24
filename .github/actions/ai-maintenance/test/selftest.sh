@@ -34,6 +34,12 @@ tmp=$(mktemp -d)
 export TMPDIR=$tmp
 trap '[ -n "${KEEP:-}" ] || rm -rf "$tmp"' EXIT
 failures=0 passes=0
+# The action under test is a copy inside the test's own directory: the fake
+# docker below may open directories for the agent's user, and only ever
+# under $tmp, whose removal undoes it.
+action_src=$action
+cp -a "$action" "$tmp/action" && action=$tmp/action
+export FAKE_DOCKER_ROOT=$tmp FAKE_DOCKER_OPENED=$tmp/opened.log
 
 ok() { passes=$((passes + 1)); printf 'ok   %s\n' "$1"; }
 fail() { failures=$((failures + 1)); printf 'FAIL %s\n' "$1"; [ -n "${2:-}" ] && printf '     %s\n' "$2"; }
@@ -192,7 +198,7 @@ fi
 
 # --- the repository's sandbox image (--image) ------------------------------------
 if [ -n "$image_mode" ]; then
-    root=$(cd "$action/../../.." && pwd)
+    root=$(cd "$action_src/../../.." && pwd)
     # The workflow's container-setup block, as the action receives it.
     setup=$(awk '
         found && /^[[:space:]]*$/ { print ""; next }
@@ -248,7 +254,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -e) case "$2" in *=*) envs+=("$2") ;; *) [ -n "${!2+x}" ] && envs+=("$2=${!2}") ;; esac; shift ;;
         -w) wd=$2; shift ;;
-        --user) [ "$(id -u)" = 0 ] && as=(setpriv --reuid "${2%%:*}" --regid "${2##*:}" --clear-groups); shift ;;
+        --user) [ "$(id -u)" = 0 ] &&
+                    as=("$(PATH=/usr/bin:/bin command -v setpriv)" --reuid "${2%%:*}" --regid "${2##*:}" --clear-groups); shift ;;
         -v) mounts+=("${2%%:*}"); shift ;;
         --name | --cap-drop | --security-opt | --network | --pids-limit) shift ;;
         -*) ;;
@@ -257,15 +264,20 @@ while [ $# -gt 0 ]; do
     shift
 done
 shift # the image
-[ "${#as[@]}" -gt 0 ] || { cd "$wd" && exec env -i "${envs[@]}" "$@"; }
+# The real env (and setpriv): the variables are the container's
+# environment, not arguments of a command the run started (the argument-log
+# shims below see only what the run itself starts).
+real_env=$(PATH=/usr/bin:/bin command -v env)
+[ "${#as[@]}" -gt 0 ] || { cd "$wd" && exec "$real_env" -i "${envs[@]}" "$@"; }
 opened=()
 for m in "${mounts[@]}" "$wd"; do
     d=$m
     while d=$(dirname "$d") && [ "$d" != / ]; do
-        [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ] && chmod o+x "$d" && opened+=("$d")
+        [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ] && chmod o+x "$d" && opened+=("$d") &&
+            printf '%s\n' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
     done
 done
-(cd "$wd" && "${as[@]}" env -i "${envs[@]}" "$@")
+(cd "$wd" && "${as[@]}" "$real_env" -i "${envs[@]}" "$@")
 rc=$?
 [ "${#opened[@]}" -eq 0 ] || chmod o-x "${opened[@]}"
 exit "$rc"
@@ -340,7 +352,8 @@ ai_route "$p3" fastest 0 >/dev/null 2>&1
 eq "route: an unknown strategy is a configuration error" 2 $?
 eq "aliases: anthropic, openai, google, agy" "claude gpt gemini gemini provider2" \
     "$(for p in anthropic openai google agy provider2; do ai_canonical_provider "$p"; done | paste -sd' ')"
-eq "scrub: every key is replaced" "x *** y *** z" "$(printf 'x k1 y k2 z' | ai_scrub '["k1","k2"]')"
+printf '%s' '["k1","k2"]' >"$tmp/scrub-keys.json"
+eq "scrub: every key is replaced" "x *** y *** z" "$(printf 'x k1 y k2 z' | ai_scrub "$tmp/scrub-keys.json")"
 printf 'GIF89a\0\1k2\0' >"$tmp/blob"
 check "leak scan: finds a key between binary bytes" ai_contains_key '["k1","k2"]' "$tmp/blob"
 check "leak scan: a clean file passes" bash -c '. "$1/lib.sh"; ! ai_contains_key "[\"k9\"]" "$2"' _ "$action" "$tmp/blob"
@@ -447,9 +460,33 @@ eq "run: a state directory others can write to is refused" 2 "$rc"
 chmod 1777 "$tmp/shared"
 run_case sticky '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared"
 eq "run: ... unless it is sticky" 0 "$rc"
+mkdir -p "$tmp/gw/owned" && chmod 777 "$tmp/gw" && chmod 700 "$tmp/gw/owned"
+run_case gwparent '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/gw/owned"
+eq "run: ... or one under a directory others can write to" 2 "$rc"
+run_case gwrunner '[{"claude":["ok-1"]}]' AI_STATE_DIR= RUNNER_TEMP="$tmp/gw/owned"
+eq "run: ... RUNNER_TEMP included" 2 "$rc"
 ln -s "$tmp/shared" "$tmp/shared-link"
 run_case statelink '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared-link"
 eq "run: ... and a symlink is refused" 2 "$rc"
+
+# Keys and instructions never reach a process's arguments, which other
+# accounts on the runner can read: every command the run starts is logged
+# by a shim, and the fake docker logs its own.
+argv_bin=$tmp/argv-bin
+mkdir -p "$argv_bin"
+for c in jq grep sed cut tr head tail cat sha256sum git timeout mktemp rm cp chmod chown find sort paste wc od \
+    base64 awk stat id dirname readlink mkdir mv tee env setpriv bash ls sleep date; do
+    real_c=$(PATH=/usr/local/bin:/usr/bin:/bin command -v "$c") || continue
+    printf '#!%s\nprintf "%%s\\0" "$0" "$@" >>"$ARGV_LOG"\nexec %s "$@"\n' "$(PATH=/usr/bin:/bin command -v bash)" "$real_c" \
+        >"$argv_bin/$c"
+    chmod +x "$argv_bin/$c"
+done
+: >"$tmp/argv.log"
+run_case argv '[{"claude":["quota-argvkeyone"]},{"gpt":["ok-argvkeytwo"]}]' PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv.log" \
+    AI_INSTRUCTIONS="Keep the argvinstructionmarker out of every process argument"
+check "run: (the shims saw the run's commands)" bash -c '[ "$1" = 0 ] && grep -qa "ai_scrub\|jq" "$2"' _ "$rc" "$tmp/argv.log"
+check "run: no key or instruction is ever a process argument" bash -c \
+    '! grep -qa "argvkey\|argvinstructionmarker" "$1" "$2"' _ "$tmp/argv.log" "$tmp/argv/docker.log"
 
 run_case symlink '[{"claude":["symlink-1"]}]'
 check "run: an output file the agent replaced by a symlink is not read" bash -c \
@@ -525,8 +562,8 @@ cat >"$bin/npm" <<EOF
 #!/usr/bin/env bash
 prefix= spec=
 while [ \$# -gt 0 ]; do case "\$1" in --prefix) prefix=\$2; shift ;; -*) ;; install) ;; *) spec=\$1 ;; esac; shift; done
-name=\${spec%@*}; name=\${name##*/}
-mkdir -p "\$prefix/node_modules/.bin" && cp "$pkgs/\$name" "\$prefix/node_modules/.bin/\$name"
+name=\${spec%@*}; name=\${name##*/}; exe=\$name; [ "\$name" != claude-code ] || exe=claude
+mkdir -p "\$prefix/node_modules/.bin" && cp "$pkgs/\$name" "\$prefix/node_modules/.bin/\$exe"
 EOF
 cat >"$bin/curl" <<EOF
 #!/usr/bin/env bash
@@ -542,22 +579,39 @@ while [ $# -gt 0 ]; do [ "$1" = -o ] && printf 'Codex done\n' >"$2"; shift; done
 EOF
 cat >"$pkgs/agy" <<'EOF'
 #!/usr/bin/env bash
+printf '%s\n' "$@" >>"$AI_ATTEMPT_DIR/agy.args"
+cat >>"$AI_ATTEMPT_DIR/agy.stdin"
 effort=
 while [ $# -gt 0 ]; do [ "$1" = --effort ] && effort=$2; shift; done
 if [ "$effort" = max ]; then echo 'Error: model "m" has no "max" effort (available: low, high)' >&2; exit 3; fi
 printf '{"event":"result","result":{"status":"OK","response":"Gemini done at %s"}}\n' "$effort"
 EOF
-chmod +x "$pkgs/codex" "$pkgs/agy"
+cat >"$pkgs/claude-code" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$@" >"$AI_ATTEMPT_DIR/claude.args"
+[ -n "${ANTHROPIC_API_KEY:-}" ] && printf '{"type":"result","is_error":false,"result":"Claude done"}\n'
+EOF
+chmod +x "$pkgs/codex" "$pkgs/agy" "$pkgs/claude-code"
 agy_sha=$(sha512sum "$pkgs/agy" | cut -d' ' -f1)
-run_case codex '[{"gpt":{"keys":["sk-x"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real"
+run_case codex '[{"gpt":{"keys":["sk-argvcodexkey"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" \
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
 check "codex: max is passed as xhigh, and reported as used" bash -c \
     'grep -qx "model_reasoning_effort=\"xhigh\"" "$1/attempt-1/out/codex.args" && [ "$(jq -r .effort "$1/result/meta.json")" = xhigh ] &&
      [ "$(jq -r "[.effort, .effort_used] | join(\" \")" "$1/attempts.jsonl")" = "max xhigh" ]' _ "$state"
-run_case agy '[{"gemini":{"keys":["g-x"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" GITHUB_STEP_SUMMARY="$tmp/agy-summary.md" \
-    AGY_DOWNLOAD_URL=https://example.invalid/dl/agy AGY_SHA512="$agy_sha"
+run_case agy '[{"gemini":{"keys":["g-argvagykey"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" GITHUB_STEP_SUMMARY="$tmp/agy-summary.md" \
+    AGY_DOWNLOAD_URL=https://example.invalid/dl/agy AGY_SHA512="$agy_sha" AI_INSTRUCTIONS="Keep agyinstructionmarker off argv" \
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
+check "agy: the prompt goes in on standard input, never in the arguments" bash -c \
+    '! grep -q agyinstructionmarker "$1/attempt-1/out/agy.args" &&
+     jq -e "select(.event == \"user\") | .message.content | contains(\"agyinstructionmarker\")" "$1/attempt-1/out/agy.stdin" >/dev/null' _ "$state"
 check "agy: an effort the model lacks steps down, and the step is reported" bash -c \
     '[ "$(jq -r .effort "$1/result/meta.json")" = high ] && grep -q "Gemini done at high" "$1/result/summary.md" &&
      grep -q "| max (used high) |" "$2"' _ "$state" "$tmp/agy-summary.md"
+run_case realclaude '[{"claude":["sk-ant-argvclaudekey"]}]' AI_PROVIDERS_DIR="$real" \
+    PATH="$argv_bin:$bin:$PATH" ARGV_LOG="$tmp/argv-real.log"
+eq "claude: the real adapter completes with a fake CLI" "0 Claude done" "$rc $(head -n1 "$state/result/summary.md")"
+check "adapters: the CLIs get their keys in the environment, never in a command's arguments" bash -c \
+    '[ -s "$1" ] && ! grep -qa "argvcodexkey\|argvclaudekey\|g-argvagykey\|agyinstructionmarker" "$1"' _ "$tmp/argv-real.log"
 run_case effortfile '[{"claude":["effort-1"]}]' AI_MODELS='{"claude":"m max"}'
 eq "run: the effort an adapter reports wins over the one requested" "low" "$(jq -r .effort "$state/result/meta.json")"
 
@@ -743,6 +797,27 @@ eq "watch: the state file is an output" "$tmp/watch-state.txt" "$(output state-f
 printf '%s' "$all_until" >"$tmp/since.txt"
 watch SINCE= SINCE_FILE="$tmp/since.txt"
 eq "watch: the state can come from a file" "0 quiet" "$rc $(output status)"
+# A long history (5,000 items handed over) stays in files: never an
+# argument or a variable in the environment of what the watch runs.
+{ printf '%s' "$all_until"; for i in $(seq 10000 14999); do printf ',i%s=%s' "$i" 0123456789abcdef; done; } >"$tmp/since-big.txt"
+watch SINCE= SINCE_FILE="$tmp/since-big.txt"
+eq "watch: a long history in the state file is read" "0 quiet" "$rc $(output status)"
+head -c 10000001 /dev/zero | tr '\0' 0 >"$tmp/since-huge.txt"
+watch SINCE= SINCE_FILE="$tmp/since-huge.txt"
+check "watch: a state file over 10 MB is refused" bash -c '[ "$1" = 2 ] && grep -q "too large" "$2"' _ "$rc" "$tmp/watch.log"
+# Without FEEDBACK_FILE and STATE_FILE, each invocation writes its own,
+# in a fresh directory under RUNNER_TEMP.
+mkdir -p "$tmp/rt"
+watch FEEDBACK_FILE= STATE_FILE= RUNNER_TEMP="$tmp/rt"
+first_fb=$(output feedback-file) first_state=$(output state-file)
+watch FEEDBACK_FILE= STATE_FILE= RUNNER_TEMP="$tmp/rt" TRUSTED_BOTS="copilot-pull-request-reviewer[bot]"
+check "watch: each invocation writes its feedback and state to files of its own" bash -c \
+    '[ "$1" != "$3" ] && [ "$2" != "$4" ] && [ "${1#"$5"/}" != "$1" ] && ! grep -q "Bot review" "$1" && grep -q "Bot review" "$3" &&
+     [ "$(cut -d"|" -f2 "$2" | tr , "\n" | grep -c .)" = 3 ] && [ "$(cut -d"|" -f2 "$4" | tr , "\n" | grep -c .)" = 4 ]' \
+    _ "$first_fb" "$first_state" "$(output feedback-file)" "$(output state-file)" "$tmp/rt"
+check "watch action: the files uploaded are the ones this invocation wrote" bash -c \
+    'grep -qF "path: \${{ steps.watch.outputs.feedback-file }}" "$1" && grep -qF "path: \${{ steps.watch.outputs.state-file }}" "$1" &&
+     ! grep -q "FEEDBACK_FILE\|STATE_FILE" "$1"' _ "$action/watch/action.yml"
 fb=$tmp/feedback-out.md
 check "watch: owners, collaborators and listed bots count" bash -c \
     'grep -q "Please split this" "$1" && grep -q "Typo here" "$1" && grep -q "src/a.rs. line 12" "$1" && grep -q "Bot review" "$1"' _ "$fb"
@@ -1035,6 +1110,8 @@ check "publish: a patch touching .github/workflows/ is refused before any push" 
     '[ "$3" = 1 ] && ! git -C "$1" rev-parse -q --verify "refs/heads/ai-maintenance/$2-97" >/dev/null && grep -q "workflows" "$4"' \
     _ "$remote" "$(date -u +%Y%m%d)" "$rc" "$tmp/pub.log"
 
+check "selftest: the fake docker opened directories only inside the test's own" bash -c \
+    '! grep -v "^$2/" "$1"' _ "$FAKE_DOCKER_OPENED" "$tmp"
 echo
 echo "$passes passed, $failures failed"
 [ "$failures" -eq 0 ]

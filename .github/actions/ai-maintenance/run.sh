@@ -74,7 +74,10 @@ pool=$(ai_normalize_pool "$pool_raw") || exit 2
 pool_raw=
 keys=$(ai_all_keys "$pool")
 # Everything withheld from published output: the keys and the instructions.
-secrets=$(ai_secret_fragments "$instructions" | jq -c --argjson k "$keys" '$k + .')
+# Secrets reach the commands that handle them through standard input or an
+# owner-only file, never through their arguments, which every account on
+# the runner can read.
+secrets=$({ printf '%s\n' "$keys"; ai_secret_fragments "$instructions"; } | jq -cs '.[0] + .[1]')
 # Keys inside the pool secret are not masked individually by GitHub.
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
     jq -r '.[] | select(test("\n") | not)' <<<"$secrets" | while IFS= read -r k; do printf '::add-mask::%s\n' "$k"; done
@@ -97,14 +100,33 @@ providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
 state_root=${AI_STATE_DIR:-${RUNNER_TEMP:+$RUNNER_TEMP/ai-maintenance}}
 state_root=${state_root:-${TMPDIR:-/tmp}}
 mkdir -p "$state_root" || exit 2
-if [ -L "$state_root" ] || ! read -r root_uid root_mode < <(stat -c '%u %a' "$state_root" 2>/dev/null) ||
-    { [ "$root_uid" != "$(id -u)" ] && [ "$root_uid" != 0 ]; } ||
-    { [ $((8#$root_mode & 8#022)) -ne 0 ] && [ $((8#$root_mode & 8#1000)) -eq 0 ]; }; then
-    ai_log "AI_STATE_DIR ($state_root) must be a directory of this user's (or root's) that others cannot write to, or a sticky one such as /tmp, not a symlink"
+# trusted_dir DIR: owned by this user or root, and not writable by anyone
+# else unless sticky (then no one else can rename what is in it).
+trusted_dir() {
+    local uid mode
+    read -r uid mode < <(stat -c '%u %a' "$1" 2>/dev/null) || return 1
+    { [ "$uid" = "$(id -u)" ] || [ "$uid" = 0 ]; } &&
+        { [ $((8#$mode & 8#022)) -eq 0 ] || [ $((8#$mode & 8#1000)) -ne 0 ]; }
+}
+# Every directory on the way to it, as the kernel resolves it: anyone who
+# can replace one could swap the run's directory for another.
+state_ok=false
+if [ ! -L "$state_root" ] && root_phys=$(cd "$state_root" && pwd -P); then
+    state_ok=true d=$root_phys
+    while :; do
+        trusted_dir "$d" || { state_ok=false; break; }
+        [ "$d" != / ] || break
+        d=$(dirname "$d")
+    done
+fi
+if [ "$state_ok" != true ]; then
+    ai_log "the state directory ($state_root) and every directory above it must belong to this user or root and be writable by no one else (unless sticky, like /tmp); it may not be a symlink"
     exit 2
 fi
-state=$(mktemp -d "$(cd "$state_root" && pwd -P)/ai-maintenance-run.XXXXXX") || exit 2
+state=$(mktemp -d "$root_phys/ai-maintenance-run.XXXXXX") || exit 2
 out state-dir "$state"
+secrets_file=$state/secrets.json
+(umask 077 && printf '%s' "$secrets" >"$secrets_file") || exit 2
 # When the invocation ends, however it ends, only the sanitized output is
 # left: the result, the uploaded logs, the scrubbed summary and the
 # attempts table. The rest (the prompt, the agent's trees and raw output,
@@ -187,7 +209,7 @@ suspend_commands() {
 resume_commands() { [ "${GITHUB_ACTIONS:-}" != true ] || printf '\n::%s::\n' "$command_token"; }
 show_capture() { # FILE: the end of a captured output, scrubbed
     suspend_commands
-    ai_tail_lines "$1" 100000 | ai_scrub "$secrets"
+    ai_tail_lines "$1" 100000 | ai_scrub "$secrets_file"
     resume_commands
 }
 
@@ -421,7 +443,7 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
     else
         echo "Nightly maintenance"
     fi
-} | ai_scrub "$secrets" | head -c 60000 >"$summary"
+} | ai_scrub "$secrets_file" | head -c 60000 >"$summary"
 
 # Logs for upload, with every key and the instructions withheld (GitHub
 # masks secrets in the console only, not in files). Only the files the run
@@ -432,7 +454,7 @@ rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
 upload() { # SOURCE DEST: scrubbed, at most 20 MB, cut at a line end
     ai_regular_file "$1" || return 0
-    ai_head_lines "$1" 20000000 | ai_scrub "$secrets" >"$2"
+    ai_head_lines "$1" 20000000 | ai_scrub "$secrets_file" >"$2"
 }
 if [ "$private" = false ]; then
     for ((i = 1; i <= n; i++)); do

@@ -291,6 +291,11 @@ collect_diagnostics() {
         fi
         return 0
     fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        # Omit session diagnostics if the verified atomic 0600 publisher is unavailable
+        # rather than reopening destination paths by name with redirection or cp/chmod.
+        return 0
+    fi
     sys_fs_ops prepare-session-evidence-dir "$out" 2>/dev/null || return 0
     if [ "$domain_owned" = "1" ]; then
         local dom_xml="$verified_xml"
@@ -334,8 +339,9 @@ cmd_cleanup() {
             sys_fs_ops prepare-evidence-dir "$out" || exit 1
         fi
     elif [ -n "$out" ]; then
-        command -v python3 >/dev/null || die "missing tool: python3"
-        sys_fs_ops prepare-session-evidence-dir "$out" || exit 1
+        if command -v python3 >/dev/null 2>&1; then
+            sys_fs_ops prepare-session-evidence-dir "$out" || exit 1
+        fi
     fi
     dir="$IMAGES/$name"
     if ! command -v virsh >/dev/null 2>&1; then
@@ -345,7 +351,7 @@ cmd_cleanup() {
         if [ -n "$out" ]; then
             if [ "$CONNECT_URI" = "qemu:///system" ]; then
                 printf '%s\n' "$note" | sys_fs_ops publish-evidence-stdin "$out" "cleanup.txt"
-            else
+            elif command -v python3 >/dev/null 2>&1; then
                 printf '%s\n' "$note" | sys_fs_ops publish-session-evidence-stdin "$out" "cleanup.txt"
             fi
         fi
@@ -1018,7 +1024,18 @@ EOF
         RUN_DOMAIN_REF="$def_uuid"
         RUN_DOMAIN_OWNED=1
     else
-        RUN_DOMAIN_REF="$name"
+        local sess_uuid=""
+        sess_uuid="$(v domuuid "$name" 2>/dev/null | tr -d '[:space:]' || true)"
+        if [[ ! "$sess_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            local sess_xml=""
+            sess_xml="$(v dumpxml "$name" 2>/dev/null || true)"
+            sess_uuid="$(sed -n 's/.*<uuid>\([0-9a-fA-F-]\{36\}\)<\/uuid>.*/\1/p' <<<"$sess_xml" | head -n 1 || true)"
+        fi
+        if [[ "$sess_uuid" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            RUN_DOMAIN_REF="$sess_uuid"
+        else
+            RUN_DOMAIN_REF="$name"
+        fi
         RUN_DOMAIN_OWNED=1
     fi
     if [ "$CONNECT_URI" = "qemu:///system" ]; then

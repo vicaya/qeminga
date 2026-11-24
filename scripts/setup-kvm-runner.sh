@@ -5128,42 +5128,71 @@ try:
             pst = os.fstat(pfd)
             p_mnt = fd_mnt_id(pfd)
             verify_parent_identity(pfd, pst, parent, ident, entries, "inspect", target)
+            if target in mountpoints:
+                raise OSError(
+                    errno.EXDEV,
+                    f"staging directory '{target}' is obscured by a mount; preserving journal reference",
+                )
             try:
                 lst = os.lstat(base, dir_fd=pfd)
             except FileNotFoundError:
                 print("absent")
                 sys.exit(0)
-            if (
-                stat.S_ISLNK(lst.st_mode)
-                or not stat.S_ISDIR(lst.st_mode)
-                or lst.st_dev != pst.st_dev
-                or lst.st_ino != ident["t_ino"]
-                or target in mountpoints
-            ):
+            if stat.S_ISLNK(lst.st_mode):
                 print("mismatch")
                 sys.exit(0)
+            if lst.st_dev != pst.st_dev:
+                raise OSError(
+                    errno.EXDEV,
+                    f"staging directory '{target}' is obscured by a mount on another device; preserving journal reference",
+                )
+            efd = os.open(base, os.O_PATH | os.O_NOFOLLOW, dir_fd=pfd)
+            try:
+                est = os.fstat(efd)
+                e_mnt = fd_mnt_id(efd)
+                if est.st_dev != pst.st_dev or e_mnt != p_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"staging directory '{target}' is obscured by a mount; preserving journal reference",
+                    )
+                e_vol = volume_id_of_fd(efd, target, entries)
+                if e_vol != ident["vol"]:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"staging directory '{target}' backing volume changed from '{ident['vol']}' to '{e_vol}'; preserving journal reference",
+                    )
+                if not stat.S_ISDIR(est.st_mode) or est.st_ino != ident["t_ino"]:
+                    print("mismatch")
+                    sys.exit(0)
+            finally:
+                os.close(efd)
             tfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)
             try:
                 tst = os.fstat(tfd)
                 t_mnt = fd_mnt_id(tfd)
-                if (
-                    tst.st_dev != pst.st_dev
-                    or t_mnt != p_mnt
-                    or tst.st_ino != ident["t_ino"]
-                ):
-                    print("mismatch")
-                    sys.exit(0)
+                if tst.st_dev != pst.st_dev or t_mnt != p_mnt:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"staging directory '{target}' is obscured by a mount; preserving journal reference",
+                    )
                 t_vol = volume_id_of_fd(tfd, target, entries)
                 if t_vol != ident["vol"]:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"staging directory '{target}' backing volume changed from '{ident['vol']}' to '{t_vol}'; preserving journal reference",
+                    )
+                if tst.st_ino != ident["t_ino"]:
                     print("mismatch")
                     sys.exit(0)
                 live_tx = read_tx_marker(tfd, t_mnt, target, sync_file=False)
                 if live_tx == ident["tx"]:
                     print("match")
-                elif not live_tx and not os.listdir(tfd):
-                    # Recognize the post-marker-unlink empty-directory retry window
-                    # without writing or recreating `.qeminga-tx-id`.
-                    print("match")
+                elif not live_tx:
+                    # Parent, mount, backing volume, and directory inode still match
+                    # the recorded stage, but `.qeminga-tx-id` is missing (whether
+                    # empty or still holding files); ownership is uncertain so treat
+                    # it as ambiguous rather than match/mismatch.
+                    print("ambiguous")
                 else:
                     print("mismatch")
             finally:
@@ -6749,6 +6778,10 @@ _rollback_runner_package_tx() {
                                         warn "rollback restored previous runner files but staging directory '$sync_stage_dir' still exists and could not be removed; retaining stage reference in restored journal for retry"
                                         restore_ok=0
                                     fi
+                                    ;;
+                                ambiguous)
+                                    warn "rollback found markerless directory at '$sync_stage_dir' with matching inode (ownership uncertain; cannot distinguish original stage from inode reuse); leaving directory untouched and retaining stage reference in restored journal for inspection"
+                                    restore_ok=0
                                     ;;
                                 *)
                                     warn "rollback got unexpected stage inspection status '${stage_status}' for '$sync_stage_dir'; retaining stage reference in restored journal for retry"

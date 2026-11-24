@@ -84,6 +84,10 @@ provider_run() {
         slow-*) sleep 30 ;;
         leak-*) echo "$key" >>file.txt; printf 'done\n' >"$final" ;;
         optleak-*) jq -r .api_token <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
+        pemprint-*) jq -r .private_key <<<"$5" | tee "$final" "$AI_ATTEMPT_DIR/stream.jsonl" ;;
+        pemleak-*) jq -r '.private_key | split("\n")[1]' <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
+        docbasic-*) echo "Connect with basic authentication in eu-west-1" >>file.txt; printf 'done\n' >"$final" ;;
+        declprint-*) jq -r '"value \(.auth.value) method \(.auth.method)"' <<<"$5" | tee "$final" ;;
         optname-*) : >"n-$(jq -r .api_token <<<"$5")"; printf 'done\n' >"$final" ;;
         optprint-*) # a CLI that echoes its configuration
             jq -r '"gateway \(.base_url) token \(.api_token) model \(.model)"' <<<"$5" | tee "$final" "$AI_ATTEMPT_DIR/stream.jsonl" ;;
@@ -116,6 +120,8 @@ provider_run() {
 }
 EOF
 cp "$fakes/claude.sh" "$fakes/gpt.sh"
+# A custom adapter that names a credential option no heuristic would find.
+{ echo 'PROVIDER_SECRET_OPTIONS="auth.value"'; cat "$fakes/claude.sh"; } >"$fakes/custom.sh"
 cat >"$fakes/broken.sh" <<'EOF'
 provider_install() { echo partial >"$AI_TOOLS_DIR/partial"; echo "cannot install" >&2; return 1; }
 provider_run() { return 0; }
@@ -352,6 +358,23 @@ optpool=$(ai_normalize_pool '[{"claude":{"keys":["k1"],"model":"m high","region"
 eq "pool: option credentials are found, public settings are not" \
     '["cs-1","p4ss-gw","pw-1","qk-123","tok-1","tokonly","user:p4ss-gw"]' "$(ai_option_secrets "$optpool")"
 eq "pool: a pool without options has none" '[]' "$(ai_option_secrets "$pool")"
+eq "pool: only an option's own name counts: an auth object's method and a region stay public" '["atok-1"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"auth":{"method":"basic","token":"atok-1"},"region":"eu-west-1"}}]')")"
+eq "pool: an adapter can declare its credential options (dotted paths)" '["declared-1"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"custom":{"keys":["k"],"auth":{"value":"declared-1","method":"basic"}}}]')" \
+        '{"custom":["auth.value"]}')"
+eq "pool: URL credentials are kept as written and percent-decoded" \
+    '["a%2Bb+c","a+b c","a+b+c","p%40ss%2Fw%C3%A9","p@ss/wé","us%40r:p%40ss%2Fw%C3%A9","us@r:p@ss/wé"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"base_url":"https://us%40r:p%40ss%2Fw%C3%A9@gw.example/v1?api_key=a%2Bb+c"}}]')")"
+pem=$'-----BEGIN TEST KEY-----
+QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq
+xyz=
+-----END TEST KEY-----
+'
+eq "pool: a multiline credential is kept whole" "$(jq -cn --arg p "$pem" '[$p]')" \
+    "$(ai_option_secrets "$(jq -cn --arg p "$pem" '[{claude: {keys: ["k"], private_key: $p}}]' | ai_normalize_pool "$(cat)")")"
+check "pool: a pattern with a line break is never scanned for (the change is refused)" \
+    ai_contains_key '["abc\n"]' /etc/hostname
 
 # --- lib.sh: model settings ---------------------------------------------------
 eq "spec: model and effort" "claude-opus-5-5|high" "$(ai_parse_model_spec 'claude-opus-5-5 high' | tr '\t' '|')"
@@ -494,6 +517,39 @@ check "run: option credentials are masked, and withheld from the summary, logs a
     '[ "$2" = 0 ] && grep -qx "::add-mask::tok-optsecret" "$3" && grep -qx "::add-mask::gwuser:gwpass-optsecret" "$3" &&
      ! grep -rqa optsecret "$1/summary.md" "$1/logs" && grep -qa "model public-model" "$1/logs/attempt-1/attempt.log"' \
     _ "$state" "$rc" "$tmp/optprint/log"
+pementry=$(jq -cn --arg p "$pem" '{private_key: $p}')
+run_case pemok '[{"claude":'"$(jq -c '. + {keys: ["ok-1"]}' <<<"$pementry")"'}]'
+eq "run: a multiline credential in the pool leaves a clean change publishable" "0 changed" "$rc $(output status)"
+run_case pemleak '[{"claude":'"$(jq -c '. + {keys: ["pemleak-1"]}' <<<"$pementry")"'}]'
+eq "run: ... and a change quoting a line of it is refused" "1 failed" "$rc $(output status)"
+run_case pemprint '[{"claude":'"$(jq -c '. + {keys: ["pemprint-1"]}' <<<"$pementry")"'}]' GITHUB_ACTIONS=true
+check "run: ... it is masked whole (escaped) and line by line, and withheld from what is uploaded" bash -c \
+    '[ "$2" = 0 ] && grep -qxF "::add-mask::-----BEGIN TEST KEY-----%0AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq%0Axyz=%0A-----END TEST KEY-----%0A" "$3" &&
+     grep -qxF "::add-mask::QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq" "$3" && grep -qxF "::add-mask::xyz=" "$3" &&
+     ! grep -rqa QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq "$1/summary.md" "$1/logs"' _ "$state" "$rc" "$tmp/pemprint/log"
+run_case docbasic '[{"claude":{"keys":["docbasic-1"],"auth":{"method":"basic"},"region":"eu-west-1"}}]'
+eq "run: public settings never block a change that mentions them" "0 changed" "$rc $(output status)"
+run_case declprint '[{"custom":{"keys":["declprint-1"],"auth":{"value":"decl-optsecret","method":"basic"}}}]' GITHUB_ACTIONS=true
+check "run: an adapter's declared credential options are masked and withheld" bash -c \
+    '[ "$2" = 0 ] && grep -qx "::add-mask::decl-optsecret" "$3" && ! grep -rqa decl-optsecret "$1/summary.md" "$1/logs" &&
+     grep -q "method basic" "$1/summary.md"' _ "$state" "$rc" "$tmp/declprint/log"
+# A producer of the withheld values that fails stops the run before any
+# attempt: an incomplete list must not look like a complete one.
+failjq=$tmp/failjq
+mkdir -p "$failjq"
+printf '#!/usr/bin/env bash
+for a; do case "$a" in *"$FAIL_JQ_ON"*) exit 5 ;; esac; done
+exec %s "$@"
+' \
+    "$(PATH=/usr/local/bin:/usr/bin:/bin command -v jq)" >"$failjq/jq"
+chmod +x "$failjq/jq"
+i=0
+for on in '[.[].keys[]]' 'paths(strings)' 'def trim'; do
+    i=$((i + 1))
+    run_case "failjq$i" '[{"claude":{"keys":["ok-1"],"api_token":"tok-1"}}]' PATH="$failjq:$bin:$PATH" FAIL_JQ_ON="$on"
+    eq "run: a failed producer of the withheld values ($on) stops the run before docker" "2 0" \
+        "$rc $(wc -l <"$tmp/failjq$i/docker.log" 2>/dev/null || echo 0)"
+done
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"

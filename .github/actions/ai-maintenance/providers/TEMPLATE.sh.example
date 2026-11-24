@@ -28,6 +28,12 @@ PROVIDER_EXHAUSTED_REGEX=''
 # shellcheck disable=SC2034 # read by run.sh
 PROVIDER_INSTALL_ENV='PROVIDER2_VERSION'
 
+# Optional: pool options that hold credentials under a name the run would
+# not recognise as one (README, Key pool), as space-separated dotted paths
+# ("auth.value"); they are then masked, withheld and refused like keys.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_SECRET_OPTIONS=''
+
 # Optional: the file in AI_ATTEMPT_DIR holding the CLI's transcript; it is
 # uploaded (scrubbed) as transcript.jsonl. No other file the attempt
 # writes is uploaded, except final.md and error.txt.

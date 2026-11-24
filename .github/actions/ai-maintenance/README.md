@@ -226,12 +226,20 @@ with spending limits.
   `OPENAI_BASE_URL` or `GOOGLE_GEMINI_BASE_URL`). Adapters receive any
   other option too.
 - Credentials in options are treated like keys: masked, withheld from what
-  is published, and refused in a change. They are the string options, at
-  any depth, under a name containing `token`, `key`, `secret`, `passw`,
-  `auth`, `credential` or `cookie` (any case); the user-info of a URL
-  (`https://user:pass@…`: both `user:pass` and `pass`, or a lone token
-  before the `@`); and URL query parameters named like that
-  (`?api_key=…`). `model` and other settings stay public.
+  is published, and refused in a change. They are:
+  - string options, at any depth, whose own name contains `token`,
+    `secret`, `passw`, `credential`, `cookie`, `authorization`, `bearer`,
+    `api_key`, `private_key` or `access_key`, or ends in `key` (any case;
+    the names of the objects above them don't count, so
+    `"auth": {"method": "basic"}` stays public);
+  - the options an adapter declares in `PROVIDER_SECRET_OPTIONS`;
+  - the user-info of a URL (`https://user:pass@…`: both `user:pass` and
+    `pass`, or a lone token before the `@`) and URL query parameters named
+    like a credential (`?api_key=…`), each as written and percent-decoded.
+
+  A multiline value (a PEM key) is masked whole and line by line, matched
+  exactly in a change, and so is each of its lines of 20 or more
+  characters. `model` and other settings stay public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
 - A provider without an adapter is skipped with a note in the run summary,
@@ -362,6 +370,9 @@ Optional settings in the adapter:
 - `PROVIDER_EXHAUSTED_REGEX`: extra error patterns that mean "try the next
   key".
 - `PROVIDER_INSTALL_ENV`: the runner variables `provider_install` reads.
+- `PROVIDER_SECRET_OPTIONS`: the options that hold credentials under a
+  name the run would not recognise (see [Key pool](#key-pool)), as
+  space-separated dotted paths, e.g. `"auth.value"`.
 - `PROVIDER_TRANSCRIPT`: the file in `$AI_ATTEMPT_DIR` holding the CLI's
   transcript, uploaded as `transcript.jsonl`. The uploaded logs hold only
   `attempt.log`, `install.log`, `final.md`, `error.txt` and that transcript.

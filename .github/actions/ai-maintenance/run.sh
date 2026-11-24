@@ -72,17 +72,47 @@ unset AI_KEY_POOL AI_INSTRUCTIONS GH_TOKEN GITHUB_TOKEN
 
 pool=$(ai_normalize_pool "$pool_raw") || exit 2
 pool_raw=
-# The keys and the credentials in the entries' options (lib.sh,
-# ai_option_secrets), withheld and refused alike; everything withheld from
-# published output: those and the instructions.
-keys=$({ ai_all_keys "$pool"; ai_option_secrets "$pool"; } | jq -cs '.[0] + .[1] | unique')
+providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
+
+# adapter_var ADAPTER NAME -> a setting the adapter declares.
+adapter_var() (
+    # shellcheck source=/dev/null
+    . "$1" >/dev/null 2>&1
+    printf '%s' "${!2:-}"
+)
+# The option paths each pool provider's adapter declares as credentials.
+declared='{}'
+while IFS= read -r p; do
+    a=$providers_dir/$(ai_canonical_provider "$p").sh
+    [ -f "$a" ] || continue
+    declared=$(adapter_var "$a" PROVIDER_SECRET_OPTIONS | jq -Rsc --arg p "$p" --argjson d "$declared" \
+        '$d + {($p): [splits("\\s+") | select(length > 0)]}') || exit 2
+done < <(jq -r '[.[].provider] | unique[]' <<<"$pool")
+
+# Withheld from everything published, and refused in a change: the keys
+# and the credentials in the entries' options (lib.sh, ai_option_secrets).
+# Withheld too: the instructions. Every producer must have delivered a
+# list: a failed one would leave a valid-looking list without its values.
+withheld_failed() { ai_log "could not list the values to withhold ($1); nothing was run"; exit 2; }
+{ pool_keys=$(ai_all_keys "$pool") && ai_string_array "$pool_keys"; } || withheld_failed "the pool's keys"
+{ option_secrets=$(ai_option_secrets "$pool" "$declared") && ai_string_array "$option_secrets"; } ||
+    withheld_failed "the credentials in the pool's options"
+{ fragments=$(ai_secret_fragments "$instructions") && ai_string_array "$fragments"; } || withheld_failed "the instructions"
+{ credentials=$(printf '%s\n%s\n' "$pool_keys" "$option_secrets" | jq -cs '.[0] + .[1] | unique') &&
+    ai_string_array "$credentials"; } || withheld_failed "the credentials"
+# The change checks scan for one-line patterns (keys) and match multiline
+# credentials exactly (credential_texts).
+{ keys=$(ai_credential_patterns "$credentials") && ai_string_array "$keys"; } || withheld_failed "the credential patterns"
+credential_texts=$(jq -c '[.[] | select(test("\n"))]' <<<"$credentials") || withheld_failed "the multiline credentials"
 # Secrets reach the commands that handle them through standard input or an
 # owner-only file, never through their arguments, which every account on
 # the runner can read.
-secrets=$({ printf '%s\n' "$keys"; ai_secret_fragments "$instructions"; } | jq -cs '.[0] + .[1]')
+{ secrets=$(printf '%s\n%s\n%s\n' "$credentials" "$keys" "$fragments" | jq -cs 'add | unique') &&
+    ai_string_array "$secrets"; } || withheld_failed "the secrets"
 # Keys inside the pool secret are not masked individually by GitHub.
 if [ "${GITHUB_ACTIONS:-}" = true ]; then
-    jq -r '.[] | select(test("\n") | not)' <<<"$secrets" | while IFS= read -r k; do printf '::add-mask::%s\n' "$k"; done
+    masks=$(ai_mask_lines "$credentials" "$secrets") || withheld_failed "the masks"
+    while IFS= read -r k; do [ -z "$k" ] || printf '::add-mask::%s\n' "$k"; done <<<"$masks"
 fi
 
 routing=${AI_ROUTING:-ordered}
@@ -92,7 +122,6 @@ private=${AI_PRIVATE_INSTRUCTIONS:-false}
 case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be true or false"; exit 2 ;; esac
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
-providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
 # The runner's Node.js, for the npm-installed CLIs, as one read-only file,
 # and its npm for the install containers.
 node_args=() npm_args=() npm_dir=''
@@ -309,13 +338,6 @@ fresh_tree() { # dir
     done
     return 0
 }
-
-# adapter_var ADAPTER NAME -> a setting the adapter declares.
-adapter_var() (
-    # shellcheck source=/dev/null
-    . "$1" >/dev/null 2>&1
-    printf '%s' "${!2:-}"
-)
 
 # install_cli ADAPTER TOOLS LOG: installs the provider's CLI into TOOLS, a
 # fresh directory of its own, in a container that sees nothing else of the
@@ -563,7 +585,8 @@ if [ -s "$export_dir/changes.patch" ]; then
     # copy of the checkout, as publish.sh will, and scan the patch and
     # every added or modified file's new contents (binary files are
     # encoded in the patch text). A scan that fails refuses as well.
-    ai_contains_key "$keys" "$result_dir/changes.patch" && refuse "the patch contains an API key or credential from the pool"
+    { ai_contains_key "$keys" "$result_dir/changes.patch" || ai_contains_text "$credential_texts" "$result_dir/changes.patch"; } &&
+        refuse "the patch contains an API key or credential from the pool"
     # Private instructions: the change may not quote a line of them either
     # (in its text, a file's contents or a file name).
     quoted='[]' quoted_whole='[]'
@@ -583,7 +606,8 @@ if [ -s "$export_dir/changes.patch" ]; then
         refuse "could not list the changed files"
     # The names as published, byte for byte (the patch may quote them):
     # checked before any of them is logged.
-    ai_contains_key "$keys" "$state/names" && refuse "a changed file's name contains an API key or credential from the pool"
+    { ai_contains_key "$keys" "$state/names" || ai_contains_text "$credential_texts" "$state/names"; } &&
+        refuse "a changed file's name contains an API key or credential from the pool"
     { ai_contains_key "$quoted" "$state/names" || ai_contains_text "$quoted_whole" "$state/names"; } &&
         refuse "a changed file's name quotes the private instructions"
     while IFS= read -r -d '' path; do
@@ -596,7 +620,8 @@ if [ -s "$export_dir/changes.patch" ]; then
         sha=$(cut -d' ' -f4 <<<"$meta")
         git -C "$verify" cat-file blob "$sha" >"$state/blob" ||
             refuse "could not read the new contents of $(ai_printable "$path")"
-        ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key or credential from the pool"
+        { ai_contains_key "$keys" "$state/blob" || ai_contains_text "$credential_texts" "$state/blob"; } &&
+            refuse "$(ai_printable "$path") contains an API key or credential from the pool"
         { ai_contains_key "$quoted" "$state/blob" || ai_contains_text "$quoted_whole" "$state/blob"; } &&
             refuse "a changed file quotes the private instructions"
     done <"$changed"

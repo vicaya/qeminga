@@ -177,9 +177,12 @@ ai_scrub() {
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
 # and also when FILE cannot be scanned (a scan that did not happen is not
-# a clean result).
+# a clean result). The keys are single-line patterns: one with a line
+# break (which would become several, an empty one among them) is not
+# scanned for and counts as found; multiline values go to ai_contains_text.
 ai_contains_key() {
     local patterns rc
+    jq -e 'all(.[]; test("\n") | not)' <<<"$1" >/dev/null 2>&1 || return 0
     patterns=$(mktemp) || return 0
     if ! jq -r '.[] | select(length > 0)' <<<"$1" >"$patterns"; then
         rm -f "$patterns"
@@ -364,20 +367,84 @@ ai_sandbox_env() {
     mkdir -p "$HOME"
 }
 
-# ai_option_secrets POOL -> JSON array of the credentials in the entries'
-# options, withheld like keys (masked, scrubbed, refused in a patch): every
-# string option, at any depth, under a name that looks like a credential;
-# the user-info of any URL value ("user:pass" and the password alone, or a
-# lone token); and URL query parameters named like credentials. The model
-# and other settings stay public.
-AI_CREDENTIAL_NAME='token|key|secret|passw|auth|credential|cookie'
+# ai_option_secrets POOL [DECLARED] -> JSON array of the credentials in the
+# entries' options, withheld like keys (masked, scrubbed, refused in a
+# change):
+#   - every string option, at any depth, whose own name looks like a
+#     credential (AI_CREDENTIAL_NAME; the names of the objects above it do
+#     not count, so an "auth" object's "method" stays public);
+#   - every option an adapter declares (DECLARED, {"provider": ["a.b", ...]},
+#     from PROVIDER_SECRET_OPTIONS: dotted paths, array indices left out);
+#   - the user-info of any URL value ("user:pass" and the password alone,
+#     or a lone token), and URL query parameters named like credentials,
+#     each as written and percent-decoded (query values also with "+" as a
+#     space), since a client sends, and may print, the decoded form.
+# Values are whole, line breaks included. The model and every other
+# setting stay public.
+AI_CREDENTIAL_NAME='token|secret|passw|credential|cookie|authorization|bearer|api[_-]?key|private[_-]?key|access[_-]?key|(^|[_-])key$'
 ai_option_secrets() {
-    jq -c --arg re "$AI_CREDENTIAL_NAME" '
-        [ .[].options | del(.model) | paths(strings) as $p | getpath($p) as $v
-          | if any($p[] | strings; test($re; "i")) then $v else empty end,
-            ($v | capture("^[A-Za-z][A-Za-z0-9+.-]*://(?<u>[^/?#@]*)@")? | .u
-                | ., (if test(":") then sub("^[^:]*:"; "") else empty end)),
-            ($v | select(test("^[A-Za-z][A-Za-z0-9+.-]*://")) | scan("[?&]([^=&#]+)=([^&#]*)")
-                | select(.[0] | test($re; "i")) | .[1])
-        ] | map(select(length > 0)) | unique' <<<"$1"
+    local declared=${2:-}
+    [ -n "$declared" ] || declared='{}'
+    jq -c --arg re "$AI_CREDENTIAL_NAME" --argjson declared "$declared" '
+        def hex: ascii_downcase | explode | map(if . >= 97 then . - 87 else . - 48 end) | .[0] * 16 + .[1];
+        # UTF-8 bytes -> string; an invalid sequence is an error.
+        def utf8:
+            def cp($n): .[1:$n] | if length == $n - 1 and all(. >= 128 and . < 192) then map(. - 128) else error("utf8") end;
+            def dec:
+                if length == 0 then []
+                else .[0] as $b
+                    | if $b < 128 then [$b] + (.[1:] | dec)
+                      elif $b >= 194 and $b < 224 then (cp(2)) as $c | [($b - 192) * 64 + $c[0]] + (.[2:] | dec)
+                      elif $b >= 224 and $b < 240 then (cp(3)) as $c | [($b - 224) * 4096 + $c[0] * 64 + $c[1]] + (.[3:] | dec)
+                      elif $b >= 240 and $b < 245 then (cp(4)) as $c | [($b - 240) * 262144 + $c[0] * 4096 + $c[1] * 64 + $c[2]] + (.[4:] | dec)
+                      else error("utf8") end
+                end;
+            dec | implode;
+        def pct_decode:
+            [scan("%[0-9A-Fa-f]{2}|[^%]+|%")]
+            | reduce .[] as $t ({s: "", b: []};
+                if ($t | test("^%[0-9A-Fa-f]{2}$")) then .b += [$t[1:] | hex]
+                else .s += ((.b | utf8) + $t) | .b = [] end)
+            | .s + (.b | utf8);
+        def decoded: try pct_decode catch empty;
+        def url: test("^[A-Za-z][A-Za-z0-9+.-]*://");
+        [ .[] | ($declared[.provider] // []) as $decl
+          | .options | del(.model) | paths(strings) as $p | getpath($p) as $v
+          | [$p[] | strings] as $names
+          | (if (($names | last // "") | test($re; "i")) or any($decl[]; . == ($names | join(".")))
+             then $v else empty end),
+            ($v | select(url) | capture("^[^:]+://(?<u>[^/?#@]*)@")? | .u
+                | ., decoded,
+                  (if test(":") then
+                      (sub("^[^:]*:"; "") | ., decoded),
+                      ((sub(":.*$"; "") | decoded) as $user | sub("^[^:]*:"; "") | decoded | "\($user):\(.)")
+                   else empty end)),
+            ($v | select(url) | scan("[?&]([^=&#]+)=([^&#]*)") | select(.[0] | test($re; "i")) | .[1]
+                | ., decoded, (gsub("\\+"; " ") | decoded))
+        ] | map(select(type == "string" and length > 0)) | unique' <<<"$1"
+}
+
+# ai_string_array JSON: success when JSON is an array of strings (a
+# producer of withheld values that failed leaves something else).
+ai_string_array() { jq -e 'type == "array" and all(.[]; type == "string")' <<<"${1:-}" >/dev/null 2>&1; }
+
+# ai_credential_patterns CREDENTIALS -> the single-line patterns the change
+# checks scan for (ai_contains_key): each one-line credential, and each
+# line of 20 or more characters of a multiline one (the whole of which is
+# matched exactly with ai_contains_text).
+ai_credential_patterns() {
+    jq -c '[.[] | if test("\n") then (split("\n")[] | gsub("^\\s+|\\s+$"; "") | select(length >= 20)) else . end]
+        | map(select(length > 0)) | unique' <<<"$1"
+}
+
+# ai_mask_lines CREDENTIALS SECRETS -> the runner's ::add-mask:: values, in
+# its escaped form ("%" "\r" "\n" as %25 %0D %0A): every one-line secret, and
+# each multiline credential whole and line by line (lines of 4 or more
+# characters; the console shows output a line at a time).
+ai_mask_lines() {
+    printf '%s\n%s\n' "$1" "$2" | jq -rs '
+        def esc: gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+        [(.[1][] | select(test("\n") | not)),
+         (.[0][] | select(test("\n")) | ., (split("\n")[] | gsub("^\\s+|\\s+$"; "") | select(length >= 4)))]
+        | unique | .[] | esc'
 }

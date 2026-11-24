@@ -467,6 +467,10 @@ eq "scrub (JSON lines): a multiline key is matched whole first, and the next eve
     '{"type":"a"}|***|{"type":"result","n":1}' \
     "$(printf '{"type":"a"}\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n{"type":"result","n":1}\n' |
         ai_scrub_jsonl "$tmp/scrub-ml.json" | paste -sd'|')"
+printf '%s' '["42\n"]' >"$tmp/scrub-nl.json"
+eq "scrub (JSON lines): a value that is one line once trimmed is left to the JSON pass, which keeps the event JSON" \
+    '{"count":"***","n":7}|*** in text: ***' \
+    "$(printf '{"count":42,"n":7}\n42 in text: 42\n' | ai_scrub_jsonl "$tmp/scrub-nl.json" | paste -sd'|')"
 eq "scrub (JSON lines): ... also inside a JSON string" '{"text":"key: *** end"}' \
     "$(printf '{"text":"key: ab12\\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\\ncd34 end"}\n' | ai_scrub_jsonl "$tmp/scrub-ml.json")"
 printf 'GIF89a\0\1k2\0' >"$tmp/blob"

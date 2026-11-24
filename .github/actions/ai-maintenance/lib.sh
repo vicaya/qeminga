@@ -489,13 +489,15 @@ ai_json_forms() {
 # First the whole stream, as written, is scrubbed of every multiline value,
 # which plain text lines may carry across lines; it is matched without its
 # leading and trailing white space, so the line break that ends it, and
-# separates it from the next event, stays. Then a line that is JSON is
+# separates it from the next event, stays. A value that is one line once
+# trimmed ("42\n") is left to the second pass, which can tell a JSON
+# number from text. Then a line that is JSON is
 # scrubbed value by value, on the decoded strings (keys included; a number
 # whose text is a withheld value becomes "***", other numbers and booleans
 # keep their types), and written back as JSON; any other line as text.
 ai_scrub_jsonl() {
     jq -Rjs --slurpfile keys "$1" '
-        reduce ($keys[0] | map(select(test("\n")) | gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))
+        reduce ($keys[0] | map(gsub("^\\s+|\\s+$"; "") | select(test("\n")))
                 | unique | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))' |
         jq -Rr --slurpfile keys "$1" '
             ($keys[0] | map(., (select(test("\n")) | gsub("^\\s+|\\s+$"; "")))

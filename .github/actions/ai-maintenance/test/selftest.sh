@@ -95,6 +95,11 @@ provider_run() {
             jq -c '{type: "assistant", text: "using \(.password)", key: .private_key, tool: {input: {password: .password}}}' <<<"$5" |
                 tee "$AI_ATTEMPT_DIR/stream.jsonl"
             printf 'done\n' >"$final" ;;
+        mixprint-*) # JSON events with a plain-text diagnostic between them
+            { jq -c '{type: "assistant", text: "start"}' <<<"$5"
+              jq -r '"diagnostic: key follows", .private_key' <<<"$5"
+              jq -c '{type: "result", pin: (.api_token | tonumber), count: 3, ok: true}' <<<"$5"; } >"$AI_ATTEMPT_DIR/stream.jsonl"
+            printf 'done\n' >"$final" ;;
         docpem-*) printf -- '-----BEGIN TEST KEY-----\nnot the configured key\n-----END TEST KEY-----\n' >parser-fixture.pem
                   printf 'done\n' >"$final" ;;
         pemleak-*) jq -r '.private_key | split("\n")[1]' <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
@@ -383,6 +388,8 @@ eq "pool: URL credentials are kept as written and percent-decoded" \
 eq "pool: names whose last word is key count, camel case and upper case included" '["ck-camel-2","sk-camel-1","up-3"]' \
     "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"signingKey":"sk-camel-1","clientKey":"ck-camel-2",
         "SIGNING_KEY":"up-3","sortkey":"public-sort","hotkeys":"public-hk","keyboard":"public-kb"}}]')")"
+eq "pool: an acronym before Key counts too (TLSKey, SSHKey)" '["ssh-2","tls-1"]' \
+    "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"TLSKey":"tls-1","SSHKey":"ssh-2","keyboard":"public-kb","sortkey":"public-sort"}}]')")"
 eq "pool: a query parameter's name is decoded before it is classified" '["qv-1"]' \
     "$(ai_option_secrets "$(ai_normalize_pool '[{"claude":{"keys":["k"],"base_url":"https://gw.example/v1?api%5Fkey=qv-1&x=1"}}]')")"
 pem=$'-----BEGIN TEST KEY-----\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlq\nxyz=\n-----END TEST KEY-----\n'
@@ -558,6 +565,17 @@ check "run: credentials JSON escapes are withheld from the transcript, which sta
     _ "$state" "$rc"
 check "run: ... and from the attempt log that printed the events" bash -c \
     '! grep -qaF -e "jsonsecret" -e "ab12\\ncd34" "$1/logs/attempt-1/attempt.log"' _ "$state"
+# A transcript mixing JSON events and plain text: a multiline credential
+# of short lines, printed as text, is withheld whole; a digit-only one,
+# written as a JSON number, becomes "***" while other numbers and
+# booleans keep their types.
+mixentry=$(jq -cn '{keys: ["mixprint-1"], api_token: "98765432", private_key: "ab12\ncd34\nef56\n"}')
+run_case mixprint '[{"claude":'"$mixentry"'}]'
+check "run: a mixed transcript keeps no credential, and its JSON lines stay JSON" bash -c \
+    't=$1/logs/attempt-1/transcript.jsonl; [ "$2" = 0 ] && [ -s "$t" ] &&
+     ! tr "\n" "|" <"$t" | grep -q "ab12|cd34" && ! grep -q 98765432 "$t" &&
+     jq -Re "fromjson? | select(.type == \"result\") | .pin == \"***\" and .count == 3 and .ok == true" "$t" >/dev/null &&
+     jq -Re "fromjson? | select(.type == \"assistant\") | .text == \"start\"" "$t" >/dev/null' _ "$state" "$rc"
 run_case docbasic '[{"claude":{"keys":["docbasic-1"],"auth":{"method":"basic"},"region":"eu-west-1"}}]'
 eq "run: public settings never block a change that mentions them" "0 changed" "$rc $(output status)"
 run_case declprint '[{"custom":{"keys":["declprint-1"],"auth":{"value":"decl-optsecret","method":"basic"}}}]' GITHUB_ACTIONS=true

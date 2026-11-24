@@ -372,7 +372,7 @@ ai_sandbox_env() {
 # change):
 #   - every string option, at any depth, whose own name looks like a
 #     credential (AI_CREDENTIAL_NAME, or a last word "key": signing_key,
-#     signingKey, SIGNING-KEY; the names of the objects above it do not
+#     signingKey, TLSKey, SIGNING-KEY; the names of the objects above it do not
 #     count, so an "auth" object's "method" stays public);
 #   - every option an adapter declares (DECLARED, {"provider": ["a.b", ...]},
 #     from PROVIDER_SECRET_OPTIONS: dotted paths, array indices left out);
@@ -412,7 +412,7 @@ ai_option_secrets() {
         def url: test("^[A-Za-z][A-Za-z0-9+.-]*://");
         # A credential name: the list, or a last word "key" (snake, kebab,
         # camel or upper case).
-        def credname: test($re; "i") or test("(^|[_-])key$"; "i") or test("[a-z0-9]Key$");
+        def credname: test($re; "i") or test("(^|[_-])key$"; "i") or test("[A-Za-z0-9]Key$");
         [ .[] | ($declared[.provider] // []) as $decl
           | .options | del(.model) | paths(strings) as $p | getpath($p) as $v
           | [$p[] | strings] as $names
@@ -467,15 +467,24 @@ ai_json_forms() {
 
 # ai_scrub_jsonl SECRETS_FILE: ai_scrub for JSON lines (transcripts). A
 # line that is JSON is scrubbed value by value, on the decoded strings
-# (keys included), and written back as JSON; any other line as text.
+# (keys included; a number whose text is a withheld value becomes "***",
+# other numbers and booleans keep their types), and written back as JSON;
+# any other line as text. Then the whole stream is scrubbed of every
+# multiline value (also without its trailing white space), which plain
+# text lines may carry across lines.
 ai_scrub_jsonl() {
     jq -Rr --slurpfile keys "$1" '
         ($keys[0] | map(select(length > 0)) | sort_by(-length)) as $ks
+        | ($ks | map({(.): true}) | add // {}) as $set
         | def scrub: reduce $ks[] as $k (.; split($k) | join("***"));
           def deep: if type == "string" then scrub
+                    elif type == "number" and $set[tostring] then "***"
                     elif type == "object" then with_entries(.key |= scrub | .value |= deep)
                     elif type == "array" then map(deep) else . end;
-          . as $line | try (fromjson | deep | tojson) catch ($line | scrub)'
+          . as $line | try (fromjson | deep | tojson) catch ($line | scrub)' |
+        jq -Rjs --slurpfile keys "$1" '
+            reduce ($keys[0] | map(select(test("\n")) | ., sub("\\s+$"; "")) | map(select(length > 0))
+                    | unique | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
 }
 
 # ai_mask_lines CREDENTIALS SECRETS -> the runner's ::add-mask:: values, in

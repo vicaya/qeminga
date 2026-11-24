@@ -230,7 +230,7 @@ with spending limits.
   - string options, at any depth, whose own name contains `token`,
     `secret`, `passw`, `credential`, `cookie`, `authorization`, `bearer`,
     `api_key`, `private_key` or `access_key` (any case), or whose last
-    word is `key` (`signing_key`, `signingKey`, `SIGNING-KEY`; not
+    word is `key` (`signing_key`, `signingKey`, `TLSKey`, `SIGNING-KEY`; not
     `hotkeys` or `keyboard`). The names of the objects above them don't
     count, so `"auth": {"method": "basic"}` stays public;
   - the options an adapter declares in `PROVIDER_SECRET_OPTIONS`;
@@ -244,8 +244,10 @@ with spending limits.
   characters other than PEM armor (`-----BEGIN … KEY-----`, the same in
   every key). Every withheld value is also withheld in the forms it takes
   inside a JSON string (escaped quotes, backslashes and line breaks), and
-  the uploaded transcripts are scrubbed as JSON, value by value. `model`
-  and other settings stay public.
+  the uploaded transcripts are scrubbed as JSON, value by value (a number
+  that is a withheld value becomes `"***"`), and then as a whole for
+  multiline values printed as plain text. `model` and other settings stay
+  public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
 - A provider without an adapter is skipped with a note in the run summary,

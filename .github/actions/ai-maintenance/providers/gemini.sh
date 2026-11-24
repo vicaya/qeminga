@@ -1,9 +1,9 @@
 # shellcheck shell=bash
 # Provider "gemini": Google Antigravity CLI (`agy -p`) with a Gemini API key
 # (settings modelProvider=gemini + GEMINI_API_KEY, the documented headless
-# setup). Pool options: "model", "effort" (--effort; a level the model does
-# not offer falls back to the nearest one it does), "base_url"
-# (GOOGLE_GEMINI_BASE_URL).
+# setup). Pool options: "model" ("<model> [effort]": --model, --effort; a
+# level the model does not offer falls back to the nearest one it does),
+# "base_url" (GOOGLE_GEMINI_BASE_URL).
 #
 # Install: the platform manifest of Google's installer
 # (https://antigravity.google/cli/install.sh) names the latest build and

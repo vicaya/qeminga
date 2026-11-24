@@ -6,10 +6,11 @@
 # Key pool (secret AI_KEY_POOL), in priority order:
 #
 #   [ {"claude": ["k1", "k2"]}, {"gpt": ["k3"]}, {"gemini": ["k4"]},
-#     {"provider2": {"keys": ["k5"], "model": "m", "effort": "high", "base_url": "https://..."}} ]
+#     {"provider2": {"keys": ["k5"], "model": "m high", "base_url": "https://..."}} ]
 #
 # An entry's value is a key, a list of keys, or an object with "keys" plus
-# provider options. A plain object ({"claude": [...], "gpt": [...]}) is
+# provider options; "model" is "<model> [effort]" (ai_parse_model_spec). A
+# plain object ({"claude": [...], "gpt": [...]}) is
 # accepted too; its keys keep their written order. A provider may appear
 # more than once (for example primary Claude keys, then GPT, then backup
 # Claude keys).
@@ -52,8 +53,13 @@ ai_normalize_pool() {
                  or any(.keys[]; type != "string" or length == 0 or test("\\s"))
               then error("POOL: provider \(.provider) needs a non-empty list of non-empty keys without whitespace")
               else . end)
-        | map(if .options.effort != null and ([.options.effort] | inside($levels) | not)
-              then error("POOL: provider \(.provider) has an unknown effort level (use one of \($levels | join(", ")))")
+        | map(if .options.effort != null
+              then error("POOL: provider \(.provider): write the effort after the model, as \"model\": \"<model> <effort>\"")
+              else . end)
+        | map((.options.model // "" | tostring | [splits("\\s+") | select(. != "")]) as $w
+              | if ($w | length) > 2
+                   or (($w | length) == 2 and (([$w[1]] | inside($levels) | not) or ([$w[0]] | inside($levels))))
+              then error("POOL: provider \(.provider): model must be \"<model> [effort]\", effort one of \($levels | join(", "))")
               else . end)
     ' <<<"$1" 2>&1); then
         # jq's own messages can quote the offending value (a key), so only
@@ -133,17 +139,6 @@ ai_contains_key() {
 
 ai_effort_levels_json() { printf '%s' "$AI_EFFORT_LEVELS" | jq -Rc 'split(" ")'; }
 
-# ai_valid_effort_spec SPEC: success for empty, one level, or a JSON object
-# mapping providers to levels.
-ai_valid_effort_spec() {
-    [ -n "${1:-}" ] || return 0
-    jq -nre --arg s "$1" --argjson levels "$(ai_effort_levels_json)" '
-        ($s | fromjson? // $s) as $v
-        | if ($v | type) == "string" then [$v] | inside($levels)
-          elif ($v | type) == "object" then [$v[]] | all(type == "string") and inside($levels)
-          else false end' >/dev/null
-}
-
 # ai_nearest_effort REQUESTED "a, b, ..." -> the highest allowed level at
 # or below REQUESTED, else the lowest allowed one (levels ordered as in
 # AI_EFFORT_LEVELS; unknown names are ignored).
@@ -156,20 +151,38 @@ ai_nearest_effort() {
           else (([$allowed[] | select(. <= $ri)] | last) // $allowed[0]) as $i | $levels[$i] end'
 }
 
-# ai_effort SPEC OPTIONS_JSON PROVIDER -> effort for this attempt: the pool
-# entry's "effort", else SPEC (one level for every provider, or a JSON
-# object of provider -> level), else empty (the CLI's default).
-ai_effort() {
-    local options=${2:-}
-    [ -n "$options" ] || options='{}'
-    jq -nr --arg s "${1:-}" --argjson o "$options" --arg p "$3" '
-        ($s | fromjson? // $s) as $v
-        | $o.effort // (if ($v | type) == "object" then $v[$p] elif $v == "" then null else $v end) // ""'
+ai_is_effort() { case " $AI_EFFORT_LEVELS " in *" ${1:-} "*) return 0 ;; esac; return 1; }
+
+# ai_parse_model_spec SPEC -> "MODEL<TAB>EFFORT". A spec is a model with an
+# optional trailing effort level ("claude-opus-5-5 high"), a model alone,
+# or a level alone ("high": the CLI's default model at that effort). Either
+# part may come out empty (the CLI's default). Anything else: status 2.
+ai_parse_model_spec() {
+    local -a w
+    read -ra w <<<"${1:-}"
+    case ${#w[@]} in
+        0) printf '\t\n' ;;
+        1)
+            if ai_is_effort "${w[0]}"; then printf '\t%s\n' "${w[0]}"; else printf '%s\t\n' "${w[0]}"; fi
+            ;;
+        2)
+            if ai_is_effort "${w[1]}" && ! ai_is_effort "${w[0]}"; then
+                printf '%s\t%s\n' "${w[0]}" "${w[1]}"
+            else
+                ai_log "model '$1': write '<model> <effort>', with the effort one of: $AI_EFFORT_LEVELS"
+                return 2
+            fi
+            ;;
+        *)
+            ai_log "model '$1': write '<model> <effort>', with the effort one of: $AI_EFFORT_LEVELS"
+            return 2
+            ;;
+    esac
 }
 
-# ai_model MODELS_JSON OPTIONS_JSON PROVIDER -> model for this attempt:
-# the pool entry's "model", else MODELS_JSON[provider], else empty (the
-# CLI's default).
+# ai_model MODELS_JSON OPTIONS_JSON PROVIDER -> the model spec for this
+# attempt (see ai_parse_model_spec): the pool entry's "model", else
+# MODELS_JSON[provider], else empty (the CLI's defaults).
 ai_model() {
     local models=${1:-} options=${2:-}
     [ -n "$models" ] || models='{}'

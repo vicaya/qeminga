@@ -13,9 +13,8 @@
 #   AI_ROUTING             ordered (default) | round-robin
 #   AI_ROUTING_SEED        rotation seed for round-robin (default GITHUB_RUN_NUMBER)
 #   AI_FALLBACK_ON         exhausted (default) | any
-#   AI_MODELS              optional JSON object, provider -> model
-#   AI_EFFORT              optional reasoning effort: one level (low, medium,
-#                          high, xhigh, max) or a JSON object, provider -> level
+#   AI_MODELS              optional JSON object, provider -> "<model> [effort]"
+#                          (effort: low, medium, high, xhigh, max)
 #   AI_ATTEMPT_TIMEOUT     timeout(1) duration per attempt (default 60m)
 #   AI_STATE_DIR           scratch directory outside the checkout
 #   AI_PROVIDERS_DIR       adapter directory (default: providers/ next to this file)
@@ -60,9 +59,9 @@ case "$fallback_on" in exhausted | any) ;; *) ai_log "AI_FALLBACK_ON must be exh
 models=${AI_MODELS:-}
 [ -n "$models" ] || models='{}'
 jq -e 'type == "object"' <<<"$models" >/dev/null 2>&1 || { ai_log "AI_MODELS must be a JSON object"; exit 2; }
-effort_spec=${AI_EFFORT:-}
-ai_valid_effort_spec "$effort_spec" ||
-    { ai_log "AI_EFFORT must be one of: $AI_EFFORT_LEVELS, or a JSON object of provider -> level"; exit 2; }
+while IFS= read -r spec; do
+    ai_parse_model_spec "$spec" >/dev/null || exit 2
+done < <(jq -r '.[] | tostring' <<<"$models")
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=${AI_PROVIDERS_DIR:-$here/providers}
 state=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
@@ -135,8 +134,8 @@ while IFS=$'\t' read -r entry keyidx provider; do
         continue
     fi
     options=$(ai_options "$pool" "$entry")
-    model=$(ai_model "$models" "$options" "$adapter_name")
-    effort=$(ai_effort "$effort_spec" "$options" "$adapter_name")
+    pair=$(ai_parse_model_spec "$(ai_model "$models" "$options" "$adapter_name")") || exit 2
+    model=${pair%%$'\t'*} effort=${pair#*$'\t'}
     dir=$state/attempt-$n
     rm -rf "$dir" && mkdir -p "$dir"
     reset_tree

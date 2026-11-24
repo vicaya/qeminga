@@ -60,18 +60,24 @@ eq "aliases: anthropic, openai, google, agy" "claude gpt gemini gemini provider2
 eq "scrub: every key is replaced" "x *** y *** z" "$(printf 'x k1 y k2 z' | ai_scrub '["k1","k2"]')"
 eq "model: the pool entry wins over the models map" "m4" "$(ai_model '{"gemini":"x"}' '{"model":"m4"}' gemini)"
 eq "model: the models map, else the CLI default" "x|" "$(ai_model '{"gemini":"x"}' '{}' gemini)|$(ai_model '' '' gemini)"
-eq "effort: the pool entry wins" "max" "$(ai_effort 'low' '{"effort":"max"}' claude)"
-eq "effort: a per-provider map" "high|" "$(ai_effort '{"claude":"high"}' '{}' claude)|$(ai_effort '{"claude":"high"}' '{}' gpt)"
-eq "effort: one level for every provider" "medium" "$(ai_effort 'medium' '{}' gemini)"
-eq "effort: unset means the CLI default" "" "$(ai_effort '' '' claude)"
-check "effort: the five levels are valid" bash -c ". '$action/lib.sh'; for l in low medium high xhigh max; do ai_valid_effort_spec \$l || exit 1; done"
-check "effort: a map of levels is valid" ai_valid_effort_spec '{"claude":"max","gpt":"xhigh"}'
-check "effort: an unknown level is not" bash -c ". '$action/lib.sh'; ! ai_valid_effort_spec extreme && ! ai_valid_effort_spec '{\"claude\":\"turbo\"}'"
+eq "spec: model and effort" "claude-opus-5-5|high" "$(ai_parse_model_spec 'claude-opus-5-5 high' | tr '\t' '|')"
+eq "spec: model only" "claude-opus-5-5|" "$(ai_parse_model_spec 'claude-opus-5-5' | tr '\t' '|')"
+eq "spec: a lone level is an effort, the model stays the CLI's" "|high" "$(ai_parse_model_spec 'high' | tr '\t' '|')"
+eq "spec: extra spaces are ignored" "m|max" "$(ai_parse_model_spec '  m   max ' | tr '\t' '|')"
+eq "spec: empty means both defaults" "|" "$(ai_parse_model_spec '' | tr '\t' '|')"
+for bad in 'm turbo' 'a b c' 'high low'; do
+    ai_parse_model_spec "$bad" >/dev/null 2>&1
+    eq "spec: rejects '$bad'" 2 $?
+done
 eq "effort: nearest allowed level at or below the request" "high|high|low|medium" \
     "$(ai_nearest_effort max 'low, high')|$(ai_nearest_effort xhigh 'low, high')|$(ai_nearest_effort medium 'low, high')|$(ai_nearest_effort medium 'medium')"
 eq "effort: below every allowed level, the lowest allowed" "medium" "$(ai_nearest_effort low 'medium, high')"
-ai_normalize_pool '[{"claude":{"keys":["k"],"effort":"turbo"}}]' >/dev/null 2>&1
-eq "pool: rejects an unknown effort level" 2 $?
+ai_normalize_pool '[{"claude":{"keys":["k"],"model":"m turbo"}}]' >/dev/null 2>&1
+eq "pool: rejects a model with an unknown effort level" 2 $?
+err=$(ai_normalize_pool '[{"claude":{"keys":["k"],"effort":"high"}}]' 2>&1 >/dev/null)
+eq "pool: a separate effort key points to the model string" 2 $?
+check "pool: ... with a hint" contains <(printf '%s' "$err") '"model": "<model> <effort>"'
+
 printf 'Error: 429 Too Many Requests\n' >"$tmp/l1"
 printf 'test failed at line 4290\n' >"$tmp/l2"
 check "exhausted: 429 is exhaustion" ai_is_exhausted "$tmp/l1"
@@ -176,13 +182,15 @@ check "run: the prompt holds the preamble, instructions and feedback" bash -c \
 run_case models '[{"claude":["noop-1"]}]' AI_MODELS='{"claude":"big-model"}'
 check "run: the models map reaches the adapter" contains "$state/seen" "model=big-model"
 
-run_case effort '[{"claude":["quota-1"]},{"gpt":{"keys":["noop-2"],"effort":"low"}}]' AI_EFFORT=xhigh \
-    GITHUB_STEP_SUMMARY="$tmp/effort-summary.md"
-check "run: AI_EFFORT reaches the adapter, a pool entry overrides it" bash -c \
-    'grep -q "effort=xhigh" "$1" && grep -q "effort=low" "$1"' _ "$state/seen"
+run_case effort '[{"claude":["quota-1"]},{"gpt":{"keys":["noop-2"],"model":"small low"}}]' \
+    AI_MODELS='{"claude":"big-model xhigh","gpt":"ignored"}' GITHUB_STEP_SUMMARY="$tmp/effort-summary.md"
+check "run: the trailing effort reaches the adapter; a pool entry's model string wins" bash -c \
+    'grep -q "model=big-model effort=xhigh" "$1" && grep -q "model=small effort=low" "$1"' _ "$state/seen"
 check "run: the effort is reported in the summary and result" bash -c \
-    'grep -q "| xhigh |" "$1" && [ "$(jq -r .effort "$2")" = low ]' _ "$tmp/effort-summary.md" "$state/result/meta.json"
-run_case badeffort '[{"claude":["ok-1"]}]' AI_EFFORT=extreme
+    'grep -q "| big-model | xhigh |" "$1" && [ "$(jq -r .effort "$2")" = low ]' _ "$tmp/effort-summary.md" "$state/result/meta.json"
+run_case effortonly '[{"claude":["noop-1"]}]' AI_MODELS='{"claude":"max"}'
+check "run: a lone level keeps the CLI's model" contains "$state/seen" "model=default effort=max"
+run_case badeffort '[{"claude":["ok-1"]}]' AI_MODELS='{"claude":"big-model extreme"}'
 eq "run: an unknown effort level is a configuration error" 2 "$rc"
 
 repo=$tmp/creds/repo

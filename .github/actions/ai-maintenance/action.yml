@@ -23,14 +23,11 @@ inputs:
     description: "Fall back to the next key when an attempt is: exhausted (quota, rate limit, bad key; default) or any (any failure)."
     default: exhausted
   models:
-    description: 'Optional JSON object of provider -> model, e.g. {"claude":"claude-opus-5-5"}. A pool entry''s "model" wins.'
-    default: ""
-  effort:
     description: >-
-      Optional reasoning effort: one level for every provider (low, medium,
-      high, xhigh, max) or a JSON object of provider -> level, e.g.
-      {"claude":"max","gpt":"high"}. A pool entry's "effort" wins; empty
-      leaves each CLI's default.
+      Optional JSON object of provider -> "<model> [effort]", e.g.
+      {"claude":"claude-opus-5-5 high","gemini":"high"}. The effort (low,
+      medium, high, xhigh, max) is optional, and a level alone keeps the
+      CLI's default model. A pool entry's "model" wins.
     default: ""
   attempt-timeout:
     description: Time limit per attempt, as a timeout(1) duration.
@@ -115,7 +112,6 @@ runs:
         AI_ROUTING: ${{ inputs.routing }}
         AI_FALLBACK_ON: ${{ inputs.fallback-on }}
         AI_MODELS: ${{ inputs.models }}
-        AI_EFFORT: ${{ inputs.effort }}
         AI_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
         AI_STATE_DIR: ${{ runner.temp }}/ai-maintenance
         CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}

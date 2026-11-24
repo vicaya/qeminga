@@ -39,10 +39,7 @@ on:
         description: "review: review round number"
         default: "0"
       models:
-        description: 'One-off models instead of AI_MAINTENANCE_MODELS, e.g. {"claude":"claude-opus-5-5"}'
-        default: ""
-      effort:
-        description: "One-off effort instead of AI_MAINTENANCE_EFFORT: low, medium, high, xhigh, max, or a JSON object per provider"
+        description: 'One-off models instead of AI_MAINTENANCE_MODELS, e.g. {"claude":"claude-opus-5-5 high"}'
         default: ""
       instructions:
         description: "One-off instructions instead of the AI_MAINTENANCE_PROMPT secret (visible in the run's metadata)"
@@ -147,11 +144,11 @@ jobs:
           extra-prompt-file: ${{ inputs.mode == 'review' && format('{0}/ai-feedback/feedback.md', runner.temp) || '' }}
           routing: ${{ vars.AI_MAINTENANCE_ROUTING || 'ordered' }}
           fallback-on: ${{ vars.AI_MAINTENANCE_FALLBACK_ON || 'exhausted' }}
-          # Model and effort: a pool entry's "model"/"effort" wins, then
-          # these (a dispatch input, else a repository variable; literal
-          # values work too), then each CLI's default.
+          # Provider -> "<model> [effort]", e.g. {"claude":"claude-opus-5-5 high"}.
+          # A pool entry's "model" wins, then this (a dispatch input, else a
+          # repository variable; a literal value works too), then each CLI's
+          # defaults.
           models: ${{ inputs.models || vars.AI_MAINTENANCE_MODELS }}
-          effort: ${{ inputs.effort || vars.AI_MAINTENANCE_EFFORT }}
           attempt-timeout: ${{ vars.AI_MAINTENANCE_ATTEMPT_TIMEOUT || '60m' }}
           working-directory: work
           branch-prefix: ${{ env.BRANCH_PREFIX }}
@@ -223,7 +220,6 @@ jobs:
           WORKFLOW_REF: ${{ github.workflow_ref }}
           # One-off dispatch overrides carry into the review rounds.
           MODELS: ${{ inputs.models }}
-          EFFORT: ${{ inputs.effort }}
           INSTRUCTIONS: ${{ inputs.instructions }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
@@ -241,7 +237,6 @@ jobs:
           workflow=${workflow%@*}
           args=(-f mode=review -f pr="$PR" -f since="$since" -f round="$round")
           [ -n "$MODELS" ] && args+=(-f models="$MODELS")
-          [ -n "$EFFORT" ] && args+=(-f effort="$EFFORT")
           [ -n "$INSTRUCTIONS" ] && args+=(-f instructions="$INSTRUCTIONS")
           gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "${args[@]}"
           echo "watching PR #$PR for review feedback (round $round, after $since)"

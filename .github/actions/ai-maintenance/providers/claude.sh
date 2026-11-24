@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Provider "claude": Claude Code CLI (`claude -p`) with an Anthropic API key.
-# Pool options: "model", "effort" (--effort), "base_url" (ANTHROPIC_BASE_URL,
-# for a gateway).
+# Pool options: "model" ("<model> [effort]": --model, --effort), "base_url"
+# (ANTHROPIC_BASE_URL, for a gateway).
 # Version: CLAUDE_CODE_VERSION (npm @anthropic-ai/claude-code).
 
 # shellcheck disable=SC2034 # read by run.sh

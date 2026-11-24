@@ -113,15 +113,16 @@ of the agent job.
   {"claude": ["sk-ant-…1", "sk-ant-…2"]},
   {"gpt": ["sk-proj-…"]},
   {"gemini": ["AIza…"]},
-  {"provider2": {"keys": ["…"], "model": "big-model", "effort": "high", "base_url": "https://gateway.example"}}
+  {"provider2": {"keys": ["…"], "model": "big-model high", "base_url": "https://gateway.example"}}
 ]
 ```
 
 - Order is priority. With the default `ordered` routing, the run tries
   `claude` key 1, then `claude` key 2, then `gpt`, then `gemini`.
 - An entry's value is a key, a list of keys, or an object with `keys` and
-  options. `model` and `effort` set the model and reasoning effort for that
-  entry (see [Model and effort](#model-and-effort)). `base_url` points the
+  options. `model` sets that entry's model and, optionally, its reasoning
+  effort (`"claude-opus-5-5 high"`; see [Model and effort](#model-and-effort)).
+  `base_url` points the
   CLI at a gateway or compatible endpoint (`ANTHROPIC_BASE_URL`,
   `OPENAI_BASE_URL` or `GOOGLE_GEMINI_BASE_URL`). Adapters receive any
   other option too.
@@ -145,14 +146,26 @@ strategies fit there without touching the rest.
 
 ### Model and effort
 
-Each attempt resolves its model and its reasoning effort separately, and the
-first setting found wins:
+A model setting is the model, optionally followed by a space and a
+reasoning-effort level:
 
-1. the pool entry's `"model"` / `"effort"` (in the `AI_KEY_POOL` secret);
-2. the agent step's `models:` / `effort:` inputs in the workflow, which
-   come from a one-off *Run workflow* input, else the repository variables
-   `AI_MAINTENANCE_MODELS` / `AI_MAINTENANCE_EFFORT`;
-3. otherwise, the CLI's own default.
+| Setting | Model | Effort |
+|---|---|---|
+| `"claude-opus-5-5 high"` | `claude-opus-5-5` | `high` |
+| `"claude-opus-5-5"` | `claude-opus-5-5` | the CLI's default |
+| `"high"` | the CLI's default | `high` |
+
+The levels are `low`, `medium`, `high`, `xhigh` and `max`. Any other second
+word, or more than two words, is a configuration error, reported before any
+attempt runs.
+
+Each attempt takes its setting from the first of:
+
+1. the pool entry's `"model"` (in the `AI_KEY_POOL` secret);
+2. the agent step's `models:` input in the workflow, which comes from a
+   one-off *Run workflow* input, else the repository variable
+   `AI_MAINTENANCE_MODELS`;
+3. otherwise, the CLI's defaults.
 
 ```yaml
 # .github/workflows/ai-maintenance.yml, job maintain, step "agent"
@@ -161,20 +174,16 @@ first setting found wins:
   with:
     # …
     models: ${{ inputs.models || vars.AI_MAINTENANCE_MODELS }}
-    effort: ${{ inputs.effort || vars.AI_MAINTENANCE_EFFORT }}
 ```
 
-`models` is a JSON object of provider → model, since model names differ by
-provider. `effort` is one level for every provider (`low`, `medium`,
-`high`, `xhigh`, `max`), or a JSON object of provider → level. Literal
-values work as well:
+`models` is a JSON object of provider → setting, because model names differ
+by provider. A literal value works as well:
 
 ```yaml
-    models: '{"claude": "claude-opus-5-5"}'
-    effort: '{"claude": "max", "gpt": "high", "gemini": "high"}'
+    models: '{"claude": "claude-opus-5-5 max", "gpt": "high", "gemini": "gemini-3.1-pro high"}'
 ```
 
-Manual-run overrides are carried into the review rounds that run starts.
+A manual-run override is carried into the review rounds that run starts.
 The attempts table in the run summary shows the model and effort each
 attempt asked for.
 
@@ -196,8 +205,7 @@ All optional (Settings → Secrets and variables → Actions → Variables):
 |---|---|---|
 | `AI_MAINTENANCE_ROUTING` | `ordered` | Routing strategy. |
 | `AI_MAINTENANCE_FALLBACK_ON` | `exhausted` | `exhausted` falls back only on exhaustion errors. `any` also falls back after other failures, including timeouts. |
-| `AI_MAINTENANCE_MODELS` | | JSON, e.g. `{"claude":"claude-opus-5-5"}`. Model names are whatever each CLI accepts (`agy models` lists Antigravity's). A pool entry's `model` wins. Empty means each CLI's default. |
-| `AI_MAINTENANCE_EFFORT` | | `low`, `medium`, `high`, `xhigh` or `max` for every provider, or JSON per provider, e.g. `{"claude":"max","gpt":"high"}`. A pool entry's `effort` wins. Empty means each CLI's default. |
+| `AI_MAINTENANCE_MODELS` | | JSON of provider → `"<model> [effort]"`, e.g. `{"claude":"claude-opus-5-5 high","gemini":"high"}` ([Model and effort](#model-and-effort)). A pool entry's `model` wins. Empty means each CLI's defaults. |
 | `AI_MAINTENANCE_ATTEMPT_TIMEOUT` | `60m` | Time limit per attempt (`timeout(1)` duration). |
 | `AI_MAINTENANCE_QUIET_MINUTES` | `90` | The review loop ends after this long without feedback. |
 | `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` | `5` | Most review rounds per pull request. |

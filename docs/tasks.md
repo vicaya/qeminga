@@ -893,7 +893,7 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
   - **Fallback:** only on exhaustion by default, on any failure with `fallback-on=any`; a timeout never falls back by default.
   - **Attempts:** the tree is reset between attempts; agent commits and untracked files are collected; uninstallable and unknown providers are skipped.
   - **Key isolation:** the agent never sees the pool; keys are masked and scrubbed; a patch containing a key is refused; persisted checkout credentials are stripped.
-  - **Prompt, model and effort:** preamble, instructions and feedback are assembled. Model and effort are resolved pool entry first, then the workflow input, then the CLI default; effort is either one level or per provider. Unknown levels are refused, and a level a model lacks is stepped down to the nearest allowed one.
+  - **Prompt, model and effort:** preamble, instructions and feedback are assembled. A model setting is `"<model> [effort]"`, or a level alone, taken from the pool entry first, then the workflow input, then the CLI defaults. Malformed settings and a separate `effort` key are refused, and a level the model lacks is stepped down to the nearest allowed one.
   - **Watcher:** trusted authors and listed bots only; the quiet, closed, foreign-branch and fork cases.
   - **Publisher:** create and update, labels, and refusal when the branch moved.
 

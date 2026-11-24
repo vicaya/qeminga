@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Provider "gpt": OpenAI Codex CLI (`codex exec`) with an OpenAI API key.
-# Pool options: "model", "effort" (model_reasoning_effort; "max" becomes
-# "xhigh", the highest Codex accepts), "base_url" (OPENAI_BASE_URL).
+# Pool options: "model" ("<model> [effort]": -m, model_reasoning_effort, with
+# "max" mapped to "xhigh", the highest Codex accepts), "base_url"
+# (OPENAI_BASE_URL).
 # Version: CODEX_VERSION (npm @openai/codex).
 
 # shellcheck disable=SC2034 # read by run.sh

@@ -24583,42 +24583,195 @@ unset REC_ALLOW_AUTO_UPDATE REC_EPHEMERAL REC_WORK_DIR
         "unset REC_* variables must default to 0 / empty for lock_runner_permissions"
     );
 
-    // 3. A `die` failure inside `lock_runner_permissions` exits only the subshell
-    //    so the rollback caller regains control.
+    // 3. Exercise the production `_rollback_runner_package_tx` caller when
+    //    `lock_runner_permissions` fails via `die`: the rollback subshell must
+    //    contain `die` so cleanup regains control, the record stays at
+    //    `RECORD_STATE=updating` / `UPDATE_PHASE=restored` with `UPDATE_WAS_ACTIVE=1`,
+    //    and no `systemctl daemon-reload` or `systemctl start` restart is attempted.
+    let bin = dir.path().join("bin");
+    let cfg = dir.path().join("cfg");
+    let inst = dir.path().join("inst");
+    let backup = dir.path().join(".qeminga-update-backup.relock-fail");
+    let unit_dir = dir.path().join("units");
+    let sc_log = dir.path().join("systemctl.log");
+    let chown_log = dir.path().join("chown.log");
+    let relock_seen = dir.path().join("relock-seen.log");
+    for d in [&bin, &cfg, &inst, &backup, &unit_dir] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        unit_dir.join("qeminga-relock-box.service"),
+        "[Unit]\nDescription=test\n",
+    )
+    .unwrap();
+    write_exec(&bin.join("chown"), FAKE_CHOWN);
+    write_exec(
+        &bin.join("stat"),
+        r#"#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%u" ]; then echo 0; exit 0; fi
+if [ "$1" = "-c" ] && [ "$2" = "%u:%a" ]; then echo "0:755"; exit 0; fi
+exec /usr/bin/stat "$@"
+"#,
+    );
+    write_mock_systemctl(
+        &bin.join("systemctl"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "${FAKE_SC_LOG:?}"
+if [ "$1" = "is-active" ]; then
+    echo "inactive"
+    exit 3
+fi
+exit 0
+"#,
+    );
+    let backup_id = String::from_utf8(
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops path-identity "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                backup.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    assert!(!backup_id.is_empty(), "backup path-identity must succeed");
+
+    let rec_path = cfg.join("install.env");
+    let path_env = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
     let out_fail = Command::new("bash")
         .args([
             "-c",
             r#"
 set -euo pipefail
 source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_STATE_DIR="$2"
+OPT_HOOK_DIR="$2"
+OPT_SERVICE="qeminga-relock-box"
+OPT_USER="qeminga-runner"
+REC_INSTALL_ID="0123456789abcdef0123456789abcdef"
+REC_SERVICE="$OPT_SERVICE"
+REC_USER="$OPT_USER"
+REC_USER_UID="995"
+REC_USER_GID="995"
+REC_USER_CREATED="1"
+REC_INSTALL_DIR="$OPT_INSTALL_DIR"
+REC_STATE_DIR="$OPT_STATE_DIR"
+REC_HOOK_DIR="$OPT_HOOK_DIR"
+REC_CONFIG_DIR="$OPT_CONFIG_DIR"
+REC_TARGET_URL="https://github.com/vicaya/qeminga-kvm-controller"
+REC_RUNNER_GROUP=""
+REC_RUNNER_NAME="qeminga-relock-box"
+REC_LABELS="qeminga-kvm"
+REC_EPHEMERAL="1"
+REC_ALLOW_AUTO_UPDATE="1"
+REC_WORK_DIR="/recorded/work"
+REC_OWNED_CONFIG_DIR="1"
+REC_OWNED_STATE_DIR="1"
+REC_OWNED_INSTALL_DIR="1"
+REC_OWNED_HOOK_DIR="1"
+REC_OWNED_UNIT="1"
+REC_VOL_UNIT=""
+REC_VOL_INSTALL_DIR="$(fs_ops volume-id "$OPT_INSTALL_DIR")"
+REC_VOL_HOOK_DIR=""
+REC_VOL_STATE_DIR=""
+REC_UPDATE_WAS_ACTIVE="1"
+OPT_ALLOW_AUTO_UPDATE=0
+OPT_EPHEMERAL=0
+RESOLVED_WORK_DIR="/outer/work"
+VOL_INSTALL_DIR="outer-vol"
+write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" "" "" "$4" "$5" "1"
+RELOCK_LOG="$6"
 lock_runner_permissions() {
+    printf '%s|%s|%s|%s\n' \
+        "$OPT_ALLOW_AUTO_UPDATE" "$OPT_EPHEMERAL" "$RESOLVED_WORK_DIR" "$VOL_INSTALL_DIR" \
+        > "$RELOCK_LOG"
     die "simulated relock failure"
 }
-REC_ALLOW_AUTO_UPDATE=0
-REC_EPHEMERAL=0
-REC_WORK_DIR=""
-if ! ( _rollback_lock_runner_permissions "recorded-vol" ); then
-    printf 'returned-to-rollback\n'
-fi
+_rollback_runner_package_tx \
+    "$OPT_CONFIG_DIR/install.env" \
+    "$REC_VOL_INSTALL_DIR" \
+    "$4" "$5" "" "1"
+printf 'returned-to-rollback\n'
+printf 'expected-vol=%s\n' "$REC_VOL_INSTALL_DIR"
 "#,
             "_",
             script().to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            inst.to_str().unwrap(),
+            backup.to_str().unwrap(),
+            &backup_id,
+            relock_seen.to_str().unwrap(),
         ])
+        .env("PATH", &path_env)
+        .env("FAKE_SC_LOG", &sc_log)
+        .env("FAKE_CHOWN_LOG", &chown_log)
+        .env("QEMINGA_SYSTEMD_UNIT_DIR", &unit_dir)
+        .env("QEMINGA_SYSTEMD_UNIT_DIRS", &unit_dir)
         .output()
         .unwrap();
     assert!(
         out_fail.status.success(),
-        "caller must regain control after subshell die: {}",
+        "production _rollback_runner_package_tx must contain relock die and return control: {}",
         text(&out_fail)
     );
+    let stdout_fail = String::from_utf8_lossy(&out_fail.stdout);
     assert!(
-        String::from_utf8_lossy(&out_fail.stdout).contains("returned-to-rollback"),
-        "expected rollback recovery branch to execute: {}",
+        stdout_fail.contains("returned-to-rollback"),
+        "cleanup caller must regain control after _rollback_runner_package_tx relock failure: {}",
         text(&out_fail)
     );
+    let expected_vol = stdout_fail
+        .lines()
+        .find_map(|l| l.strip_prefix("expected-vol="))
+        .expect("expected-vol line on stdout");
     assert!(
-        String::from_utf8_lossy(&out_fail.stderr).contains("simulated relock failure"),
-        "expected die diagnostic on stderr: {}",
+        !expected_vol.is_empty(),
+        "volume-id must return a non-empty fingerprint"
+    );
+    let stderr_fail = String::from_utf8_lossy(&out_fail.stderr);
+    assert!(
+        stderr_fail.contains("simulated relock failure")
+            && stderr_fail.contains("failed to re-lock permissions"),
+        "expected relock die diagnostic and rollback warning on stderr: {}",
         text(&out_fail)
+    );
+    let seen_fail = std::fs::read_to_string(&relock_seen).unwrap();
+    assert_eq!(
+        seen_fail.trim(),
+        format!("1|1|/recorded/work|{expected_vol}"),
+        "production rollback caller must invoke lock_runner_permissions with recorded settings"
+    );
+    assert!(
+        !backup.exists(),
+        "verified backup container must be pruned after saving UPDATE_PHASE=restored"
+    );
+    let rec_after = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        rec_after.contains("RECORD_STATE=updating\n")
+            && rec_after.contains("UPDATE_PHASE=restored\n")
+            && rec_after.contains("UPDATE_WAS_ACTIVE=1\n")
+            && rec_after.contains("UPDATE_BACKUP_DIR=\n")
+            && rec_after.contains("UPDATE_BACKUP_ID=\n")
+            && !rec_after.contains("RECORD_STATE=installed\n"),
+        "failed relock during rollback must keep install.env at updating/restored (was_active=1):\n{rec_after}"
+    );
+    let sc_after = std::fs::read_to_string(&sc_log).unwrap_or_default();
+    assert!(
+        !sc_after.contains("start ") && !sc_after.contains("daemon-reload"),
+        "failed relock during rollback must skip daemon-reload and service restart (sc_log:\n{sc_after})"
     );
 }

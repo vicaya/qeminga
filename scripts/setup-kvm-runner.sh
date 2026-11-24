@@ -5187,10 +5187,11 @@ try:
                 live_tx = read_tx_marker(tfd, t_mnt, target, sync_file=False)
                 if live_tx == ident["tx"]:
                     print("match")
-                elif not live_tx and not os.listdir(tfd):
-                    # An empty directory with a missing `.qeminga-tx-id` cannot be
-                    # reliably distinguished from an immediate filesystem inode reuse
-                    # after removal; treat it as ambiguous rather than match/mismatch.
+                elif not live_tx:
+                    # Parent, mount, backing volume, and directory inode still match
+                    # the recorded stage, but `.qeminga-tx-id` is missing (whether
+                    # empty or still holding files); ownership is uncertain so treat
+                    # it as ambiguous rather than match/mismatch.
                     print("ambiguous")
                 else:
                     print("mismatch")
@@ -6779,7 +6780,7 @@ _rollback_runner_package_tx() {
                                     fi
                                     ;;
                                 ambiguous)
-                                    warn "rollback found markerless empty directory at '$sync_stage_dir' (cannot distinguish post-marker-unlink retry from inode reuse); leaving directory untouched and retaining stage reference in restored journal for inspection"
+                                    warn "rollback found markerless directory at '$sync_stage_dir' with matching inode (ownership uncertain; cannot distinguish original stage from inode reuse); leaving directory untouched and retaining stage reference in restored journal for inspection"
                                     restore_ok=0
                                     ;;
                                 *)

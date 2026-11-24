@@ -23288,7 +23288,9 @@ assert rc != 0 and out != "mismatch", f"volume-obscured stage MUST be indetermin
     std::fs::remove_dir(&stage_a).unwrap();
 
     // Non-empty directory with the original inode but missing `.qeminga-tx-id`:
-    // MUST return `mismatch` without stamping `.qeminga-tx-id`!
+    // parent, volume, and inode still match the recorded stage, so missing marker
+    // leaves ownership uncertain -> MUST return `ambiguous` (NEVER `mismatch` or
+    // `match`) without stamping `.qeminga-tx-id`!
     std::fs::rename(&saved_orig, &stage_a).unwrap();
     std::fs::write(stage_a.join("unexpected-entry"), b"data\n").unwrap();
     let insp_nonempty_unmarked = Command::new("bash")
@@ -23304,10 +23306,38 @@ assert rc != 0 and out != "mismatch", f"volume-obscured stage MUST be indetermin
         .unwrap();
     assert!(
         insp_nonempty_unmarked.status.success()
-            && String::from_utf8_lossy(&insp_nonempty_unmarked.stdout).trim() == "mismatch"
+            && String::from_utf8_lossy(&insp_nonempty_unmarked.stdout).trim() == "ambiguous"
             && !stage_a.join(".qeminga-tx-id").exists(),
-        "inspect-path-identity must classify non-empty unmarked dir as `mismatch` without stamping: {}",
+        "inspect-path-identity must classify non-empty markerless same-inode dir as `ambiguous` without stamping: {}",
         text(&insp_nonempty_unmarked)
+    );
+    // Same inode affirmatively stamped with a DIFFERENT valid transaction marker
+    // is a confirmed replacement by another transaction -> MUST return `mismatch`.
+    let other_tx = "00000000000000000000000000000000";
+    let different_tx = if stage_a_id.contains(other_tx) {
+        "11111111111111111111111111111111"
+    } else {
+        other_tx
+    };
+    let other_marker = stage_a.join(".qeminga-tx-id");
+    std::fs::write(&other_marker, format!("{different_tx}\n")).unwrap();
+    std::fs::set_permissions(&other_marker, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let insp_other_tx = Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1"; fs_ops inspect-path-identity "$2" "$3""#,
+            "_",
+            script().to_str().unwrap(),
+            stage_a.to_str().unwrap(),
+            &stage_a_id,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        insp_other_tx.status.success()
+            && String::from_utf8_lossy(&insp_other_tx.stdout).trim() == "mismatch",
+        "inspect-path-identity must classify directory stamped by a different transaction as `mismatch`: {}",
+        text(&insp_other_tx)
     );
     std::fs::remove_dir_all(&stage_a).unwrap();
     let insp_absent = Command::new("bash")
@@ -23560,54 +23590,63 @@ esac
         );
     }
 
-    // Part 4: Rollback caller with an ambiguous markerless empty directory (reused-inode case):
-    //   `_rollback_runner_package_tx` MUST neither remove that directory via `safe-rmtree-id`
-    //   nor clear `UPDATE_STAGE_DIR` / mark `installed`!
-    let amb_stage = inst_parent.join(".qeminga-extract.ambig1");
-    let amb_backup = inst_parent.join(".qeminga-update-backup.ambig1");
-    std::fs::create_dir(&amb_stage).unwrap();
-    std::fs::create_dir(&amb_backup).unwrap();
-    std::fs::set_permissions(&amb_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
-    std::fs::set_permissions(&amb_backup, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let amb_sid = String::from_utf8(
-        Command::new("bash")
+    // Part 4: Rollback caller with ambiguous markerless same-inode directories (both empty
+    //   reused-inode case and non-empty stage that lost its `.qeminga-tx-id` marker while
+    //   files remain on disk): `_rollback_runner_package_tx` MUST neither remove the
+    //   directory via `safe-rmtree-id` nor clear `UPDATE_STAGE_DIR` / mark `installed`!
+    for (amb_label, with_file) in [("empty", false), ("nonempty", true)] {
+        let amb_stage = inst_parent.join(format!(".qeminga-extract.ambig-{amb_label}"));
+        let amb_backup = inst_parent.join(format!(".qeminga-update-backup.ambig-{amb_label}"));
+        std::fs::create_dir(&amb_stage).unwrap();
+        std::fs::create_dir(&amb_backup).unwrap();
+        std::fs::set_permissions(&amb_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&amb_backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if with_file {
+            std::fs::write(
+                amb_stage.join("stage-payload.txt"),
+                b"original-stage-data\n",
+            )
+            .unwrap();
+        }
+        let amb_sid = String::from_utf8(
+            Command::new("bash")
+                .args([
+                    "-c",
+                    r#"source "$1"; fs_ops path-identity "$2""#,
+                    "_",
+                    script().to_str().unwrap(),
+                    amb_stage.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let amb_bid = String::from_utf8(
+            Command::new("bash")
+                .args([
+                    "-c",
+                    r#"source "$1"; fs_ops path-identity "$2""#,
+                    "_",
+                    script().to_str().unwrap(),
+                    amb_backup.to_str().unwrap(),
+                ])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        // Remove `.qeminga-tx-id` while keeping the original directory inode (empty or with files).
+        std::fs::remove_file(amb_stage.join(".qeminga-tx-id")).unwrap();
+        std::fs::write(&state_file, "inactive\n").unwrap();
+        let rb_amb = Command::new("bash")
             .args([
                 "-c",
-                r#"source "$1"; fs_ops path-identity "$2""#,
-                "_",
-                script().to_str().unwrap(),
-                amb_stage.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    let amb_bid = String::from_utf8(
-        Command::new("bash")
-            .args([
-                "-c",
-                r#"source "$1"; fs_ops path-identity "$2""#,
-                "_",
-                script().to_str().unwrap(),
-                amb_backup.to_str().unwrap(),
-            ])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_string();
-    // Remove `.qeminga-tx-id` to simulate an empty dir with the same inode and no marker.
-    std::fs::remove_file(amb_stage.join(".qeminga-tx-id")).unwrap();
-    std::fs::write(&state_file, "inactive\n").unwrap();
-    let rb_amb = Command::new("bash")
-        .args([
-            "-c",
-            r#"
+                r#"
 set -euo pipefail
 source "$1"
 OPT_CONFIG_DIR="$2"
@@ -23620,40 +23659,48 @@ _rollback_runner_package_tx \
     "$4" "$5" "" "1" "" "" "" "" "" \
     "$6" "$7"
 "#,
-            "_",
-            script().to_str().unwrap(),
-            cfg.to_str().unwrap(),
-            inst.to_str().unwrap(),
-            amb_backup.to_str().unwrap(),
-            &amb_bid,
-            amb_stage.to_str().unwrap(),
-            &amb_sid,
-        ])
-        .env(
-            "PATH",
-            format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        )
-        .env("FAKE_STATE_FILE", &state_file)
-        .env("FAKE_EXPECTED_FRAG", &unit_file)
-        .env("QEMINGA_RUNTIME_ROOT", &rt_root)
-        .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
-        .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
-        .output()
-        .unwrap();
-    assert!(rb_amb.status.success(), "{}", text(&rb_amb));
-    let rec_amb = std::fs::read_to_string(&rec_path).unwrap();
-    assert!(
-        amb_stage.is_dir()
-            && !amb_stage.join(".qeminga-tx-id").exists()
-            && rec_amb.contains("RECORD_STATE=updating\n")
-            && rec_amb.contains("UPDATE_PHASE=restored\n")
-            && rec_amb.contains(&format!("UPDATE_STAGE_DIR={}\n", amb_stage.display()))
-            && rec_amb.contains(&format!("UPDATE_STAGE_ID={amb_sid}\n"))
-            && rec_amb.contains("UPDATE_WAS_ACTIVE=1\n"),
-        "rollback MUST leave ambiguous markerless empty dir untouched and retain UPDATE_STAGE_DIR/ID in restored journal:\n{rec_amb}"
-    );
+                "_",
+                script().to_str().unwrap(),
+                cfg.to_str().unwrap(),
+                inst.to_str().unwrap(),
+                amb_backup.to_str().unwrap(),
+                &amb_bid,
+                amb_stage.to_str().unwrap(),
+                &amb_sid,
+            ])
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .env("FAKE_STATE_FILE", &state_file)
+            .env("FAKE_EXPECTED_FRAG", &unit_file)
+            .env("QEMINGA_RUNTIME_ROOT", &rt_root)
+            .env("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir)
+            .env("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir)
+            .output()
+            .unwrap();
+        assert!(rb_amb.status.success(), "{amb_label}: {}", text(&rb_amb));
+        let rec_amb = std::fs::read_to_string(&rec_path).unwrap();
+        assert!(
+            amb_stage.is_dir()
+                && !amb_stage.join(".qeminga-tx-id").exists()
+                && rec_amb.contains("RECORD_STATE=updating\n")
+                && rec_amb.contains("UPDATE_PHASE=restored\n")
+                && rec_amb.contains(&format!("UPDATE_STAGE_DIR={}\n", amb_stage.display()))
+                && rec_amb.contains(&format!("UPDATE_STAGE_ID={amb_sid}\n"))
+                && rec_amb.contains("UPDATE_WAS_ACTIVE=1\n"),
+            "{amb_label}: rollback MUST leave ambiguous markerless dir untouched and retain UPDATE_STAGE_DIR/ID in restored journal:\n{rec_amb}"
+        );
+        if with_file {
+            assert_eq!(
+                std::fs::read_to_string(amb_stage.join("stage-payload.txt")).unwrap(),
+                "original-stage-data\n",
+                "{amb_label}: rollback MUST preserve original files inside markerless stage directory"
+            );
+        }
+    }
 }

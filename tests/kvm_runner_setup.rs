@@ -17983,7 +17983,14 @@ real_close = os.close
 class SimulatedCrash(BaseException):
     pass
 
-def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=None, track_ino=None):
+def make_spy_hook(
+    fail_top_fsync=False,
+    crash_after_top_tx=False,
+    fake_uid_ino=None,
+    track_ino=None,
+    fail_parent_fsync=False,
+    parent_ino=None,
+):
     target_ino = c1_ino if track_ino is None else track_ino
     def spy_hook(ns):
         orig_os = ns["os"]
@@ -17996,6 +18003,10 @@ def make_spy_hook(fail_top_fsync=False, crash_after_top_tx=False, fake_uid_ino=N
                     events.append(("fsync_top_dir", st.st_ino))
                     if fail_top_fsync:
                         raise OSError(errno.EIO, "simulated dir fsync failure")
+                elif parent_ino is not None and st.st_ino == parent_ino:
+                    events.append(("fsync_parent_dir", st.st_ino))
+                    if fail_parent_fsync:
+                        raise OSError(errno.EIO, "simulated parent dir fsync failure")
                 else:
                     events.append(("fsync", st.st_ino))
                 return real_fsync(fd)
@@ -18074,6 +18085,47 @@ assert (
     and ("close_top_fd", c1_pin_ino) not in events[pin_tx_idx:pin_rmdir_idx]
 ), (
     f"safe-rmtree-id MUST hold tfd open through rmdir (payload < fsync < unlink_tx < rmdir < final close_tfd, no close between unlink_tx and rmdir), got {events}"
+)
+
+# 1a-ii-b. Post-rmdir parent fsync failure + absent-path retry: if `rmdir` succeeds and
+#          `os.fsync(pfd)` fails, the caller keeps the journal; retrying `safe-rmtree-id`
+#          on the now-absent container MUST still sync `pfd` (propagating failure while EIO
+#          persists and succeeding only once `os.fsync(pfd)` succeeds)!
+parent_ino = os.lstat(root).st_ino
+c1_psync = os.path.join(root, ".qeminga-update-backup.case1-psync")
+os.makedirs(c1_psync, mode=0o700)
+os.chmod(c1_psync, 0o700)
+rc_ps, ident_ps, err_ps = exec_fs_op(["path-identity", c1_psync])
+assert rc_ps == 0 and ident_ps, f"path-identity failed: rc={rc_ps} err={err_ps}"
+c1_ps_ino = os.lstat(c1_psync).st_ino
+events.clear()
+rc_ps_fail, _, err_ps_fail = exec_fs_op(
+    ["safe-rmtree-id", c1_psync, ident_ps],
+    hook=make_spy_hook(track_ino=c1_ps_ino, fail_parent_fsync=True, parent_ino=parent_ino),
+)
+assert rc_ps_fail != 0 and "simulated parent dir fsync failure" in err_ps_fail, (
+    f"post-rmdir parent fsync failure must propagate: rc={rc_ps_fail} err={err_ps_fail}"
+)
+assert not os.path.exists(c1_psync), "rmdir should already have removed c1_psync before parent fsync failed"
+events.clear()
+rc_abs_fail, _, err_abs_fail = exec_fs_op(
+    ["safe-rmtree-id", c1_psync, ident_ps],
+    hook=make_spy_hook(track_ino=c1_ps_ino, fail_parent_fsync=True, parent_ino=parent_ino),
+)
+assert (
+    rc_abs_fail != 0
+    and "simulated parent dir fsync failure" in err_abs_fail
+    and ("fsync_parent_dir", parent_ino) in events
+), (
+    f"absent-path retry MUST still sync parent dir and propagate EIO: rc={rc_abs_fail} err={err_abs_fail} events={events}"
+)
+events.clear()
+rc_abs_ok, _, err_abs_ok = exec_fs_op(
+    ["safe-rmtree-id", c1_psync, ident_ps],
+    hook=make_spy_hook(track_ino=c1_ps_ino, fail_parent_fsync=False, parent_ino=parent_ino),
+)
+assert rc_abs_ok == 0 and ("fsync_parent_dir", parent_ino) in events, (
+    f"absent-path retry must sync parent dir before returning 0: rc={rc_abs_ok} err={err_abs_ok} events={events}"
 )
 
 # 1a-iii. Re-add payload and verify full ordering: payload unlinks -> fsync(tfd) -> unlink(.qeminga-tx-id).

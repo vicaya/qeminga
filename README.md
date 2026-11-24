@@ -53,8 +53,10 @@ confidential VM (CVM) deployment guidance — using the data-protection
 profile (`packaging/config-data-protection.toml`) as the CVM default and
 noting the v1 single-freezer assumption — are in
 [`packaging/README.md`](packaging/README.md). The libvirt
-interoperability checks (the TCG smoke lane in CI and the manual KVM
-recipe) are described in [`docs/testing.md`](docs/testing.md).
+interoperability checks (the TCG smoke lane in CI, the self-hosted
+`x86_64` / `arm64` KVM lane and community runner setup script
+`scripts/setup-kvm-runner.sh`, and the manual KVM recipe) are described
+in [`docs/testing.md`](docs/testing.md).
 
 - [`docs/design.md`](docs/design.md) — the design document (normative).
 - [`docs/tasks.md`](docs/tasks.md) — the implementation task list, with

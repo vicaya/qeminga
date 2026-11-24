@@ -6668,8 +6668,10 @@ fn hosted_amd64_kvm_workflow_enables_dev_kvm_via_udev_and_runs_unprivileged_sess
             && stage_step.contains("steps.prep_out.outcome == 'success'")
             && stage_step.contains("steps.checkout.outcome == 'success'")
             && stage_step.contains("steps.ensure_result.outcome == 'success'")
-            && stage_step.contains("env.OUT != ''"),
-        "stage-evidence step must expose id: stage_evidence and gate on prep_out, checkout, ensure_result, and non-empty OUT:\n{stage_step}"
+            && stage_step.contains("env.OUT != ''")
+            && stage_step.contains(r#"--run-id "$GITHUB_RUN_ID""#)
+            && stage_step.contains(r#"--run-attempt "$GITHUB_RUN_ATTEMPT""#),
+        "stage-evidence step must expose id: stage_evidence, pass --run-id/--run-attempt, and gate on prep_out, checkout, ensure_result, and non-empty OUT:\n{stage_step}"
     );
 
     let upload_idx = smoke.find("uses: actions/upload-artifact").unwrap();
@@ -9385,6 +9387,10 @@ esac
             arch,
             "--source-sha",
             SHA,
+            "--run-id",
+            "89",
+            "--run-attempt",
+            "1",
             "--expect-sha256",
             &digest,
         ],
@@ -10340,8 +10346,148 @@ try:
     early_doc = json.loads(open(os.path.join(early_dir, "result.json"), "rb").read().decode("utf-8"))
     assert early_doc["result"] == "fail" and early_doc["source_sha"] == result_spec["source_sha"]
 
-    # 3j (Review #27 P3): `--help` usage text MUST document `--run-token` on `result`
-    #     (explaining when it is required vs omitted) and attempt-ownership flags on `ensure-result`.
+    # 3j (Review #28 P2): Two attempts of the SAME build (identical SHA and candidate digest)
+    #     with distinct AC16 transcripts & guest diagnostics reusing `--out`: after Attempt 2
+    #     initializes `--out` and completes, Attempt 1's delayed `stage-evidence` (by stale
+    #     `--run-id`/`--run-attempt`, stale `--run-token`, or unfenced) MUST fail closed and
+    #     NEVER copy Attempt 2's transcript or diagnostics into Attempt 1's artifact!
+    same_build_out = os.path.join(root_path, "same-build-shared-out")
+    att1_owner = f"qeminga-e2e-301-1-{result_spec['arch']}"
+    att2_owner = f"qeminga-e2e-301-2-{result_spec['arch']}"
+    att1_tok = mod.prepare_evidence_dir(
+        same_build_out, init_run=True, run_owner=att1_owner, session=True,
+        root_fd=root_fd, root_path=root_path,
+    )
+    for t in result_spec["mandatory_tests"]:
+        mod.publish_evidence_bytes(
+            same_build_out, t, b"pass\n", subdir="tests", session=True,
+            run_token=att1_tok, root_fd=root_fd, root_path=root_path,
+        )
+    mod.publish_evidence_bytes(
+        same_build_out, "e2e-libvirt.log", b"ATTEMPT1_AC16_TRANSCRIPT\n",
+        session=True, run_token=att1_tok, root_fd=root_fd, root_path=root_path,
+    )
+    mod.publish_evidence_bytes(
+        same_build_out, "domain.xml", b"<domain><name>attempt1</name></domain>\n",
+        session=True, run_token=att1_tok, root_fd=root_fd, root_path=root_path,
+    )
+    _, att1_passed = mod.write_result_file(
+        same_build_out, result_spec, result_spec["expect_sha256"], "kvm",
+        session=True, run_token=att1_tok, root_fd=root_fd, root_path=root_path,
+    )
+    assert att1_passed
+
+    # Attempt 2 of the EXACT SAME build SHA & candidate digest re-initializes `same_build_out`
+    # with distinct diagnostics and finishes passing.
+    att2_tok = mod.prepare_evidence_dir(
+        same_build_out, init_run=True, run_owner=att2_owner, session=True,
+        root_fd=root_fd, root_path=root_path,
+    )
+    for t in result_spec["mandatory_tests"]:
+        mod.publish_evidence_bytes(
+            same_build_out, t, b"pass\n", subdir="tests", session=True,
+            run_token=att2_tok, root_fd=root_fd, root_path=root_path,
+        )
+    mod.publish_evidence_bytes(
+        same_build_out, "e2e-libvirt.log", b"ATTEMPT2_AC16_TRANSCRIPT\n",
+        session=True, run_token=att2_tok, root_fd=root_fd, root_path=root_path,
+    )
+    mod.publish_evidence_bytes(
+        same_build_out, "domain.xml", b"<domain><name>attempt2</name></domain>\n",
+        session=True, run_token=att2_tok, root_fd=root_fd, root_path=root_path,
+    )
+    _, att2_passed = mod.write_result_file(
+        same_build_out, result_spec, result_spec["expect_sha256"], "kvm",
+        session=True, run_token=att2_tok, root_fd=root_fd, root_path=root_path,
+    )
+    assert att2_passed
+
+    stage_fence_parent = os.path.join(root_path, "stage-fence-parent")
+    os.mkdir(stage_fence_parent, 0o700)
+    for label, extra_args in (
+        ("stale_owner", ["--run-id", "301", "--run-attempt", "1"]),
+        ("stale_token", ["--run-token", att1_tok]),
+        ("unfenced", []),
+    ):
+        stale_stage = os.path.join(stage_fence_parent, f"att1-{label}")
+        late_stage = subprocess.run(
+            [
+                "bash", smoke_script, "stage-evidence",
+                "--out", same_build_out,
+                "--stage", stale_stage,
+                "--arch", result_spec["arch"],
+                "--source-sha", result_spec["source_sha"],
+                "--expect-sha256", result_spec["expect_sha256"],
+                *extra_args,
+            ],
+            env=env_pub,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert late_stage.returncode != 0, (
+            f"late Attempt 1 stage-evidence ({label}) must fail closed rather than copying Attempt 2's diagnostics:\n"
+            f"stdout={late_stage.stdout!r}\nstderr={late_stage.stderr!r}"
+        )
+        assert not os.path.exists(stale_stage), (
+            f"late Attempt 1 stage-evidence ({label}) must not publish {stale_stage}"
+        )
+    assert os.listdir(stage_fence_parent) == [], (
+        f"rejected stale stage-evidence attempts must leave no staging dirs behind: {os.listdir(stage_fence_parent)!r}"
+    )
+
+    # Owning Attempt 2 `stage-evidence` (by `--run-id`/`--run-attempt` AND by `--run-token`)
+    # succeeds and stages Attempt 2's own transcript and domain XML!
+    for label, extra_args in (
+        ("matching_owner", ["--run-id", "301", "--run-attempt", "2"]),
+        ("matching_token", ["--run-token", att2_tok]),
+    ):
+        att2_stage = os.path.join(stage_fence_parent, f"att2-{label}")
+        ok_stage = subprocess.run(
+            [
+                "bash", smoke_script, "stage-evidence",
+                "--out", same_build_out,
+                "--stage", att2_stage,
+                "--arch", result_spec["arch"],
+                "--source-sha", result_spec["source_sha"],
+                "--expect-sha256", result_spec["expect_sha256"],
+                *extra_args,
+            ],
+            env=env_pub,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert ok_stage.returncode == 0, (
+            f"owning Attempt 2 stage-evidence ({label}) must succeed:\n"
+            f"stdout={ok_stage.stdout!r}\nstderr={ok_stage.stderr!r}"
+        )
+        assert open(os.path.join(att2_stage, "e2e-libvirt.log"), "rb").read() == b"ATTEMPT2_AC16_TRANSCRIPT\n"
+        assert open(os.path.join(att2_stage, "domain.xml"), "rb").read() == b"<domain><name>attempt2</name></domain>\n"
+
+    # Early-failure uninitialized dir (no `.run-token`) MUST still stage cleanly with `--run-id`/`--run-attempt`!
+    early_stage = os.path.join(stage_fence_parent, "early-stage")
+    early_stage_proc = subprocess.run(
+        [
+            "bash", smoke_script, "stage-evidence",
+            "--out", early_dir,
+            "--stage", early_stage,
+            "--arch", result_spec["arch"],
+            "--source-sha", result_spec["source_sha"],
+            "--run-id", "203",
+            "--run-attempt", "1",
+            "--expect-sha256", result_spec["expect_sha256"],
+        ],
+        env=env_pub,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert early_stage_proc.returncode == 0, (
+        f"early-failure uninitialized dir must still stage cleanly:\n"
+        f"stdout={early_stage_proc.stdout!r}\nstderr={early_stage_proc.stderr!r}"
+    )
+    assert os.path.isfile(os.path.join(early_stage, "result.json"))
+
+    # 3k (Review #27 & #28 P3): Extract EACH subcommand's own synopsis block from `--help`
+    #     through the next subcommand and assert its own options and initialization rule!
     help_proc = subprocess.run(
         ["bash", smoke_script, "--help"],
         env=env_pub,
@@ -10350,12 +10496,43 @@ try:
     )
     assert help_proc.returncode == 0
     help_txt = help_proc.stdout.decode("utf-8", errors="replace")
-    assert "--run-token" in help_txt and "initialized" in help_txt, (
-        f"--help must document --run-token and when it is required:\n{help_txt}"
-    )
-    assert "--run-id N --run-attempt N" in help_txt and "ensure-result" in help_txt, (
-        f"--help must document attempt ownership flags on ensure-result:\n{help_txt}"
-    )
+
+    def extract_subcmd_block(subcmd):
+        marker = f'#   libvirt-kvm-smoke.sh {subcmd} '
+        lines = help_txt.splitlines()
+        start = None
+        for idx, line in enumerate(lines):
+            if line.startswith(marker):
+                start = idx
+                break
+        assert start is not None, f"missing synopsis for subcommand '{subcmd}' in --help:\n{help_txt}"
+        end = len(lines)
+        for idx in range(start + 1, len(lines)):
+            if lines[idx].startswith('#   libvirt-kvm-smoke.sh ') or not lines[idx].startswith('#       '):
+                end = idx
+                break
+        return "\n".join(lines[start:end])
+
+    res_block = extract_subcmd_block("result")
+    assert (
+        "--run-token TOKEN" in res_block
+        and "initialized by `run`" in res_block
+        and "manually prepared" in res_block
+    ), f"`result` help block must document --run-token and initialized vs manually prepared rule:\n{res_block}"
+
+    ens_block = extract_subcmd_block("ensure-result")
+    assert (
+        "--run-id N --run-attempt N" in ens_block
+        and "--run-token TOKEN" in ens_block
+        and "initialized by `run`" in ens_block
+    ), f"`ensure-result` help block must document attempt-ownership flags and initialization rule:\n{ens_block}"
+
+    stg_block = extract_subcmd_block("stage-evidence")
+    assert (
+        "--run-id N --run-attempt N" in stg_block
+        and "--run-token TOKEN" in stg_block
+        and "initialized by `run`" in stg_block
+    ), f"`stage-evidence` help block must document attempt-ownership flags and initialization rule:\n{stg_block}"
 finally:
     os.close(root_fd)
 "#,

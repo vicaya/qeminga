@@ -215,6 +215,7 @@ jobs:
           stage="${RUNNER_TEMP:?}/libvirt-kvm-hosted-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$"
           scripts/ci/libvirt-kvm-smoke.sh stage-evidence --out "$OUT" --stage "$stage" \
             --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
           echo "dir=$stage" >> "$GITHUB_OUTPUT"
       - name: Result summary

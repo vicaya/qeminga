@@ -2233,23 +2233,28 @@ def stage_evidence_dir(
     spec,
     *,
     session=False,
+    run_token=None,
+    run_owner=None,
     root_fd=None,
     root_path="/",
 ):
     """Copy ONLY verified allowlisted regular files from ``out_dir`` into a fresh ``0700`` ``stage_dir``.
 
-    Requires ``out_dir`` to be verified and ``result.json`` to exist, pass
-    regular single-link verification, and match ``spec`` (passing reports
-    additionally require ``--expect-sha256`` and a verified non-empty
-    ``e2e-libvirt.log`` AC16 transcript). Optional allowlisted diagnostics and
-    ``tests/*`` markers that are unsafe or unreadable (e.g. symlinked,
-    oversized, or write-only ``0200``) are skipped with a stderr warning so a
-    valid structured failure report can still be published; any non-allowlisted
-    files, symlinks, or subdirectories under ``out_dir`` are ignored completely.
-    Keeps the original staging directory descriptor and identity through both
-    atomic ``renameat2_noreplace`` publication and error cleanup (removing only
-    entries created by this invocation and stopping on any name, inode, or
-    mount mismatch).
+    Requires ``out_dir`` to be verified, checks attempt ownership/token under
+    ``LOCK_SH`` whenever ``out_dir`` was initialized by ``run`` (``.run-token``
+    present, failing ``ESTALE`` on mismatch or unfenced call so a delayed
+    caller cannot stage a newer retry's diagnostics), and requires
+    ``result.json`` to exist, pass regular single-link verification, and match
+    ``spec`` (passing reports additionally require ``--expect-sha256`` and a
+    verified non-empty ``e2e-libvirt.log`` AC16 transcript). Optional
+    allowlisted diagnostics and ``tests/*`` markers that are unsafe or
+    unreadable (e.g. symlinked, oversized, or write-only ``0200``) are skipped
+    with a stderr warning so a valid structured failure report can still be
+    published; any non-allowlisted files, symlinks, or subdirectories under
+    ``out_dir`` are ignored completely. Keeps the original staging directory
+    descriptor and identity through both atomic ``renameat2_noreplace``
+    publication and error cleanup (removing only entries created by this
+    invocation and stopping on any name, inode, or mount mismatch).
     """
     _reject_dot_segments(out_dir, "evidence directory")
     _reject_dot_segments(stage_dir, "evidence staging directory")
@@ -2271,6 +2276,14 @@ def stage_evidence_dir(
             )
         fcntl.flock(out_fd, fcntl.LOCK_SH)
         try:
+            _verify_expected_run_token(
+                out_fd,
+                out_path,
+                run_token,
+                owner_uids,
+                run_owner=run_owner,
+                reject_unfenced_if_initialized=True,
+            )
             result_data = _read_evidence_bytes_from_open_dir(
                 out_fd,
                 out_path,
@@ -3595,11 +3608,15 @@ def main(argv):
         elif op in ("stage-evidence", "stage-session-evidence"):
             is_session = op == "stage-session-evidence"
             spec = _result_spec_from_argv(argv[3:13])
+            run_token = argv[13] if len(argv) > 13 and argv[13] else None
+            run_owner = argv[14] if len(argv) > 14 and argv[14] else None
             stage_evidence_dir(
                 argv[1],
                 argv[2],
                 spec,
                 session=is_session,
+                run_token=run_token,
+                run_owner=run_owner,
                 root_fd=root_fd,
                 root_path=root_path,
             )

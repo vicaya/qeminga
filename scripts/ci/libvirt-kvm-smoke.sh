@@ -34,6 +34,7 @@
 #       [--run-id N --run-attempt N] [--run-token TOKEN]    # required when DIR was initialized by `run`; omit only before `run` initializes DIR
 #   libvirt-kvm-smoke.sh stage-evidence --out DIR --stage DIR --arch ARCH
 #       --source-sha SHA [--expect-sha256 HEX]              # required for passing reports (omission supports failure reports only)
+#       [--run-id N --run-attempt N] [--run-token TOKEN]    # required when DIR was initialized by `run`; omit only before `run` initializes DIR
 #   libvirt-kvm-smoke.sh verify-pass --out DIR --arch ARCH --source-sha SHA
 #       --expect-sha256 HEX
 #   libvirt-kvm-smoke.sh cleanup --arch ARCH --run-id N --run-attempt N
@@ -562,14 +563,23 @@ cmd_ensure_result() {
 
 cmd_stage_evidence() {
     parse_opts "$@"
-    local out stage arch sha expect machine image image_sha stage_op="stage-session-evidence"
+    local out stage arch sha expect run_id attempt run_token run_owner="" machine image image_sha stage_op="stage-session-evidence"
     out="$(need out)"; stage="$(need stage)"; arch="$(need arch)"; sha="$(need source_sha)"
     expect="${opt_expect_sha256:-}"
+    run_id="${opt_run_id:-}"
+    attempt="${opt_run_attempt:-}"
+    run_token="${opt_run_token:-}"
     check_out_path "$out"
     check_no_dot_segments --stage "$stage"
     check_arch "$arch"; check_sha "$sha"
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
+    fi
+    if [ -n "$run_id" ] || [ -n "$attempt" ]; then
+        [ -n "$run_id" ] && [ -n "$attempt" ] || die "--run-id and --run-attempt must be provided together"
+        check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
+        run_owner="$(domain_name "$run_id" "$attempt" "$arch")"
+        check_name "$run_owner"
     fi
     command -v python3 >/dev/null || die "missing tool: python3"
     machine="$(machine_of "$arch")" || exit 1
@@ -581,6 +591,7 @@ cmd_stage_evidence() {
     sys_fs_ops "$stage_op" \
         "$out" "$stage" "$SUITE" "$SOURCE_REPOSITORY" "$sha" "$arch" "$expect" \
         "$machine" "$image" "$IMAGE_RELEASE" "$image_sha" "$MANDATORY_TESTS" \
+        "$run_token" "$run_owner" \
         || die "cannot stage verified allowlisted evidence from $out into $stage"
 }
 

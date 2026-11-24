@@ -76,7 +76,7 @@ graph LR
 | 3 | T3.1–T3.7 | `CAP_SYS_ADMIN` for real ioctls (fakes otherwise) | T3.2/T3.3 `∥` after T3.1 |
 | 4 | T4.1–T4.7 | yes | T4.1–T4.5 `∥`, then T4.6, T4.7 |
 | 5 | T5.1–T5.7 | CI runners with `sudo` | mostly `∥` |
-| 6 | T6.1–T6.9 | fakes (privileged late completion not reproducible) | post-release follow-ups from review, #43 and #53 |
+| 6 | T6.1–T6.10 | fakes (privileged late completion not reproducible) | post-release follow-ups from review, #43 and #53; T6.10 is developer tooling |
 
 ---
 
@@ -881,6 +881,24 @@ Status as of 0.1.0: **green** = automated and passing in CI or verified locally;
 | AC25 data-protection profile | T6.6 (`a_profile_without_shutdown_gives_up_cap_sys_boot_everywhere`, `the_profile_carries_only_the_surfaces_the_configuration_enables`, `a_data_protection_profile_disables_the_optional_families_and_nothing_the_host_sends_re_enables_them`, `privileged_data_protection_profile_holds_no_reboot_authority`, `privileged_data_protection_profile_recovers_without_the_host`) | unit + privileged | green on x86-64 and aarch64 |
 | AC26 resource bounds under adversarial traffic | T6.7 (`a_mount_table_whose_reply_exceeds_the_bound_is_an_explicit_error`, `a_reply_beyond_the_bound_is_an_explicit_error_not_a_truncated_list`, `repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order`, `a_flood_of_denied_and_malformed_frames_is_bounded_by_the_audit_queue`; §5.10 rows by their tasks) | unit + integration | green |
 | AC27 CVM disclosure boundaries and single-freezer guidance | T6.9 (`visible_mounts_errors_on_nonempty_rootless_table_and_allows_empty_table`, `parse_fdinfo_mnt_id_extracts_id_and_rejects_malformed_lines`, `read_fdinfo_mnt_id_is_bounded_and_reads_real_o_path_descriptors`, `fdinfo_mnt_id_round_trips`, `mount_snapshot_tracks_unchanged_proc_mountinfo_and_enforces_size_bound`, `poll_mountinfo_revents_detects_change_on_pollpri_or_error`, `fd_mount_identity_matches_proc_mountinfo_for_root_and_works_on_regular_file`, `resolve_mount_id_falls_back_to_fdinfo_when_statx_mnt_id_is_clear`, `fsinfo_uses_opaque_superblock_ids_and_never_discloses_mount_sources`, `fsinfo_omits_covered_mounts_and_never_attributes_covering_sizes`, `non_utf8_mount_points_are_omitted_and_prefer_utf8_alias_without_fffd_collision`, `system_statfs_verifies_device_and_mount_id_on_directory_and_regular_file`, `fsinfo_omits_sizes_when_statfs_detects_device_or_mount_id_mismatch`, `fsinfo_discards_sizes_when_mount_namespace_changes_before_or_during_sample`, `handler_uses_mount_snapshot_monitor_to_discard_sizes_on_change`, `fsinfo_errors_on_nonempty_mount_table_without_root_and_allows_empty_table`, `inventory_selection_through_freeze_protects_covered_superblock_via_visible_alias`, `inventory_selection_through_freeze_avoids_non_utf8_fffd_collision_and_full_freeze_stays_byte_exact`, `host_reason_never_discloses_marker_path`, `lifecycle_errors_hide_guest_paths_devices_and_marker_paths_on_wire_while_logging_locally`, `all_host_descriptions_are_fixed_and_redact_guest_secrets`, `a_first_target_worker_loss_publishes_worker_lost_reason_without_leaking_path`, `thaw_during_preparation_reports_abort_accepted_without_claiming_marker_retained`, `thaw_joining_during_finalisation_after_marker_unlink_does_not_claim_marker_retained`, `a_hidden_target_is_trimmed_through_an_alias_and_an_unreachable_one_reports_it`, `cvm_installation_defaults_to_data_protection_profile_and_documents_single_freezer`, `the_manifest_names_the_source_the_build_and_the_digest_of_the_binary`, `privileged_thaw_reaches_the_frozen_filesystem_hidden_by_an_overmount`, `privileged_raw_byte_mount_point_survives_startup_fsinfo_and_freeze`, `privileged_fsinfo_discards_sizes_on_mount_namespace_change`) | unit + integration + packaging + privileged | green |
+
+#### T6.10 — Nightly AI maintenance workflow ∥
+- **Status:** done (scripts verified offline and against the real Antigravity and Codex CLIs with invalid keys, which fell back in order; the first run with real keys is a `workflow_dispatch` once the `AI_KEY_POOL` and `AI_MAINTENANCE_PROMPT` secrets are set)
+- **Design:** none (developer tooling; no daemon behaviour changes).
+- **Depends on:** —
+- **Files:** `.github/workflows/ai-maintenance.yml`, `.github/actions/ai-maintenance/**`, `tests/ai_maintenance.rs`, `docs/testing.md`, `CHANGELOG.md`, `docs/tasks.md`.
+- **Tests:** `.github/actions/ai-maintenance/test/selftest.sh` covers:
+  - **Key pool:** the accepted forms and order; invalid pools refused without echoing a key.
+  - **Routing:** `ordered` and `round-robin`; unknown strategies refused; provider aliases.
+  - **Fallback:** only on exhaustion by default, on any failure with `fallback-on=any`; a timeout never falls back by default.
+  - **Attempts:** the tree is reset between attempts; agent commits and untracked files are collected; uninstallable and unknown providers are skipped.
+  - **Key isolation:** the agent never sees the pool; keys are masked and scrubbed; a patch containing a key is refused; persisted checkout credentials are stripped.
+  - **Prompt:** preamble, instructions and feedback are assembled; the models map reaches the adapter.
+  - **Watcher:** trusted authors and listed bots only; the quiet, closed, foreign-branch and fork cases.
+  - **Publisher:** create and update, labels, and refusal when the branch moved.
+
+  `tests/ai_maintenance.rs` runs the self-test and checks the workflow's isolation: empty default permissions, the key pool only in the read-only agent job, no cache saved there, no write job sees keys or runs the agent, no checkout keeps credentials, action code comes from the workflow's commit, and no `${{ }}` is interpolated into a script.
+- **Done when:** the checks above and the full CI suite pass.
 
 ---
 

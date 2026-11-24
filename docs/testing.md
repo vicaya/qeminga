@@ -242,3 +242,19 @@ figures for the current tip of their source branch (checked before
 generating and before every push), so a slow run for an older commit
 never overwrites a newer one's badges; overlapping writers of the badges
 branch are resolved by regenerating on the fetched tip and retrying.
+
+## AI maintenance workflow
+
+The nightly AI maintenance workflow (`.github/workflows/ai-maintenance.yml`)
+is developer tooling and does not touch the daemon. Its scripts have an
+offline self-test that uses fake provider adapters, a fake `gh` and a local
+remote, so it needs no network or API keys. `tests/ai_maintenance.rs` runs
+it as part of `cargo test`, along with checks on the workflow's isolation
+properties:
+
+```sh
+.github/actions/ai-maintenance/test/selftest.sh
+```
+
+Setup, the key-pool format and the security model are in
+`.github/actions/ai-maintenance/README.md`.

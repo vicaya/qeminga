@@ -60,6 +60,17 @@ semantic versioning.
 
 ### Added
 
+- Nightly AI maintenance workflow (`.github/workflows/ai-maintenance.yml`,
+  `.github/actions/ai-maintenance/`, T6.10): a coding agent (Claude Code,
+  OpenAI Codex or the Antigravity CLI, with room for more providers)
+  follows the instructions in the `AI_MAINTENANCE_PROMPT` secret, using
+  API keys from the ordered `AI_KEY_POOL` secret and falling back to the
+  next key or provider when one is exhausted (`ordered` and `round-robin`
+  routing). Its changes are opened as a pull request, then review feedback
+  from trusted authors is addressed in rounds until the pull request has
+  been quiet for 90 minutes. The agent runs with a read-only token, and its
+  work leaves its job only as a patch; a job with write access but no keys
+  publishes it. Developer tooling only, with no change to the daemon.
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
   part): on GitHub-hosted runners, natively on x86-64 and aarch64, the
   release candidate built in the same run is installed with the shipped

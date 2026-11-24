@@ -846,6 +846,16 @@ the answer is a one-line change, and leave the question here.
 - **Implement (green):** mount-tree visibility filtering with per-path caching and missing-root detection (`freeze_plan::visible_mounts` / `VisibleMountsError::MissingRoot`), UTF-8 round-trip filtering, metadata-only `O_PATH` + `statx(STATX_MNT_ID)` device & mount-ID verification with bounded `/proc/self/fdinfo/<fd>` fallback on Linux 5.4–5.7 (`kernel::statx::fd_mount_identity`, `mountinfo::read_fdinfo_mnt_id`, `SystemStatfs`) before `fstatfs(2)`, open `/proc/self/mountinfo` `ppoll(POLLPRI)` namespace-change monitoring with sticky latching (`mountinfo::MountSnapshot`, `ProcMountMonitor`, `fsinfo::fs_info_with_monitor`), and per-reply opaque `fs-N` superblock identifiers in `fs_info`; host-facing error representations (`MarkerError::host_reason`, `AbortCause::host_reason`, `FreezeStop::host_reason`, `RecoveryReason::host_reason`, `FreezeFailure::host_description`, `ThawFailure::host_description`, sanitized `join_operation`/`format_joining_pending`, sanitized `fstrim` open failures, `Phase::Recovering` published before abort reply, unified `Driver::publish_recovery_progress`) keeping full details in guest-local `tracing` logs; data-protection profile as the CVM installation default in `packaging/README.md` and candidate `PACKAGING_FILES`, explicit v1 single-freezer and mount-binding guidance; `rustix` 1.1.4 → 1.1.6 in `Cargo.lock` (`RUSTSEC-2026-0486`) and `tokio` 1.53.1 → 1.53.3 in `fuzz/Cargo.lock` (matching root `Cargo.lock`).
 - **Done when:** all tests above and the full CI check suite pass, and `AC27` is green.
 
+#### T6.10 — shellcheck over every shell script in CI ∥
+- **Status:** done
+- **Design:** §5.8, AC7 (the checks CI runs are the ones `AGENTS.md` lists).
+- **Depends on:** T0.3
+- **Files:** `scripts/check-shell.sh`, `.github/workflows/ci.yml`, `tests/ci_workflow.rs`, `scripts/ci/bounded-test.sh`, `scripts/ci/verify-badges-render.sh`, `scripts/e2e-libvirt.sh`, `AGENTS.md`, `README.md`, `docs/tasks.md`.
+- **Tests first (red):** `shellcheck_covers_every_shell_script_in_the_repository` (`tests/ci_workflow.rs`): `scripts/check-shell.sh --list` names every `*.sh` file and every file with an `sh`/`bash`/`dash` `#!` line under `scripts/`, `packaging/`, `tests/` and `fuzz/` (build output skipped), so a new script cannot escape the lint; `the_shellcheck_job_lints_every_script_and_cannot_fail_quietly`: the CI `shellcheck` job runs that script, prints the shellcheck version and is never `continue-on-error`.
+- **Implement (green):** `scripts/check-shell.sh` discovers the scripts and runs shellcheck at every severity; a `shellcheck` job in `ci.yml` (gated on the change classification, like the other checks) runs it with the runner image's shellcheck. The three existing findings are fixed: `verify-badges-render.sh` reads its counters with a `case` instead of `eval` (SC2154); `bounded-test.sh` (`ulimit -v`, which dash implements; SC3045) and the two `e2e-libvirt.sh` checks invoked through `step` (SC2317) carry a reasoned directive.
+- **Not done here:** the inline `run:` blocks of the workflows are not linted (that is `actionlint`, which embeds shellcheck).
+- **Done when:** `scripts/check-shell.sh` is clean locally and the `shellcheck` job is green in CI.
+
 ---
 
 ## 6. Acceptance-criteria traceability

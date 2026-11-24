@@ -261,45 +261,47 @@ ai_contains_text() {
     [ "$rc" -ne 1 ]
 }
 
-# ai_cut_lines FILE LIMIT head|tail SECRETS_FILE: about LIMIT bytes from
-# the start (head) or end (tail) of FILE, for the scrubber. When FILE is
-# longer, the cut falls at a line end, and never inside a withheld value
-# (AI_PATTERNS_JQ; a multiline one has line ends of its own): cut in two,
-# the value would escape the exact-match scrubber. It reads, beyond the
-# LIMIT bytes, as many more as the longest value has, and chooses the cut
-# on a copy in which every value is overwritten character for character:
-# a value that runs past what was read lies wholly beyond the cut. What
-# precedes (follows) the cut is then kept as it was. The limit counts
-# characters here; ai_publish_lines holds the published file to LIMIT
-# bytes once it is scrubbed.
+# ai_cut_lines FILE LIMIT head|tail SECRETS_FILE: at most LIMIT bytes from
+# the start (head) or end (tail) of FILE, in whole lines, for the
+# scrubber. When FILE is longer, the cut falls at a line end, and never
+# inside a withheld value (AI_PATTERNS_JQ): cut in two, a value would
+# escape the exact-match scrubber. Only a multiline value has line ends of
+# its own: the cut is chosen on a copy in which each of its line breaks
+# inside such a value is a space (the same characters and bytes), and the
+# file is read with a lookahead, beyond the LIMIT bytes, of the longest
+# such value, so that one running past what was read lies wholly beyond
+# the cut. Lengths are counted in UTF-8 bytes; the text kept is the
+# original.
 ai_cut_lines() {
-    local size extra window eof=false
+    local size extra=0 window eof=false
     size=$(wc -c <"$1") || return 1
     if [ "$size" -le "$2" ]; then cat -- "$1"; return; fi
-    extra=$(jq -r "$AI_PATTERNS_JQ"' [patterns[] | utf8bytelength] | max // 0' "$4") || return 1
-    window=$(($2 + extra))
+    extra=$(jq -r "$AI_PATTERNS_JQ"' [patterns[] | select(test("\n")) | utf8bytelength] | max // 0' "$4") || return 1
+    # The tail reads one byte more: the line end before its first line.
+    window=$(($2 + extra + 1))
     [ "$size" -gt "$window" ] || eof=true
     if [ "$3" = head ]; then head -c "$window" -- "$1"; else tail -c "$window" -- "$1"; fi |
         jq -Rjs --arg end "$3" --argjson limit "$2" --argjson eof "$eof" --slurpfile keys "$4" "$AI_PATTERNS_JQ"'
-            ($keys[0] | patterns) as $ks
-            | ($ks | map(length) | max // 0) as $l
-            | . as $raw | length as $n
-            | (reduce $ks[] as $k (.; split($k) | join("*" * ($k | length)))) as $m
+            . as $raw
+            | (reduce ($keys[0] | patterns | map(select(test("\n"))) | .[]) as $k
+                (.; split($k) | join($k | gsub("\n"; " ")))) as $m
+            | ($m | split("\n")) as $p | ($m | length) as $mlen
             | if $end == "head" then
-                # Up to the last line end within the limit, and short of
-                # where a value running past the window could start.
-                ([$limit, (if $eof then $n else $n - $l end), 0] | sort | .[1]) as $b
-                | ($m[:$b] | split("\n")) as $p
-                | $raw[: (if ($p | length) > 1 then ($p[:-1] | map(length + 1) | add) else 0 end)]
+                # The lines, each with its line end, that fit in the limit.
+                (reduce $p[:-1][] as $line ({b: 0, c: 0, done: false};
+                    if .done then . else (($line | utf8bytelength) + 1) as $lb
+                    | if .b + $lb <= $limit then .b += $lb | .c += ($line | length) + 1 else .done = true end end)) as $r
+                | $raw[:$r.c]
               else
-                # From the first line start past the limit, and past where
-                # a value running into the window could end (when the
-                # window starts inside the file, its first line is partial).
-                ([$n - $limit, (if $eof then 0 else [$l, 1] | max end)] | max) as $s
-                | if $s <= 0 then $raw
-                  else ($m[$s - 1:] | split("\n")) as $p
-                    | $raw[(if ($p | length) > 1 then $s + ($p[0] | length) else $n end):]
-                  end
+                # The last lines that fit in the limit, from a line start:
+                # the first line read is a whole one only at the start of
+                # the file.
+                (reduce range(($p | length) - 1; -1; -1) as $i ({b: -1, c: -1, start: $mlen, done: false};
+                    if .done then . else
+                      .b += ($p[$i] | utf8bytelength) + 1 | .c += ($p[$i] | length) + 1
+                      | if .b <= $limit and ($i > 0 or $eof) then .start = $mlen - .c else .done = true end
+                    end)) as $r
+                | $raw[$r.start:]
               end'
 }
 
@@ -320,16 +322,19 @@ ai_tail_lines() {
     else tail -c "$2" -- "$1" | sed '1d'; fi
 }
 
-# ai_publish_lines SOURCE DEST LIMIT SECRETS_FILE [jsonl]: SOURCE cut to
-# size (ai_cut_lines), scrubbed (ai_scrub, or ai_scrub_jsonl for JSON
-# lines), then held to LIMIT bytes in whole lines: scrubbing can make text
-# longer ("***" for a shorter value, a JSON number quoted).
+# ai_publish_lines SOURCE DEST LIMIT SECRETS_FILE head|tail [jsonl]: the
+# start (end) of SOURCE cut to size (ai_cut_lines), scrubbed (ai_scrub, or
+# ai_scrub_jsonl for JSON lines), then held to LIMIT bytes in whole lines:
+# scrubbing can make text longer ("***" for a shorter value, a JSON number
+# quoted). Fails, leaving no DEST, when any step fails.
 ai_publish_lines() {
-    local scrub=ai_scrub rc=0
-    [ "${5:-}" = jsonl ] && scrub=ai_scrub_jsonl
-    { ai_cut_lines "$1" "$3" head "$4" | "$scrub" "$4" >"$2.part"; } &&
-        ai_head_lines "$2.part" "$3" >"$2" || rc=1
+    local scrub=ai_scrub cap=ai_head_lines rc=0
+    [ "${6:-}" = jsonl ] && scrub=ai_scrub_jsonl
+    [ "$5" = tail ] && cap=ai_tail_lines
+    { ai_cut_lines "$1" "$3" "$5" "$4" | "$scrub" "$4" >"$2.part"; } &&
+        "$cap" "$2.part" "$3" >"$2" || rc=1
     rm -f -- "$2.part"
+    [ "$rc" -eq 0 ] || rm -f -- "$2"
     return "$rc"
 }
 

@@ -171,7 +171,10 @@ Around the agent job:
   bytes, changes it) at line ends that fall outside every withheld value,
   so no key, multiline credential or line of the instructions is cut in
   two before it is withheld; the scrubbed file is then held to that size
-  in whole lines. What the instructions ask for
+  in whole lines (sizes in UTF-8 bytes). A log that cannot be published
+  is left out of the logs artifact and listed in its `INCOMPLETE.txt`,
+  and the action's `logs-complete` output is `false`. What the
+  instructions ask for
   can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.

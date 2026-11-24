@@ -99,6 +99,9 @@ outputs:
   base-sha:
     description: The commit the agent started from.
     value: ${{ steps.run.outputs.base-sha }}
+  logs-complete:
+    description: false when a log could not be published (listed in INCOMPLETE.txt in the logs artifact).
+    value: ${{ steps.run.outputs.logs-complete }}
 
 runs:
   using: composite

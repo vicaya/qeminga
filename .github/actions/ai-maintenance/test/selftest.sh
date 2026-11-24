@@ -531,18 +531,42 @@ eq "cut: ... nor from the tail" "line 6|line 7|line 8|line 9" \
     "$(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-long.json" | paste -sd'|')"
 eq "cut: ... also when the lookahead does not reach the end of the log" "line 1|line 2|line 3|line 4 line 6|line 7|line 8|line 9" \
     "$(ai_cut_lines "$tmp/cut7" 28 head "$tmp/cut-20.json" | paste -sd'|') $(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-20.json" | paste -sd'|')"
+# Limits and lookahead are counted in bytes, also for multibyte text.
+for i in $(seq 40); do printf '測試行\n'; done >"$tmp/cut-mb"
+jq -cn --arg l "$(head -c 40 /dev/zero | tr '\0' L)"$'\n'"$(head -c 42 /dev/zero | tr '\0' M)" '[$l]' >"$tmp/cut-ml.json"
+for keys in cut-long cut-ml; do
+    eq "cut: a multibyte log keeps the whole lines that fit in the limit ($keys)" "測試行|測試行 測試行|測試行" \
+        "$(ai_cut_lines "$tmp/cut-mb" 28 head "$tmp/$keys.json" | paste -sd'|') $(ai_cut_lines "$tmp/cut-mb" 28 tail "$tmp/$keys.json" | paste -sd'|')"
+done
+# ... and a multibyte credential is never cut, at any limit.
+r20=$(printf '測%.0s' $(seq 20))
+printf '前言行\n%s\nab12\n測試QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34 測\n%s\n結束行\n' "$r20" "$r20" >"$tmp/cut-mbk"
+jq -cn '["ab12\n測試QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34 測\n"]' >"$tmp/cut-mbk.json"
+check "cut: at every limit, head and tail keep no part of a multibyte credential, and whole public lines" bash -c '
+    . "$1/lib.sh"
+    for ((n = 1; n <= $(wc -c <"$2/cut-mbk"); n++)); do
+        for end in head tail; do
+            out=$(ai_cut_lines "$2/cut-mbk" "$n" "$end" "$2/cut-mbk.json" | ai_scrub "$2/cut-mbk.json")
+            if grep -qE "ab12|cd34|QUJDREVG" <<<"$out"; then echo "$n $end"; exit 1; fi
+            if grep -vqxE "前言行|結束行|(測)+|\\*\\*\\*|" <<<"$out"; then echo "$n $end: $out"; exit 1; fi
+            if [ "$(printf "%s" "$out" | wc -c)" -gt "$n" ] && [ "$out" != "$(cat "$2/cut-mbk")" ]; then echo "$n $end: over"; exit 1; fi
+        done
+    done' _ "$action" "$tmp"
 # The limit holds for what is published, after the scrubber, which can
 # make a log longer ("a" -> "***"), in whole lines.
 printf 'a\nb\nc\nd\n' >"$tmp/pub1"
 printf '%s' '["a","b","c","d"]' >"$tmp/pub-keys.json"
-ai_publish_lines "$tmp/pub1" "$tmp/pub1.out" 8 "$tmp/pub-keys.json"
+ai_publish_lines "$tmp/pub1" "$tmp/pub1.out" 8 "$tmp/pub-keys.json" head
 eq "publish: the limit holds after scrubbing, in whole lines" "***|***" "$(paste -sd'|' "$tmp/pub1.out")"
 printf '{"n":7}\n{"n":7}\n' >"$tmp/pub2"
 printf '%s' '["7"]' >"$tmp/pub-keys7.json"
-ai_publish_lines "$tmp/pub2" "$tmp/pub2.out" 16 "$tmp/pub-keys7.json" jsonl
+ai_publish_lines "$tmp/pub2" "$tmp/pub2.out" 16 "$tmp/pub-keys7.json" head jsonl
 eq "publish: ... for JSON lines too" '{"n":"***"}' "$(cat "$tmp/pub2.out")"
 eq "publish: ... and a log within the limit is published whole" "***|***|***|***" \
-    "$(ai_publish_lines "$tmp/pub1" "$tmp/pub3.out" 100 "$tmp/pub-keys.json"; paste -sd'|' "$tmp/pub3.out")"
+    "$(ai_publish_lines "$tmp/pub1" "$tmp/pub3.out" 100 "$tmp/pub-keys.json" head; paste -sd'|' "$tmp/pub3.out")"
+printf 'a\nb\nc\nkeep\n' >"$tmp/pub4"
+eq "publish: the tail of a log (the console excerpt) is held to the limit after scrubbing too" "***|keep" \
+    "$(ai_publish_lines "$tmp/pub4" "$tmp/pub4.out" 9 "$tmp/pub-keys.json" tail; paste -sd'|' "$tmp/pub4.out")"
 check "publish: no work file is left beside the output" bash -c '! ls "$1"/pub*.out.* >/dev/null 2>&1' _ "$tmp"
 { cat "$tmp/cut3"; printf '%s\nlast\n' "$x60"; } >"$tmp/cut4"
 eq "cut: ... also in a log over the limit, which keeps its whole lines" "start line|***|end line" \
@@ -642,6 +666,7 @@ check "run: credentials JSON escapes are withheld from the transcript, which sta
     't=$1/logs/attempt-1/transcript.jsonl; [ "$2" = 0 ] && [ -s "$t" ] &&
      jq -e "select(.type == \"assistant\") | .text == \"using ***\" and .key == \"***\" and .tool.input.password == \"***\"" "$t" >/dev/null' \
     _ "$state" "$rc"
+eq "run: logs-complete is true when every log is published" true "$(output logs-complete)"
 check "run: ... and from the attempt log that printed the events" bash -c \
     '! grep -qaF -e "jsonsecret" -e "ab12\\ncd34" "$1/logs/attempt-1/attempt.log"' _ "$state"
 # A transcript mixing JSON events and plain text: a multiline credential
@@ -696,6 +721,15 @@ for on in '[.[].keys[]]' 'paths(strings)' 'def trim' '[.[].provider]' 'splits(';
     eq "run: a failed producer of the withheld values ($on) stops the run before docker" "2 0" \
         "$rc $(wc -l <"$tmp/failjq$i/docker.log" 2>/dev/null || echo 0)"
 done
+# A log that cannot be published is left out and listed; the run's own
+# result stands.
+run_case failupload '[{"claude":{"keys":["jsonprint-1"],"password":"pw-failupload"}}]' PATH="$failjq:$bin:$PATH" \
+    FAIL_JQ_ON='fromjson | deep'
+check "run: a log that cannot be published is left out, listed, and the run's result stands" bash -c \
+    'l=$1/logs; [ "$2" = 0 ] && [ "$3" = unchanged ] && [ "$4" = false ] && [ -s "$l/attempt-1/final.md" ] &&
+     [ ! -e "$l/attempt-1/transcript.jsonl" ] && grep -qx "attempt-1/transcript.jsonl" "$l/INCOMPLETE.txt" &&
+     ! ls "$l"/attempt-1/*.part >/dev/null 2>&1' \
+    _ "$state" "$rc" "$(output status)" "$(output logs-complete)"
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"

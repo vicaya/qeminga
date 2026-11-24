@@ -49,7 +49,8 @@
 # every candidate failed, 2 on a configuration error. Outputs (to
 # GITHUB_OUTPUT when set): status=changed|unchanged|failed, provider,
 # model, effort (the one the CLI used), title, summary-file, result-dir,
-# logs-dir, base-sha, state-dir (this invocation's own directory).
+# logs-dir, logs-complete (false when a log could not be published),
+# base-sha, state-dir (this invocation's own directory).
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -304,9 +305,10 @@ suspend_commands() {
     printf '::stop-commands::%s\n' "$command_token"
 }
 resume_commands() { [ "${GITHUB_ACTIONS:-}" != true ] || printf '\n::%s::\n' "$command_token"; }
-show_capture() { # FILE: the end of a captured output, scrubbed
+show_capture() { # FILE: the end of a captured output, scrubbed, at most 100 kB
     suspend_commands
-    ai_cut_lines "$1" 100000 tail "$secrets_file" | ai_scrub "$secrets_file"
+    ai_publish_lines "$1" "$state/capture.txt" 100000 "$secrets_file" tail && cat "$state/capture.txt"
+    rm -f "$state/capture.txt"
     resume_commands
 }
 
@@ -542,13 +544,12 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 logs=$state/logs
 rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
-upload() { # SOURCE DEST: scrubbed, at most AI_UPLOAD_LIMIT bytes, in whole lines
+# A log that cannot be published is left out and listed in INCOMPLETE.txt,
+# and the logs-complete output is false; the run's result stands.
+unpublished=()
+upload() { # SOURCE DEST [jsonl]: scrubbed, at most AI_UPLOAD_LIMIT bytes, in whole lines
     ai_regular_file "$1" || return 0
-    ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file"
-}
-upload_jsonl() { # SOURCE DEST: the same, scrubbed value by value (JSON lines)
-    ai_regular_file "$1" || return 0
-    ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file" jsonl
+    ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file" head "${3:-}" || unpublished+=("${2#"$logs"/}")
 }
 if [ "$private" = false ]; then
     for ((i = 1; i <= n; i++)); do
@@ -561,8 +562,15 @@ if [ "$private" = false ]; then
         upload "$d/out/final.md" "$l/final.md"
         upload "$d/out/error.txt" "$l/error.txt"
         t=$(head -n 1 "$d/transcript-name" 2>/dev/null)
-        [ -z "$t" ] || upload_jsonl "$d/out/$t" "$l/transcript.jsonl"
+        [ -z "$t" ] || upload "$d/out/$t" "$l/transcript.jsonl" jsonl
     done
+fi
+if [ "${#unpublished[@]}" -gt 0 ]; then
+    ai_log "logs that could not be published, left out: ${unpublished[*]}"
+    printf '%s\n' "${unpublished[@]}" >"$logs/INCOMPLETE.txt"
+    out logs-complete false
+else
+    out logs-complete true
 fi
 out logs-dir "$logs"
 

@@ -5091,6 +5091,65 @@ try:
         and b"later foreign launch" not in pub
         and b"unattributed later launch" not in pub
     ), f"pinned collect_qemu_log MUST NOT leak discarded prefix or unattributed later launch, got {pub!r}"
+
+    # Rotate to an inode containing ONLY a headerless continuation carrying our UUID
+    # (no `starting up` launch header) -> MUST be rejected (not pinned at byte 0)!
+    os.rename(qlog, qlog + ".4")
+    with open(qlog, "wb") as fh:
+        fh.write(f"qemu -uuid {our_uuid} -accel kvm\nOLD_CONTINUATION_ONLY\n".encode())
+    seg_hdrless = mod.read_qemu_log_segment(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert seg_hdrless is None, f"headerless rotated continuation MUST be rejected, got {seg_hdrless!r}"
+    pin_hdrless = mod.pin_qemu_log_cursor(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert pin_hdrless is None, f"headerless rotated continuation MUST NOT pin a verified cursor, got {pin_hdrless!r}"
+    out_dir_hdrless = out_dir + "-hdrless"
+    ok_hdrless = mod.collect_qemu_log(qlog, out_dir_hdrless, "qemu.log", cursor=cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert ok_hdrless is False and not os.path.exists(os.path.join(out_dir_hdrless, "qemu.log")), (
+        "headerless rotated continuation must not be published"
+    )
+
+    # Rotate to an inode starting with a headerless continuation carrying the SAME UUID
+    # (and an older `-accel tcg` flag), followed by a recognized `starting up` launch block
+    # for our UUID -> MUST skip byte 0, pin `verified` at the launch header offset, and
+    # omit the continuation from both read and collect!
+    os.rename(qlog, qlog + ".5")
+    cont_prefix = f"qemu -uuid {our_uuid} -accel tcg\nOLD_SAME_UUID_CONTINUATION\n".encode()
+    with open(qlog, "wb") as fh:
+        fh.write(
+            cont_prefix
+            + f"2026-11-23 12:25:00.000+0000: starting up\nqemu -uuid {our_uuid} -accel kvm\nVERIFIED_NEW_LAUNCH\n".encode()
+        )
+    seg_cont = mod.read_qemu_log_segment(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert (
+        seg_cont is not None
+        and b"VERIFIED_NEW_LAUNCH" in seg_cont
+        and b"OLD_SAME_UUID_CONTINUATION" not in seg_cont
+        and b"-accel tcg" not in seg_cont
+    ), f"rotated read MUST drop headerless same-UUID continuation, got {seg_cont!r}"
+    pin_cont = mod.pin_qemu_log_cursor(qlog, cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert pin_cont is not None and pin_cont[0] == "verified" and pin_cont[3] == len(cont_prefix), (
+        f"pinned cursor MUST start at recognized launch header offset {len(cont_prefix)}, got {pin_cont!r}"
+    )
+    out_dir_cont = out_dir + "-cont"
+    ok_cont = mod.collect_qemu_log(qlog, out_dir_cont, "qemu.log", cursor=pin_cont, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert ok_cont is True, "collect_qemu_log with header-verified rotated cursor must succeed"
+    pub_cont = open(os.path.join(out_dir_cont, "qemu.log"), "rb").read()
+    assert (
+        b"VERIFIED_NEW_LAUNCH" in pub_cont
+        and b"OLD_SAME_UUID_CONTINUATION" not in pub_cont
+        and b"-accel tcg" not in pub_cont
+    ), f"collected rotated qemu.log MUST NOT include headerless same-UUID continuation, got {pub_cont!r}"
+
+    # Non-rotated (initially absent) log containing only a headerless line carrying our UUID
+    # MUST NOT promote cursor status to `verified` without a recognized launch header.
+    qlog_abs = os.path.join(qlog_dir, "absent-hdrless.log")
+    abs_cursor = mod.snapshot_qemu_log_cursor(qlog_abs, session=False, root_fd=root_fd, root_path=root_path)
+    assert abs_cursor[0] == "absent"
+    with open(qlog_abs, "wb") as fh:
+        fh.write(f"qemu -uuid {our_uuid} -accel kvm\nHEADERLESS_ONLY\n".encode())
+    pin_abs = mod.pin_qemu_log_cursor(qlog_abs, abs_cursor, expected_uuid=our_uuid, session=False, root_fd=root_fd, root_path=root_path)
+    assert pin_abs is not None and pin_abs[0] == "present", (
+        f"headerless non-rotated block must stay 'present' (not 'verified'), got {pin_abs!r}"
+    )
 finally:
     os.close(root_fd)
 "#,
@@ -5811,6 +5870,163 @@ fn session_mode_captures_uuid_for_rotated_logs_and_atomically_replaces_domain_xm
         !nopy_out.join("serial.log").exists() && !nopy_out.join("qemu.log").exists(),
         "without python3 publisher, session collect_diagnostics MUST omit serial.log and qemu.log rather than unsafe cp/chmod"
     );
+
+    // 4. Session `run` and `prove_kvm` without `python3` MUST NOT fall back to reading the
+    //    entire historical QEMU log: `preflight` refuses missing `python3` (leaving
+    //    `accelerator_kvm` != "pass"), and direct `prove_kvm` fails closed without a
+    //    current-run segment even when a historical log contains `-accel kvm`!
+    let nopy_run_bin = fx.dir.path().join("nopy-run-bin");
+    create_private_dir(&nopy_run_bin);
+    for tool in [
+        "bash",
+        "mkdir",
+        "sed",
+        "tr",
+        "head",
+        "tail",
+        "cat",
+        "rm",
+        "dirname",
+        "basename",
+        "grep",
+        "awk",
+        "uname",
+        "id",
+        "df",
+        "nproc",
+        "date",
+        "jq",
+        "curl",
+        "sha256sum",
+        "chmod",
+        "cp",
+        "mktemp",
+        "cut",
+        "mv",
+        "stat",
+        "touch",
+        "sleep",
+        "env",
+    ] {
+        for dir_cand in ["/usr/bin", "/bin"] {
+            let p = Path::new(dir_cand).join(tool);
+            if p.is_file() {
+                let _ = std::os::unix::fs::symlink(&p, nopy_run_bin.join(tool));
+                break;
+            }
+        }
+    }
+    for entry in std::fs::read_dir(&fx.session_bin).unwrap().flatten() {
+        let name = entry.file_name();
+        let dst = nopy_run_bin.join(&name);
+        let _ = std::fs::remove_file(&dst);
+        let _ = std::os::unix::fs::symlink(entry.path(), dst);
+    }
+    let nopy_run_qlogs = fx.dir.path().join("nopy-run-qlogs");
+    create_private_dir(&nopy_run_qlogs);
+    let nopy_run_name = fx.run_name("126");
+    let hist_qlog = nopy_run_qlogs.join(format!("{nopy_run_name}.log"));
+    std::fs::write(
+        &hist_qlog,
+        b"2026-11-20 00:00:00.000+0000: starting up\nqemu -accel kvm\nHISTORICAL_KVM_LINE\n",
+    )
+    .unwrap();
+    let nopy_run_out = fx.dir.path().join("nopy-run-out");
+    std::fs::create_dir_all(&nopy_run_out).unwrap();
+    std::fs::write(&fx.dom_state_file, "absent\n").unwrap();
+    let nopy_run_xml =
+        format!("<domain type='kvm'><name>{nopy_run_name}</name><uuid>{dom_uuid}</uuid></domain>");
+    let nopy_run = Command::new("/usr/bin/env")
+        .args([
+            "-i",
+            &format!("PATH={}", nopy_run_bin.display()),
+            &format!("HOME={}", fx.dir.path().display()),
+            "QEMINGA_E2E_CONNECT=qemu:///session",
+            &format!("QEMINGA_E2E_IMAGES={}", nopy_images.display()),
+            &format!("QEMINGA_E2E_QEMU_LOG_DIR={}", nopy_run_qlogs.display()),
+            "QEMINGA_KVM_DEVICE=/dev/null",
+            &format!("QEMINGA_AAVMF_CODE={}", fx.aavmf_code.display()),
+            &format!("QEMINGA_AAVMF_VARS={}", fx.aavmf_vars.display()),
+            &format!("FAKE_IMAGE_SHA={}", fx.pinned_image_sha),
+            &format!("FAKE_DOM_STATE_FILE={}", fx.dom_state_file.display()),
+            &format!("FAKE_DOM_NAME={nopy_run_name}"),
+            &format!("FAKE_DOM_UUID={dom_uuid}"),
+            &format!("FAKE_DUMPXML_CONTENT={nopy_run_xml}"),
+            "FAKE_START_EXIT=0",
+            "bash",
+            root()
+                .join("scripts/ci/libvirt-kvm-smoke.sh")
+                .to_str()
+                .unwrap(),
+            "run",
+            "--arch",
+            fx.arch,
+            "--candidate",
+            fx.candidate.to_str().unwrap(),
+            "--source-sha",
+            SHA,
+            "--run-id",
+            "126",
+            "--run-attempt",
+            "1",
+            "--out",
+            nopy_run_out.to_str().unwrap(),
+            "--expect-sha256",
+            &fx.digest,
+        ])
+        .output()
+        .unwrap();
+    let nopy_run_txt = text(&nopy_run);
+    assert!(
+        !nopy_run.status.success() && nopy_run_txt.contains("missing tool: python3"),
+        "session cmd_run without python3 MUST fail in preflight rather than running without current-run QEMU log segmentation:\n{nopy_run_txt}"
+    );
+    let nopy_res: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(nopy_run_out.join("result.json")).unwrap()).unwrap();
+    assert_eq!(nopy_res["result"], "fail");
+    assert_ne!(
+        nopy_res["tests"]["accelerator_kvm"], "pass",
+        "session accelerator_kvm MUST NOT pass without python3:\n{nopy_res}"
+    );
+
+    // Direct `prove_kvm` in session mode MUST ALSO fail closed when cursor is empty or
+    // python3 is unavailable, NEVER falling back to reading the entire historical log.
+    for (probe_label, cursor_arg) in [
+        ("empty_cursor", ""),
+        ("present_cursor_no_python3", "present\t1\t2\t0"),
+    ] {
+        let prove_out = Command::new("/usr/bin/env")
+            .args([
+                "-i",
+                &format!("PATH={}", nopy_run_bin.display()),
+                &format!("HOME={}", fx.dir.path().display()),
+                "QEMINGA_E2E_CONNECT=qemu:///session",
+                &format!("QEMINGA_E2E_IMAGES={}", nopy_images.display()),
+                &format!("QEMINGA_E2E_QEMU_LOG_DIR={}", nopy_run_qlogs.display()),
+                &format!("FAKE_DOM_STATE_FILE={}", fx.dom_state_file.display()),
+                &format!("FAKE_DOM_NAME={nopy_run_name}"),
+                &format!("FAKE_DOM_UUID={dom_uuid}"),
+                &format!("FAKE_DUMPXML_CONTENT={nopy_run_xml}"),
+                "bash",
+                "-c",
+                r#"set -euo pipefail; eval "$(sed '/^# ---- dispatch/,$d' "$1")"; prove_kvm "$2" "$3" "$4""#,
+                "_",
+                root()
+                    .join("scripts/ci/libvirt-kvm-smoke.sh")
+                    .to_str()
+                    .unwrap(),
+                dom_uuid,
+                &nopy_run_name,
+                cursor_arg,
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            !prove_out.status.success(),
+            "session prove_kvm ({probe_label}) MUST fail closed rather than reading historical qemu.log:\n{}",
+            text(&prove_out)
+        );
+    }
 }
 
 // ---- result contract ------------------------------------------------------

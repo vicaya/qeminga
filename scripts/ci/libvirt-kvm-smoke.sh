@@ -694,12 +694,9 @@ preflight() {
         || die "KVM device $kvm_dev is missing or not readable/writable by uid $(id -u)"
 
     local tool
-    for tool in virsh qemu-img genisoimage jq curl sha256sum "qemu-system-$arch"; do
+    for tool in virsh qemu-img genisoimage jq curl sha256sum python3 "qemu-system-$arch"; do
         command -v "$tool" >/dev/null || die "missing tool: $tool"
     done
-    if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        command -v python3 >/dev/null || die "missing tool: python3"
-    fi
     if [ "$arch" = aarch64 ]; then
         local fw fw_code fw_vars
         fw="$(resolve_aavmf)"
@@ -768,20 +765,16 @@ prove_kvm() {
         *"kvm support: enabled"*) ;;
         *) echo "KVM is not enabled"; return 1 ;;
     esac
+    [ -n "$qlog_cursor" ] || { echo "missing QEMU log cursor for $qemu_log"; return 1; }
+    command -v python3 >/dev/null 2>&1 || { echo "current-run QEMU log evidence unavailable (python3 missing)"; return 1; }
+    local c_st="" c_dev="" c_ino="" c_off=""
+    IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
-        [ -n "$qlog_cursor" ] || { echo "missing QEMU log cursor for $qemu_log"; return 1; }
-        local c_st="" c_dev="" c_ino="" c_off=""
-        IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
         qlog_seg="$(sys_fs_ops read-qemu-log-segment "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid")" \
             || { echo "missing current-run QEMU log segment at $qemu_log"; return 1; }
-    elif [ -n "$qlog_cursor" ] && command -v python3 >/dev/null 2>&1; then
-        local c_st="" c_dev="" c_ino="" c_off=""
-        IFS=$'\t' read -r c_st c_dev c_ino c_off <<<"$qlog_cursor"
+    else
         qlog_seg="$(sys_fs_ops read-qemu-log-segment-session "$qemu_log" "$c_st" "$c_dev" "$c_ino" "$c_off" "$expected_uuid")" \
             || { echo "missing current-run QEMU log segment at $qemu_log"; return 1; }
-    else
-        [ ! -L "$qemu_log" ] && [ -f "$qemu_log" ] || { echo "missing QEMU log at $qemu_log"; return 1; }
-        qlog_seg="$(cat -- "$qemu_log")" || return 1
     fi
     grep -qE -- '-accel kvm|accel=kvm' <<<"$qlog_seg" || { echo "no KVM accelerator flag on QEMU command line"; return 1; }
     if grep -qE -- '-accel tcg|accel=tcg' <<<"$qlog_seg"; then
@@ -939,7 +932,7 @@ EOF
     if [ "$CONNECT_URI" = "qemu:///system" ]; then
         RUN_QLOG_CURSOR="$(sys_fs_ops snapshot-qemu-log-cursor "$(qemu_log_of "$name")")" \
             || die "cannot inspect QEMU log path before starting $name ($RUN_DOMAIN_REF)"
-    elif command -v python3 >/dev/null 2>&1; then
+    else
         RUN_QLOG_CURSOR="$(sys_fs_ops snapshot-qemu-log-cursor-session "$(qemu_log_of "$name")")" \
             || die "cannot inspect QEMU log path before starting $name ($RUN_DOMAIN_REF)"
     fi

@@ -4267,7 +4267,6 @@ def verify_dir_identity(
     expected_ident,
     entries,
     label,
-    allow_empty_missing_tx=False,
 ):
     # Enforce same-operation mount consistency between parent and child FDs,
     # private ownership/mode (euid + 0700) on the live directory descriptor,
@@ -4299,12 +4298,6 @@ def verify_dir_identity(
         )
     live_tx = read_tx_marker(dfd, d_mnt, target)
     if not live_tx:
-        # Pruning deletes `.qeminga-tx-id` last right before `os.rmdir`. If a crash
-        # interrupts that final window, retrying `safe-rmtree-id` may finish
-        # removing the already-empty, euid-owned 0700 directory whose parent/target
-        # inodes and backing volume were verified above — never deleting any contents.
-        if allow_empty_missing_tx and not os.listdir(dfd):
-            return False
         raise OSError(
             errno.EXDEV,
             f"refusing {label} '{target}': missing transaction identity marker '{TX_MARKER_NAME}' (leaving for inspection)",
@@ -5200,14 +5193,10 @@ try:
         finally:
             os.close(pfd)
     elif op == "safe-rmtree-id":
+        if len(sys.argv) != 4:
+            raise OSError(errno.EINVAL, f"unexpected safe-rmtree-id argument(s): {sys.argv[4:]}")
         target = norm_abs(sys.argv[2])
         ident = parse_path_identity(sys.argv[3], target)
-        require_tx = False
-        if len(sys.argv) > 4:
-            if sys.argv[4] == "--require-tx" and len(sys.argv) == 5:
-                require_tx = True
-            else:
-                raise OSError(errno.EINVAL, f"unexpected safe-rmtree-id argument(s): {sys.argv[4:]}")
         parent = os.path.dirname(target) or "/"
         base = os.path.basename(target)
         pfd, p_sync = open_chain_rdir_or_opath(parent)
@@ -5226,7 +5215,7 @@ try:
             try:
                 tst = os.fstat(tfd)
                 t_mnt = fd_mnt_id(tfd)
-                has_marker = verify_dir_identity(
+                verify_dir_identity(
                     pfd,
                     pst,
                     p_mnt,
@@ -5238,45 +5227,45 @@ try:
                     ident,
                     entries,
                     "delete",
-                    allow_empty_missing_tx=not require_tx,
                 )
                 if tst.st_dev != pst.st_dev or t_mnt != p_mnt:
                     raise OSError(errno.EXDEV, f"'{target}' crosses mount boundary")
-                if has_marker:
-                    clear_dir_contents_same_mount(
-                        tfd,
-                        tst.st_dev,
-                        t_mnt,
-                        target,
-                        mountpoints,
-                        skip_names=(TX_MARKER_NAME,),
+                clear_dir_contents_same_mount(
+                    tfd,
+                    tst.st_dev,
+                    t_mnt,
+                    target,
+                    mountpoints,
+                    skip_names=(TX_MARKER_NAME,),
+                )
+                os.fsync(tfd)
+                mst = assert_entry_same_mount(
+                    tfd,
+                    TX_MARKER_NAME,
+                    tst.st_dev,
+                    t_mnt,
+                    f"{target}/{TX_MARKER_NAME}",
+                    mountpoints,
+                )
+                if not stat.S_ISREG(mst.st_mode):
+                    raise OSError(
+                        errno.EINVAL,
+                        f"unsafe transaction marker '{target}/{TX_MARKER_NAME}'",
                     )
-                    os.fsync(tfd)
-                    mst = assert_entry_same_mount(
-                        tfd,
-                        TX_MARKER_NAME,
-                        tst.st_dev,
-                        t_mnt,
-                        f"{target}/{TX_MARKER_NAME}",
-                        mountpoints,
+                os.unlink(TX_MARKER_NAME, dir_fd=tfd)
+                # Keep `tfd` open through the parent-entry check and `os.rmdir` so
+                # the verified inode stays pinned and cannot be recycled before removal.
+                lst = os.lstat(base, dir_fd=pfd)
+                if lst.st_dev != pst.st_dev or lst.st_ino != ident["t_ino"]:
+                    raise OSError(
+                        errno.EXDEV,
+                        f"refusing to remove '{target}': directory inode changed before rmdir (leaving for inspection)",
                     )
-                    if not stat.S_ISREG(mst.st_mode):
-                        raise OSError(
-                            errno.EINVAL,
-                            f"unsafe transaction marker '{target}/{TX_MARKER_NAME}'",
-                        )
-                    os.unlink(TX_MARKER_NAME, dir_fd=tfd)
+                os.rmdir(base, dir_fd=pfd)
+                if p_sync:
+                    os.fsync(pfd)
             finally:
                 os.close(tfd)
-            lst = os.lstat(base, dir_fd=pfd)
-            if lst.st_dev != pst.st_dev or lst.st_ino != ident["t_ino"]:
-                raise OSError(
-                    errno.EXDEV,
-                    f"refusing to remove '{target}': directory inode changed before rmdir (leaving for inspection)",
-                )
-            os.rmdir(base, dir_fd=pfd)
-            if p_sync:
-                os.fsync(pfd)
         finally:
             os.close(pfd)
     elif op == "safe-rmtree":
@@ -6652,19 +6641,19 @@ ensure_owned_service_disabled() {
     esac
 }
 
-# Remove a recorded or live staging directory only with positive
-# `.qeminga-tx-id` transaction ownership (`--require-tx`); an absent stage
-# already succeeds. Never enables `allow_empty_missing_tx` so an unrelated
-# empty directory reusing a freed stage inode is never removed automatically.
+# Remove a recorded or live staging directory via `safe-rmtree-id`, which
+# unconditionally requires positive `.qeminga-tx-id` transaction ownership
+# (never allowing a markerless empty directory reusing a freed inode); an
+# absent stage already succeeds.
 _prune_verified_stage_dir() {
     local stage_dir="$1" stage_id="$2"
-    fs_ops safe-rmtree-id "$stage_dir" "$stage_id" --require-tx
+    fs_ops safe-rmtree-id "$stage_dir" "$stage_id"
 }
 
 # Shared recovery helper: validate recorded stage/backup paths (and volumes in
 # uninstall mode), durably persist `$pre_phase` while the containers still
-# exist on disk, prune verified stage (`--require-tx`) and/or backup containers
-# via `safe-rmtree-id`, and then durably persist `$post_state` / `$post_phase`
+# exist on disk, prune verified stage and/or backup containers via strict
+# `safe-rmtree-id`, and then durably persist `$post_state` / `$post_phase`
 # with empty container fields. Any pre-prune journal write failure leaves the
 # containers and journal as a consistent recoverable pair.
 _sync_and_prune_update_containers() {

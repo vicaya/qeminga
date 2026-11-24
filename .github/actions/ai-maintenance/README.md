@@ -116,8 +116,10 @@ nothing it downloads. Each attempt runs in its own container:
   owner-only directory of its own under `runner.temp` (or under
   `AI_STATE_DIR`; either way, every directory on the path must belong to the
   runner's user or root and be writable by no one else, unless sticky like
-  `/tmp`, and it may not be inside the checkout, which the image build and
-  every attempt copy whole), and uploads only the result and the attempts it
+  `/tmp`, and it may not be inside any directory a container sees: the
+  checkout, which the image build and every attempt copy whole, the action,
+  a separate adapter directory or the runner's npm), and uploads only the
+  result and the attempts it
   made itself, so a later invocation in the same job never publishes an
   earlier one's (private) output. When it ends, however it ends, only the
   sanitized output is left there: the prompt, the agent's trees, raw logs
@@ -154,9 +156,11 @@ Around the agent job:
   still at the commit the agent worked on; the push itself only succeeds
   while the branch is at that commit, so a closed pull request or a deleted
   branch is never updated or recreated.
-- Every key and the instructions are masked in the job log, and withheld
-  wherever the agent quotes them verbatim in the PR text or the uploaded
-  logs. A paraphrase can't be detected: if the instructions themselves
+- Every key, every credential in the pool's options (see
+  [Key pool](#key-pool)) and the instructions are masked in the job
+  log, and withheld wherever the agent quotes them verbatim in the PR text
+  or the uploaded logs; a change containing a key or option credential is
+  not published. A paraphrase can't be detected: if the instructions themselves
   must stay unpublished, set `AI_MAINTENANCE_PRIVATE_INSTRUCTIONS` to
   `true`. The PR description and replies are then a fixed text, the
   agent's output stays off the job log, and no transcripts are uploaded.
@@ -221,6 +225,13 @@ with spending limits.
   CLI at a gateway or compatible endpoint (`ANTHROPIC_BASE_URL`,
   `OPENAI_BASE_URL` or `GOOGLE_GEMINI_BASE_URL`). Adapters receive any
   other option too.
+- Credentials in options are treated like keys: masked, withheld from what
+  is published, and refused in a change. They are the string options, at
+  any depth, under a name containing `token`, `key`, `secret`, `passw`,
+  `auth`, `credential` or `cookie` (any case); the user-info of a URL
+  (`https://user:pass@…`: both `user:pass` and `pass`, or a lone token
+  before the `@`); and URL query parameters named like that
+  (`?api_key=…`). `model` and other settings stay public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
 - A provider without an adapter is skipped with a note in the run summary,

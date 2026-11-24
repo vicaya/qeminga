@@ -363,3 +363,21 @@ ai_sandbox_env() {
     export PATH
     mkdir -p "$HOME"
 }
+
+# ai_option_secrets POOL -> JSON array of the credentials in the entries'
+# options, withheld like keys (masked, scrubbed, refused in a patch): every
+# string option, at any depth, under a name that looks like a credential;
+# the user-info of any URL value ("user:pass" and the password alone, or a
+# lone token); and URL query parameters named like credentials. The model
+# and other settings stay public.
+AI_CREDENTIAL_NAME='token|key|secret|passw|auth|credential|cookie'
+ai_option_secrets() {
+    jq -c --arg re "$AI_CREDENTIAL_NAME" '
+        [ .[].options | del(.model) | paths(strings) as $p | getpath($p) as $v
+          | if any($p[] | strings; test($re; "i")) then $v else empty end,
+            ($v | capture("^[A-Za-z][A-Za-z0-9+.-]*://(?<u>[^/?#@]*)@")? | .u
+                | ., (if test(":") then sub("^[^:]*:"; "") else empty end)),
+            ($v | select(test("^[A-Za-z][A-Za-z0-9+.-]*://")) | scan("[?&]([^=&#]+)=([^&#]*)")
+                | select(.[0] | test($re; "i")) | .[1])
+        ] | map(select(length > 0)) | unique' <<<"$1"
+}

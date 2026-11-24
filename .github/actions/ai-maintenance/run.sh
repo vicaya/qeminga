@@ -72,8 +72,10 @@ unset AI_KEY_POOL AI_INSTRUCTIONS GH_TOKEN GITHUB_TOKEN
 
 pool=$(ai_normalize_pool "$pool_raw") || exit 2
 pool_raw=
-keys=$(ai_all_keys "$pool")
-# Everything withheld from published output: the keys and the instructions.
+# The keys and the credentials in the entries' options (lib.sh,
+# ai_option_secrets), withheld and refused alike; everything withheld from
+# published output: those and the instructions.
+keys=$({ ai_all_keys "$pool"; ai_option_secrets "$pool"; } | jq -cs '.[0] + .[1] | unique')
 # Secrets reach the commands that handle them through standard input or an
 # owner-only file, never through their arguments, which every account on
 # the runner can read.
@@ -91,6 +93,17 @@ case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be t
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
+# The runner's Node.js, for the npm-installed CLIs, as one read-only file,
+# and its npm for the install containers.
+node_args=() npm_args=() npm_dir=''
+if node=$(command -v node 2>/dev/null) && node=$(readlink -f "$node") && [ -f "$node" ]; then
+    node_args=(-v "$node:/opt/ai-maintenance/node/bin/node:ro" -e AI_NODE_BIN=/opt/ai-maintenance/node/bin)
+    if npm_js=$(command -v npm 2>/dev/null) && npm_js=$(readlink -f "$npm_js") && [ -f "$npm_js" ] &&
+        [ "${npm_js##*/}" = npm-cli.js ]; then
+        npm_dir=${npm_js%/bin/npm-cli.js}
+        npm_args=(-v "$npm_dir:/opt/ai-maintenance/npm:ro" -e AI_NPM_CLI=/opt/ai-maintenance/npm/bin/npm-cli.js)
+    fi
+fi
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { ai_log "not inside a git checkout"; exit 2; }
 top=$(git rev-parse --show-toplevel)
@@ -105,7 +118,12 @@ fi
 subdir=$(git rev-parse --show-prefix)
 base=$(git rev-parse HEAD)
 out base-sha "$base"
-top_phys=$(cd "$top" && pwd -P) || exit 2
+# Every directory a container mounts or an image build reads, as the
+# kernel resolves it: the checkout, the action, the adapters, npm.
+shared_dirs=()
+for d in "$top" "$here" "$providers_dir" ${npm_dir:+"$npm_dir"}; do
+    shared_dirs+=("$(cd "$d" && pwd -P)") || exit 2
+done
 
 # A fresh, owner-only directory for this invocation: an earlier one in the
 # same job (with the same AI_STATE_DIR) leaves its attempts, private or
@@ -115,14 +133,23 @@ top_phys=$(cd "$top" && pwd -P) || exit 2
 # rename it in: the runner's own, or a sticky one such as /tmp.
 state_root=${AI_STATE_DIR:-${RUNNER_TEMP:+$RUNNER_TEMP/ai-maintenance}}
 state_root=${state_root:-${TMPDIR:-/tmp}}
-# Never at or under the checkout, which the image build and every attempt
-# copy whole: the keys written below would go with it. Checked on the path
-# as the kernel will resolve it, before anything is made there.
-inside_checkout() { case "$1/" in "$top_phys"/*) true ;; *) false ;; esac; }
-if want=$(realpath -m -- "$state_root") && inside_checkout "$want"; then
-    ai_log "the state directory ($state_root) is inside the checkout ($top); set AI_STATE_DIR to a directory outside it"
+# Never at or under a directory the containers see (the checkout, which
+# the image build and every attempt copy whole, the action, the adapters,
+# npm): the keys written below would be readable there. Checked on the
+# path as the kernel will resolve it, before anything is made there.
+# shared_dir PATH -> the shared directory PATH is in, if any.
+shared_dir() {
+    local s
+    for s in "${shared_dirs[@]}"; do
+        case "$1/" in "$s"/*) printf '%s' "$s"; return 0 ;; esac
+    done
+    return 1
+}
+refuse_shared() {
+    ai_log "the state directory ($state_root) is inside $1, which the containers see; set AI_STATE_DIR to a directory outside it"
     exit 2
-fi
+}
+if want=$(realpath -m -- "$state_root") && in=$(shared_dir "$want"); then refuse_shared "$in"; fi
 mkdir -p "$state_root" || exit 2
 # trusted_dir DIR: owned by this user or root, and not writable by anyone
 # else unless sticky (then no one else can rename what is in it).
@@ -143,10 +170,7 @@ if [ ! -L "$state_root" ] && root_phys=$(cd "$state_root" && pwd -P); then
         d=$(dirname "$d")
     done
 fi
-if [ "$state_ok" = true ] && inside_checkout "$root_phys"; then
-    ai_log "the state directory ($state_root) is inside the checkout ($top); set AI_STATE_DIR to a directory outside it"
-    exit 2
-fi
+if [ "$state_ok" = true ] && in=$(shared_dir "$root_phys"); then refuse_shared "$in"; fi
 if [ "$state_ok" != true ]; then
     ai_log "the state directory ($state_root) and every directory above it must belong to this user or root and be writable by no one else (unless sticky, like /tmp); it may not be a symlink"
     exit 2
@@ -257,17 +281,6 @@ container_args() { # NAME WORKDIR -> sets docker_args
     docker_args=(run --rm --init --name "$1" --user "$uid_gid" --cap-drop ALL
         --security-opt no-new-privileges -v "$here:$here:ro" -w "$2")
 }
-# The runner's Node.js, for the npm-installed CLIs, as one read-only file,
-# and its npm for the install containers.
-node_args=() npm_args=()
-if node=$(command -v node 2>/dev/null) && node=$(readlink -f "$node") && [ -f "$node" ]; then
-    node_args=(-v "$node:/opt/ai-maintenance/node/bin/node:ro" -e AI_NODE_BIN=/opt/ai-maintenance/node/bin)
-    if npm_js=$(command -v npm 2>/dev/null) && npm_js=$(readlink -f "$npm_js") && [ -f "$npm_js" ] &&
-        [ "${npm_js##*/}" = npm-cli.js ]; then
-        npm_args=(-v "${npm_js%/bin/npm-cli.js}:/opt/ai-maintenance/npm:ro"
-            -e AI_NPM_CLI=/opt/ai-maintenance/npm/bin/npm-cli.js)
-    fi
-fi
 providers_args=()
 case "$providers_dir/" in "$here/"*) ;; *) providers_args=(-v "$providers_dir:$providers_dir:ro") ;; esac
 
@@ -550,7 +563,7 @@ if [ -s "$export_dir/changes.patch" ]; then
     # copy of the checkout, as publish.sh will, and scan the patch and
     # every added or modified file's new contents (binary files are
     # encoded in the patch text). A scan that fails refuses as well.
-    ai_contains_key "$keys" "$result_dir/changes.patch" && refuse "the patch contains an API key from the pool"
+    ai_contains_key "$keys" "$result_dir/changes.patch" && refuse "the patch contains an API key or credential from the pool"
     # Private instructions: the change may not quote a line of them either
     # (in its text, a file's contents or a file name).
     quoted='[]' quoted_whole='[]'
@@ -570,7 +583,7 @@ if [ -s "$export_dir/changes.patch" ]; then
         refuse "could not list the changed files"
     # The names as published, byte for byte (the patch may quote them):
     # checked before any of them is logged.
-    ai_contains_key "$keys" "$state/names" && refuse "a changed file's name contains an API key from the pool"
+    ai_contains_key "$keys" "$state/names" && refuse "a changed file's name contains an API key or credential from the pool"
     { ai_contains_key "$quoted" "$state/names" || ai_contains_text "$quoted_whole" "$state/names"; } &&
         refuse "a changed file's name quotes the private instructions"
     while IFS= read -r -d '' path; do
@@ -583,7 +596,7 @@ if [ -s "$export_dir/changes.patch" ]; then
         sha=$(cut -d' ' -f4 <<<"$meta")
         git -C "$verify" cat-file blob "$sha" >"$state/blob" ||
             refuse "could not read the new contents of $(ai_printable "$path")"
-        ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key from the pool"
+        ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key or credential from the pool"
         { ai_contains_key "$quoted" "$state/blob" || ai_contains_text "$quoted_whole" "$state/blob"; } &&
             refuse "a changed file quotes the private instructions"
     done <"$changed"

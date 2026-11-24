@@ -83,6 +83,10 @@ provider_run() {
         boom-*) echo "segmentation fault"; return 1 ;;
         slow-*) sleep 30 ;;
         leak-*) echo "$key" >>file.txt; printf 'done\n' >"$final" ;;
+        optleak-*) jq -r .api_token <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
+        optname-*) : >"n-$(jq -r .api_token <<<"$5")"; printf 'done\n' >"$final" ;;
+        optprint-*) # a CLI that echoes its configuration
+            jq -r '"gateway \(.base_url) token \(.api_token) model \(.model)"' <<<"$5" | tee "$final" "$AI_ATTEMPT_DIR/stream.jsonl" ;;
         binleak-*) printf 'GIF89a\0\1\2%s\0\3' "$key" >image.bin; printf 'done\n' >"$final" ;;
         prompt-*) cp "$prompt" "$final"; cat "$prompt" ;;
         quote-*) grep -m1 advisory "$prompt" >notes.txt; printf 'done\n' >"$final" ;;
@@ -331,6 +335,16 @@ for bad in '' 'not json' '[]' '[{"claude":[]}]' '[{"claude":[""]}]' '[{"claude":
 done
 err=$(ai_normalize_pool '["sk-secret-1"]' 2>&1 >/dev/null)
 check "pool: an error never echoes a key" bash -c '! grep -q "sk-secret" <<<"$1"' _ "$err"
+# Credentials in an entry's options are withheld like keys: options named
+# like credentials, the user-info of any URL, and URL query parameters
+# named like credentials. Public settings (the model, a region) are not.
+optpool=$(ai_normalize_pool '[{"claude":{"keys":["k1"],"model":"m high","region":"eu-west",
+    "base_url":"https://user:p4ss-gw@gw.example/v1?api_key=qk-123&region=eu","api_token":"tok-1",
+    "extra":{"client_secret":"cs-1","retries":3},"Password":"pw-1"}},
+    {"gpt":{"keys":["k2"],"base_url":"https://tokonly@gw2.example","endpoint":"https://gw3.example/v1"}}]')
+eq "pool: option credentials are found, public settings are not" \
+    '["cs-1","p4ss-gw","pw-1","qk-123","tok-1","tokonly","user:p4ss-gw"]' "$(ai_option_secrets "$optpool")"
+eq "pool: a pool without options has none" '[]' "$(ai_option_secrets "$pool")"
 
 # --- lib.sh: model settings ---------------------------------------------------
 eq "spec: model and effort" "claude-opus-5-5|high" "$(ai_parse_model_spec 'claude-opus-5-5 high' | tr '\t' '|')"
@@ -434,7 +448,7 @@ check "run: the patch is exported by a container without a key or network" bash 
 check "run: the image is built once from the configured base" bash -c \
     '[ "$(grep -c "^build " "$1")" = 1 ] && grep -q "^FROM ubuntu:24.04$" "$2/image/Dockerfile"' _ "$tmp/fallback/docker.log" "$state"
 
-run_case providers '[{"provider2":["ok-x"]},{"anthropic":["quota-a"]},{"openai":["ok-b"]}]'
+run_case provmix '[{"provider2":["ok-x"]},{"anthropic":["quota-a"]},{"openai":["ok-b"]}]'
 eq "run: unknown provider skipped, aliases resolved, next provider used" "0 unsupported exhausted success openai" "$rc $(results) $(output provider)"
 
 run_case stop '[{"claude":["boom-1","ok-2"]}]'
@@ -463,6 +477,16 @@ run_case leak '[{"claude":["leak-1"]}]'
 eq "run: changes containing a pool key are not published" "1 failed" "$rc $(output status)"
 check "run: no patch with the key is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"
 
+optentry='"base_url":"https://gwuser:gwpass-optsecret@gw.invalid/v1","api_token":"tok-optsecret","model":"public-model"'
+run_case optleak '[{"claude":{"keys":["optleak-1"],'"$optentry"'}}]'
+eq "run: changes containing an option credential are not published" "1 failed" "$rc $(output status)"
+run_case optname '[{"claude":{"keys":["optname-1"],'"$optentry"'}}]'
+eq "run: ... nor a changed file named after one" "1 failed" "$rc $(output status)"
+run_case optprint '[{"claude":{"keys":["optprint-1"],'"$optentry"'}}]' GITHUB_ACTIONS=true
+check "run: option credentials are masked, and withheld from the summary, logs and transcript" bash -c \
+    '[ "$2" = 0 ] && grep -qx "::add-mask::tok-optsecret" "$3" && grep -qx "::add-mask::gwuser:gwpass-optsecret" "$3" &&
+     ! grep -rqa optsecret "$1/summary.md" "$1/logs" && grep -qa "model public-model" "$1/logs/attempt-1/attempt.log"' \
+    _ "$state" "$rc" "$tmp/optprint/log"
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"
@@ -509,6 +533,22 @@ in_checkout attop "run: ... the checkout itself too (a TMPDIR there included)"
 mkdir -p "$tmp/vialink" && ln -s "$tmp/vialink/repo" "$tmp/repo-link"
 run_case vialink '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/repo-link/sub"
 in_checkout vialink "run: ... and through a symlink above it"
+# ... nor under any other directory a container mounts: the action, a
+# separate adapter directory, the runner's npm.
+refused_under() { # NAME DIR: refused, nothing made in DIR, docker never called
+    eq "$3" "2 0 0" "$rc $(find "$2" -name 'ai-maintenance-run.*' | wc -l) $(wc -l <"$tmp/$1/docker.log" 2>/dev/null || echo 0)"
+}
+run_case underaction '[{"claude":["ok-1"]}]' AI_STATE_DIR="$action/state"
+refused_under underaction "$action" "run: a state directory inside the action is refused"
+cp -a "$fakes" "$tmp/extprov"
+run_case underprov '[{"claude":["ok-1"]}]' AI_PROVIDERS_DIR="$tmp/extprov" AI_STATE_DIR="$tmp/extprov/state"
+refused_under underprov "$tmp/extprov" "run: ... or inside a separate adapter directory"
+npmpkg=$tmp/npmpkg/lib/node_modules/npm
+mkdir -p "$npmpkg/bin" "$tmp/npmpath" && : >"$npmpkg/bin/npm-cli.js" && chmod +x "$npmpkg/bin/npm-cli.js"
+printf '#!/bin/sh\n' >"$tmp/npmpath/node" && chmod +x "$tmp/npmpath/node"
+ln -s "$npmpkg/bin/npm-cli.js" "$tmp/npmpath/npm"
+run_case undernpm '[{"claude":["ok-1"]}]' PATH="$tmp/npmpath:$bin:$PATH" AI_STATE_DIR="$npmpkg/state"
+refused_under undernpm "$npmpkg" "run: ... or inside the npm mounted for the installs"
 # Debugging keeps the raw files, but never the file listing every key, nor
 # an attempt's options; neither is left behind by a run that stops early.
 run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true

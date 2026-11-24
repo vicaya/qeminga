@@ -326,6 +326,8 @@ prompt=$prompt_dir/prompt.md
     fi
 } >"$prompt"
 instructions=
+# The agent's user reads it (mounted read-only) whatever the umask was.
+own "$prompt_dir" || exit 2
 
 # A fresh copy of the checkout for each attempt. actions/checkout leaves a
 # token in the repository config unless it runs with persist-credentials:

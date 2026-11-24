@@ -30,6 +30,11 @@ docker_mode='' image_mode=''
 [ "${1:-}" = --docker ] && docker_mode=1
 [ "${1:-}" = --image ] && image_mode=1
 
+# The fixtures are made readable to others whatever the caller's umask: run
+# as root, the fake docker runs each attempt as another user, who reads
+# them as a container would its mounts. run.sh itself runs under
+# RUN_UMASK (run_case), 022 unless a check sets another.
+umask 022
 tmp=$(mktemp -d) && [ -d "$tmp" ] || { echo "selftest: could not create a temporary directory" >&2; exit 2; }
 export TMPDIR=$tmp
 trap '[ -n "${KEEP:-}" ] || rm -rf "$tmp"' EXIT
@@ -142,7 +147,7 @@ run_case() { # name pool [VAR=value ...]; leaves $rc, $outf, $state, $repo
     newrepo "$repo"
     mkdir -p "$state"
     : >"$outf"
-    (cd "$repo" && env -u AI_MODELS PATH="$bin:$PATH" FAKE_DOCKER_LOG="$tmp/$name/docker.log" \
+    (umask "${RUN_UMASK:-022}"; cd "$repo" && env -u AI_MODELS PATH="$bin:$PATH" FAKE_DOCKER_LOG="$tmp/$name/docker.log" \
         AI_KEY_POOL="$pool" AI_INSTRUCTIONS="tidy up" AI_STATE_DIR="$state" AI_KEEP_RAW_STATE=true \
         AI_PROVIDERS_DIR="$fakes" GITHUB_OUTPUT="$outf" GITHUB_ACTIONS= "$@" \
         "$action/run.sh") >"$tmp/$name/log" 2>&1
@@ -300,7 +305,7 @@ done
 shift # the image
 if [ -n "${FAKE_DOCKER_ARGV_DIR:-}" ] && [ -n "$name" ]; then
     rec=$FAKE_DOCKER_ARGV_DIR/$name.log
-    { mkdir -p "$FAKE_DOCKER_ARGV_DIR" && : >>"$rec"; } || exit 125
+    { (umask 022 && mkdir -p "$FAKE_DOCKER_ARGV_DIR") && : >>"$rec"; } || exit 125
     [ -z "$user" ] || chown "$user" "$rec" || exit 125
     envs+=("ARGV_LOG=$rec")
 fi
@@ -614,6 +619,10 @@ run_case undernpm '[{"claude":["ok-1"]}]' PATH="$tmp/npmpath:$bin:$PATH" AI_STAT
 refused_under undernpm "$npmpkg" "run: ... or inside the npm mounted for the installs"
 # Debugging keeps the raw files, but never the file listing every key, nor
 # an attempt's options; neither is left behind by a run that stops early.
+# Under a restrictive umask (077), the agent's user can still read the
+# prompt the run wrote for it.
+RUN_UMASK=077 run_case umask077 '[{"claude":["prompt-1"]}]'
+eq "run: the agent reads its prompt under a restrictive umask too" "0 unchanged" "$rc $(output status)"
 run_case keepraw '[{"claude":{"keys":["ok-1"],"token":"tok-argvoptionsecret"}}]' AI_KEEP_RAW_STATE=true
 check "run: raw state is kept for debugging, without the key file or the options" bash -c \
     '[ "$2" = 0 ] && [ -d "$1/attempt-1/tree" ] && [ ! -e "$1/secrets.json" ] && ! grep -rqa argvoptionsecret "$1"' _ "$state" "$rc"
@@ -671,6 +680,10 @@ eq "fake docker: opens the closed directories above a mount inside the fixture" 
 # would name $b/outside, a closed directory outside the fixture.
 evil="$b/fixture/nl"$'\n'"$b/outside"
 mkdir -p "$evil/x" && chmod 700 "$evil"
+# The directories between the fixture and $evil are open whatever the
+# umask: only the fixture and $evil are expected.
+d=${evil%/*}
+while [ "$d" != "$b/fixture" ]; do chmod 755 "$d"; d=${d%/*}; done
 eq "fake docker: ... a name with a newline in it stays one name, and nothing changes" "$b/fixture|$evil| 700" \
     "$(closed "$b/fixture" "$evil/x") $(stat -c %a "$b/outside")"
 eq "fake docker: ... none above a sibling whose name extends the fixture's" "" "$(closed "$b/fixture" "$b/fixture-sibling/x")"

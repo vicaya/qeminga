@@ -227,6 +227,23 @@ jobs:
       - uses: actions/checkout@v4
       - run: scripts/check-unsafe.sh
 
+  # Every shell script in the repository (the CI helpers under scripts/ci/
+  # included) is linted with shellcheck at every severity. The runner
+  # image ships shellcheck; the version is printed so a finding that
+  # appears with an image update can be traced to it. tests/ci_workflow.rs
+  # checks that the script's listing covers every shell script.
+  shellcheck:
+    name: shellcheck (shell scripts)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: shellcheck --version
+      - run: scripts/check-shell.sh
+
   # Design §8.5: aarch64 is a supported target and the native jobs above
   # and below execute it. This cross-check is kept as the cheap first
   # signal: it is the command an x86-64 developer runs locally

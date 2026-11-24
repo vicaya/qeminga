@@ -211,3 +211,100 @@ fn no_native_job_is_allowed_to_fail_quietly() {
         );
     }
 }
+
+/// The shell scripts `scripts/check-shell.sh` lints, as it lists them
+/// with `--list` (no shellcheck needed for the listing).
+fn linted_shell_scripts() -> Vec<String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let script = root.join("scripts/check-shell.sh");
+    let out = std::process::Command::new(&script)
+        .arg("--list")
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+    assert!(
+        out.status.success(),
+        "check-shell.sh --list: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every file under `dir` (recursively) that is a shell script by name
+/// (`*.sh`) or by its `#!` line, relative to the repository root.
+fn shell_scripts_under(root: &Path, dir: &Path, found: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            shell_scripts_under(root, &path, found);
+            continue;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let first = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+        let first = String::from_utf8_lossy(first);
+        let shebang = first.starts_with("#!")
+            && ["sh", "bash", "dash"]
+                .iter()
+                .any(|sh| first.ends_with(&format!("/{sh}")) || first.ends_with(&format!(" {sh}")));
+        if path.extension().is_some_and(|e| e == "sh") || shebang {
+            found.push(
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+}
+
+#[test]
+fn shellcheck_covers_every_shell_script_in_the_repository() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut expected = Vec::new();
+    for dir in ["scripts", "packaging", "tests", "fuzz"] {
+        let dir = root.join(dir);
+        if dir.is_dir() {
+            shell_scripts_under(root, &dir, &mut expected);
+        }
+    }
+    expected.sort();
+    let linted = linted_shell_scripts();
+    assert!(
+        linted.len() >= 11,
+        "only {} shell scripts listed",
+        linted.len()
+    );
+    for script in &expected {
+        assert!(
+            linted.contains(script),
+            "{script}: a shell script check-shell.sh does not lint"
+        );
+    }
+    for must in ["scripts/check-unsafe.sh", "scripts/e2e-libvirt.sh"] {
+        assert!(linted.iter().any(|s| s == must), "{must} is not linted");
+    }
+}
+
+#[test]
+fn the_shellcheck_job_lints_every_script_and_cannot_fail_quietly() {
+    let text = workflow();
+    let block = job(&text, "shellcheck");
+    assert!(
+        block.contains("scripts/check-shell.sh"),
+        "the shellcheck job runs the script the test above covers"
+    );
+    assert!(
+        block.contains("shellcheck --version"),
+        "the job records which shellcheck judged the scripts"
+    );
+    assert!(
+        !block.contains("continue-on-error"),
+        "a shellcheck finding must fail the workflow"
+    );
+}

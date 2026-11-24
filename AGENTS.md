@@ -44,12 +44,21 @@ cargo test --all-features --locked
 cargo test --locked                       # default features too
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features --locked
 scripts/check-unsafe.sh
+scripts/check-shell.sh                    # shellcheck 0.11.0 over every shell script (see below)
+scripts/ci/check-shell-selftest.sh        # cases the shell lint must fail on, through the same shellcheck
 cargo deny check                          # cargo install cargo-deny --locked
 cargo audit --deny warnings              # cargo install cargo-audit --locked
 cargo check --target aarch64-unknown-linux-gnu --all-targets --all-features --locked
 cargo build --release --locked --features seccomp
 scripts/ci/coverage.sh                    # cargo llvm-cov + 85 % floor on production lines; cargo install cargo-llvm-cov --locked; rustup component add llvm-tools-preview
 ```
+
+`scripts/check-shell.sh` is written against the shellcheck release it pins
+(`SHELLCHECK_VERSION`, currently 0.11.0), which CI installs; releases
+differ in what they report, so another version only warns locally and
+fails under CI. Distribution packages are often older (Ubuntu 24.04 has
+0.9.0): take the release binary from
+<https://github.com/koalaman/shellcheck/releases>.
 
 `cargo test` also needs `jq` on `PATH` (`apt-get install jq`; GitHub's
 runners have it): `tests/libvirt_tcg_smoke.rs` drives
@@ -118,6 +127,13 @@ running it locally is in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`
   line, as described in `docs/tasks.md` C-1. Use the fixtures in
   `tests/fixtures/qga/` and add to them.
 
+- **Shell scripts are shellcheck-clean.** Every `*.sh` file and every file
+  with an `sh`/`bash`/`dash` `#!` line is linted at every severity by
+  `scripts/check-shell.sh`, as the dialect its `#!` line runs unless a
+  `# shellcheck shell=` directive names one. Silence a finding only with a
+  `# shellcheck disable=SCxxxx # reason` directive directly above the
+  command it covers, never file-wide or in a config file.
+
 ## Layout
 
 ```
@@ -128,7 +144,7 @@ src/handlers/       one file per command family
 src/kernel/         the only place `unsafe` may appear
 tests/              integration and end-to-end tests (`tests/e2e/` harness)
 tests/fixtures/     mountinfo, os-release, config, and wire-format samples
-scripts/            CI helpers (`check-unsafe.sh`, loop-device setup)
+scripts/            CI helpers (`check-unsafe.sh`, `check-shell.sh`, loop-device setup)
 packaging/          systemd unit, udev rule, sysusers, example config
 docs/               design.md (spec), tasks.md (work queue)
 ```

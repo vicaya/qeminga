@@ -1,0 +1,4 @@
+#!/usr/bin/env --split-string=bash -eu
+# bash through env --split-string=.
+declare -A seen=([a]=1)
+echo "${!seen[@]}"

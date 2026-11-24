@@ -6,5 +6,6 @@
 # diagnostics (T5.6). Selected with CARGO_TARGET_<triple>_RUNNER; the cap
 # is inherited by anything the tests spawn.
 set -e
+# shellcheck disable=SC3045 # dash (/bin/sh on the runners) and bash both have ulimit -v
 ulimit -v "${QEMINGA_TEST_VMEM_KIB:-4194304}"
 exec "$@"

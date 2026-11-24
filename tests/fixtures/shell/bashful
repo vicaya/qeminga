@@ -1,0 +1,2 @@
+#!/usr/bin/bashful
+fn main() { let x = [1, 2]; }

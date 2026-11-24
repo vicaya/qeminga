@@ -542,13 +542,13 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 logs=$state/logs
 rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
-upload() { # SOURCE DEST: scrubbed, at most AI_UPLOAD_LIMIT bytes, cut at a line end
+upload() { # SOURCE DEST: scrubbed, at most AI_UPLOAD_LIMIT bytes, in whole lines
     ai_regular_file "$1" || return 0
-    ai_cut_lines "$1" "$upload_limit" head "$secrets_file" | ai_scrub "$secrets_file" >"$2"
+    ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file"
 }
 upload_jsonl() { # SOURCE DEST: the same, scrubbed value by value (JSON lines)
     ai_regular_file "$1" || return 0
-    ai_cut_lines "$1" "$upload_limit" head "$secrets_file" | ai_scrub_jsonl "$secrets_file" >"$2"
+    ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file" jsonl
 }
 if [ "$private" = false ]; then
     for ((i = 1; i <= n; i++)); do

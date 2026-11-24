@@ -499,12 +499,51 @@ jq -cn '["ab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n", "QUJDREVGR0hJSktM
 printf 'start line\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\nend line\n' >"$tmp/cut3"
 x60=$(head -c 60 /dev/zero | tr '\0' x)
 printf 'start line\n%s\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n%s\nend line\n' "$x60" "$x60" >"$tmp/cut5"
-eq "cut: the head of a log never ends inside a multiline credential (here, after its long line)" "start line" \
+eq "cut: the head of a log never ends inside a multiline credential (here, after its long line)" "start line|$x60" \
     "$(ai_cut_lines "$tmp/cut5" 115 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
-eq "cut: ... nor does its tail start inside one (here, inside its long line)" "end line" \
+eq "cut: ... nor does its tail start inside one (here, inside its long line)" "$x60|end line" \
     "$(ai_cut_lines "$tmp/cut5" 89 tail "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
 eq "cut: a credential wholly inside the limit is kept for the scrubber, and its line break" "start line|***|end line" \
     "$(ai_cut_lines "$tmp/cut3" 1000 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"
+# Every limit, head and tail: no part of the credential, whether it is
+# printed as configured or trimmed (here, with text after its last line),
+# and the public lines around it whole.
+printf 'start line\n%s\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34 and more\n%s\nend line\n' "$x60" "$x60" >"$tmp/cut6"
+check "cut: at every limit, head and tail keep no part of a credential, as configured or trimmed" bash -c '
+    . "$1/lib.sh"
+    for f in "$2/cut5" "$2/cut6"; do
+        for ((n = 1; n <= $(wc -c <"$f"); n++)); do
+            for end in head tail; do
+                out=$(ai_cut_lines "$f" "$n" "$end" "$2/cut-keys.json" | ai_scrub "$2/cut-keys.json")
+                if grep -qE "ab12|cd34|QUJDREVG" <<<"$out"; then echo "$f $n $end"; exit 1; fi
+                if grep -vqxE "start line|end line|x+|\\*\\*\\*|\\*\\*\\* and more|" <<<"$out"; then echo "$f $n $end: $out"; exit 1; fi
+            done
+        done
+    done' _ "$action" "$tmp"
+# The lookahead lies beyond the part kept: a long withheld value that the
+# log does not hold takes nothing from it.
+for i in 1 2 3 4 5 6 7 8 9; do printf 'line %d\n' "$i"; done >"$tmp/cut7"
+jq -cn --arg l "$(head -c 83 /dev/zero | tr '\0' L)" '[$l]' >"$tmp/cut-long.json"
+jq -cn --arg l "$(head -c 20 /dev/zero | tr '\0' L)" '[$l]' >"$tmp/cut-20.json"
+eq "cut: a long withheld value elsewhere takes nothing from the head" "line 1|line 2|line 3|line 4" \
+    "$(ai_cut_lines "$tmp/cut7" 28 head "$tmp/cut-long.json" | paste -sd'|')"
+eq "cut: ... nor from the tail" "line 6|line 7|line 8|line 9" \
+    "$(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-long.json" | paste -sd'|')"
+eq "cut: ... also when the lookahead does not reach the end of the log" "line 1|line 2|line 3|line 4 line 6|line 7|line 8|line 9" \
+    "$(ai_cut_lines "$tmp/cut7" 28 head "$tmp/cut-20.json" | paste -sd'|') $(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-20.json" | paste -sd'|')"
+# The limit holds for what is published, after the scrubber, which can
+# make a log longer ("a" -> "***"), in whole lines.
+printf 'a\nb\nc\nd\n' >"$tmp/pub1"
+printf '%s' '["a","b","c","d"]' >"$tmp/pub-keys.json"
+ai_publish_lines "$tmp/pub1" "$tmp/pub1.out" 8 "$tmp/pub-keys.json"
+eq "publish: the limit holds after scrubbing, in whole lines" "***|***" "$(paste -sd'|' "$tmp/pub1.out")"
+printf '{"n":7}\n{"n":7}\n' >"$tmp/pub2"
+printf '%s' '["7"]' >"$tmp/pub-keys7.json"
+ai_publish_lines "$tmp/pub2" "$tmp/pub2.out" 16 "$tmp/pub-keys7.json" jsonl
+eq "publish: ... for JSON lines too" '{"n":"***"}' "$(cat "$tmp/pub2.out")"
+eq "publish: ... and a log within the limit is published whole" "***|***|***|***" \
+    "$(ai_publish_lines "$tmp/pub1" "$tmp/pub3.out" 100 "$tmp/pub-keys.json"; paste -sd'|' "$tmp/pub3.out")"
+check "publish: no work file is left beside the output" bash -c '! ls "$1"/pub*.out.* >/dev/null 2>&1' _ "$tmp"
 { cat "$tmp/cut3"; printf '%s\nlast\n' "$x60"; } >"$tmp/cut4"
 eq "cut: ... also in a log over the limit, which keeps its whole lines" "start line|***|end line" \
     "$(ai_cut_lines "$tmp/cut4" 120 head "$tmp/cut-keys.json" | ai_scrub "$tmp/cut-keys.json" | paste -sd'|')"

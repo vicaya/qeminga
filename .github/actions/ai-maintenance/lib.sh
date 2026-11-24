@@ -167,15 +167,25 @@ ai_is_exhausted() {
     [ -f "$1" ] && grep -Eiq -- "$re" "$1"
 }
 
+# The patterns the withheld values are found by, longest first, for the
+# scrubbers and for the cut (ai_cut_lines) alike: a multiline value is
+# matched without its leading and trailing white space, so the line break
+# after it, which may separate it from the next line or event, stays.
+# Inside a decoded JSON string there is no such separator to keep:
+# patterns_and_values also has each value as configured, matched first.
+# shellcheck disable=SC2016 # jq text
+AI_PATTERNS_JQ='def patterns: map(if test("\n") then gsub("^\\s+|\\s+$"; "") else . end)
+    | map(select(length > 0)) | unique | sort_by(-length);
+  def patterns_and_values: map(., (select(test("\n")) | gsub("^\\s+|\\s+$"; "")))
+    | map(select(length > 0)) | unique | sort_by(-length);'
+
 # ai_scrub SECRETS_FILE < in > out: replaces every secret (pool keys, the
-# instructions) with "***", longest first. A multiline one is matched
-# without its leading and trailing white space, so the line break after it
-# stays. The secrets come from a file (a JSON array), never from an
-# argument, which other accounts can read.
+# instructions) with "***", longest first (AI_PATTERNS_JQ). The secrets
+# come from a file (a JSON array), never from an argument, which other
+# accounts can read.
 ai_scrub() {
-    jq -Rjs --slurpfile keys "$1" '
-        reduce ($keys[0] | map(if test("\n") then gsub("^\\s+|\\s+$"; "") else . end) | map(select(length > 0))
-                | unique | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))'
+    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
+        reduce ($keys[0] | patterns | .[]) as $k (.; split($k) | join("***"))'
 }
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
@@ -251,32 +261,76 @@ ai_contains_text() {
     [ "$rc" -ne 1 ]
 }
 
-# ai_cut_lines FILE LIMIT head|tail SECRETS_FILE: at most LIMIT bytes from
+# ai_cut_lines FILE LIMIT head|tail SECRETS_FILE: about LIMIT bytes from
 # the start (head) or end (tail) of FILE, for the scrubber. When FILE is
 # longer, the cut falls at a line end, and never inside a withheld value
-# (a multiline credential has line ends of its own): cut in two, the value
-# would escape the exact-match scrubber. The cut is chosen on a copy in
-# which every value is overwritten, character for character, and keeps a
-# lookahead of the longest value: a value running past the LIMIT bytes
-# lies wholly beyond the cut. What precedes (follows) the cut is
-# then kept as it was.
+# (AI_PATTERNS_JQ; a multiline one has line ends of its own): cut in two,
+# the value would escape the exact-match scrubber. It reads, beyond the
+# LIMIT bytes, as many more as the longest value has, and chooses the cut
+# on a copy in which every value is overwritten character for character:
+# a value that runs past what was read lies wholly beyond the cut. What
+# precedes (follows) the cut is then kept as it was. The limit counts
+# characters here; ai_publish_lines holds the published file to LIMIT
+# bytes once it is scrubbed.
 ai_cut_lines() {
-    local size
+    local size extra window eof=false
     size=$(wc -c <"$1") || return 1
     if [ "$size" -le "$2" ]; then cat -- "$1"; return; fi
-    if [ "$3" = head ]; then head -c "$2" -- "$1"; else tail -c "$2" -- "$1"; fi |
-        jq -Rjs --arg end "$3" --slurpfile keys "$4" '
-            ($keys[0] | map(select(length > 0)) | unique | sort_by(-length)) as $ks
+    extra=$(jq -r "$AI_PATTERNS_JQ"' [patterns[] | utf8bytelength] | max // 0' "$4") || return 1
+    window=$(($2 + extra))
+    [ "$size" -gt "$window" ] || eof=true
+    if [ "$3" = head ]; then head -c "$window" -- "$1"; else tail -c "$window" -- "$1"; fi |
+        jq -Rjs --arg end "$3" --argjson limit "$2" --argjson eof "$eof" --slurpfile keys "$4" "$AI_PATTERNS_JQ"'
+            ($keys[0] | patterns) as $ks
             | ($ks | map(length) | max // 0) as $l
-            | . as $raw
+            | . as $raw | length as $n
             | (reduce $ks[] as $k (.; split($k) | join("*" * ($k | length)))) as $m
             | if $end == "head" then
-                ($m[: ([($m | length) - $l, 0] | max)] | split("\n")) as $p
+                # Up to the last line end within the limit, and short of
+                # where a value running past the window could start.
+                ([$limit, (if $eof then $n else $n - $l end), 0] | sort | .[1]) as $b
+                | ($m[:$b] | split("\n")) as $p
                 | $raw[: (if ($p | length) > 1 then ($p[:-1] | map(length + 1) | add) else 0 end)]
               else
-                ($m[([$l, ($m | length)] | min):] | split("\n")) as $p
-                | $raw[(if ($p | length) > 1 then $l + ($p[0] | length) + 1 else ($m | length) end):]
+                # From the first line start past the limit, and past where
+                # a value running into the window could end (when the
+                # window starts inside the file, its first line is partial).
+                ([$n - $limit, (if $eof then 0 else [$l, 1] | max end)] | max) as $s
+                | if $s <= 0 then $raw
+                  else ($m[$s - 1:] | split("\n")) as $p
+                    | $raw[(if ($p | length) > 1 then $s + ($p[0] | length) else $n end):]
+                  end
               end'
+}
+
+# ai_head_lines FILE LIMIT, ai_tail_lines FILE LIMIT: at most LIMIT bytes
+# from the start (end) of FILE, in whole lines: for text already scrubbed.
+ai_head_lines() {
+    local size
+    size=$(wc -c <"$1") || return 1
+    if [ "$size" -le "$2" ]; then cat -- "$1"
+    elif [ "$(tail -c +"$2" -- "$1" | head -c 1 | od -An -tx1 | tr -d ' \n')" = 0a ]; then head -c "$2" -- "$1"
+    else head -c "$2" -- "$1" | sed '$d'; fi
+}
+ai_tail_lines() {
+    local size
+    size=$(wc -c <"$1") || return 1
+    if [ "$size" -le "$2" ]; then cat -- "$1"
+    elif [ "$(tail -c +"$((size - $2))" -- "$1" | head -c 1 | od -An -tx1 | tr -d ' \n')" = 0a ]; then tail -c "$2" -- "$1"
+    else tail -c "$2" -- "$1" | sed '1d'; fi
+}
+
+# ai_publish_lines SOURCE DEST LIMIT SECRETS_FILE [jsonl]: SOURCE cut to
+# size (ai_cut_lines), scrubbed (ai_scrub, or ai_scrub_jsonl for JSON
+# lines), then held to LIMIT bytes in whole lines: scrubbing can make text
+# longer ("***" for a shorter value, a JSON number quoted).
+ai_publish_lines() {
+    local scrub=ai_scrub rc=0
+    [ "${5:-}" = jsonl ] && scrub=ai_scrub_jsonl
+    { ai_cut_lines "$1" "$3" head "$4" | "$scrub" "$4" >"$2.part"; } &&
+        ai_head_lines "$2.part" "$3" >"$2" || rc=1
+    rm -f -- "$2.part"
+    return "$rc"
 }
 
 # ai_regular_file PATH: success for a regular file that is not a symlink.
@@ -496,12 +550,10 @@ ai_json_forms() {
 # whose text is a withheld value becomes "***", other numbers and booleans
 # keep their types), and written back as JSON; any other line as text.
 ai_scrub_jsonl() {
-    jq -Rjs --slurpfile keys "$1" '
-        reduce ($keys[0] | map(gsub("^\\s+|\\s+$"; "") | select(test("\n")))
-                | unique | sort_by(-length) | .[]) as $k (.; split($k) | join("***"))' |
-        jq -Rr --slurpfile keys "$1" '
-            ($keys[0] | map(., (select(test("\n")) | gsub("^\\s+|\\s+$"; "")))
-             | map(select(length > 0)) | unique | sort_by(-length)) as $ks
+    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
+        reduce ($keys[0] | patterns | map(select(test("\n"))) | .[]) as $k (.; split($k) | join("***"))' |
+        jq -Rr --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
+            ($keys[0] | patterns_and_values) as $ks
             | ($ks | map({(.): true}) | add // {}) as $set
             | def scrub: reduce $ks[] as $k (.; split($k) | join("***"));
               def deep: if type == "string" then scrub

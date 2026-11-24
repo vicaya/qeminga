@@ -170,7 +170,8 @@ Around the agent job:
   uploaded file; the step's `AI_UPLOAD_LIMIT` environment variable, in
   bytes, changes it) at line ends that fall outside every withheld value,
   so no key, multiline credential or line of the instructions is cut in
-  two before it is withheld. What the instructions ask for
+  two before it is withheld; the scrubbed file is then held to that size
+  in whole lines. What the instructions ask for
   can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.
@@ -245,11 +246,12 @@ with spending limits.
   matched exactly in a change, as is each of its lines of 20 or more
   characters other than PEM armor (`-----BEGIN … KEY-----`, the same in
   every key). Every withheld value is also withheld in the forms it takes
-  inside a JSON string (escaped quotes, backslashes and line breaks), and
-  the uploaded transcripts are scrubbed as JSON, value by value (a number
-  that is a withheld value becomes `"***"`), and then as a whole for
-  multiline values printed as plain text. `model` and other settings stay
-  public.
+  inside a JSON string (escaped quotes, backslashes and line breaks).
+  Uploaded transcripts are scrubbed first as written, of every multiline
+  value printed as plain text (matched without its leading and trailing
+  white space, so the line break after it stays), and then as JSON, value
+  by value (a number that is a withheld value becomes `"***"`). `model`
+  and other settings stay public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
 - A provider without an adapter is skipped with a note in the run summary,

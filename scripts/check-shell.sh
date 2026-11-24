@@ -14,6 +14,10 @@
 # command it covers; `.shellcheckrc` files, the repository's or the
 # user's, are not read (`--norc`).
 #
+# The shellcheck release is pinned (SHELLCHECK_VERSION below; CI installs
+# exactly it): releases differ in what they report. Another version prints
+# a warning, and fails the run under CI (CI=true).
+#
 # Usage: scripts/check-shell.sh [DIR]          (exit 0 = clean, 1 = findings)
 #        scripts/check-shell.sh --list [DIR]   (print the scripts it would lint)
 # DIR defaults to the repository root.
@@ -21,6 +25,8 @@
 # tests/ci_workflow.rs checks the listing against the repository and
 # against fixtures.
 set -euo pipefail
+
+SHELLCHECK_VERSION=0.11.0
 
 list=0
 if [ "${1:-}" = --list ]; then
@@ -102,8 +108,15 @@ if [ "${#scripts[@]}" -eq 0 ]; then
     exit 1
 fi
 command -v shellcheck >/dev/null || {
-    echo "check-shell: shellcheck is not on PATH (apt-get install shellcheck)" >&2
+    echo "check-shell: shellcheck is not on PATH (install $SHELLCHECK_VERSION from https://github.com/koalaman/shellcheck/releases)" >&2
     exit 1
 }
-echo "check-shell: shellcheck $(shellcheck --version | sed -n 's/^version: //p'), ${#scripts[@]} scripts"
+found=$(shellcheck --version | sed -n 's/^version: //p')
+if [ "$found" != "$SHELLCHECK_VERSION" ]; then
+    echo "check-shell: shellcheck $found is not the pinned $SHELLCHECK_VERSION; findings may differ from CI" >&2
+    if [ "${CI:-}" = true ]; then
+        exit 1
+    fi
+fi
+echo "check-shell: shellcheck $found, ${#scripts[@]} scripts"
 shellcheck --norc "${scripts[@]}"

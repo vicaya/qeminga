@@ -479,3 +479,36 @@ fn the_shellcheck_job_lints_every_script_and_cannot_fail_quietly() {
         "a shellcheck finding must fail the workflow"
     );
 }
+
+/// The shellcheck release `scripts/check-shell.sh` is written against
+/// (`SHELLCHECK_VERSION=` in the script).
+fn pinned_shellcheck_version() -> String {
+    let script = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh"),
+    )
+    .unwrap();
+    script
+        .lines()
+        .find_map(|l| l.strip_prefix("SHELLCHECK_VERSION="))
+        .expect("check-shell.sh pins SHELLCHECK_VERSION")
+        .to_owned()
+}
+
+#[test]
+fn ci_installs_the_shellcheck_release_the_script_pins() {
+    // Releases differ in what they report (0.11 added SC2329), so CI must
+    // not judge with whatever the runner image happens to ship.
+    let version = pinned_shellcheck_version();
+    let parts: Vec<&str> = version.split('.').collect();
+    assert!(
+        parts.len() == 3 && parts.iter().all(|p| p.parse::<u32>().is_ok()),
+        "SHELLCHECK_VERSION={version} is not an exact release"
+    );
+    let text = workflow();
+    let block = job(&text, "shellcheck");
+    assert!(
+        block.contains("uses: taiki-e/install-action@v2")
+            && block.contains(&format!("tool: shellcheck@{version}")),
+        "the shellcheck job installs shellcheck {version} (checksum-verified)"
+    );
+}

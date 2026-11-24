@@ -23796,4 +23796,187 @@ _rollback_runner_package_tx \
             "{amb_label}: retry after manual removal must honor UPDATE_WAS_ACTIVE=1"
         );
     }
+
+    // Part 5: `publishing`-phase recovery (after `retire_verified_stage_dir` could have freed
+    //   the stage inode before `committed` became durable) MUST ALSO require positive
+    //   `.qeminga-tx-id` ownership when reclaiming `UPDATE_STAGE_DIR` across `update` AND
+    //   both `uninstall` branches (live runner dir present vs absent). An absent stage still
+    //   succeeds cleanly.
+    let pub_stage = inst_parent.join(".qeminga-extract.pub-reuse");
+    let pub_backup = inst_parent.join(".qeminga-update-backup.pub-reuse");
+    std::fs::create_dir(&pub_stage).unwrap();
+    std::fs::create_dir(&pub_backup).unwrap();
+    std::fs::set_permissions(&pub_stage, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::set_permissions(&pub_backup, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pub_sid = String::from_utf8(
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops path-identity "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                pub_stage.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let pub_bid = String::from_utf8(
+        Command::new("bash")
+            .args([
+                "-c",
+                r#"source "$1"; fs_ops path-identity "$2""#,
+                "_",
+                script().to_str().unwrap(),
+                pub_backup.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    // Simulate an unrelated empty directory reusing the freed stage inode (no `.qeminga-tx-id`).
+    std::fs::remove_file(pub_stage.join(".qeminga-tx-id")).unwrap();
+    let save_pub = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+OPT_CONFIG_DIR="$2"
+OPT_INSTALL_DIR="$3"
+OPT_SERVICE="qeminga-restored-stage-box"
+read_install_record "$OPT_CONFIG_DIR/install.env"
+write_update_record "$OPT_CONFIG_DIR/install.env" "updating" "publishing" "$4" "$5" "$6" "$7" "1"
+"#,
+            "_",
+            script().to_str().unwrap(),
+            cfg.to_str().unwrap(),
+            inst.to_str().unwrap(),
+            pub_stage.to_str().unwrap(),
+            &pub_sid,
+            pub_backup.to_str().unwrap(),
+            &pub_bid,
+        ])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        )
+        .output()
+        .unwrap();
+    assert!(save_pub.status.success(), "{}", text(&save_pub));
+    std::fs::write(&state_file, "inactive\n").unwrap();
+
+    for (pub_label, hide_inst, args) in [
+        (
+            "publishing/update",
+            false,
+            vec![
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+        ),
+        (
+            "publishing/uninstall-live-present",
+            false,
+            vec!["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        ),
+        (
+            "publishing/uninstall-live-absent",
+            true,
+            vec!["uninstall", "--config-dir", cfg.to_str().unwrap()],
+        ),
+    ] {
+        let inst_aside = inst_parent.join("opt-runner-temporarily-aside");
+        if hide_inst {
+            std::fs::rename(&inst, &inst_aside).unwrap();
+        }
+        let pub_out = run_setup_env(
+            &args,
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        if hide_inst {
+            std::fs::rename(&inst_aside, &inst).unwrap();
+        }
+        assert!(
+            !pub_out.status.success(),
+            "{pub_label}: publishing recovery MUST refuse to remove markerless empty dir reusing stage inode:\n{}",
+            text(&pub_out)
+        );
+        let rec_pub = std::fs::read_to_string(&rec_path).unwrap();
+        assert!(
+            pub_stage.is_dir()
+                && !pub_stage.join(".qeminga-tx-id").exists()
+                && pub_backup.is_dir()
+                && inst.is_dir()
+                && rec_pub.contains("RECORD_STATE=updating\n")
+                && rec_pub.contains("UPDATE_PHASE=publishing\n")
+                && rec_pub.contains(&format!("UPDATE_STAGE_DIR={}\n", pub_stage.display()))
+                && rec_pub.contains(&format!("UPDATE_STAGE_ID={pub_sid}\n"))
+                && rec_pub.contains(&format!("UPDATE_BACKUP_DIR={}\n", pub_backup.display()))
+                && rec_pub.contains(&format!("UPDATE_BACKUP_ID={pub_bid}\n")),
+            "{pub_label}: publishing recovery MUST leave markerless stage, backup, and publishing journal intact:\n{rec_pub}"
+        );
+    }
+
+    // When the stage directory is genuinely absent (retired before crash), `publishing`
+    // recovery succeeds cleanly, restores/prunes backup, updates to v2, and restarts service.
+    std::fs::remove_dir(&pub_stage).unwrap();
+    let pub_absent_ok = run_setup_env(
+        &[
+            "update",
+            "--config-dir",
+            cfg.to_str().unwrap(),
+            "--runner-sha256",
+            &v2_sha,
+        ],
+        &[
+            ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+            ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+            ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+            ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+            ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+            ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+            ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+        ],
+        Some(&bin),
+    );
+    assert!(
+        pub_absent_ok.status.success(),
+        "publishing recovery with absent retired stage MUST succeed:\n{}",
+        text(&pub_absent_ok)
+    );
+    let rec_pub_done = std::fs::read_to_string(&rec_path).unwrap();
+    assert!(
+        rec_pub_done.contains("RECORD_STATE=installed\n")
+            && !pub_backup.exists()
+            && !rec_pub_done.contains("UPDATE_STAGE_DIR="),
+        "publishing recovery with absent stage must prune backup and return to installed:\n{rec_pub_done}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_file).unwrap().trim(),
+        "active",
+        "publishing recovery must honor UPDATE_WAS_ACTIVE=1 and restart service"
+    );
 }

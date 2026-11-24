@@ -56,8 +56,11 @@ ai_normalize_pool() {
         | map(if .options.effort != null
               then error("POOL: provider \(.provider): write the effort after the model, as \"model\": \"<model> <effort>\"")
               else . end)
-        | map(if .options.model != null and (.options.model | type) != "string"
+        | map(if (.options | has("model")) and (.options.model | type) != "string"
               then error("POOL: provider \(.provider): \"model\" must be a string, \"<model> [effort]\"")
+              else . end)
+        | map(if (.options.model // "") | test("[[:cntrl:]]")
+              then error("POOL: provider \(.provider): \"model\" must be one line of \"<model> [effort]\"")
               else . end)
     ' <<<"$1" 2>&1); then
         # jq's own messages can quote the offending value (a key), so only
@@ -91,9 +94,11 @@ ai_normalize_pool() {
 ai_normalize_models() {
     local raw=${1:-} out='{}' key canon spec
     [ -n "$raw" ] || { printf '{}\n'; return 0; }
-    if ! jq -e 'type == "object" and all(.[]; type == "string")
+    # Checked on the JSON strings themselves: extracting a value through a
+    # command substitution would drop a trailing newline unseen.
+    if ! jq -e 'type == "object" and all(.[]; type == "string" and (test("[[:cntrl:]]") | not))
                 and all(keys[]; ascii_downcase | test("^[a-z0-9][a-z0-9_-]*$"))' <<<"$raw" >/dev/null 2>&1; then
-        ai_log "models must be a JSON object of provider name -> \"<model> [effort]\" string"
+        ai_log "models must be a JSON object of provider name -> \"<model> [effort]\" string, one line each"
         return 2
     fi
     while IFS= read -r key; do
@@ -216,6 +221,11 @@ ai_protected_path() {
 # replaced by "?", at most 200 characters: for names the agent chose
 # (file paths) in log lines, which must stay one line.
 ai_printable() { local t=${1//[[:cntrl:]]/?}; printf '%s' "${t:0:200}"; }
+
+# ai_scan_fragments SECRETS_JSON -> what a change is scanned for with
+# private instructions: the single lines of 20 or more characters (a
+# shorter one would match ordinary code).
+ai_scan_fragments() { jq -c '[.[] | select(length >= 20 and (test("\n") | not))] | unique' <<<"$1"; }
 
 # ai_regular_file PATH: success for a regular file that is not a symlink.
 # Files an attempt wrote are read only through this check.

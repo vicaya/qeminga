@@ -450,6 +450,11 @@ if [ -s "$export_dir/changes.patch" ]; then
     # every added or modified file's new contents (binary files are
     # encoded in the patch text). A scan that fails refuses as well.
     ai_contains_key "$keys" "$result_dir/changes.patch" && refuse "the patch contains an API key from the pool"
+    # Private instructions: the change may not quote a line of them either
+    # (in its text, a file's contents or a file name).
+    quoted='[]'
+    [ "$private" = false ] || quoted=$(ai_scan_fragments "$secrets")
+    ai_contains_key "$quoted" "$result_dir/changes.patch" && refuse "the patch quotes the private instructions"
     verify=$state/verify
     { rm -rf "$verify" && cp -a "$top/." "$verify" && git -C "$verify" update-index -q --refresh; } ||
         refuse "no copy to check the changes in"
@@ -459,6 +464,7 @@ if [ -s "$export_dir/changes.patch" ]; then
     # are never part of a maintenance change (README, Limits).
     git -C "$verify" diff --cached --name-only -z --no-renames "$base" >"$state/names" ||
         refuse "could not list the changed files"
+    ai_contains_key "$quoted" "$state/names" && refuse "a changed file's name quotes the private instructions"
     while IFS= read -r -d '' path; do
         ai_protected_path "$path" && refuse "the changes touch $(ai_printable "$path") (under $AI_PROTECTED_PATHS)"
     done <"$state/names"
@@ -470,6 +476,7 @@ if [ -s "$export_dir/changes.patch" ]; then
         git -C "$verify" cat-file blob "$sha" >"$state/blob" ||
             refuse "could not read the new contents of $(ai_printable "$path")"
         ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key from the pool"
+        ai_contains_key "$quoted" "$state/blob" && refuse "a changed file quotes the private instructions"
     done <"$changed"
     rm -rf "$verify" "$state/blob" "$changed" "$state/names"
 else

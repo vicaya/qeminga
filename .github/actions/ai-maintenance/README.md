@@ -123,6 +123,9 @@ Around the agent job:
   must stay unpublished, set `AI_MAINTENANCE_PRIVATE_INSTRUCTIONS` to
   `true`. The PR description and replies are then a fixed text, the
   agent's output stays off the job log, and no transcripts are uploaded.
+  A change that quotes a line of the instructions (20 or more characters)
+  in a file's contents or name is refused. What the instructions ask for
+  can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.
 

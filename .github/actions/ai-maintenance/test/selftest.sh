@@ -77,6 +77,8 @@ provider_run() {
         leak-*) echo "$key" >>file.txt; printf 'done\n' >"$final" ;;
         binleak-*) printf 'GIF89a\0\1\2%s\0\3' "$key" >image.bin; printf 'done\n' >"$final" ;;
         prompt-*) cp "$prompt" "$final"; cat "$prompt" ;;
+        quote-*) grep -m1 advisory "$prompt" >notes.txt; printf 'done\n' >"$final" ;;
+        quotename-*) : >"notes $(grep -m1 advisory "$prompt" | tr -d '/')"; printf 'done\n' >"$final" ;;
         creds-*) { git config --get-regexp 'extraheader|includeif' || echo "no credentials"; } >"$final" 2>&1 ;;
         symlink-*) ln -sf /etc/hostname "$final" ;;
         effort-*) printf 'Done\n' >"$final"; printf 'low\n' >"$AI_ATTEMPT_DIR/effort" ;;
@@ -278,7 +280,8 @@ for bad in 'm turbo' 'a b c' 'high low' 'demo med' 'demo hig' $'demo\nhigh' $'de
 done
 eq "pool: a model string accepted on its own is accepted in the pool" "m max" \
     "$(ai_normalize_pool '[{"claude":{"keys":["k"],"model":"m max"}}]' | jq -r '.[0].options.model')"
-for bad in '"m turbo"' '"demo med"' '"demo hig"' '"demo\nhigh"' '["demo","high"]' '{"model":"demo"}' '3'; do
+for bad in '"m turbo"' '"demo med"' '"demo hig"' '"demo\nhigh"' '"demo\n"' '"demo high\n"' '"\tdemo"' 'null' \
+    '["demo","high"]' '{"model":"demo"}' '3'; do
     ai_normalize_pool "[{\"claude\":[\"k0\"]},{\"gpt\":{\"keys\":[\"k\"],\"model\":$bad}}]" >/dev/null 2>&1
     eq "pool: rejects the model $bad, in any entry" 2 $?
 done
@@ -292,7 +295,8 @@ eq "models: provider aliases resolve as in the pool" '{"gpt":"m high","gemini":"
     "$(ai_normalize_models '{"openai":"m high","Google":"x"}')"
 eq "models: empty means none" '{}' "$(ai_normalize_models '')"
 for bad in '[]' '"x"' '{"openai":"a","gpt":"b"}' '{"claude":{"model":"demo","effort":"high"}}' '{"claude":["demo","high"]}' \
-    '{"claude":"demo\nhigh"}' '{"claude":"demo low\nextra"}' '{"claude":"demo med"}' 'not json'; do
+    '{"claude":"demo\nhigh"}' '{"claude":"demo low\nextra"}' '{"claude":"demo\n"}' '{"claude":"demo high\n"}' \
+    '{"claude":"demo med"}' '{"claude":null}' 'not json'; do
     ai_normalize_models "$bad" >/dev/null 2>&1
     eq "models: rejects $bad" 2 $?
 done
@@ -405,6 +409,16 @@ run_case private '[{"claude":["prompt-1"]}]' AI_INSTRUCTIONS="$secret_instr" AI_
 check "run: private instructions publish no free-form text and no transcripts" bash -c \
     '! grep -rq "bump what it flags\|Unattended" "$1/result" "$1/logs" "$2" "$3" && [ "$(ls "$1/logs")" = attempts.jsonl ]' \
     _ "$state" "$outf" "$tmp/private/log"
+
+# Private instructions: a change quoting a line of them is not published.
+run_case privquote '[{"claude":["quote-1"]}]' AI_INSTRUCTIONS="$secret_instr" AI_PRIVATE_INSTRUCTIONS=true
+eq "run: with private instructions, a change quoting a line of them is not published" "1 failed" "$rc $(output status)"
+check "run: ... no patch is left, and the log does not quote it" bash -c \
+    '[ ! -e "$1/result/changes.patch" ] && ! grep -q "advisory" "$2" && grep -q "instructions" "$2"' _ "$state" "$tmp/privquote/log"
+run_case privname '[{"claude":["quotename-1"]}]' AI_INSTRUCTIONS="$secret_instr" AI_PRIVATE_INSTRUCTIONS=true
+eq "run: ... nor one naming a file after a line of them" "1 failed" "$rc $(output status)"
+run_case pubquote '[{"claude":["quote-1"]}]' AI_INSTRUCTIONS="$secret_instr"
+eq "run: public instructions may be quoted in the change itself" "0 changed" "$rc $(output status)"
 
 run_case models '[{"claude":["noop-1"]}]' AI_MODELS='{"claude":"big-model"}'
 check "run: the models map reaches the adapter" contains <(seen) "model=big-model"

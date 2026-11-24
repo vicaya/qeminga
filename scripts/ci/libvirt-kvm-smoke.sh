@@ -1018,18 +1018,21 @@ EOF
 # ---- dispatch -------------------------------------------------------------
 
 usage() { awk 'NR > 1 && /^set -euo/ { exit } NR > 1 { print }' "$0"; }
-[ $# -ge 1 ] || { usage; exit 64; }
-sub="$1"; shift
-case "$sub" in
-    manifest) cmd_manifest "$@" ;;
-    verify-candidate) cmd_verify_candidate "$@" ;;
-    domain-xml) cmd_domain_xml "$@" ;;
-    stale-check) cmd_stale_check "$@" ;;
-    image-key) cmd_image_key "$@" ;;
-    fetch-image) cmd_fetch_image "$@" ;;
-    run) cmd_run "$@" ;;
-    result) cmd_result "$@" ;;
-    cleanup) cmd_cleanup "$@" ;;
-    -h | --help) usage ;;
-    *) die "unknown subcommand '$sub'" ;;
-esac
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    [ $# -ge 1 ] || { usage; exit 64; }
+    sub="$1"; shift
+    case "$sub" in
+        manifest) cmd_manifest "$@" ;;
+        verify-candidate) cmd_verify_candidate "$@" ;;
+        domain-xml) cmd_domain_xml "$@" ;;
+        stale-check) cmd_stale_check "$@" ;;
+        image-key) cmd_image_key "$@" ;;
+        fetch-image) cmd_fetch_image "$@" ;;
+        run) cmd_run "$@" ;;
+        result) cmd_result "$@" ;;
+        cleanup) cmd_cleanup "$@" ;;
+        -h | --help) usage ;;
+        *) die "unknown subcommand '$sub'" ;;
+    esac
+fi

@@ -66,7 +66,8 @@ semantic versioning.
   follows the instructions in the `AI_MAINTENANCE_PROMPT` secret, using
   API keys from the ordered `AI_KEY_POOL` secret and falling back to the
   next key or provider when one is exhausted (`ordered` and `round-robin`
-  routing). Its changes are opened as a pull request, then review feedback
+  routing; model and reasoning effort per pool entry, per provider, or for
+  every provider). Its changes are opened as a pull request, then review feedback
   from trusted authors is addressed in rounds until the pull request has
   been quiet for 90 minutes. The agent runs with a read-only token, and its
   work leaves its job only as a patch; a job with write access but no keys

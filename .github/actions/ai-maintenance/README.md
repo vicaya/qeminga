@@ -113,14 +113,15 @@ of the agent job.
   {"claude": ["sk-ant-…1", "sk-ant-…2"]},
   {"gpt": ["sk-proj-…"]},
   {"gemini": ["AIza…"]},
-  {"provider2": {"keys": ["…"], "model": "big-model", "base_url": "https://gateway.example"}}
+  {"provider2": {"keys": ["…"], "model": "big-model", "effort": "high", "base_url": "https://gateway.example"}}
 ]
 ```
 
 - Order is priority. With the default `ordered` routing, the run tries
   `claude` key 1, then `claude` key 2, then `gpt`, then `gemini`.
 - An entry's value is a key, a list of keys, or an object with `keys` and
-  options. `model` picks the model for that entry. `base_url` points the
+  options. `model` and `effort` set the model and reasoning effort for that
+  entry (see [Model and effort](#model-and-effort)). `base_url` points the
   CLI at a gateway or compatible endpoint (`ANTHROPIC_BASE_URL`,
   `OPENAI_BASE_URL` or `GOOGLE_GEMINI_BASE_URL`). Adapters receive any
   other option too.
@@ -142,6 +143,51 @@ A strategy is a branch of `ai_route` in [`lib.sh`](lib.sh). It maps the pool
 to an ordered list of candidates, so weighted, cost-based or health-based
 strategies fit there without touching the rest.
 
+### Model and effort
+
+Each attempt resolves its model and its reasoning effort separately, and the
+first setting found wins:
+
+1. the pool entry's `"model"` / `"effort"` (in the `AI_KEY_POOL` secret);
+2. the agent step's `models:` / `effort:` inputs in the workflow, which
+   come from a one-off *Run workflow* input, else the repository variables
+   `AI_MAINTENANCE_MODELS` / `AI_MAINTENANCE_EFFORT`;
+3. otherwise, the CLI's own default.
+
+```yaml
+# .github/workflows/ai-maintenance.yml, job maintain, step "agent"
+- id: agent
+  uses: ./_ai-maintenance/.github/actions/ai-maintenance
+  with:
+    # …
+    models: ${{ inputs.models || vars.AI_MAINTENANCE_MODELS }}
+    effort: ${{ inputs.effort || vars.AI_MAINTENANCE_EFFORT }}
+```
+
+`models` is a JSON object of provider → model, since model names differ by
+provider. `effort` is one level for every provider (`low`, `medium`,
+`high`, `xhigh`, `max`), or a JSON object of provider → level. Literal
+values work as well:
+
+```yaml
+    models: '{"claude": "claude-opus-5-5"}'
+    effort: '{"claude": "max", "gpt": "high", "gemini": "high"}'
+```
+
+Manual-run overrides are carried into the review rounds that run starts.
+The attempts table in the run summary shows the model and effort each
+attempt asked for.
+
+| Provider | Model | Effort |
+|---|---|---|
+| `claude` | `--model` | `--effort` (low, medium, high, xhigh, max) |
+| `gpt` | `-m` | `-c model_reasoning_effort=…`; `max` becomes `xhigh`, the highest Codex accepts |
+| `gemini` | `--model` (`agy models` lists the slugs) | `--effort`. Levels depend on the model (`gemini-3.1-pro` offers only low and high). `agy` rejects any other level before making a request, and the adapter then retries once with the nearest level the model offers. |
+
+For `claude` and `gpt`, a level the chosen model doesn't support fails the
+attempt with an ordinary error, which doesn't fall back (unless
+`fallback-on` is `any`). Pick levels the configured model supports.
+
 ### Variables
 
 All optional (Settings → Secrets and variables → Actions → Variables):
@@ -151,6 +197,7 @@ All optional (Settings → Secrets and variables → Actions → Variables):
 | `AI_MAINTENANCE_ROUTING` | `ordered` | Routing strategy. |
 | `AI_MAINTENANCE_FALLBACK_ON` | `exhausted` | `exhausted` falls back only on exhaustion errors. `any` also falls back after other failures, including timeouts. |
 | `AI_MAINTENANCE_MODELS` | | JSON, e.g. `{"claude":"claude-opus-5-5"}`. Model names are whatever each CLI accepts (`agy models` lists Antigravity's). A pool entry's `model` wins. Empty means each CLI's default. |
+| `AI_MAINTENANCE_EFFORT` | | `low`, `medium`, `high`, `xhigh` or `max` for every provider, or JSON per provider, e.g. `{"claude":"max","gpt":"high"}`. A pool entry's `effort` wins. Empty means each CLI's default. |
 | `AI_MAINTENANCE_ATTEMPT_TIMEOUT` | `60m` | Time limit per attempt (`timeout(1)` duration). |
 | `AI_MAINTENANCE_QUIET_MINUTES` | `90` | The review loop ends after this long without feedback. |
 | `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` | `5` | Most review rounds per pull request. |
@@ -173,7 +220,7 @@ Copy [`providers/TEMPLATE.sh.example`](providers/TEMPLATE.sh.example) to
 
 - `provider_install` installs the CLI. It must be idempotent and pin a
   version.
-- `provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON` runs the
+- `provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT` runs the
   agent headless in the checkout, writes its final message to
   `FINAL_FILE`, and returns 0 only on success.
 

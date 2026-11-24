@@ -1,6 +1,7 @@
 # shellcheck shell=bash
 # Provider "claude": Claude Code CLI (`claude -p`) with an Anthropic API key.
-# Pool options: "model", "base_url" (ANTHROPIC_BASE_URL, for a gateway).
+# Pool options: "model", "effort" (--effort), "base_url" (ANTHROPIC_BASE_URL,
+# for a gateway).
 # Version: CLAUDE_CODE_VERSION (npm @anthropic-ai/claude-code).
 
 # shellcheck disable=SC2034 # read by run.sh
@@ -12,11 +13,12 @@ provider_install() {
     ai_npm_install "$(claude_dir)" "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION:-2.1.319}"
 }
 
-# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON
+# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT
 provider_run() {
-    local key=$1 prompt=$2 final=$3 model=$4 options=$5 stream rc base_url
+    local key=$1 prompt=$2 final=$3 model=$4 options=$5 effort=${6:-} stream rc base_url
     local -a args=(-p --output-format stream-json --verbose --dangerously-skip-permissions)
     [ -n "$model" ] && args+=(--model "$model")
+    [ -n "$effort" ] && args+=(--effort "$effort")
     base_url=$(jq -r '.base_url // ""' <<<"$options")
     stream="$AI_ATTEMPT_DIR/claude.jsonl"
     mkdir -p "$AI_ATTEMPT_DIR/claude-config"

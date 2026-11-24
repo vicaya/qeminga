@@ -1,7 +1,9 @@
 # shellcheck shell=bash
 # Provider "gemini": Google Antigravity CLI (`agy -p`) with a Gemini API key
 # (settings modelProvider=gemini + GEMINI_API_KEY, the documented headless
-# setup). Pool options: "model", "base_url" (GOOGLE_GEMINI_BASE_URL).
+# setup). Pool options: "model", "effort" (--effort; a level the model does
+# not offer falls back to the nearest one it does), "base_url"
+# (GOOGLE_GEMINI_BASE_URL).
 #
 # Install: the platform manifest of Google's installer
 # (https://antigravity.google/cli/install.sh) names the latest build and
@@ -66,21 +68,19 @@ provider_install() {
     chmod +x "$dir/agy"
 }
 
-# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON
-provider_run() {
-    local key=$1 prompt=$2 final=$3 model=$4 options=$5 stream rc base_url
+# gemini_agy PROMPT_FILE MODEL EFFORT STREAM -> runs agy once; stderr is
+# kept in $AI_ATTEMPT_DIR/agy.err and echoed.
+gemini_agy() {
+    local prompt=$1 model=$2 effort=$3 stream=$4 rc
     # Headless: Gemini API key, never wait for an artifact review.
     local settings='{"modelProvider":"gemini","artifactReviewPolicy":"always-proceed","showTips":false,"showFeedbackSurvey":false}'
     local -a args=(-p "$(cat "$prompt")" --settings "$settings" --dangerously-skip-permissions
         --disable-slash-commands --output-format stream-json)
     [ -n "$model" ] && args+=(--model "$model")
-    base_url=$(jq -r '.base_url // ""' <<<"$options")
-    stream="$AI_ATTEMPT_DIR/agy.jsonl"
-    local -a extra=()
-    [ -n "$base_url" ] && extra+=(GOOGLE_GEMINI_BASE_URL="$base_url")
-    env -u GOOGLE_API_KEY -u GOOGLE_GEMINI_BASE_URL -u AGY_ADC_AUTH "${extra[@]}" \
-        GEMINI_API_KEY="$key" \
-        "$(gemini_dir)/agy" "${args[@]}" </dev/null |
+    [ -n "$effort" ] && args+=(--effort "$effort")
+    env -u GOOGLE_API_KEY -u GOOGLE_GEMINI_BASE_URL -u AGY_ADC_AUTH "${GEMINI_EXTRA_ENV[@]}" \
+        GEMINI_API_KEY="$GEMINI_KEY" \
+        "$(gemini_dir)/agy" "${args[@]}" </dev/null 2>"$AI_ATTEMPT_DIR/agy.err" |
         tee "$stream" |
         jq --unbuffered -Rr 'fromjson? |
             if .event == "step_update" then "· \(.step_update.step_type) \(.step_update.state)"
@@ -88,6 +88,33 @@ provider_run() {
                 (if .result.status == "ERROR" then "error: \(.result.error)" else "result: \(.result.status)" end)
             else empty end'
     rc=${PIPESTATUS[0]}
+    cat "$AI_ATTEMPT_DIR/agy.err" >&2
+    return "$rc"
+}
+
+# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT
+provider_run() {
+    local key=$1 prompt=$2 final=$3 model=$4 options=$5 effort=${6:-} stream rc base_url allowed nearest
+    base_url=$(jq -r '.base_url // ""' <<<"$options")
+    stream="$AI_ATTEMPT_DIR/agy.jsonl"
+    GEMINI_KEY=$key
+    GEMINI_EXTRA_ENV=()
+    [ -n "$base_url" ] && GEMINI_EXTRA_ENV+=(GOOGLE_GEMINI_BASE_URL="$base_url")
+    gemini_agy "$prompt" "$model" "$effort" "$stream"
+    rc=$?
+    # agy checks the effort against the model before any request and names
+    # the levels that model allows ("... has no "max" effort (available:
+    # low, high)"); retry once with the nearest allowed level.
+    allowed=$(sed -n 's/.*has no "[a-z]*" effort (available: \([a-z, ]*\)).*/\1/p' "$AI_ATTEMPT_DIR/agy.err" | head -1)
+    if [ "$rc" -ne 0 ] && [ -n "$effort" ] && [ -n "$allowed" ]; then
+        nearest=$(ai_nearest_effort "$effort" "$allowed")
+        if [ -n "$nearest" ] && [ "$nearest" != "$effort" ]; then
+            ai_log "agy: effort '$effort' is not available for this model (allowed: $allowed); using '$nearest'"
+            gemini_agy "$prompt" "$model" "$nearest" "$stream"
+            rc=$?
+        fi
+    fi
+    GEMINI_KEY=
     jq -Rrs '[split("\n")[] | fromjson? | select(.event == "result")] | last | .result.response // empty' \
         "$stream" >"$final" || true
     if [ "$rc" -eq 0 ] && jq -Rse '[split("\n")[] | fromjson? | select(.event == "result")] | last | .result.status == "ERROR"' \

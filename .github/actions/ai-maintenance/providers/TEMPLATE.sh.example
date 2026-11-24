@@ -20,17 +20,19 @@ provider_install() {
     ai_npm_install "$AI_TOOLS_DIR/provider2" "provider2-cli@1.2.3"
 }
 
-# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON
+# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT
 #   KEY           the API key for this attempt; pass it only to the CLI
 #   PROMPT_FILE   the full prompt (preamble + instructions)
 #   FINAL_FILE    write the agent's final message here (the PR description)
 #   MODEL         model to use, or empty for the CLI's default
 #   OPTIONS_JSON  the pool entry's options, e.g. {"base_url": "..."}
+#   EFFORT        low | medium | high | xhigh | max, or empty for the CLI's
+#                 default; map it onto the CLI's own levels
 # Print progress to stdout/stderr (it becomes the attempt log) and return
 # 0 only when the agent finished its task.
 provider_run() {
-    local key=$1 prompt=$2 final=$3 model=$4 options=$5 base_url
+    local key=$1 prompt=$2 final=$3 model=$4 options=$5 effort=${6:-} base_url
     base_url=$(jq -r '.base_url // ""' <<<"$options")
     PROVIDER2_API_KEY="$key" PROVIDER2_BASE_URL="$base_url" "$AI_TOOLS_DIR/provider2/node_modules/.bin/provider2" \
-        --prompt-file "$prompt" ${model:+--model "$model"} --yes --last-message "$final"
+        --prompt-file "$prompt" ${model:+--model "$model"} ${effort:+--reasoning "$effort"} --yes --last-message "$final"
 }

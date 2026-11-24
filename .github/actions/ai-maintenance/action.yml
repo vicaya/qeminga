@@ -25,6 +25,13 @@ inputs:
   models:
     description: 'Optional JSON object of provider -> model, e.g. {"claude":"claude-opus-5-5"}. A pool entry''s "model" wins.'
     default: ""
+  effort:
+    description: >-
+      Optional reasoning effort: one level for every provider (low, medium,
+      high, xhigh, max) or a JSON object of provider -> level, e.g.
+      {"claude":"max","gpt":"high"}. A pool entry's "effort" wins; empty
+      leaves each CLI's default.
+    default: ""
   attempt-timeout:
     description: Time limit per attempt, as a timeout(1) duration.
     default: 60m
@@ -63,6 +70,9 @@ outputs:
   model:
     description: Its model (empty means the CLI's default).
     value: ${{ steps.run.outputs.model }}
+  effort:
+    description: Its reasoning effort (empty means the CLI's default).
+    value: ${{ steps.run.outputs.effort }}
   title:
     description: First line of the agent's final message.
     value: ${{ steps.run.outputs.title }}
@@ -105,6 +115,7 @@ runs:
         AI_ROUTING: ${{ inputs.routing }}
         AI_FALLBACK_ON: ${{ inputs.fallback-on }}
         AI_MODELS: ${{ inputs.models }}
+        AI_EFFORT: ${{ inputs.effort }}
         AI_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
         AI_STATE_DIR: ${{ runner.temp }}/ai-maintenance
         CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}

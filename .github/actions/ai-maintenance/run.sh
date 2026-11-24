@@ -14,6 +14,8 @@
 #   AI_ROUTING_SEED        rotation seed for round-robin (default GITHUB_RUN_NUMBER)
 #   AI_FALLBACK_ON         exhausted (default) | any
 #   AI_MODELS              optional JSON object, provider -> model
+#   AI_EFFORT              optional reasoning effort: one level (low, medium,
+#                          high, xhigh, max) or a JSON object, provider -> level
 #   AI_ATTEMPT_TIMEOUT     timeout(1) duration per attempt (default 60m)
 #   AI_STATE_DIR           scratch directory outside the checkout
 #   AI_PROVIDERS_DIR       adapter directory (default: providers/ next to this file)
@@ -21,7 +23,7 @@
 # Exit status: 0 when an agent finished (with or without changes), 1 when
 # every candidate failed, 2 on a configuration error. Outputs (to
 # GITHUB_OUTPUT when set): status=changed|unchanged|failed, provider,
-# model, title, summary-file, result-dir, logs-dir, base-sha.
+# model, effort, title, summary-file, result-dir, logs-dir, base-sha.
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -58,6 +60,9 @@ case "$fallback_on" in exhausted | any) ;; *) ai_log "AI_FALLBACK_ON must be exh
 models=${AI_MODELS:-}
 [ -n "$models" ] || models='{}'
 jq -e 'type == "object"' <<<"$models" >/dev/null 2>&1 || { ai_log "AI_MODELS must be a JSON object"; exit 2; }
+effort_spec=${AI_EFFORT:-}
+ai_valid_effort_spec "$effort_spec" ||
+    { ai_log "AI_EFFORT must be one of: $AI_EFFORT_LEVELS, or a JSON object of provider -> level"; exit 2; }
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=${AI_PROVIDERS_DIR:-$here/providers}
 state=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
@@ -107,12 +112,12 @@ reset_tree() {
 # --- attempts -------------------------------------------------------------
 attempts=$state/attempts.jsonl
 : >"$attempts"
-record() { # provider entry key model result
-    jq -nc --arg p "$1" --argjson e "$2" --argjson k "$3" --arg m "$4" --arg r "$5" \
-        '{provider: $p, entry: $e, key: $k, model: $m, result: $r}' >>"$attempts"
+record() { # provider entry key model effort result
+    jq -nc --arg p "$1" --argjson e "$2" --argjson k "$3" --arg m "$4" --arg f "$5" --arg r "$6" \
+        '{provider: $p, entry: $e, key: $k, model: $m, effort: $f, result: $r}' >>"$attempts"
 }
 
-n=0 winner='' winner_model='' final=''
+n=0 winner='' winner_model='' winner_effort='' final=''
 declare -A install_failed=()
 while IFS=$'\t' read -r entry keyidx provider; do
     [ -n "$entry" ] || continue
@@ -122,20 +127,21 @@ while IFS=$'\t' read -r entry keyidx provider; do
     label="${provider}[$((keyidx + 1))]"
     if [ ! -f "$adapter" ]; then
         ai_log "attempt $n: no adapter for provider '$provider' (expected $adapter); skipping"
-        record "$provider" "$entry" "$keyidx" "" unsupported
+        record "$provider" "$entry" "$keyidx" "" "" unsupported
         continue
     fi
     if [ -n "${install_failed[$adapter_name]:-}" ]; then
-        record "$provider" "$entry" "$keyidx" "" install-failed
+        record "$provider" "$entry" "$keyidx" "" "" install-failed
         continue
     fi
     options=$(ai_options "$pool" "$entry")
     model=$(ai_model "$models" "$options" "$adapter_name")
+    effort=$(ai_effort "$effort_spec" "$options" "$adapter_name")
     dir=$state/attempt-$n
     rm -rf "$dir" && mkdir -p "$dir"
     reset_tree
 
-    group "attempt $n: $label${model:+ ($model)}"
+    group "attempt $n: $label${model:+ model $model}${effort:+ effort $effort}"
     (
         # shellcheck source=/dev/null
         . "$adapter"
@@ -149,7 +155,7 @@ while IFS=$'\t' read -r entry keyidx provider; do
             timeout --kill-after=60s "$attempt_timeout" bash -c '
                 . "$AI_LIB"; . "$AI_ADAPTER"
                 k=$AI_ATTEMPT_KEY; unset AI_ATTEMPT_KEY AI_LIB AI_ADAPTER
-                provider_run "$k" "$@"' _ "$prompt" "$dir/final.md" "$model" "$options" 2>&1
+                provider_run "$k" "$@"' _ "$prompt" "$dir/final.md" "$model" "$options" "$effort" 2>&1
     ) | tee "$dir/attempt.log"
     rc=${PIPESTATUS[0]}
     endgroup
@@ -157,13 +163,13 @@ while IFS=$'\t' read -r entry keyidx provider; do
     if [ "$rc" -eq 90 ]; then
         ai_log "attempt $n: could not install the $adapter_name CLI; skipping its keys"
         install_failed[$adapter_name]=1
-        record "$provider" "$entry" "$keyidx" "$model" install-failed
+        record "$provider" "$entry" "$keyidx" "$model" "$effort" install-failed
         continue
     fi
     if [ "$rc" -eq 0 ]; then
         ai_log "attempt $n: $label finished"
-        record "$provider" "$entry" "$keyidx" "$model" success
-        winner=$provider winner_model=$model final=$dir/final.md
+        record "$provider" "$entry" "$keyidx" "$model" "$effort" success
+        winner=$provider winner_model=$model winner_effort=$effort final=$dir/final.md
         break
     fi
     # Classify on the CLI's own error and the end of the log, not on
@@ -181,7 +187,7 @@ while IFS=$'\t' read -r entry keyidx provider; do
     else
         result=failed
     fi
-    record "$provider" "$entry" "$keyidx" "$model" "$result"
+    record "$provider" "$entry" "$keyidx" "$model" "$effort" "$result"
     if [ "$result" = exhausted ] || [ "$fallback_on" = any ]; then
         ai_log "attempt $n: $label $result (exit $rc); trying the next key"
         continue
@@ -214,9 +220,10 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {
         echo "### AI maintenance"
         echo
-        echo "| # | provider | key | model | result |"
-        echo "|---|---|---|---|---|"
-        jq -r '"| \(input_line_number) | \(.provider) | #\(.key + 1) | \(if .model == "" then "default" else .model end) | \(.result) |"' "$attempts"
+        echo "| # | provider | key | model | effort | result |"
+        echo "|---|---|---|---|---|---|"
+        jq -r 'def d: if . == "" then "default" else . end;
+            "| \(input_line_number) | \(.provider) | #\(.key + 1) | \(.model | d) | \(.effort | d) | \(.result) |"' "$attempts"
     } >>"$GITHUB_STEP_SUMMARY"
 fi
 
@@ -251,14 +258,15 @@ else
     rm -f "$result_dir/changes.patch"
 fi
 cp "$summary" "$result_dir/summary.md"
-jq -n --arg status "$status" --arg provider "$winner" --arg model "$winner_model" \
+jq -n --arg status "$status" --arg provider "$winner" --arg model "$winner_model" --arg effort "$winner_effort" \
     --arg title "$title" --arg base "$base" \
-    '{status: $status, provider: $provider, model: $model, title: $title, base_sha: $base}' \
+    '{status: $status, provider: $provider, model: $model, effort: $effort, title: $title, base_sha: $base}' \
     >"$result_dir/meta.json"
 ai_log "result: $status (provider $winner)"
 out status "$status"
 out provider "$winner"
 out model "$winner_model"
+out effort "$winner_effort"
 out title "$title"
 out summary-file "$summary"
 out result-dir "$result_dir"

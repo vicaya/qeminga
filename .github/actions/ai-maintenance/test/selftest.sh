@@ -60,6 +60,18 @@ eq "aliases: anthropic, openai, google, agy" "claude gpt gemini gemini provider2
 eq "scrub: every key is replaced" "x *** y *** z" "$(printf 'x k1 y k2 z' | ai_scrub '["k1","k2"]')"
 eq "model: the pool entry wins over the models map" "m4" "$(ai_model '{"gemini":"x"}' '{"model":"m4"}' gemini)"
 eq "model: the models map, else the CLI default" "x|" "$(ai_model '{"gemini":"x"}' '{}' gemini)|$(ai_model '' '' gemini)"
+eq "effort: the pool entry wins" "max" "$(ai_effort 'low' '{"effort":"max"}' claude)"
+eq "effort: a per-provider map" "high|" "$(ai_effort '{"claude":"high"}' '{}' claude)|$(ai_effort '{"claude":"high"}' '{}' gpt)"
+eq "effort: one level for every provider" "medium" "$(ai_effort 'medium' '{}' gemini)"
+eq "effort: unset means the CLI default" "" "$(ai_effort '' '' claude)"
+check "effort: the five levels are valid" bash -c ". '$action/lib.sh'; for l in low medium high xhigh max; do ai_valid_effort_spec \$l || exit 1; done"
+check "effort: a map of levels is valid" ai_valid_effort_spec '{"claude":"max","gpt":"xhigh"}'
+check "effort: an unknown level is not" bash -c ". '$action/lib.sh'; ! ai_valid_effort_spec extreme && ! ai_valid_effort_spec '{\"claude\":\"turbo\"}'"
+eq "effort: nearest allowed level at or below the request" "high|high|low|medium" \
+    "$(ai_nearest_effort max 'low, high')|$(ai_nearest_effort xhigh 'low, high')|$(ai_nearest_effort medium 'low, high')|$(ai_nearest_effort medium 'medium')"
+eq "effort: below every allowed level, the lowest allowed" "medium" "$(ai_nearest_effort low 'medium, high')"
+ai_normalize_pool '[{"claude":{"keys":["k"],"effort":"turbo"}}]' >/dev/null 2>&1
+eq "pool: rejects an unknown effort level" 2 $?
 printf 'Error: 429 Too Many Requests\n' >"$tmp/l1"
 printf 'test failed at line 4290\n' >"$tmp/l2"
 check "exhausted: 429 is exhaustion" ai_is_exhausted "$tmp/l1"
@@ -72,8 +84,9 @@ cat >"$fakes/claude.sh" <<'EOF'
 # Fake adapter: behaviour by key prefix.
 provider_install() { :; }
 provider_run() {
-    local key=$1 prompt=$2 final=$3 model=$4
-    printf 'pool=%s model=%s\n' "${AI_KEY_POOL:-unset}" "${model:-default}" >>"$AI_ATTEMPT_DIR/../seen"
+    local key=$1 prompt=$2 final=$3 model=$4 effort=${6:-}
+    printf 'pool=%s model=%s effort=%s\n' "${AI_KEY_POOL:-unset}" "${model:-default}" "${effort:-default}" \
+        >>"$AI_ATTEMPT_DIR/../seen"
     case "$key" in
         ok-*) echo "change by ${key%%-*} agent" >>file.txt
               printf '# Fix things\n\nUsed %s; pool %s\n' "$key" "${AI_KEY_POOL:-unset}" >"$final" ;;
@@ -162,6 +175,15 @@ check "run: the prompt holds the preamble, instructions and feedback" bash -c \
 
 run_case models '[{"claude":["noop-1"]}]' AI_MODELS='{"claude":"big-model"}'
 check "run: the models map reaches the adapter" contains "$state/seen" "model=big-model"
+
+run_case effort '[{"claude":["quota-1"]},{"gpt":{"keys":["noop-2"],"effort":"low"}}]' AI_EFFORT=xhigh \
+    GITHUB_STEP_SUMMARY="$tmp/effort-summary.md"
+check "run: AI_EFFORT reaches the adapter, a pool entry overrides it" bash -c \
+    'grep -q "effort=xhigh" "$1" && grep -q "effort=low" "$1"' _ "$state/seen"
+check "run: the effort is reported in the summary and result" bash -c \
+    'grep -q "| xhigh |" "$1" && [ "$(jq -r .effort "$2")" = low ]' _ "$tmp/effort-summary.md" "$state/result/meta.json"
+run_case badeffort '[{"claude":["ok-1"]}]' AI_EFFORT=extreme
+eq "run: an unknown effort level is a configuration error" 2 "$rc"
 
 repo=$tmp/creds/repo
 newrepo "$repo"

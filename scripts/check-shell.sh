@@ -6,13 +6,14 @@
 # through `env`, with or without arguments). The files considered are
 # git's: tracked and untracked ones, never ignored ones (build output,
 # fuzzer artifacts) and never symbolic links (the file a link points to is
-# the unit of linting). A file list that cannot be established fails the
+# the unit of linting); embedded repositories and submodules are separate
+# repositories and are not entered. A file list that cannot be established fails the
 # run rather than shrinking it.
 #
 # Findings of every severity fail. A deliberate exception is a
 # `# shellcheck disable=SCxxxx # reason` directive directly above the
 # command it covers; `.shellcheckrc` files, the repository's or the
-# user's, are not read (`--norc`).
+# user's, are not read (`--norc`), and neither is SHELLCHECK_OPTS.
 #
 # The shellcheck release is pinned (SHELLCHECK_VERSION below; CI installs
 # exactly it): releases differ in what they report. Another version prints
@@ -25,6 +26,10 @@
 # tests/ci_workflow.rs checks the listing against the repository and
 # against fixtures.
 set -euo pipefail
+# Byte order for the listing; nothing from the caller's environment may
+# change what shellcheck reports (`--norc` below covers .shellcheckrc).
+export LC_ALL=C
+unset SHELLCHECK_OPTS
 
 SHELLCHECK_VERSION=0.11.0
 
@@ -35,12 +40,49 @@ if [ "${1:-}" = --list ]; then
 fi
 cd "${1:-$(dirname "$0")/..}"
 
+# Splits $1 into the array `words` as `env -S` does: whitespace separates,
+# and '...', "..." and backslash escapes are honoured. Nothing is expanded
+# or evaluated.
+split_words() {
+    local text=$1 c word="" quote="" in_word=0 i
+    words=()
+    for ((i = 0; i < ${#text}; i++)); do
+        c=${text:i:1}
+        if [ -n "$quote" ]; then
+            if [ "$c" = "$quote" ]; then
+                quote=""
+            elif [ "$c" = "\\" ] && [ "$quote" = '"' ]; then
+                i=$((i + 1))
+                word+=${text:i:1}
+            else
+                word+=$c
+            fi
+            continue
+        fi
+        case "$c" in
+            "'" | '"') quote=$c; in_word=1 ;;
+            "\\") i=$((i + 1)); word+=${text:i:1}; in_word=1 ;;
+            ' ' | $'\t')
+                if [ "$in_word" -eq 1 ]; then
+                    words+=("$word")
+                    word=""
+                    in_word=0
+                fi ;;
+            *) word+=$c; in_word=1 ;;
+        esac
+    done
+    if [ "$in_word" -eq 1 ]; then
+        words+=("$word")
+    fi
+}
+
 # Whether $1 is a shell script by name or by its `#!` line's interpreter:
-# the first word, or for `env` the first word after its options and
-# NAME=value assignments.
+# the first word, or for `env` the first word after its options (a split
+# string, `-S STRING`, `-SSTRING` or `--split-string=STRING`, is split
+# again) and NAME=value assignments.
 is_shell_script() {
-    local first="" interpreter="" i=1
-    local -a words
+    local first="" interpreter="" word
+    local -a words args
     case "$1" in
         *.sh) return 0 ;;
     esac
@@ -49,16 +91,25 @@ is_shell_script() {
         '#!'*) ;;
         *) return 1 ;;
     esac
-    read -r -a words <<< "${first#'#!'}" || true
+    split_words "${first#'#!'}"
     [ "${#words[@]}" -gt 0 ] || return 1
     interpreter=${words[0]##*/}
     if [ "$interpreter" = env ]; then
         interpreter=""
-        while [ "$i" -lt "${#words[@]}" ]; do
-            case "${words[i]}" in
-                -u | --unset | -C | --chdir) i=$((i + 2)) ;;
-                -* | *=*) i=$((i + 1)) ;;
-                *) interpreter=${words[i]##*/}; break ;;
+        args=("${words[@]:1}")
+        while [ "${#args[@]}" -gt 0 ]; do
+            word=${args[0]}
+            args=("${args[@]:1}")
+            case "$word" in
+                --split-string=* | -S?*)
+                    case "$word" in
+                        --split-string=*) split_words "${word#--split-string=}" ;;
+                        *) split_words "${word#-S}" ;;
+                    esac
+                    args=("${words[@]}" "${args[@]}") ;;
+                -u | --unset | -C | --chdir) args=("${args[@]:1}") ;;
+                -* | *=*) ;;
+                *) interpreter=${word##*/}; break ;;
             esac
         done
     fi
@@ -85,6 +136,12 @@ scripts=()
 while IFS= read -r -d '' file; do
     # A tracked file deleted from the work tree, or a link.
     if [ -L "$file" ] || [ ! -e "$file" ]; then
+        continue
+    fi
+    # git lists a directory only for an embedded repository (an untracked
+    # nested checkout, `dir/`) or a submodule: separate repositories, each
+    # linted by its own checks.
+    if [ -d "$file" ]; then
         continue
     fi
     if [ ! -f "$file" ] || [ ! -r "$file" ]; then
@@ -119,4 +176,4 @@ if [ "$found" != "$SHELLCHECK_VERSION" ]; then
     fi
 fi
 echo "check-shell: shellcheck $found, ${#scripts[@]} scripts"
-shellcheck --norc "${scripts[@]}"
+shellcheck --norc -- "${scripts[@]}"

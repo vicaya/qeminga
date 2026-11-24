@@ -9,7 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// The jobs that must run natively on every supported architecture.
 const NATIVE_JOBS: [&str; 2] = ["test", "privileged"];
@@ -212,54 +212,127 @@ fn no_native_job_is_allowed_to_fail_quietly() {
     }
 }
 
-/// Runs `scripts/check-shell.sh --list` over `dir` (the repository when
-/// `None`); no shellcheck is needed for the listing.
-fn check_shell_list(dir: Option<&Path>) -> std::process::Output {
+/// The git environment for listing the files of `dir`: none when `dir` is
+/// a checkout; otherwise (an unpacked source archive) a throwaway
+/// repository, kept alive by the returned guard, whose work tree is `dir`.
+fn git_inventory_env(dir: &Path) -> (Option<tempfile::TempDir>, Vec<(&'static str, PathBuf)>) {
+    if dir.join(".git").exists() {
+        return (None, Vec::new());
+    }
+    let meta = tempfile::tempdir().unwrap();
+    let git_dir = meta.path().join("meta.git");
+    let status = std::process::Command::new("git")
+        .args(["init", "-q", "--bare"])
+        .arg(&git_dir)
+        .status()
+        .expect("git is needed by this test");
+    assert!(status.success(), "git init --bare");
+    let env = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", dir.to_owned())];
+    (Some(meta), env)
+}
+
+/// Runs `scripts/check-shell.sh --list DIR` (no shellcheck is needed for
+/// the listing) with `env` added to a git environment that never reaches
+/// a repository enclosing `dir`.
+fn check_shell_list(dir: &Path, env: &[(&str, PathBuf)]) -> std::process::Output {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh");
     let mut cmd = std::process::Command::new(&script);
-    cmd.arg("--list");
-    if let Some(dir) = dir {
-        // Never let git find the enclosing repository of a fixture.
-        cmd.arg(dir)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap());
+    cmd.arg("--list")
+        .arg(dir)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap());
+    for (key, value) in env {
+        cmd.env(key, value);
     }
     cmd.output()
         .unwrap_or_else(|e| panic!("{}: {e}", script.display()))
 }
 
-/// The scripts `check_shell_list` reports, failing the test if it fails.
-fn linted_shell_scripts(dir: Option<&Path>) -> Vec<String> {
-    let out = check_shell_list(dir);
+/// The scripts `check_shell_list` reports, sorted, failing the test if
+/// the listing fails.
+fn linted_shell_scripts(dir: &Path, env: &[(&str, PathBuf)]) -> Vec<String> {
+    let out = check_shell_list(dir, env);
     assert!(
         out.status.success(),
         "check-shell.sh --list: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
+    let mut listed: Vec<String> = String::from_utf8(out.stdout)
         .unwrap()
         .lines()
         .map(str::to_owned)
-        .collect()
+        .collect();
+    listed.sort();
+    listed
+}
+
+/// Splits `text` into words as `env -S` does: whitespace separates, and
+/// '...', "..." and backslash escapes are honoured. Nothing is expanded.
+fn split_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut in_word = false;
+    let mut quote = None;
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') => word.extend(chars.next()),
+            (Some(_), c) => word.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, '\\') => {
+                word.extend(chars.next());
+                in_word = true;
+            }
+            (None, ' ' | '\t') => {
+                if in_word {
+                    words.push(std::mem::take(&mut word));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                word.push(c);
+                in_word = true;
+            }
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
 }
 
 /// The interpreter a `#!` line runs: its first word, or for `env` the
-/// first word after env's options and `NAME=value` assignments.
-fn shebang_interpreter(line: &str) -> Option<&str> {
-    fn program(word: &str) -> &str {
-        word.rsplit('/').next().unwrap_or(word)
+/// first word after env's options (a split string, `-S STRING`, `-SSTRING`
+/// or `--split-string=STRING`, is split again) and `NAME=value`
+/// assignments.
+fn shebang_interpreter(line: &str) -> Option<String> {
+    fn program(word: &str) -> String {
+        word.rsplit('/').next().unwrap_or(word).to_owned()
     }
-    let mut words = line.strip_prefix("#!")?.split_whitespace();
-    let first = words.next()?;
+    let words = split_words(line.strip_prefix("#!")?);
+    let first = words.first()?;
     if program(first) != "env" {
         return Some(program(first));
     }
-    let mut words = words.peekable();
-    while let Some(word) = words.next() {
-        match word {
+    let mut args: std::collections::VecDeque<String> = words[1..].iter().cloned().collect();
+    while let Some(word) = args.pop_front() {
+        let split = word
+            .strip_prefix("--split-string=")
+            .or_else(|| word.strip_prefix("-S").filter(|rest| !rest.is_empty()));
+        if let Some(split) = split {
+            for (i, w) in split_words(split).into_iter().enumerate() {
+                args.insert(i, w);
+            }
+            continue;
+        }
+        match word.as_str() {
             "-u" | "--unset" | "-C" | "--chdir" => {
-                words.next();
+                args.pop_front();
             }
             w if w.starts_with('-') || w.contains('=') => {}
             w => return Some(program(w)),
@@ -283,38 +356,9 @@ fn is_shell_script(path: &Path) -> bool {
         .unwrap();
     let first = String::from_utf8_lossy(&first);
     matches!(
-        shebang_interpreter(first.trim_end()),
+        shebang_interpreter(first.trim_end()).as_deref(),
         Some("sh" | "bash" | "dash")
     )
-}
-
-/// Build output and other generated trees that are git-ignored and that
-/// `check-shell.sh` therefore never lints.
-fn generated(name: &str) -> bool {
-    matches!(name, ".git" | "target" | "artifacts" | "coverage") || name.starts_with("mutants.out")
-}
-
-/// Every regular file under `dir` (recursively, never following a
-/// symbolic link: the source file is the unit of linting) that is a shell
-/// script, relative to `root`.
-fn shell_scripts_under(root: &Path, dir: &Path, found: &mut Vec<String>) {
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let entry = entry.unwrap();
-        let kind = entry.file_type().unwrap();
-        let path = entry.path();
-        if kind.is_dir() {
-            if !generated(&entry.file_name().to_string_lossy()) {
-                shell_scripts_under(root, &path, found);
-            }
-        } else if kind.is_file() && is_shell_script(&path) {
-            found.push(
-                path.strip_prefix(root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-    }
 }
 
 #[test]
@@ -325,34 +369,72 @@ fn shebang_interpreters_are_matched_as_words_with_their_arguments() {
         ("#! /bin/dash -e", Some("dash")),
         ("#!/usr/bin/env bash", Some("bash")),
         ("#!/usr/bin/env -S bash -eu", Some("bash")),
+        ("#!/usr/bin/env -S 'bash' -eu", Some("bash")),
+        ("#!/usr/bin/env -S\"/bin/sh\" -e", Some("sh")),
+        ("#!/usr/bin/env -Sbash -e", Some("bash")),
+        ("#!/usr/bin/env --split-string=bash -eu", Some("bash")),
+        ("#!/usr/bin/env --split-string='dash -e'", Some("dash")),
+        ("#!/usr/bin/env -S -u HOME LC_ALL=C sh -e", Some("sh")),
         ("#!/usr/bin/env -u HOME LC_ALL=C sh -e", Some("sh")),
         ("#!/usr/bin/bashful", Some("bashful")),
         ("#!/usr/bin/env python3", Some("python3")),
+        ("#!/usr/bin/env -S 'python3 -u'", Some("python3 -u")),
         ("#!/usr/bin/env", None),
         ("# not a shebang", None),
     ] {
-        assert_eq!(shebang_interpreter(line), interpreter, "{line}");
+        assert_eq!(shebang_interpreter(line).as_deref(), interpreter, "{line}");
     }
+}
+
+/// The shell scripts among the files git lists for `dir` (tracked and
+/// untracked, never ignored), classified here independently of the
+/// script: regular files only, so links and the directories git reports
+/// for embedded repositories and submodules are left out.
+fn shell_scripts_in_inventory(dir: &Path, env: &[(&str, PathBuf)]) -> Vec<String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.current_dir(dir)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("git is needed by this test");
+    assert!(out.status.success(), "git ls-files");
+    let mut found: Vec<String> = out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8(p.to_vec()).unwrap())
+        .filter(|p| {
+            std::fs::symlink_metadata(dir.join(p)).is_ok_and(|m| m.is_file())
+                && is_shell_script(&dir.join(p))
+        })
+        .collect();
+    found.sort();
+    found
 }
 
 #[test]
 fn shellcheck_covers_every_shell_script_in_the_repository() {
+    // From a checkout, git's own inventory; from an unpacked source
+    // archive (no .git), the same inventory through a throwaway repository.
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut expected = Vec::new();
-    shell_scripts_under(root, root, &mut expected);
-    expected.sort();
-    let linted = linted_shell_scripts(None);
+    let (_meta, env) = git_inventory_env(root);
+    let linted = linted_shell_scripts(root, &env);
+    assert_eq!(linted, shell_scripts_in_inventory(root, &env));
     assert!(
         linted.len() >= 11,
         "only {} shell scripts listed",
         linted.len()
     );
-    for script in &expected {
-        assert!(
-            linted.contains(script),
-            "{script}: a shell script check-shell.sh does not lint"
-        );
-    }
     for must in ["scripts/check-unsafe.sh", "scripts/e2e-libvirt.sh"] {
         assert!(linted.iter().any(|s| s == must), "{must} is not linted");
     }
@@ -366,46 +448,67 @@ fn put(dir: &Path, rel: &str, text: &str) {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let status = std::process::Command::new("git")
+    let out = std::process::Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
         .args(args)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
-        .status()
+        .output()
         .expect("git is needed by this test");
-    assert!(status.success(), "git {args:?}");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
-#[test]
-fn the_listing_finds_scripts_by_name_and_interpreter_and_skips_links_and_ignored_files() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("repo");
-    std::fs::create_dir(&dir).unwrap();
-    git(&dir, &["init", "-q"]);
+/// The fixture repository of the listing tests, and the scripts it holds.
+fn fixture_repository(dir: &Path) -> Vec<&'static str> {
+    git(dir, &["init", "-q"]);
     // Shell scripts, tracked and untracked, inside and outside scripts/.
-    put(&dir, "lib.sh", "echo no shebang, named .sh\n");
-    put(&dir, "bash-eu", "#!/bin/bash -eu\necho\n");
-    put(&dir, "tools/dash-e", "#!/bin/dash -e\necho\n");
+    put(dir, "lib.sh", "echo no shebang, named .sh\n");
+    put(dir, "-helper.sh", "echo a name that looks like an option\n");
+    put(dir, "bash-eu", "#!/bin/bash -eu\necho\n");
+    put(dir, "tools/dash-e", "#!/bin/dash -e\necho\n");
+    put(dir, "tools/env-split", "#!/usr/bin/env -S bash -eu\necho\n");
     put(
-        &dir,
-        "tools/env-split",
-        "#!/usr/bin/env -S bash -eu\necho\n",
+        dir,
+        "tools/env-split-long",
+        "#!/usr/bin/env --split-string=bash -eu\necho\n",
     );
-    put(&dir, "deep/er/plain", "#!/bin/sh\necho\n");
-    put(&dir, "untracked-env-sh", "#!/usr/bin/env sh\necho\n");
+    put(
+        dir,
+        "tools/env-split-quoted",
+        "#!/usr/bin/env -S 'bash' -eu\necho\n",
+    );
+    put(dir, "deep/er/plain", "#!/bin/sh\necho\n");
+    put(dir, "untracked-env-sh", "#!/usr/bin/env sh\necho\n");
     // Not shell scripts.
-    put(&dir, "tool.py", "#!/usr/bin/env python3\nprint()\n");
-    put(&dir, "bashful", "#!/usr/bin/bashful\n");
-    put(&dir, "notes.txt", "run it with /bin/bash\n");
+    put(dir, "tool.py", "#!/usr/bin/env python3\nprint()\n");
+    put(dir, "bashful", "#!/usr/bin/bashful\n");
+    put(dir, "notes.txt", "run it with /bin/bash\n");
     std::fs::write(dir.join("blob"), [0u8, 0xff, b'\n', 0]).unwrap();
-    // Ignored output and a link to a linted script are not linted.
-    put(&dir, ".gitignore", "out/\n");
-    put(&dir, "out/generated.sh", "#!/bin/sh\necho\n");
+    // Ignored output (by .gitignore and by the repository-local excludes)
+    // and links to linted scripts are not linted.
+    put(dir, ".gitignore", "out/\ndebug\n");
+    put(dir, "out/generated.sh", "#!/bin/sh\necho\n");
+    put(dir, "debug/local-test.sh", "#!/bin/sh\necho\n");
+    put(dir, ".git/info/exclude", "scratch.sh\n");
+    put(dir, "scratch.sh", "#!/bin/sh\necho\n");
     std::os::unix::fs::symlink("bash-eu", dir.join("lint-alias")).unwrap();
     std::os::unix::fs::symlink("lib.sh", dir.join("alias.sh")).unwrap();
+    // Embedded repositories are separate repositories: an untracked
+    // nested checkout and a submodule (a gitlink) are not entered.
+    put(dir, "checkout/in.sh", "#!/bin/sh\necho\n");
+    git(&dir.join("checkout"), &["init", "-q"]);
+    put(dir, "sub/in.sh", "#!/bin/sh\necho\n");
+    git(&dir.join("sub"), &["init", "-q"]);
+    git(&dir.join("sub"), &["add", "in.sh"]);
+    git(&dir.join("sub"), &["commit", "-q", "-m", "sub"]);
     git(
-        &dir,
+        dir,
         &[
             "add",
             ".gitignore",
@@ -416,19 +519,47 @@ fn the_listing_finds_scripts_by_name_and_interpreter_and_skips_links_and_ignored
             "tool.py",
             "lint-alias",
             "alias.sh",
+            "sub",
         ],
     );
-    assert_eq!(
-        linted_shell_scripts(Some(&dir)),
-        [
-            "bash-eu",
-            "deep/er/plain",
-            "lib.sh",
-            "tools/dash-e",
-            "tools/env-split",
-            "untracked-env-sh",
-        ]
-    );
+    vec![
+        "-helper.sh",
+        "bash-eu",
+        "deep/er/plain",
+        "lib.sh",
+        "tools/dash-e",
+        "tools/env-split",
+        "tools/env-split-long",
+        "tools/env-split-quoted",
+        "untracked-env-sh",
+    ]
+}
+
+#[test]
+fn the_listing_finds_scripts_by_name_and_interpreter_and_skips_links_ignored_files_and_embedded_repositories()
+ {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("repo");
+    std::fs::create_dir(&dir).unwrap();
+    let expected = fixture_repository(&dir);
+    assert_eq!(linted_shell_scripts(&dir, &[]), expected);
+    // The independent classification of the coverage test agrees.
+    assert_eq!(shell_scripts_in_inventory(&dir, &[]), expected);
+}
+
+#[test]
+fn an_unpacked_source_archive_is_listed_through_a_throwaway_repository() {
+    // `git archive` output has no .git: the coverage test must still run.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("archive");
+    std::fs::create_dir(&dir).unwrap();
+    put(&dir, ".gitignore", "target\n");
+    put(&dir, "scripts/a.sh", "#!/bin/sh\necho\n");
+    put(&dir, "target/b.sh", "#!/bin/sh\necho\n");
+    let (meta, env) = git_inventory_env(&dir);
+    assert!(meta.is_some());
+    assert_eq!(linted_shell_scripts(&dir, &env), ["scripts/a.sh"]);
+    assert_eq!(shell_scripts_in_inventory(&dir, &env), ["scripts/a.sh"]);
 }
 
 #[test]
@@ -438,27 +569,37 @@ fn a_listing_that_cannot_be_established_fails() {
     let dir = tmp.path().join("plain");
     std::fs::create_dir(&dir).unwrap();
     put(&dir, "x.sh", "#!/bin/sh\necho\n");
-    let out = check_shell_list(Some(&dir));
+    let out = check_shell_list(&dir, &[]);
     assert!(!out.status.success(), "listed {:?}", out.stdout);
     assert!(out.stdout.is_empty());
 }
 
 #[test]
-fn the_linter_ignores_shellcheckrc_files() {
+fn the_linter_ignores_caller_configuration() {
     // AGENTS.md: a finding is silenced only by a directive at the command
-    // it covers, so no repository or per-user .shellcheckrc may apply.
+    // it covers, so no .shellcheckrc (`--norc`) and no SHELLCHECK_OPTS may
+    // apply, and a file name is never read as an option (`--`).
     let script = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-shell.sh"),
     )
     .unwrap();
-    let runs: Vec<&str> = script
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("shellcheck "))
+    let lines: Vec<&str> = script.lines().map(str::trim).collect();
+    let unset = lines
+        .iter()
+        .position(|l| *l == "unset SHELLCHECK_OPTS")
+        .expect("check-shell.sh clears SHELLCHECK_OPTS");
+    let runs: Vec<(usize, &&str)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.starts_with("shellcheck ") && !l.starts_with("shellcheck --version"))
         .collect();
     assert!(!runs.is_empty(), "check-shell.sh never runs shellcheck");
-    for run in runs {
-        assert!(run.starts_with("shellcheck --norc "), "{run}");
+    for (at, run) in runs {
+        assert!(at > unset, "{run} runs before SHELLCHECK_OPTS is cleared");
+        assert!(
+            run.starts_with("shellcheck --norc -- "),
+            "{run}: not `shellcheck --norc -- FILES`"
+        );
     }
 }
 

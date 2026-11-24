@@ -1,0 +1,77 @@
+name: AI maintenance (watch for review feedback)
+description: >-
+  Polls a maintenance pull request for trusted review feedback until there
+  is some, or until a quiet period passes without any. Read-only.
+
+inputs:
+  pr:
+    description: Pull request number.
+    required: true
+  since:
+    description: ISO-8601 time; feedback at or before it is already handled.
+    required: true
+  github-token:
+    description: Read access to pull requests.
+    default: ${{ github.token }}
+  branch-prefix:
+    description: Only pull requests from this repository on branches with this prefix are handled.
+    default: ai-maintenance/
+  quiet-minutes:
+    description: Stop after this many minutes without feedback.
+    default: "90"
+  poll-seconds:
+    description: Polling interval.
+    default: "300"
+  settle-seconds:
+    description: After feedback appears, wait until none newer arrives for this long.
+    default: "300"
+  trusted-associations:
+    description: Author associations whose feedback counts.
+    default: OWNER,MEMBER,COLLABORATOR
+  trusted-bots:
+    description: Comma-separated bot logins whose reviews count.
+    default: ""
+  feedback-artifact:
+    description: Name of the artifact holding the feedback.
+    default: ai-maintenance-feedback
+
+outputs:
+  status:
+    description: feedback, quiet, closed or ignored.
+    value: ${{ steps.watch.outputs.status }}
+  until:
+    description: Time of the newest feedback handed over.
+    value: ${{ steps.watch.outputs.until }}
+  head-ref:
+    description: The pull request's branch.
+    value: ${{ steps.watch.outputs.head-ref }}
+  head-sha:
+    description: The pull request's head commit.
+    value: ${{ steps.watch.outputs.head-sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: watch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ inputs.pr }}
+        SINCE: ${{ inputs.since }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        QUIET_MINUTES: ${{ inputs.quiet-minutes }}
+        POLL_SECONDS: ${{ inputs.poll-seconds }}
+        SETTLE_SECONDS: ${{ inputs.settle-seconds }}
+        TRUSTED_ASSOCIATIONS: ${{ inputs.trusted-associations }}
+        TRUSTED_BOTS: ${{ inputs.trusted-bots }}
+        FEEDBACK_FILE: ${{ runner.temp }}/ai-feedback/feedback.md
+      run: |
+        mkdir -p "$(dirname "$FEEDBACK_FILE")"
+        "$GITHUB_ACTION_PATH/../watch.sh"
+
+    - if: steps.watch.outputs.status == 'feedback'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.feedback-artifact }}
+        path: ${{ runner.temp }}/ai-feedback
+        retention-days: 7

@@ -1,0 +1,36 @@
+# shellcheck shell=bash
+# Template for a new provider. Copy to providers/<name>.sh, where <name> is
+# the provider's name in the key pool (for example "provider2"). run.sh
+# sources the file in a subshell per attempt; it may use the helpers in
+# lib.sh (ai_log, ai_npm_install) and these variables:
+#
+#   AI_TOOLS_DIR     install CLIs here (shared across attempts of one run)
+#   AI_ATTEMPT_DIR   scratch space for this attempt (outside the checkout)
+#
+# The working directory is the repository checkout.
+
+# Optional: extra extended regex (case-insensitive) for errors that mean
+# "this key is exhausted, try the next one". The common patterns (429,
+# quota, rate limit, 401, billing, overloaded, ...) always apply.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_EXHAUSTED_REGEX=''
+
+# Install the CLI (idempotent). Pin a version.
+provider_install() {
+    ai_npm_install "$AI_TOOLS_DIR/provider2" "provider2-cli@1.2.3"
+}
+
+# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON
+#   KEY           the API key for this attempt; pass it only to the CLI
+#   PROMPT_FILE   the full prompt (preamble + instructions)
+#   FINAL_FILE    write the agent's final message here (the PR description)
+#   MODEL         model to use, or empty for the CLI's default
+#   OPTIONS_JSON  the pool entry's options, e.g. {"base_url": "..."}
+# Print progress to stdout/stderr (it becomes the attempt log) and return
+# 0 only when the agent finished its task.
+provider_run() {
+    local key=$1 prompt=$2 final=$3 model=$4 options=$5 base_url
+    base_url=$(jq -r '.base_url // ""' <<<"$options")
+    PROVIDER2_API_KEY="$key" PROVIDER2_BASE_URL="$base_url" "$AI_TOOLS_DIR/provider2/node_modules/.bin/provider2" \
+        --prompt-file "$prompt" ${model:+--model "$model"} --yes --last-message "$final"
+}

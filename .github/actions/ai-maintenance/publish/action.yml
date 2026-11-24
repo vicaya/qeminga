@@ -1,0 +1,75 @@
+name: AI maintenance (publish)
+description: >-
+  Applies an agent run's patch artifact and opens a pull request (create)
+  or pushes to the maintenance pull request and replies (update). Runs no
+  agent and needs no API keys.
+
+inputs:
+  mode:
+    description: create or update.
+    required: true
+  github-token:
+    description: >-
+      Token with contents and pull-requests write access. Pushes made with
+      the default GITHUB_TOKEN start no workflows, so CI does not run on the
+      pull request; use a GitHub App token or fine-grained PAT for that.
+    default: ${{ github.token }}
+  working-directory:
+    description: Checkout of the commit the agent started from (create) or of the PR branch (update).
+    default: .
+  pr:
+    description: "update: the pull request number."
+    default: ""
+  round:
+    description: "update: the review round."
+    default: "1"
+  branch-prefix:
+    description: "create: prefix of the new branch."
+    default: ai-maintenance/
+  base-branch:
+    description: "create: base branch of the pull request."
+    default: ${{ github.event.repository.default_branch }}
+  draft:
+    description: "create: open the pull request as a draft."
+    default: "false"
+  labels:
+    description: "create: comma-separated labels to add (missing ones are skipped)."
+    default: ""
+  result-artifact:
+    description: Name of the agent run's result artifact.
+    default: ai-maintenance-result
+
+outputs:
+  pr-number:
+    description: The pull request number.
+    value: ${{ steps.publish.outputs.pr-number }}
+  pr-url:
+    description: "create: the new pull request's URL."
+    value: ${{ steps.publish.outputs.pr-url }}
+  published-at:
+    description: When the result was published (ISO-8601).
+    value: ${{ steps.publish.outputs.published-at }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.result-artifact }}
+        path: ${{ runner.temp }}/ai-maintenance-result
+
+    - id: publish
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        RESULT_DIR: ${{ runner.temp }}/ai-maintenance-result
+        MODE: ${{ inputs.mode }}
+        PR: ${{ inputs.pr }}
+        ROUND: ${{ inputs.round }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        PR_DRAFT: ${{ inputs.draft }}
+        PR_LABELS: ${{ inputs.labels }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: '"$GITHUB_ACTION_PATH/../publish.sh"'

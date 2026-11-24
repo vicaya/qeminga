@@ -5209,6 +5209,8 @@ try:
             try:
                 os.lstat(base, dir_fd=pfd)
             except FileNotFoundError:
+                if p_sync:
+                    os.fsync(pfd)
                 sys.exit(0)
             check_no_mounts(target, mountpoints)
             tfd = os.open(base, READ_DIR_FLAGS, dir_fd=pfd)

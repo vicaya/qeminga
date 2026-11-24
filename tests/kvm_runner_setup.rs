@@ -23702,5 +23702,98 @@ _rollback_runner_package_tx \
                 "{amb_label}: rollback MUST preserve original files inside markerless stage directory"
             );
         }
+
+        // Second invocation (`update` AND `uninstall`) consuming the exact restored journal
+        // written by the first rollback MUST ALSO fail closed without removing `amb_stage`
+        // (even when empty!) and MUST keep the restored journal entry intact.
+        for second_cmd in ["update", "uninstall"] {
+            let args: Vec<&str> = if second_cmd == "update" {
+                vec![
+                    "update",
+                    "--config-dir",
+                    cfg.to_str().unwrap(),
+                    "--runner-sha256",
+                    &v2_sha,
+                ]
+            } else {
+                vec!["uninstall", "--config-dir", cfg.to_str().unwrap()]
+            };
+            let second_out = run_setup_env(
+                &args,
+                &[
+                    ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                    ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                    ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                    ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                    ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                    ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                    ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+                ],
+                Some(&bin),
+            );
+            assert!(
+                !second_out.status.success(),
+                "{amb_label}/{second_cmd}: subsequent {second_cmd} MUST refuse to prune markerless ambiguous stage:\n{}",
+                text(&second_out)
+            );
+            let rec_second = std::fs::read_to_string(&rec_path).unwrap();
+            assert!(
+                amb_stage.is_dir()
+                    && !amb_stage.join(".qeminga-tx-id").exists()
+                    && inst.is_dir()
+                    && rec_second.contains("RECORD_STATE=updating\n")
+                    && rec_second.contains("UPDATE_PHASE=restored\n")
+                    && rec_second.contains(&format!("UPDATE_STAGE_DIR={}\n", amb_stage.display()))
+                    && rec_second.contains(&format!("UPDATE_STAGE_ID={amb_sid}\n"))
+                    && rec_second.contains("UPDATE_WAS_ACTIVE=1\n"),
+                "{amb_label}/{second_cmd}: subsequent {second_cmd} MUST preserve ambiguous stage dir and restored journal:\n{rec_second}"
+            );
+            if with_file {
+                assert_eq!(
+                    std::fs::read_to_string(amb_stage.join("stage-payload.txt")).unwrap(),
+                    "original-stage-data\n",
+                    "{amb_label}/{second_cmd}: subsequent {second_cmd} MUST preserve files inside markerless stage dir"
+                );
+            }
+        }
+
+        // Once the operator inspects and removes `amb_stage`, retrying `update` MUST
+        // recover cleanly, return to `RECORD_STATE=installed`, and restart the service.
+        std::fs::remove_dir_all(&amb_stage).unwrap();
+        let after_manual_rm = run_setup_env(
+            &[
+                "update",
+                "--config-dir",
+                cfg.to_str().unwrap(),
+                "--runner-sha256",
+                &v2_sha,
+            ],
+            &[
+                ("FAKE_USER_FLAG", user_flag.to_str().unwrap()),
+                ("FAKE_GOOD_TARBALL", v2_tb.to_str().unwrap()),
+                ("FAKE_STATE_FILE", state_file.to_str().unwrap()),
+                ("FAKE_EXPECTED_FRAG", unit_file.to_str().unwrap()),
+                ("QEMINGA_RUNTIME_ROOT", rt_root.to_str().unwrap()),
+                ("QEMINGA_SYSTEMD_UNIT_DIR", unit_dir),
+                ("QEMINGA_SYSTEMD_UNIT_DIRS", unit_dir),
+            ],
+            Some(&bin),
+        );
+        assert!(
+            after_manual_rm.status.success(),
+            "{amb_label}: update after operator removed ambiguous stage MUST succeed:\n{}",
+            text(&after_manual_rm)
+        );
+        let rec_done = std::fs::read_to_string(&rec_path).unwrap();
+        assert!(
+            rec_done.contains("RECORD_STATE=installed\n")
+                && !rec_done.contains("UPDATE_STAGE_DIR="),
+            "{amb_label}: record must return to installed after manual removal and retry:\n{rec_done}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state_file).unwrap().trim(),
+            "active",
+            "{amb_label}: retry after manual removal must honor UPDATE_WAS_ACTIVE=1"
+        );
     }
 }

@@ -10486,6 +10486,32 @@ try:
     )
     assert os.path.isfile(os.path.join(early_stage, "result.json"))
 
+    # Both `ensure-result` and `stage-evidence` reject an incomplete (--run-id / --run-attempt) pair.
+    for subcmd, extra_sub in (
+        ("ensure-result", []),
+        ("stage-evidence", ["--stage", os.path.join(stage_fence_parent, "incomplete-pair")]),
+    ):
+        for pair_args in (["--run-id", "301"], ["--run-attempt", "2"]):
+            bad_pair = subprocess.run(
+                [
+                    "bash", smoke_script, subcmd,
+                    "--out", same_build_out,
+                    *extra_sub,
+                    "--arch", result_spec["arch"],
+                    "--source-sha", result_spec["source_sha"],
+                    "--expect-sha256", result_spec["expect_sha256"],
+                    *pair_args,
+                ],
+                env=env_pub,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            assert bad_pair.returncode != 0 and b"must be provided together" in bad_pair.stderr, (
+                f"{subcmd} with incomplete pair {pair_args!r} must fail cleanly: "
+                f"rc={bad_pair.returncode} stderr={bad_pair.stderr!r}"
+            )
+    assert not os.path.exists(os.path.join(stage_fence_parent, "incomplete-pair"))
+
     # 3k (Review #27 & #28 P3): Extract EACH subcommand's own synopsis block from `--help`
     #     through the next subcommand and assert its own options and initialization rule!
     help_proc = subprocess.run(

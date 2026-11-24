@@ -528,25 +528,32 @@ valid_result_json() {
     esac
 }
 
+# Validates an optional (--run-id, --run-attempt) pair for an arch and prints
+# the canonical run owner name, or prints nothing when both flags are omitted.
+optional_run_owner() {
+    local arch="$1" run_id="${2:-}" attempt="${3:-}" owner=""
+    if [ -z "$run_id" ] && [ -z "$attempt" ]; then
+        return 0
+    fi
+    [ -n "$run_id" ] && [ -n "$attempt" ] || die "--run-id and --run-attempt must be provided together"
+    check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
+    owner="$(domain_name "$run_id" "$attempt" "$arch")"
+    check_name "$owner"
+    printf '%s\n' "$owner"
+}
+
 cmd_ensure_result() {
     parse_opts "$@"
-    local out arch sha expect run_id attempt run_token run_owner="" machine image image_sha ensure_op="ensure-session-result"
+    local out arch sha expect run_token run_owner="" machine image image_sha ensure_op="ensure-session-result"
     out="$(need out)"; arch="$(need arch)"; sha="$(need source_sha)"
     expect="${opt_expect_sha256:-}"
-    run_id="${opt_run_id:-}"
-    attempt="${opt_run_attempt:-}"
     run_token="${opt_run_token:-}"
     check_out_path "$out"
     check_arch "$arch"; check_sha "$sha"
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     fi
-    if [ -n "$run_id" ] || [ -n "$attempt" ]; then
-        [ -n "$run_id" ] && [ -n "$attempt" ] || die "--run-id and --run-attempt must be provided together"
-        check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
-        run_owner="$(domain_name "$run_id" "$attempt" "$arch")"
-        check_name "$run_owner"
-    fi
+    run_owner="$(optional_run_owner "$arch" "${opt_run_id:-}" "${opt_run_attempt:-}")" || exit 1
     command -v python3 >/dev/null || die "missing tool: python3"
     machine="$(machine_of "$arch")" || exit 1
     image="$(image_file_of "$arch")" || exit 1
@@ -563,11 +570,9 @@ cmd_ensure_result() {
 
 cmd_stage_evidence() {
     parse_opts "$@"
-    local out stage arch sha expect run_id attempt run_token run_owner="" machine image image_sha stage_op="stage-session-evidence"
+    local out stage arch sha expect run_token run_owner="" machine image image_sha stage_op="stage-session-evidence"
     out="$(need out)"; stage="$(need stage)"; arch="$(need arch)"; sha="$(need source_sha)"
     expect="${opt_expect_sha256:-}"
-    run_id="${opt_run_id:-}"
-    attempt="${opt_run_attempt:-}"
     run_token="${opt_run_token:-}"
     check_out_path "$out"
     check_no_dot_segments --stage "$stage"
@@ -575,12 +580,7 @@ cmd_stage_evidence() {
     if [ -n "$expect" ]; then
         [[ "$expect" =~ ^[0-9a-f]{64}$ ]] || die "--expect-sha256 must be 64 hex digits: '$expect'"
     fi
-    if [ -n "$run_id" ] || [ -n "$attempt" ]; then
-        [ -n "$run_id" ] && [ -n "$attempt" ] || die "--run-id and --run-attempt must be provided together"
-        check_number --run-id "$run_id"; check_number --run-attempt "$attempt"
-        run_owner="$(domain_name "$run_id" "$attempt" "$arch")"
-        check_name "$run_owner"
-    fi
+    run_owner="$(optional_run_owner "$arch" "${opt_run_id:-}" "${opt_run_attempt:-}")" || exit 1
     command -v python3 >/dev/null || die "missing tool: python3"
     machine="$(machine_of "$arch")" || exit 1
     image="$(image_file_of "$arch")" || exit 1

@@ -24489,3 +24489,136 @@ _rollback_runner_package_tx \
         );
     }
 }
+
+#[test]
+fn rollback_lock_runner_permissions_preserves_recorded_settings_and_recovers_on_failure() {
+    let dir = private_tempdir();
+    let seen_log = dir.path().join("seen.log");
+    let defaults_log = dir.path().join("defaults.log");
+
+    // 1. Calling `_rollback_lock_runner_permissions` inside a subshell passes the
+    //    recorded pre-update settings to `lock_runner_permissions` via local dynamic
+    //    scoping without mutating the outer shell's options.
+    let out = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+LOG_FILE="$2"
+lock_runner_permissions() {
+    printf '%s|%s|%s|%s\n' \
+        "$OPT_ALLOW_AUTO_UPDATE" "$OPT_EPHEMERAL" "$RESOLVED_WORK_DIR" "$VOL_INSTALL_DIR" \
+        > "$LOG_FILE"
+}
+OPT_ALLOW_AUTO_UPDATE=0
+OPT_EPHEMERAL=0
+RESOLVED_WORK_DIR="/outer/work"
+VOL_INSTALL_DIR="outer-vol"
+REC_ALLOW_AUTO_UPDATE=1
+REC_EPHEMERAL=1
+REC_WORK_DIR="/recorded/work"
+( _rollback_lock_runner_permissions "recorded-vol" )
+printf 'outer=%s|%s|%s|%s\n' \
+    "$OPT_ALLOW_AUTO_UPDATE" "$OPT_EPHEMERAL" "$RESOLVED_WORK_DIR" "$VOL_INSTALL_DIR"
+"#,
+            "_",
+            script().to_str().unwrap(),
+            seen_log.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "rollback helper invocation must succeed: {}",
+        text(&out)
+    );
+    let seen = std::fs::read_to_string(&seen_log).unwrap();
+    assert_eq!(
+        seen.trim(),
+        "1|1|/recorded/work|recorded-vol",
+        "lock_runner_permissions must observe the recorded rollback settings"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("outer=0|0|/outer/work|outer-vol"),
+        "outer shell globals must remain untouched: {}",
+        text(&out)
+    );
+
+    // 2. Unset REC_* variables fall back to safe defaults (0 / empty).
+    let out_defaults = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+LOG_FILE="$2"
+lock_runner_permissions() {
+    printf '%s|%s|%s|%s\n' \
+        "$OPT_ALLOW_AUTO_UPDATE" "$OPT_EPHEMERAL" "$RESOLVED_WORK_DIR" "$VOL_INSTALL_DIR" \
+        > "$LOG_FILE"
+}
+OPT_ALLOW_AUTO_UPDATE=1
+OPT_EPHEMERAL=1
+RESOLVED_WORK_DIR="/outer/work"
+VOL_INSTALL_DIR="outer-vol"
+unset REC_ALLOW_AUTO_UPDATE REC_EPHEMERAL REC_WORK_DIR
+( _rollback_lock_runner_permissions "" )
+"#,
+            "_",
+            script().to_str().unwrap(),
+            defaults_log.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out_defaults.status.success(),
+        "rollback helper with unset REC_* must succeed: {}",
+        text(&out_defaults)
+    );
+    let defaults = std::fs::read_to_string(&defaults_log).unwrap();
+    assert_eq!(
+        defaults.trim(),
+        "0|0||",
+        "unset REC_* variables must default to 0 / empty for lock_runner_permissions"
+    );
+
+    // 3. A `die` failure inside `lock_runner_permissions` exits only the subshell
+    //    so the rollback caller regains control.
+    let out_fail = Command::new("bash")
+        .args([
+            "-c",
+            r#"
+set -euo pipefail
+source "$1"
+lock_runner_permissions() {
+    die "simulated relock failure"
+}
+REC_ALLOW_AUTO_UPDATE=0
+REC_EPHEMERAL=0
+REC_WORK_DIR=""
+if ! ( _rollback_lock_runner_permissions "recorded-vol" ); then
+    printf 'returned-to-rollback\n'
+fi
+"#,
+            "_",
+            script().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        out_fail.status.success(),
+        "caller must regain control after subshell die: {}",
+        text(&out_fail)
+    );
+    assert!(
+        String::from_utf8_lossy(&out_fail.stdout).contains("returned-to-rollback"),
+        "expected rollback recovery branch to execute: {}",
+        text(&out_fail)
+    );
+    assert!(
+        String::from_utf8_lossy(&out_fail.stderr).contains("simulated relock failure"),
+        "expected die diagnostic on stderr: {}",
+        text(&out_fail)
+    );
+}

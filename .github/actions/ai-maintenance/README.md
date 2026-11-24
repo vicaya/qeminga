@@ -59,7 +59,11 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    afterwards (a review's body, or a comment within the same second, which
    GitHub's timestamps miss) is handed over again, whatever else is still
    waiting; a comment submitted late as part of a pending review is new.
-   An edit during the settle period restarts it.
+   That record goes to the next round as an artifact of the watch's run.
+   An edit during the settle period restarts it, and after it the pull
+   request and the feedback are checked again: a pull request closed
+   meanwhile ends the loop, and an edit reverted meanwhile is not handed
+   over.
 4. **Back to nightly.** The loop ends after `AI_MAINTENANCE_QUIET_MINUTES`
    (default 90) without feedback, when the pull request is closed or merged,
    or after `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` (default 5) rounds. By
@@ -108,10 +112,16 @@ nothing it downloads. Each attempt runs in its own container:
   binary file can't smuggle a key past that scan, and a scan that fails
   refuses as well. A patch that touches `.github/workflows/` is refused (see
   [Limits](#limits)).
-- **One invocation's files.** Each run of the action works in a fresh
-  directory of its own under `runner.temp`, and uploads only the result
-  and the attempts it made itself, so a later invocation in the same job
-  never publishes an earlier one's (private) output.
+- **One invocation's files.** Each run of the action works in a fresh,
+  owner-only directory of its own under `runner.temp` (or under a
+  directory of the runner's, or a sticky one such as `/tmp`, when
+  `AI_STATE_DIR` names it), and uploads only the result and the attempts it
+  made itself, so a later invocation in the same job never publishes an
+  earlier one's (private) output. When it ends, however it ends, only the
+  sanitized output is left there: the prompt, the agent's trees, raw logs
+  and the CLIs are removed. No other account on a shared runner can read
+  them meanwhile: the containers reach their mounts through the Docker
+  daemon.
 - **No workflow commands.** Everything a container prints is captured in
   files on the runner. When it is shown in the job log, the runner's
   workflow commands (`::add-mask::`, `::set-env::`, ...) are suspended
@@ -334,6 +344,48 @@ Optional settings in the adapter:
 If the CLI is a variant of one already listed, an alias in
 `ai_canonical_provider` (`lib.sh`) is enough.
 
+### Two invocations in one workflow run
+
+Each invocation uploads its result and logs as artifacts named after
+`result-artifact`, and an artifact name can be used once per workflow run.
+To run the action twice (two instruction sets, say), give each its own
+name and pass the same name to the publish action that applies it:
+
+```yaml
+- id: deps
+  uses: ./_ai-maintenance/.github/actions/ai-maintenance
+  with:
+    key-pool: ${{ secrets.AI_KEY_POOL }}
+    instructions: ${{ secrets.AI_MAINTENANCE_DEPS_PROMPT }}
+    result-artifact: ai-maintenance-deps
+- id: docs
+  uses: ./_ai-maintenance/.github/actions/ai-maintenance
+  with:
+    key-pool: ${{ secrets.AI_KEY_POOL }}
+    instructions: ${{ secrets.AI_MAINTENANCE_DOCS_PROMPT }}
+    result-artifact: ai-maintenance-docs
+```
+
+and, in the publish job, one step per result, each in its own checkout
+and on its own branch prefix:
+
+```yaml
+- uses: ./_ai-maintenance/.github/actions/ai-maintenance/publish
+  with:
+    mode: create
+    working-directory: work-deps
+    result-artifact: ai-maintenance-deps
+    branch-prefix: ai-maintenance/deps-
+- uses: ./_ai-maintenance/.github/actions/ai-maintenance/publish
+  with:
+    mode: create
+    working-directory: work-docs
+    result-artifact: ai-maintenance-docs
+    branch-prefix: ai-maintenance/docs-
+```
+
+Each result is downloaded into a directory named after its artifact.
+
 ## Files
 
 | File | Role |
@@ -386,7 +438,6 @@ minutes):
   describe the change in its final message for a human to make.
 - A watch occupies a runner for up to the quiet period (90 minutes) per
   round.
-- The watch's state travels between rounds as a workflow input, about 30
-  characters per feedback item handed over. Past 30,000 characters (some
-  1,000 items) the watch stops with an error, and further feedback needs a
-  human.
+- The watch's state (every feedback item handed over, by ID and body
+  digest) travels between rounds as an artifact of the watch's run, kept
+  for 7 days; the next round names that run in its `state-run` input.

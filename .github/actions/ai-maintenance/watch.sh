@@ -11,9 +11,11 @@
 # Environment:
 #   GH_TOKEN, GITHUB_REPOSITORY      read access to pull requests
 #   PR                               pull request number
-#   SINCE                            feedback up to here is handled: an
-#                                    ISO-8601 time, or the state this script
-#                                    output last time (until; see below)
+#   SINCE                            feedback up to here is handled: a UTC
+#                                    time such as 2026-01-31T12:00:00Z, or
+#                                    the state this script wrote last time
+#   SINCE_FILE                       a file holding that state (wins over SINCE)
+#   STATE_FILE                       where to write the next state
 #   BRANCH_PREFIX                    the PR must come from this repository on
 #                                    a branch with this prefix
 #   QUIET_MINUTES (90)  POLL_SECONDS (300)  SETTLE_SECONDS (300)
@@ -23,8 +25,10 @@
 #   FEEDBACK_FILE                    where to write the feedback (Markdown)
 #   FEEDBACK_BUDGET (60000)          most bytes of feedback handed over at once
 #
-# Outputs (GITHUB_OUTPUT): status=feedback|quiet|closed|ignored, until (the
-# state after this hand-over, the next round's SINCE), head-ref, head-sha.
+# Outputs (GITHUB_OUTPUT): status=feedback|quiet|closed|ignored, state-file
+# (STATE_FILE, the state after this hand-over: the next round's SINCE),
+# head-ref, head-sha. The state grows with every item handed over, so it
+# travels between rounds as a file, never as a workflow input.
 # Items that do not fit the budget are left for the next round; an item
 # that alone exceeds it is handed over in pieces, one per round. An item
 # edited after it was handed over is handed over again, and one submitted
@@ -37,7 +41,11 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 out() { [ -n "${GITHUB_OUTPUT:-}" ] && printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; return 0; }
 
-: "${PR:?PR is required}" "${SINCE:?SINCE is required}" "${BRANCH_PREFIX:?BRANCH_PREFIX is required}"
+: "${PR:?PR is required}" "${BRANCH_PREFIX:?BRANCH_PREFIX is required}"
+if [ -n "${SINCE_FILE:-}" ]; then
+    SINCE=$(head -c 50000000 "$SINCE_FILE") || { ai_log "SINCE_FILE: cannot read $SINCE_FILE"; exit 2; }
+fi
+: "${SINCE:?SINCE or SINCE_FILE is required}"
 case "$PR" in '' | *[!0-9]*) ai_log "PR must be a number"; exit 2 ;; esac
 repo=${GITHUB_REPOSITORY:?}
 quiet=$((${QUIET_MINUTES:-90} * 60))
@@ -47,16 +55,19 @@ budget=${FEEDBACK_BUDGET:-60000}
 associations=${TRUSTED_ASSOCIATIONS:-OWNER,MEMBER,COLLABORATOR}
 bots=${TRUSTED_BOTS:-}
 feedback_file=${FEEDBACK_FILE:-${RUNNER_TEMP:-/tmp}/ai-maintenance-feedback.md}
+state_file=${STATE_FILE:-${RUNNER_TEMP:-/tmp}/ai-maintenance-watch-state.txt}
 # Marks the workflow's own comments, which are never feedback.
 MARKER='<!-- ai-maintenance -->'
 # Every item has a key "<kind><id>" (kind r, c or i: review, inline
 # comment, comment) and a cursor "<created>#<kind>-<zero-padded id>" that
 # sorts in the order the items arrived.
 #
-# The state handed from round to round (until, the next SINCE) is
+# The state handed from round to round (STATE_FILE, the next SINCE) is
 # "<floor>|<handed>":
-#   floor    an ISO-8601 UTC time (the pull request's publication): items
-#            neither created nor changed after it are not feedback
+#   floor    a UTC time to the second, as GitHub writes them (the pull
+#            request's publication): items neither created nor changed
+#            after it are not feedback (times compare as text, so no other
+#            form is accepted)
 #   handed   "<key>=<digest>[+<offset>]" for each item handed over, comma
 #            separated, digest being the first 16 hex digits of the SHA-256
 #            of its body when it was; "+<offset>" means its body went out up
@@ -69,7 +80,7 @@ MARKER='<!-- ai-maintenance -->'
 # nothing handed over.
 case "$SINCE" in *'|'*'|'*) ai_log "SINCE: not a state this script wrote"; exit 2 ;; esac
 IFS='|' read -r floor handed <<<"$SINCE"
-if ! [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$ ]]; then
+if ! [[ "$floor" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]]; then
     ai_log "SINCE: the state must start with a UTC time such as 2026-01-31T12:00:00Z"
     exit 2
 fi
@@ -183,7 +194,7 @@ if [ "$budget" -lt "$min_budget" ]; then
 fi
 
 deadline=$(($(date +%s) + quiet))
-ai_log "watching PR #$PR for feedback after $SINCE until $(date -u -d "@$deadline" +%FT%TZ 2>/dev/null || echo "+${quiet}s")"
+ai_log "watching PR #$PR for feedback after $floor (and changes to what was handed over) until $(date -u -d "@$deadline" +%FT%TZ 2>/dev/null || echo "+${quiet}s")"
 while :; do
     collect
     if [ "$(jq length "$work/found.json")" -gt 0 ]; then
@@ -195,6 +206,16 @@ while :; do
             collect
             [ "$(signature)" = "$before" ] && break
         done
+        # As things are now: the pull request may have been closed, and an
+        # edit reverted meanwhile leaves nothing to hand over.
+        pr_state
+        if [ "$(jq -r .state "$work/pr.json")" != open ]; then
+            ai_log "PR #$PR was closed"
+            out status closed
+            exit 0
+        fi
+    fi
+    if [ "$(jq length "$work/found.json")" -gt 0 ]; then
         # Items in order, whole, as many as fit the budget (the file,
         # its final newline included, never exceeds it). When the first one
         # alone does not fit, as much of its body as fits goes now (at least
@@ -235,17 +256,11 @@ while :; do
                delivered: $n, remaining: $left,
                markdown: (([$intro] + .parts | join("\n")) + (if $left > 0 then $note else "" end))}
         ' "$work/found.json" >"$work/handover.json"
-        until="$floor|$(jq -r .handed "$work/handover.json")"
-        # It travels as a workflow input (65,535 characters in all): about
-        # 30 per item handed over.
-        if [ "${#until}" -gt 30000 ]; then
-            ai_log "PR #$PR: too much feedback to track between rounds; further feedback needs a human"
-            exit 1
-        fi
+        printf '%s|%s\n' "$floor" "$(jq -r .handed "$work/handover.json")" >"$state_file"
         jq -r .markdown "$work/handover.json" >"$feedback_file"
         ai_log "PR #$PR: $(jq .delivered "$work/handover.json") feedback item(s) handed over, $(jq .remaining "$work/handover.json") left for the next round"
         out status feedback
-        out until "$until"
+        out state-file "$state_file"
         out feedback-file "$feedback_file"
         exit 0
     fi

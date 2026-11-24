@@ -56,14 +56,14 @@ runs:
     - uses: actions/download-artifact@v4
       with:
         name: ${{ inputs.result-artifact }}
-        path: ${{ runner.temp }}/ai-maintenance-result
+        path: ${{ runner.temp }}/ai-maintenance-result/${{ inputs.result-artifact }}
 
     - id: publish
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
         GH_TOKEN: ${{ inputs.github-token }}
-        RESULT_DIR: ${{ runner.temp }}/ai-maintenance-result
+        RESULT_DIR: ${{ runner.temp }}/ai-maintenance-result/${{ inputs.result-artifact }}
         MODE: ${{ inputs.mode }}
         PR: ${{ inputs.pr }}
         ROUND: ${{ inputs.round }}

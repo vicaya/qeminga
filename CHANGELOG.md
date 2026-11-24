@@ -73,7 +73,9 @@ semantic versioning.
   minutes. Each attempt runs in its own container with only its own key,
   on a fresh copy of the checkout, out of reach of the runner's files and
   credentials; CLIs are installed in containers without keys; the agent job
-  uses no cache, and container output can't issue workflow commands. The
+  uses no cache, container output can't issue workflow commands, and the
+  raw prompt and attempt files stay owner-only and are removed when the
+  run ends. The
   agent's work leaves its job only as a patch, checked byte for byte (file
   names included) for pool keys and refused if it touches
   `.github/workflows/`, and a job with

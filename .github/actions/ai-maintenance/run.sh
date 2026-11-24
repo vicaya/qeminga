@@ -35,8 +35,13 @@
 #   AI_SANDBOX_IMAGE       base image of the attempt containers (default ubuntu:24.04)
 #   AI_SANDBOX_SETUP       shell script run as root while building the image,
 #                          in a throwaway copy of the checkout (repository tools)
-#   AI_STATE_DIR           scratch directory outside the checkout; each
-#                          invocation works in a fresh directory under it
+#   AI_STATE_DIR           scratch directory outside the checkout, the
+#                          runner's own (or sticky, like /tmp); each invocation
+#                          works in a fresh, owner-only directory under it
+#                          (default: RUNNER_TEMP/ai-maintenance, else TMPDIR)
+#   AI_KEEP_RAW_STATE      true keeps the raw files (prompt, attempts, tools)
+#                          after the run, for debugging; by default only the
+#                          sanitized output is left
 #   AI_PROVIDERS_DIR       adapter directory (default: providers/ next to this file)
 #
 # Exit status: 0 when an agent finished (with or without changes), 1 when
@@ -83,13 +88,41 @@ case "$private" in true | false) ;; *) ai_log "AI_PRIVATE_INSTRUCTIONS must be t
 models=$(ai_normalize_models "${AI_MODELS:-}") || exit 2
 attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
-# A fresh directory for this invocation: an earlier one in the same job
-# (with the same AI_STATE_DIR) leaves its attempts, private or not, in its
-# own, and nothing of them is read, reused or uploaded here.
-state_root=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
-{ mkdir -p "$state_root" && state=$(mktemp -d "$(cd "$state_root" && pwd)/run.XXXXXX") && chmod 755 "$state"; } ||
+# A fresh, owner-only directory for this invocation: an earlier one in the
+# same job (with the same AI_STATE_DIR) leaves its attempts, private or
+# not, in its own, and nothing of them is read, reused or uploaded here.
+# The containers reach their mounts through the docker daemon, so no other
+# account needs to search it. It goes in a directory no one else can
+# rename it in: the runner's own, or a sticky one such as /tmp.
+state_root=${AI_STATE_DIR:-${RUNNER_TEMP:+$RUNNER_TEMP/ai-maintenance}}
+state_root=${state_root:-${TMPDIR:-/tmp}}
+mkdir -p "$state_root" || exit 2
+if [ -L "$state_root" ] || ! read -r root_uid root_mode < <(stat -c '%u %a' "$state_root" 2>/dev/null) ||
+    { [ "$root_uid" != "$(id -u)" ] && [ "$root_uid" != 0 ]; } ||
+    { [ $((8#$root_mode & 8#022)) -ne 0 ] && [ $((8#$root_mode & 8#1000)) -eq 0 ]; }; then
+    ai_log "AI_STATE_DIR ($state_root) must be a directory of this user's (or root's) that others cannot write to, or a sticky one such as /tmp, not a symlink"
     exit 2
+fi
+state=$(mktemp -d "$(cd "$state_root" && pwd -P)/ai-maintenance-run.XXXXXX") || exit 2
 out state-dir "$state"
+# When the invocation ends, however it ends, only the sanitized output is
+# left: the result, the uploaded logs, the scrubbed summary and the
+# attempts table. The rest (the prompt, the agent's trees and raw output,
+# the tools) is removed, write-protected files included.
+image_tag='' image_built=''
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+cleanup() {
+    [ -z "$image_built" ] || docker image rm -f "$image_tag" >/dev/null 2>&1
+    [ "${AI_KEEP_RAW_STATE:-}" != true ] || return 0
+    local p
+    for p in "$state"/* "$state"/.[!.]*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        case "${p##*/}" in result | logs | summary.md | attempts.jsonl) continue ;; esac
+        [ -L "$p" ] || chmod -R u+rwx "$p" 2>/dev/null
+        rm -rf "$p"
+    done
+}
+trap cleanup EXIT
 # One tools directory per provider, created by this run.
 tools_root=$state/tools
 mkdir -p "$tools_root" || exit 2
@@ -169,7 +202,7 @@ if [ "$build_rc" -ne 0 ]; then
     out status failed
     exit 1
 fi
-trap 'docker image rm -f "$image_tag" >/dev/null 2>&1' EXIT
+image_built=1
 
 # docker run arguments shared by the attempt and export containers: an
 # unprivileged user without capabilities, the action's scripts read-only,

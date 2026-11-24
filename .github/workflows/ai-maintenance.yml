@@ -36,7 +36,10 @@ on:
         description: "review: pull request number"
         default: ""
       since:
-        description: "review: feedback after this point is new (a UTC time such as 2026-01-31T12:00:00Z, or a previous watch's state)"
+        description: "review: feedback after this UTC time (such as 2026-01-31T12:00:00Z) is new; for the first round"
+        default: ""
+      state-run:
+        description: "review: the run whose watch state to continue from (set by the workflow for later rounds)"
         default: ""
       round:
         description: "review: review round number"
@@ -72,12 +75,13 @@ jobs:
     if: inputs.mode == 'review'
     runs-on: ubuntu-24.04
     timeout-minutes: 150
+    # actions: read for the previous round's state artifact.
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
       status: ${{ steps.watch.outputs.status }}
-      until: ${{ steps.watch.outputs.until }}
       head-ref: ${{ steps.watch.outputs.head-ref }}
     steps:
       - uses: actions/checkout@v4
@@ -85,11 +89,21 @@ jobs:
           path: ${{ env.ACTION_DIR }}
           sparse-checkout: .github/actions/ai-maintenance
           persist-credentials: false
+      # Later rounds continue from the state the previous round's watch
+      # left as an artifact of its run.
+      - if: inputs.state-run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-maintenance-watch-state
+          path: ${{ runner.temp }}/ai-watch-state
+          run-id: ${{ inputs.state-run }}
+          github-token: ${{ github.token }}
       - id: watch
         uses: ./_ai-maintenance/.github/actions/ai-maintenance/watch
         with:
           pr: ${{ inputs.pr }}
           since: ${{ inputs.since }}
+          since-file: ${{ inputs.state-run != '' && format('{0}/ai-watch-state/state.txt', runner.temp) || '' }}
           branch-prefix: ${{ env.BRANCH_PREFIX }}
           quiet-minutes: ${{ vars.AI_MAINTENANCE_QUIET_MINUTES || '90' }}
           trusted-bots: ${{ vars.AI_MAINTENANCE_TRUSTED_BOTS }}
@@ -228,7 +242,6 @@ jobs:
           PR: ${{ needs.publish.outputs.pr-number }}
           ROUND: ${{ inputs.round }}
           PUBLISHED_AT: ${{ needs.publish.outputs.published-at }}
-          UNTIL: ${{ needs.watch.outputs.until }}
           MAX_ROUNDS: ${{ vars.AI_MAINTENANCE_MAX_REVIEW_ROUNDS || '5' }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           # One-off dispatch overrides carry into the review rounds.
@@ -236,10 +249,12 @@ jobs:
           INSTRUCTIONS: ${{ inputs.instructions }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
+          # Later rounds continue from this run's watch state (an
+          # artifact: it outgrows the dispatch inputs' 65,535 characters).
           if [ "$MODE" = review ]; then
-            round=$((ROUND + 1)) since=$UNTIL
+            round=$((ROUND + 1)) from=(-f state-run="$GITHUB_RUN_ID")
           else
-            round=1 since=$PUBLISHED_AT
+            round=1 from=(-f since="$PUBLISHED_AT")
           fi
           if [ "$round" -gt "$MAX_ROUNDS" ]; then
             gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Automated follow-up stopped after $MAX_ROUNDS review rounds; further feedback needs a human. <!-- ai-maintenance -->"
@@ -248,8 +263,8 @@ jobs:
           # .github/workflows/<file>.yml from owner/repo/.github/workflows/<file>.yml@ref
           workflow=${WORKFLOW_REF#"$GITHUB_REPOSITORY/"}
           workflow=${workflow%@*}
-          args=(-f mode=review -f pr="$PR" -f since="$since" -f round="$round")
+          args=(-f mode=review -f pr="$PR" "${from[@]}" -f round="$round")
           [ -n "$MODELS" ] && args+=(-f models="$MODELS")
           [ -n "$INSTRUCTIONS" ] && args+=(-f instructions="$INSTRUCTIONS")
           gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "${args[@]}"
-          echo "watching PR #$PR for review feedback (round $round, after $since)"
+          echo "watching PR #$PR for review feedback (round $round)"

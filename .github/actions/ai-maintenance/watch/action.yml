@@ -8,8 +8,11 @@ inputs:
     description: Pull request number.
     required: true
   since:
-    description: Feedback up to here is handled - a UTC time such as 2026-01-31T12:00:00Z, or the until output of the previous watch.
-    required: true
+    description: Feedback up to here is handled - a UTC time such as 2026-01-31T12:00:00Z (the first round).
+    default: ""
+  since-file:
+    description: A file holding the state the previous watch wrote (its state artifact); wins over since.
+    default: ""
   github-token:
     description: Read access to pull requests.
     default: ${{ github.token }}
@@ -34,14 +37,17 @@ inputs:
   feedback-artifact:
     description: Name of the artifact holding the feedback.
     default: ai-maintenance-feedback
+  state-artifact:
+    description: Name of the artifact holding the state for the next round (pass it as since-file there).
+    default: ai-maintenance-watch-state
 
 outputs:
   status:
     description: feedback, quiet, closed or ignored.
     value: ${{ steps.watch.outputs.status }}
-  until:
-    description: The state after this hand-over (pass it as the next since) - the feedback items handed over, by ID and body digest; items over the size budget wait for the next round.
-    value: ${{ steps.watch.outputs.until }}
+  state-file:
+    description: The state after this hand-over (the feedback items handed over, by ID and body digest), also uploaded as the state artifact; items over the size budget wait for the next round.
+    value: ${{ steps.watch.outputs.state-file }}
   head-ref:
     description: The pull request's branch.
     value: ${{ steps.watch.outputs.head-ref }}
@@ -58,6 +64,8 @@ runs:
         GH_TOKEN: ${{ inputs.github-token }}
         PR: ${{ inputs.pr }}
         SINCE: ${{ inputs.since }}
+        SINCE_FILE: ${{ inputs.since-file }}
+        STATE_FILE: ${{ runner.temp }}/ai-watch-state-out/state.txt
         BRANCH_PREFIX: ${{ inputs.branch-prefix }}
         QUIET_MINUTES: ${{ inputs.quiet-minutes }}
         POLL_SECONDS: ${{ inputs.poll-seconds }}
@@ -66,7 +74,7 @@ runs:
         TRUSTED_BOTS: ${{ inputs.trusted-bots }}
         FEEDBACK_FILE: ${{ runner.temp }}/ai-feedback/feedback.md
       run: |
-        mkdir -p "$(dirname "$FEEDBACK_FILE")"
+        mkdir -p "$(dirname "$FEEDBACK_FILE")" "$(dirname "$STATE_FILE")"
         "$GITHUB_ACTION_PATH/../watch.sh"
 
     - if: steps.watch.outputs.status == 'feedback'
@@ -74,4 +82,13 @@ runs:
       with:
         name: ${{ inputs.feedback-artifact }}
         path: ${{ runner.temp }}/ai-feedback
+        retention-days: 7
+
+    # The state grows with every item handed over: it travels to the next
+    # round as an artifact of this run, not as a workflow input.
+    - if: steps.watch.outputs.status == 'feedback'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.state-artifact }}
+        path: ${{ runner.temp }}/ai-watch-state-out
         retention-days: 7

@@ -98,6 +98,7 @@ provider_run() {
             echo changed >>file.txt; printf 'done\n' >"$final" ;;
         workflow-*) mkdir -p .github/workflows && echo 'on: push' >.github/workflows/new.yml; printf 'done\n' >"$final" ;;
         keyname*) : >"n-$key"; printf 'done\n' >"$final" ;;
+        locked-*) mkdir -p locked/sub && : >locked/sub/f && chmod 000 locked/sub locked; printf 'done\n' >"$final" ;;
         quotewholename-*) : >"n $(sed -n '/^## Maintenance instructions$/,$p' "$prompt" | tail -n +3)"; printf 'done\n' >"$final" ;;
     esac
 }
@@ -124,7 +125,7 @@ run_case() { # name pool [VAR=value ...]; leaves $rc, $outf, $state, $repo
     mkdir -p "$state"
     : >"$outf"
     (cd "$repo" && env -u AI_MODELS PATH="$bin:$PATH" FAKE_DOCKER_LOG="$tmp/$name/docker.log" \
-        AI_KEY_POOL="$pool" AI_INSTRUCTIONS="tidy up" AI_STATE_DIR="$state" \
+        AI_KEY_POOL="$pool" AI_INSTRUCTIONS="tidy up" AI_STATE_DIR="$state" AI_KEEP_RAW_STATE=true \
         AI_PROVIDERS_DIR="$fakes" GITHUB_OUTPUT="$outf" GITHUB_ACTIONS= "$@" \
         "$action/run.sh") >"$tmp/$name/log" 2>&1
     rc=$?
@@ -230,7 +231,10 @@ fi
 # Fake docker: `run` runs the command on the host with only the variables
 # passed with -e (the sandbox mounts every path at the same place, so paths
 # need no translation), as the --user given when run as root; every call
-# is logged to $FAKE_DOCKER_LOG.
+# is logged to $FAKE_DOCKER_LOG. The run's directories are their owner's
+# alone and real docker reaches the mounts through its daemon: for as long
+# as the command runs, the fake lets that user search the directories
+# above each mount.
 cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"${FAKE_DOCKER_LOG:-/dev/null}"
@@ -239,20 +243,32 @@ case "$1" in
     run) shift ;;
     *) exit 0 ;;
 esac
-envs=("PATH=$PATH") wd=. as=()
+envs=("PATH=$PATH") wd=. as=() mounts=()
 while [ $# -gt 0 ]; do
     case "$1" in
         -e) case "$2" in *=*) envs+=("$2") ;; *) [ -n "${!2+x}" ] && envs+=("$2=${!2}") ;; esac; shift ;;
         -w) wd=$2; shift ;;
         --user) [ "$(id -u)" = 0 ] && as=(setpriv --reuid "${2%%:*}" --regid "${2##*:}" --clear-groups); shift ;;
-        -v | --name | --cap-drop | --security-opt | --network | --pids-limit) shift ;;
+        -v) mounts+=("${2%%:*}"); shift ;;
+        --name | --cap-drop | --security-opt | --network | --pids-limit) shift ;;
         -*) ;;
         *) break ;;
     esac
     shift
 done
 shift # the image
-cd "$wd" && exec "${as[@]}" env -i "${envs[@]}" "$@"
+[ "${#as[@]}" -gt 0 ] || { cd "$wd" && exec env -i "${envs[@]}" "$@"; }
+opened=()
+for m in "${mounts[@]}" "$wd"; do
+    d=$m
+    while d=$(dirname "$d") && [ "$d" != / ]; do
+        [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ] && chmod o+x "$d" && opened+=("$d")
+    done
+done
+(cd "$wd" && "${as[@]}" env -i "${envs[@]}" "$@")
+rc=$?
+[ "${#opened[@]}" -eq 0 ] || chmod o-x "${opened[@]}"
+exit "$rc"
 EOF
 chmod +x "$bin/docker"
 # Run as root, the fake runs attempts as another user, who must reach the
@@ -409,6 +425,31 @@ check "run: no patch with the key is left" bash -c '[ ! -e "$1/result/changes.pa
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"
+
+# The invocation's directory is its owner's alone, and what is left in it
+# once the run ends is only the sanitized output: the prompt, the trees,
+# the raw logs and the tools are removed, whatever the outcome.
+raw_left() { find "$1" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort | paste -sd' '; }
+run_case raw '[{"claude":["quota-1","ok-2"]}]' AI_KEEP_RAW_STATE=
+check "run: the invocation's directory is its owner's alone" bash -c '[ "$(stat -c %a "$1")" = 700 ]' _ "$state"
+eq "run: a successful run leaves only its sanitized output" "0 attempts.jsonl logs result summary.md" "$rc $(raw_left "$state")"
+check "run: ... which holds the result and the uploaded logs" bash -c \
+    '[ -s "$1/result/changes.patch" ] && [ -s "$1/logs/attempt-1/attempt.log" ]' _ "$state"
+run_case rawfail '[{"claude":["boom-1"]}]' AI_KEEP_RAW_STATE=
+eq "run: ... and so does a failed one" "1 attempts.jsonl logs summary.md" "$rc $(raw_left "$state")"
+run_case rawlocked '[{"claude":["locked-1"]}]' AI_KEEP_RAW_STATE=
+check "run: ... even when the agent locked its files away" bash -c '[ ! -e "$1/attempt-1" ] && [ ! -e "$1/prompt" ]' _ "$state"
+# The directory the invocations go in must be the runner's own, or a
+# shared one with the sticky bit (like /tmp): no one else may rename them.
+mkdir -p "$tmp/shared" && chmod 777 "$tmp/shared"
+run_case shared '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared"
+eq "run: a state directory others can write to is refused" 2 "$rc"
+chmod 1777 "$tmp/shared"
+run_case sticky '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared"
+eq "run: ... unless it is sticky" 0 "$rc"
+ln -s "$tmp/shared" "$tmp/shared-link"
+run_case statelink '[{"claude":["ok-1"]}]' AI_STATE_DIR="$tmp/shared-link"
+eq "run: ... and a symlink is refused" 2 "$rc"
 
 run_case symlink '[{"claude":["symlink-1"]}]'
 check "run: an output file the agent replaced by a symlink is not read" bash -c \
@@ -593,7 +634,7 @@ git -C "$repo" config http.https://github.com/.extraheader "AUTHORIZATION: basic
 (cd "$repo" && env PATH="$bin:$PATH" AI_KEY_POOL='[{"claude":["creds-1"]}]' AI_INSTRUCTIONS=x \
     AI_STATE_DIR="$tmp/creds/state" AI_PROVIDERS_DIR="$fakes" "$action/run.sh") >/dev/null 2>&1
 check "run: persisted checkout credentials are removed from the agent's copy" \
-    contains "$(echo "$tmp"/creds/state/run.*/result/summary.md)" "no credentials"
+    contains "$(echo "$tmp"/creds/state/ai-maintenance-run.*/result/summary.md)" "no credentials"
 
 # Each invocation keeps to its own state: a later one in the same job (and
 # the same AI_STATE_DIR) uploads none of an earlier one's attempts.
@@ -608,6 +649,10 @@ check "run: ... and uploads only the attempts it made itself" bash -c \
     '[ -d "$1/attempt-1" ] && [ ! -e "$1/attempt-2" ] && ! grep -rqF "eleventh audit" "$1"' _ "$(output logs-dir)"
 check "action: the result uploaded is the invocation's own" grep -qF \
     'path: ${{ steps.run.outputs.result-dir }}' "$action/action.yml"
+check "action: the README shows two invocations in one workflow run, each with its own artifacts" bash -c \
+    '[ "$(grep -c "result-artifact: ai-maintenance-" "$1")" -ge 4 ]' _ "$action/README.md"
+check "publish: each result artifact is downloaded into a directory of its own" bash -c \
+    '[ "$(grep -c "ai-maintenance-result/\${{ inputs.result-artifact }}" "$1")" = 2 ]' _ "$action/publish/action.yml"
 
 run_case nopool ''
 eq "run: an empty pool is a configuration error" 2 "$rc"
@@ -676,19 +721,28 @@ EOF
 watch() { # extra env...
     outf=$tmp/watch.out
     : >"$outf"
+    rm -f "$tmp/watch-state.txt"
     env PATH="$bin:$PATH" FAKE_GH="$gh_dir" GITHUB_REPOSITORY=o/r PR=7 SINCE=2026-01-15T00:00:00Z \
         BRANCH_PREFIX=ai-maintenance/ QUIET_MINUTES=0 POLL_SECONDS=0 SETTLE_SECONDS=0 \
-        FEEDBACK_FILE="$tmp/feedback-out.md" GITHUB_OUTPUT="$outf" "$@" "$action/watch.sh" >"$tmp/watch.log" 2>&1
+        FEEDBACK_FILE="$tmp/feedback-out.md" STATE_FILE="$tmp/watch-state.txt" GITHUB_OUTPUT="$outf" "$@" \
+        "$action/watch.sh" >"$tmp/watch.log" 2>&1
     rc=$?
 }
 pr_json open ai-maintenance/20260201-1 o/r
 dg() { printf '%s' "$1" | sha256sum | cut -c1-16; }
+# The state for the next round: a file, which the workflow carries as an
+# artifact (the dispatch inputs are too small for it).
+next_state() { cat "$tmp/watch-state.txt" 2>/dev/null; }
 keys_of() { cut -d'|' -f2 <<<"$1" | tr ',' '\n' | cut -d= -f1 | paste -sd' '; }
 watch TRUSTED_BOTS="copilot-pull-request-reviewer[bot]"
 eq "watch: trusted feedback is reported, and each item handed over is recorded by its ID" \
     "0 feedback 2026-01-15T00:00:00Z c11 c12 r2 r5" \
-    "$rc $(output status) $(output until | cut -d'|' -f1) $(keys_of "$(output until)")"
-all_until=$(output until)
+    "$rc $(output status) $(next_state | cut -d'|' -f1) $(keys_of "$(next_state)")"
+all_until=$(next_state)
+eq "watch: the state file is an output" "$tmp/watch-state.txt" "$(output state-file)"
+printf '%s' "$all_until" >"$tmp/since.txt"
+watch SINCE= SINCE_FILE="$tmp/since.txt"
+eq "watch: the state can come from a file" "0 quiet" "$rc $(output status)"
 fb=$tmp/feedback-out.md
 check "watch: owners, collaborators and listed bots count" bash -c \
     'grep -q "Please split this" "$1" && grep -q "Typo here" "$1" && grep -q "src/a.rs. line 12" "$1" && grep -q "Bot review" "$1"' _ "$fb"
@@ -703,6 +757,8 @@ watch SINCE="2026-01-15T00:00:00Z|r2=$(dg 'Please split this')|x"
 eq "watch: a state this script did not write is a configuration error" 2 "$rc"
 watch SINCE="2026-01-15T00:00:00Z|r2=nothex"
 eq "watch: ... as is a malformed entry" 2 "$rc"
+watch SINCE="2026-01-15T00:00:00.500Z"
+eq "watch: ... and a time that is not to the whole second (times compare as text)" 2 "$rc"
 # Edits: an item handed over in full and edited afterwards comes again.
 watch SINCE="$all_until"
 eq "watch: nothing new after everything was handed over" "quiet" "$(output status)"
@@ -713,7 +769,7 @@ watch SINCE="$all_until"
 check "watch: an item edited after it was handed over is handed over again" bash -c \
     '[ "$2" = feedback ] && grep -q "and rename it" "$1" && grep -q "inline comment, updated" "$1" && ! grep -q "Please split this\|Same second" "$1"' \
     _ "$fb" "$(output status)"
-watch SINCE="$(output until)"
+watch SINCE="$(next_state)"
 eq "watch: ... once" "quiet" "$(output status)"
 # GitHub's timestamps cannot tell these edits: a review keeps its
 # submitted_at, and a comment edited within the second keeps its updated_at.
@@ -758,9 +814,9 @@ while [ "$rounds" -lt 6 ]; do
     [ "$(wc -c <"$fb")" -le 60000 ] || sizes="round $rounds: $(wc -c <"$fb") bytes"
     grep -oE '^(START)?y+(END)?$' "$fb" | tr -d '\n' >>"$got"
     grep -q "Small one after" "$fb" && break
-    since=$(output until)
+    since=$(next_state)
 done
-final_until=$(output until)
+final_until=$(next_state)
 eq "watch: an item larger than the budget arrives in pieces within the budget" "ok" "$sizes"
 eq "watch: ... resuming where each round stopped, until all of it and what follows are handed over" \
     "3 START150000END 2026-02-01T00:00:00Z|c32=$(dg 'Small one after'),r31=$({ printf START; cat "$tmp/huge.txt"; printf END; } | sha256sum | cut -c1-16)" \
@@ -786,7 +842,7 @@ mkcomments 9 comments 3 200 a
 watch PR=9 FEEDBACK_BUDGET="$min" SINCE=2026-02-03T00:00:00Z
 check "watch: at the smallest budget, whole items that fit are handed over, and no more" bash -c \
     'grep -q "^\[0\]a" "$1" && ! grep -q "^\[1\]" "$1" && [ "$(wc -c <"$1")" -le "$2" ]' _ "$fb" "$min"
-watch PR=9 FEEDBACK_BUDGET="$min" SINCE="$(output until)"
+watch PR=9 FEEDBACK_BUDGET="$min" SINCE="$(next_state)"
 check "watch: ... and the next round picks up where the last stopped" bash -c \
     'grep -q "^\[1\]a" "$1" && ! grep -q "^\[0\]" "$1"' _ "$fb"
 
@@ -798,7 +854,7 @@ check "watch: one item larger than a small budget is cut to fit it exactly" bash
 first=$(grep -o '^\[0\]A*' "$fb")
 # The comment is rewritten before the next round: it starts over, in full.
 mkcomments 10 comments 1 2000 B 2026-02-03T10:00:00Z
-watch PR=10 FEEDBACK_BUDGET="$min" SINCE="$(output until)"
+watch PR=10 FEEDBACK_BUDGET="$min" SINCE="$(next_state)"
 check "watch: a partly handed-over item that was edited starts over from its beginning" bash -c \
     '[ -n "$3" ] && [ "${#3}" -lt 2003 ] && grep -q "^\[0\]BBBB" "$1" && grep -q "inline comment, updated" "$1" && [ "$(wc -c <"$1")" -le "$2" ]' \
     _ "$fb" "$min" "$first"
@@ -815,7 +871,7 @@ rounds_until_quiet() { # pr since
         rounds=$((rounds + 1))
         [ "$(wc -c <"$fb")" -le "$min" ] || sizes="round $rounds: $(wc -c <"$fb") bytes"
         cat "$fb" >>"$tmp/rounds.md"
-        since=$(output until)
+        since=$(next_state)
     done
 }
 
@@ -829,13 +885,13 @@ jq -n --arg b "$long_b" '[{id: 60, user: {login: "carol"}, author_association: "
         created_at: "2026-02-04T09:01:00Z", updated_at: "2026-02-04T09:01:00Z", html_url: "u"}]' \
     >"$gh_dir/repos_o_r_pulls_12_comments.json"
 watch PR=12 FEEDBACK_BUDGET="$min" SINCE=2026-02-04T00:00:00Z
-watch PR=12 FEEDBACK_BUDGET="$min" SINCE="$(output until)"
+watch PR=12 FEEDBACK_BUDGET="$min" SINCE="$(next_state)"
 check "watch: (a short item, then the start of a long one)" bash -c \
     'grep -q "^\[B\]b" "$1" && grep -q "continued in the next round" "$1"' _ "$fb"
 jq --arg b "${long_b//b/c}" '.[0].body = "Short A, edited" | .[0].updated_at = "2026-02-04T10:00:00Z"
     | .[1].body = ("[B]" + $b) | .[1].updated_at = "2026-02-04T10:01:00Z"' \
     "$gh_dir/repos_o_r_pulls_12_comments.json" >"$tmp/c12" && mv "$tmp/c12" "$gh_dir/repos_o_r_pulls_12_comments.json"
-rounds_until_quiet 12 "$(output until)"
+rounds_until_quiet 12 "$(next_state)"
 check "watch: an edit to an item handed over in full is handed over even when a later-edited item starts over first" bash -c \
     'grep -q "Short A, edited" "$1" && [ "$(tr -cd c <"$1" | wc -c)" -ge 3000 ] && [ "$2" = quiet ] && [ "$3" = ok ]' \
     _ "$tmp/rounds.md" "$(output status)" "$sizes"
@@ -863,6 +919,22 @@ mv "$gh_dir/repos_o_r_pulls_11_comments.json.json" "$gh_dir/repos_o_r_pulls_11_c
 watch PR=11 SINCE=2026-02-03T00:00:00Z
 check "watch: an edit during the settle period is waited out and handed over" bash -c \
     'grep -q "^\[0\]dddd" "$1" && [ "$(grep -c "pulls/11/comments" "$2")" = 3 ]' _ "$fb" "$gh_dir/api-calls"
+
+# After the settle period, the pull request and the pending items are
+# checked again: an edit reverted meanwhile leaves nothing to hand over,
+# and a pull request closed meanwhile is closed.
+pr_json open ai-maintenance/20260205-1 o/r 14
+mkcomments 14 comments 1 10 c
+mv "$gh_dir/repos_o_r_pulls_14_comments.json" "$gh_dir/repos_o_r_pulls_14_comments.json.next"
+mkcomments 14 comments 1 10 d
+watch PR=14 SINCE="2026-02-03T00:00:00Z|c40=$(dg '[0]cccccccccc')"
+eq "watch: an edit reverted during the settle period is not handed over" "0 quiet" "$rc $(output status)"
+pr_json closed ai-maintenance/20260205-2 o/r 15
+mv "$gh_dir/repos_o_r_pulls_15.json" "$gh_dir/repos_o_r_pulls_15.json.next"
+pr_json open ai-maintenance/20260205-2 o/r 15
+mkcomments 15 comments 1 10 e
+watch PR=15 SINCE=2026-02-03T00:00:00Z
+eq "watch: a pull request closed during the settle period is closed" "0 closed" "$rc $(output status)"
 
 # --- gate.sh ------------------------------------------------------------------------
 gate() { # max

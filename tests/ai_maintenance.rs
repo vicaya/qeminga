@@ -81,6 +81,25 @@ fn the_workflow_grants_nothing_by_default() {
 }
 
 #[test]
+fn the_review_state_travels_as_an_artifact_named_by_its_run() {
+    // Dispatch inputs are limited to 65,535 characters in all, and the
+    // one-off instructions travel with them: the watch state does not.
+    let text = workflow();
+    let watch = job(&text, "watch");
+    assert!(
+        watch.contains("      actions: read\n"),
+        "the watch reads the previous run's state artifact"
+    );
+    assert!(watch.contains("run-id: ${{ inputs.state-run }}"), "{watch}");
+    let follow = job(&text, "follow-up");
+    assert!(follow.contains("state-run="), "{follow}");
+    assert!(
+        !text.contains("outputs.until"),
+        "the state is not carried as a dispatch input"
+    );
+}
+
+#[test]
 fn only_the_agent_job_sees_the_key_pool_and_it_cannot_write() {
     let text = workflow();
     assert_eq!(

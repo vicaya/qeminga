@@ -6724,6 +6724,17 @@ _inspect_record_entry() {
     return 2
 }
 
+# Re-lock runner permissions using the recorded pre-update settings via local
+# dynamic scoping (called inside a subshell so a `die` returns to rollback
+# without mutating globals inside a subshell and tripping SC2030/SC2031).
+_rollback_lock_runner_permissions() {
+    local OPT_ALLOW_AUTO_UPDATE="${REC_ALLOW_AUTO_UPDATE:-0}"
+    local OPT_EPHEMERAL="${REC_EPHEMERAL:-0}"
+    local RESOLVED_WORK_DIR="${REC_WORK_DIR:-}"
+    local VOL_INSTALL_DIR="${1:-}"
+    lock_runner_permissions
+}
+
 # Shared rollback helper for both `update` and transactional `install`
 # (reinstalling an existing installed runner). Stops any active replacement
 # service first, restores the previous runner binaries and any snapshotted
@@ -6819,13 +6830,7 @@ _rollback_runner_package_tx() {
                         fi
                     fi
                     if [ "$restore_ok" -eq 1 ]; then
-                        if ! (
-                            OPT_ALLOW_AUTO_UPDATE="${REC_ALLOW_AUTO_UPDATE:-0}"
-                            OPT_EPHEMERAL="${REC_EPHEMERAL:-0}"
-                            RESOLVED_WORK_DIR="${REC_WORK_DIR:-}"
-                            VOL_INSTALL_DIR="$expected_vol"
-                            lock_runner_permissions
-                        ); then
+                        if ! ( _rollback_lock_runner_permissions "$expected_vol" ); then
                             warn "rollback restored previous runner files but failed to re-lock permissions on '$OPT_INSTALL_DIR'; preserving updating record for retry"
                             restore_ok=0
                         fi
@@ -8725,6 +8730,7 @@ stop_temp_session_libvirt_daemons() {
     local force_kill="${2:-0}"
     [ ! -L "$rt_dir" ] && [ -d "$rt_dir" ] || return 0
     [ ! -L "$rt_dir/libvirt" ] && [ -d "$rt_dir/libvirt" ] || return 0
+    # shellcheck disable=SC2016 # single quotes are intentional; the child sh -c expands its own parameters and variables
     runuser -u "$OPT_USER" -- sh -c '
         rt_dir="$1"
         force_kill="$2"

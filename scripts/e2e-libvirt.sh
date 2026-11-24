@@ -44,6 +44,7 @@ for cmd in domfsfreeze domfsthaw domifaddr domfsinfo domstate qemu-agent-command
 done
 
 # Every check runs in this shell (a `bash -c` child would not see `v`).
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
 refused_exec() {
     local out
     if out="$(agent '{"execute":"guest-exec","arguments":{"path":"/bin/true"}}' 2>&1)"; then
@@ -57,6 +58,7 @@ refused_exec() {
         *) echo "unexpected refusal text"; return 1 ;;
     esac
 }
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
 status_is() {
     local out
     out="$(agent '{"execute":"guest-fsfreeze-status"}')" || { echo "$out"; return 1; }

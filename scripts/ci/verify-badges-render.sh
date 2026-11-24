@@ -58,7 +58,10 @@ for url in $urls; do
     esac
 done
 for badge in tests coverage; do
-    eval "n=\$seen_$badge"
+    case "$badge" in
+        tests) n=$seen_tests ;;
+        coverage) n=$seen_coverage ;;
+    esac
     if [ "$n" -eq 0 ]; then
         echo "verify-badges-render: the rendered README does not embed badges/main/$badge.svg" >&2
         status=1

@@ -1,0 +1,10 @@
+#!/usr/bin/env -S 'bash' -eu
+# A directive line inside a here-document is data, not a directive: the
+# shebang's dialect still applies (without it, SC1008).
+words=(a b)
+cat <<'TEXT'
+#!/bin/sh
+# shellcheck shell=sh
+echo generated
+TEXT
+echo "${words[1]}"

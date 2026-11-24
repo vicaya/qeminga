@@ -75,6 +75,7 @@ cargo build --release --features seccomp   # panic=abort, LTO; the release confi
 cargo test --all-features                  # unit, property, integration and E2E tests
 cargo clippy --all-targets --all-features -- -D warnings
 scripts/check-unsafe.sh                    # no `unsafe` outside src/kernel/
+scripts/check-shell.sh                     # shellcheck over every shell script
 ```
 
 Cargo features (compile-time half of the two-level switches in the design):

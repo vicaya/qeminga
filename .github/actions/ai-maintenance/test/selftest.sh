@@ -269,12 +269,18 @@ shift # the image
 # shims below see only what the run itself starts).
 real_env=$(PATH=/usr/bin:/bin command -v env)
 [ "${#as[@]}" -gt 0 ] || { cd "$wd" && exec "$real_env" -i "${envs[@]}" "$@"; }
+# Only directories inside FAKE_DOCKER_ROOT (the test's own) are opened,
+# each logged before it is: a mount elsewhere stays as it is, and the
+# attempt cannot reach it unless it is already searchable.
 opened=()
+root=${FAKE_DOCKER_ROOT:-}
 for m in "${mounts[@]}" "$wd"; do
     d=$m
-    while d=$(dirname "$d") && [ "$d" != / ]; do
-        [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ] && chmod o+x "$d" && opened+=("$d") &&
+    while [ -n "$root" ] && d=$(dirname "$d") && case "$d/" in "$root"/*) true ;; *) false ;; esac; do
+        if [ -d "$d" ] && [ $((8#$(stat -c %a "$d") & 1)) -eq 0 ]; then
             printf '%s\n' "$d" >>"${FAKE_DOCKER_OPENED:-/dev/null}"
+            chmod o+x "$d" && opened+=("$d")
+        fi
     done
 done
 (cd "$wd" && "${as[@]}" "$real_env" -i "${envs[@]}" "$@")
@@ -487,6 +493,15 @@ run_case argv '[{"claude":["quota-argvkeyone"]},{"gpt":["ok-argvkeytwo"]}]' PATH
 check "run: (the shims saw the run's commands)" bash -c '[ "$1" = 0 ] && grep -qa "ai_scrub\|jq" "$2"' _ "$rc" "$tmp/argv.log"
 check "run: no key or instruction is ever a process argument" bash -c \
     '! grep -qa "argvkey\|argvinstructionmarker" "$1" "$2"' _ "$tmp/argv.log" "$tmp/argv/docker.log"
+
+# The fake docker changes permissions only inside the test's own directory:
+# a private directory elsewhere that holds a mount is never opened.
+ext=$(mktemp -d /tmp/ai-selftest-ext.XXXXXX)
+mkdir -p "$ext/private" && cp -a "$fakes" "$ext/private/providers" && chmod 700 "$ext/private"
+run_case external '[{"claude":["ok-1"]}]' AI_PROVIDERS_DIR="$ext/private/providers"
+check "selftest: a private directory outside the test is never opened, and keeps its mode" bash -c \
+    '! grep -v "^$2/" "$1" && [ "$(stat -c %a "$3")" = 700 ]' _ "$FAKE_DOCKER_OPENED" "$tmp" "$ext/private"
+rm -rf "$ext"
 
 run_case symlink '[{"claude":["symlink-1"]}]'
 check "run: an output file the agent replaced by a symlink is not read" bash -c \

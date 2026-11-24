@@ -100,6 +100,11 @@ provider_run() {
               jq -r '"diagnostic: key follows", .private_key' <<<"$5"
               jq -c '{type: "result", pin: (.api_token | tonumber), count: 3, ok: true}' <<<"$5"; } >"$AI_ATTEMPT_DIR/stream.jsonl"
             printf 'done\n' >"$final" ;;
+        mix2print-*) # a key with long and short lines, printed raw, the next event right after it
+            { jq -c '{type: "assistant", text: "start"}' <<<"$5"
+              jq -j '.private_key' <<<"$5"
+              jq -c '{type: "result", n: 1}' <<<"$5"; } >"$AI_ATTEMPT_DIR/stream.jsonl"
+            printf 'done\n' >"$final" ;;
         docpem-*) printf -- '-----BEGIN TEST KEY-----\nnot the configured key\n-----END TEST KEY-----\n' >parser-fixture.pem
                   printf 'done\n' >"$final" ;;
         pemleak-*) jq -r '.private_key | split("\n")[1]' <<<"$5" >>file.txt; printf 'done\n' >"$final" ;;
@@ -451,6 +456,16 @@ eq "aliases: anthropic, openai, google, agy" "claude gpt gemini gemini provider2
     "$(for p in anthropic openai google agy provider2; do ai_canonical_provider "$p"; done | paste -sd' ')"
 printf '%s' '["k1","k2"]' >"$tmp/scrub-keys.json"
 eq "scrub: every key is replaced" "x *** y *** z" "$(printf 'x k1 y k2 z' | ai_scrub "$tmp/scrub-keys.json")"
+# A multiline key of long and short lines, printed as text right before
+# an event: withheld whole (its long line is a key of its own too), and
+# the event keeps its line.
+jq -cn '["ab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n", "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph"]' >"$tmp/scrub-ml.json"
+eq "scrub (JSON lines): a multiline key is matched whole first, and the next event keeps its line" \
+    '{"type":"a"}|***|{"type":"result","n":1}' \
+    "$(printf '{"type":"a"}\nab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n{"type":"result","n":1}\n' |
+        ai_scrub_jsonl "$tmp/scrub-ml.json" | paste -sd'|')"
+eq "scrub (JSON lines): ... also inside a JSON string" '{"text":"key: *** end"}' \
+    "$(printf '{"text":"key: ab12\\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\\ncd34 end"}\n' | ai_scrub_jsonl "$tmp/scrub-ml.json")"
 printf 'GIF89a\0\1k2\0' >"$tmp/blob"
 check "leak scan: finds a key between binary bytes" ai_contains_key '["k1","k2"]' "$tmp/blob"
 check "leak scan: a clean file passes" bash -c '. "$1/lib.sh"; ! ai_contains_key "[\"k9\"]" "$2"' _ "$action" "$tmp/blob"
@@ -577,6 +592,13 @@ check "run: a mixed transcript keeps no credential, and its JSON lines stay JSON
      ! tr "\n" "|" <"$t" | grep -q "ab12|cd34" && ! grep -q 98765432 "$t" &&
      jq -Re "fromjson? | select(.type == \"result\") | .pin == \"***\" and .count == 3 and .ok == true" "$t" >/dev/null &&
      jq -Re "fromjson? | select(.type == \"assistant\") | .text == \"start\"" "$t" >/dev/null' _ "$state" "$rc"
+mix2entry=$(jq -cn '{keys: ["mix2print-1"], private_key: "ab12\nQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34\n"}')
+run_case mix2print '[{"claude":'"$mix2entry"'}]'
+check "run: a key of long and short lines is withheld whole, and the next event keeps its line" bash -c \
+    't=$1/logs/attempt-1/transcript.jsonl; [ "$2" = 0 ] && [ -s "$t" ] &&
+     ! grep -qE "ab12|cd34|QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph" "$t" &&
+     [ "$(jq -Rc "fromjson? | select(type == \"object\") | .type" "$t" | paste -sd" ")" = "\"assistant\" \"result\"" ]' \
+    _ "$state" "$rc"
 run_case docbasic '[{"claude":{"keys":["docbasic-1"],"auth":{"method":"basic"},"region":"eu-west-1"}}]'
 eq "run: public settings never block a change that mentions them" "0 changed" "$rc $(output status)"
 run_case declprint '[{"custom":{"keys":["declprint-1"],"auth":{"value":"decl-optsecret","method":"basic"}}}]' GITHUB_ACTIONS=true

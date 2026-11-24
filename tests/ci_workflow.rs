@@ -238,14 +238,19 @@ fn git_local_env_vars() -> &'static [String] {
 /// command of these tests: every repository-local variable a hook or
 /// another git tool may have left set is cleared (an inherited
 /// `GIT_INDEX_FILE` would make a fixture's `git add` rewrite the caller's
-/// index), and the global and system configuration are not read. A test's
-/// own overrides are set after this.
+/// index), the global and system configuration and the per-user excludes
+/// file are not read. A test's own overrides are set after this.
 fn isolate_git(cmd: &mut std::process::Command) {
     for var in git_local_env_vars() {
         cmd.env_remove(var);
     }
     cmd.env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // The default per-user excludes file ($XDG_CONFIG_HOME/git/ignore or
+        // ~/.config/git/ignore) is read even without a global config.
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.excludesFile")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null");
 }
 
 /// The git environment for listing the files of `root`: none when it is
@@ -598,6 +603,29 @@ fn git_with(dir: &Path, args: &[&str], inherited: &[(&str, &Path)]) {
 
 fn git(dir: &Path, args: &[&str]) {
     git_with(dir, args, &[]);
+}
+
+#[test]
+fn fixture_git_ignores_the_callers_personal_excludes() {
+    // GIT_CONFIG_GLOBAL=/dev/null alone still leaves git reading the
+    // default per-user excludes file, $XDG_CONFIG_HOME/git/ignore.
+    let tmp = tempfile::tempdir().unwrap();
+    let xdg = tmp.path().join("xdg");
+    put(&xdg, "git/ignore", "tools/\n*.sh\n");
+    let inherited: [(&str, &Path); 1] = [("XDG_CONFIG_HOME", &xdg)];
+    let fixture = tmp.path().join("fixture");
+    std::fs::create_dir(&fixture).unwrap();
+    git_with(&fixture, &["init", "-q"], &inherited);
+    put(&fixture, "tools/a.sh", "#!/bin/sh\necho\n");
+    put(&fixture, "b.sh", "#!/bin/sh\necho\n");
+    git_with(&fixture, &["add", "tools"], &inherited);
+    let untracked = git_output_with(
+        &fixture,
+        &["ls-files", "--others", "--exclude-standard"],
+        &inherited,
+    )
+    .stdout;
+    assert_eq!(untracked, b"b.sh\n");
 }
 
 #[test]

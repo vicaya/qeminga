@@ -28,6 +28,8 @@ while IFS= read -r var; do
     unset "$var"
 done < <(git rev-parse --local-env-vars)
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+# Nor the per-user excludes file, read even without a global config.
+export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.excludesFile GIT_CONFIG_VALUE_0=/dev/null
 
 # in_scratch DIR: refuses (exit 2) unless DIR's index is its own, inside
 # the scratch area; checked before every git write.

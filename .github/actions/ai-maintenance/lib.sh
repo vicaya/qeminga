@@ -227,6 +227,34 @@ ai_printable() { local t=${1//[[:cntrl:]]/?}; printf '%s' "${t:0:200}"; }
 # shorter one would match ordinary code).
 ai_scan_fragments() { jq -c '[.[] | select(length >= 20 and (test("\n") | not))] | unique' <<<"$1"; }
 
+# ai_scan_texts SECRETS_JSON -> the multi-line fragments of 20 or more
+# characters (the whole instructions), matched exactly by ai_contains_text.
+ai_scan_texts() { jq -c '[.[] | select(length >= 20 and test("\n"))] | unique' <<<"$1"; }
+
+# ai_contains_text TEXTS_JSON FILE: success when FILE holds any of the
+# texts (which may span lines) exactly, and when FILE cannot be scanned.
+ai_contains_text() {
+    local texts rc
+    [ "$(jq length <<<"$1" 2>/dev/null)" != 0 ] || return 1
+    texts=$(mktemp) || return 0
+    printf '%s' "$1" >"$texts"
+    jq -Rse --slurpfile t "$texts" '. as $f | any($t[0][]; . as $x | $f | contains($x))' "$2" >/dev/null 2>&1
+    rc=$?
+    rm -f "$texts"
+    [ "$rc" -ne 1 ]
+}
+
+# ai_head_lines FILE LIMIT, ai_tail_lines FILE LIMIT: at most LIMIT bytes
+# from the start (end) of FILE. When FILE is longer, the cut falls at a
+# line end, so that no key (which has no whitespace) or line of the
+# instructions is cut in two and escapes the exact-match scrubber.
+ai_head_lines() {
+    if [ "$(wc -c <"$1")" -le "$2" ]; then cat "$1"; else head -c "$2" "$1" | sed '$d'; fi
+}
+ai_tail_lines() {
+    if [ "$(wc -c <"$1")" -le "$2" ]; then cat "$1"; else tail -c "$2" "$1" | sed '1d'; fi
+}
+
 # ai_regular_file PATH: success for a regular file that is not a symlink.
 # Files an attempt wrote are read only through this check.
 ai_regular_file() { [ -f "$1" ] && [ ! -L "$1" ]; }

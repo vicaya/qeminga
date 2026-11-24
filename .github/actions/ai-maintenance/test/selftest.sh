@@ -57,8 +57,8 @@ provider_install() {
     # What the install step sees: its environment, and whether the run's
     # private files are reachable (only meaningful in real containers).
     env >"$AI_TOOLS_DIR/install.env"
-    for p in "$AI_TOOLS_DIR/../prompt/prompt.md" "$AI_TOOLS_DIR/../attempts.jsonl"; do
-        [ ! -e "$p" ] || echo "visible: $p"
+    for p in "$AI_TOOLS_DIR/../../prompt/prompt.md" "$AI_TOOLS_DIR/../../attempts.jsonl" "$AI_TOOLS_DIR"/../*; do
+        [ ! -e "$p" ] || [ "$p" -ef "$AI_TOOLS_DIR" ] || echo "visible: $p"
     done >"$AI_TOOLS_DIR/install-probe"
 }
 provider_run() {
@@ -78,6 +78,7 @@ provider_run() {
         binleak-*) printf 'GIF89a\0\1\2%s\0\3' "$key" >image.bin; printf 'done\n' >"$final" ;;
         prompt-*) cp "$prompt" "$final"; cat "$prompt" ;;
         quote-*) grep -m1 advisory "$prompt" >notes.txt; printf 'done\n' >"$final" ;;
+        quoteall-*) sed -n '/^## Maintenance instructions$/,$p' "$prompt" | tail -n +3 >notes.txt; printf 'done\n' >"$final" ;;
         quotename-*) : >"notes $(grep -m1 advisory "$prompt" | tr -d '/')"; printf 'done\n' >"$final" ;;
         creds-*) { git config --get-regexp 'extraheader|includeif' || echo "no credentials"; } >"$final" 2>&1 ;;
         symlink-*) ln -sf /etc/hostname "$final" ;;
@@ -101,7 +102,7 @@ provider_run() {
 EOF
 cp "$fakes/claude.sh" "$fakes/gpt.sh"
 cat >"$fakes/broken.sh" <<'EOF'
-provider_install() { echo "cannot install" >&2; return 1; }
+provider_install() { echo partial >"$AI_TOOLS_DIR/partial"; echo "cannot install" >&2; return 1; }
 provider_run() { return 0; }
 EOF
 
@@ -172,7 +173,7 @@ EOF
     check "docker: the attempt sees neither other keys nor the runner" contains "$state/result/summary.md" "probe: 0 problems"
     check "docker: the change comes back as a patch" contains "$state/result/changes.patch" "change by probe"
     check "docker: the CLI install sees neither the prompt nor the run's state" bash -c \
-        '[ -f "$1" ] && [ ! -s "$1" ]' _ "$state/tools/install-probe"
+        '[ -f "$1" ] && [ ! -s "$1" ]' _ "$state/tools/claude/install-probe"
     check "docker: the checkout the run started from is untouched" bash -c \
         '[ -z "$(git -C "$1" status --porcelain)" ] && ! grep -q dirty "$1/file.txt"' _ "$repo"
     [ "$failures" -eq 0 ] || sed 's/^/     | /' "$tmp/docker/log"
@@ -326,6 +327,16 @@ eq "secrets: the instructions and each long line are withheld" \
     '["Rotate the signing keys listed in the private runbook","Never mention the vendor contract renewal date"]' \
     "$(ai_secret_fragments "$instr" | jq -c '.[1:]')"
 
+# Cutting a log to size happens at line ends: a key or a line of the
+# instructions cut in two would escape the exact-match scrubber.
+{ head -c 90 /dev/zero | tr '\0' x; printf '\nyyyyyKEYSECRET123 more\n'; } >"$tmp/cut"
+check "cut: the head of a long log ends at a line end" bash -c \
+    '. "$1/lib.sh"; out=$(ai_head_lines "$2" 100); ! grep -q KEY <<<"$out" && grep -q xxx <<<"$out"' _ "$action" "$tmp/cut"
+{ printf 'pre KEYSECRET123zzzzz\n'; head -c 90 /dev/zero | tr '\0' w; printf '\n'; } >"$tmp/cut2"
+check "cut: the tail of a long log starts at a line start" bash -c \
+    '. "$1/lib.sh"; out=$(ai_tail_lines "$2" 100); ! grep -q "123" <<<"$out" && grep -q www <<<"$out"' _ "$action" "$tmp/cut2"
+eq "cut: a short log is kept whole" "$(cat "$tmp/cut")" "$(ai_head_lines "$tmp/cut" 1000)"
+
 printf 'Error: 429 Too Many Requests\n' >"$tmp/l1"
 printf 'test failed at line 4290\n' >"$tmp/l2"
 check "exhausted: 429 is exhaustion" ai_is_exhausted "$tmp/l1"
@@ -378,6 +389,8 @@ check "run: the timed-out container is removed" grep -q "^rm -f ai-maintenance-"
 
 run_case noinstall '[{"broken":["ok-1","ok-2"]},{"gpt":["ok-3"]}]'
 eq "run: a provider whose CLI will not install is skipped" "0 install-failed install-failed success gpt" "$rc $(results) $(output provider)"
+check "run: ... and its partial installation is discarded" bash -c \
+    '[ ! -e "$1/tools/broken" ] && [ ! -e "$1/tools/partial" ]' _ "$state"
 
 run_case nobuild '[{"claude":["ok-1"]}]' FAKE_DOCKER_BUILD_FAIL=1
 eq "run: no attempt runs when the sandbox image does not build" "1 failed" "$rc $(output status)"
@@ -417,6 +430,9 @@ check "run: ... no patch is left, and the log does not quote it" bash -c \
     '[ ! -e "$1/result/changes.patch" ] && ! grep -q "advisory" "$2" && grep -q "instructions" "$2"' _ "$state" "$tmp/privquote/log"
 run_case privname '[{"claude":["quotename-1"]}]' AI_INSTRUCTIONS="$secret_instr" AI_PRIVATE_INSTRUCTIONS=true
 eq "run: ... nor one naming a file after a line of them" "1 failed" "$rc $(output status)"
+short_instr=$'Fix the\nflaky tests\nin mod foo,\nthen stop.'
+run_case privwhole '[{"claude":["quoteall-1"]}]' AI_INSTRUCTIONS="$short_instr" AI_PRIVATE_INSTRUCTIONS=true
+eq "run: ... nor one quoting the whole instructions, made of short lines" "1 failed" "$rc $(output status)"
 run_case pubquote '[{"claude":["quote-1"]}]' AI_INSTRUCTIONS="$secret_instr"
 eq "run: public instructions may be quoted in the change itself" "0 changed" "$rc $(output status)"
 
@@ -446,27 +462,45 @@ eq "run: a bad model in a later pool entry stops the run before any attempt" "2 
 
 # The real Codex and Antigravity adapters, with fake CLIs: the effort they
 # actually used is what the result reports.
+# They are installed through their own provider_install, by a fake npm and
+# a fake download.
 real=$action/providers
-mkdir -p "$tmp/codex/state/tools/codex/node_modules/.bin" "$tmp/agy/state/tools/agy"
-printf '@openai/codex@0.167.0\n' >"$tmp/codex/state/tools/codex/.installed"
-cat >"$tmp/codex/state/tools/codex/node_modules/.bin/codex" <<'EOF'
+pkgs=$tmp/pkgs
+mkdir -p "$pkgs"
+cat >"$bin/npm" <<EOF
+#!/usr/bin/env bash
+prefix= spec=
+while [ \$# -gt 0 ]; do case "\$1" in --prefix) prefix=\$2; shift ;; -*) ;; install) ;; *) spec=\$1 ;; esac; shift; done
+name=\${spec%@*}; name=\${name##*/}
+mkdir -p "\$prefix/node_modules/.bin" && cp "$pkgs/\$name" "\$prefix/node_modules/.bin/\$name"
+EOF
+cat >"$bin/curl" <<EOF
+#!/usr/bin/env bash
+out=
+while [ \$# -gt 0 ]; do case "\$1" in -o) out=\$2; shift ;; https://*) url=\$1 ;; esac; shift; done
+cp "$pkgs/\${url##*/}" "\$out"
+EOF
+chmod +x "$bin/npm" "$bin/curl"
+cat >"$pkgs/codex" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$AI_ATTEMPT_DIR/codex.args"
 while [ $# -gt 0 ]; do [ "$1" = -o ] && printf 'Codex done\n' >"$2"; shift; done
 EOF
-cat >"$tmp/agy/state/tools/agy/agy" <<'EOF'
+cat >"$pkgs/agy" <<'EOF'
 #!/usr/bin/env bash
 effort=
 while [ $# -gt 0 ]; do [ "$1" = --effort ] && effort=$2; shift; done
 if [ "$effort" = max ]; then echo 'Error: model "m" has no "max" effort (available: low, high)' >&2; exit 3; fi
 printf '{"event":"result","result":{"status":"OK","response":"Gemini done at %s"}}\n' "$effort"
 EOF
-chmod +x "$tmp/codex/state/tools/codex/node_modules/.bin/codex" "$tmp/agy/state/tools/agy/agy"
+chmod +x "$pkgs/codex" "$pkgs/agy"
+agy_sha=$(sha512sum "$pkgs/agy" | cut -d' ' -f1)
 run_case codex '[{"gpt":{"keys":["sk-x"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real"
 check "codex: max is passed as xhigh, and reported as used" bash -c \
     'grep -qx "model_reasoning_effort=\"xhigh\"" "$1/attempt-1/out/codex.args" && [ "$(jq -r .effort "$1/result/meta.json")" = xhigh ] &&
      [ "$(jq -r "[.effort, .effort_used] | join(\" \")" "$1/attempts.jsonl")" = "max xhigh" ]' _ "$state"
-run_case agy '[{"gemini":{"keys":["g-x"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" GITHUB_STEP_SUMMARY="$tmp/agy-summary.md"
+run_case agy '[{"gemini":{"keys":["g-x"],"model":"m max"}}]' AI_PROVIDERS_DIR="$real" GITHUB_STEP_SUMMARY="$tmp/agy-summary.md" \
+    AGY_DOWNLOAD_URL=https://example.invalid/dl/agy AGY_SHA512="$agy_sha"
 check "agy: an effort the model lacks steps down, and the step is reported" bash -c \
     '[ "$(jq -r .effort "$1/result/meta.json")" = high ] && grep -q "Gemini done at high" "$1/result/summary.md" &&
      grep -q "| max (used high) |" "$2"' _ "$state" "$tmp/agy-summary.md"
@@ -486,11 +520,19 @@ export -f raw_commands
 run_case install '[{"claude":["noop-1"]}]'
 check "run: the CLI is installed in a container without a key, the prompt or the run's state" bash -c '
     grep "install.sh" "$1" >"$1.install" && [ "$(wc -l <"$1.install")" = 1 ] &&
-    grep -q -- "-v $2/tools:$2/tools " "$1.install" && ! grep -qE -- "-v $2/(prompt|attempt|logs)" "$1.install" &&
-    ! grep -qE -- "-v $2(:| )" "$1.install" && ! grep -q AI_ATTEMPT_KEY "$1.install" &&
+    grep -q -- "-v $2/tools/claude:$2/tools/claude " "$1.install" && ! grep -qE -- "-v $2/(prompt|attempt|logs)" "$1.install" &&
+    ! grep -qE -- "-v $2(/tools)?(:| )" "$1.install" && ! grep -q AI_ATTEMPT_KEY "$1.install" &&
     grep -q -- "--cap-drop ALL" "$1.install" &&
-    ! grep -qE "^(AI_KEY_POOL|AI_INSTRUCTIONS|AI_ATTEMPT_KEY)=" "$2/tools/install.env"' _ "$tmp/install/docker.log" "$state"
+    ! grep -qE "^(AI_KEY_POOL|AI_INSTRUCTIONS|AI_ATTEMPT_KEY)=" "$2/tools/claude/install.env"' _ "$tmp/install/docker.log" "$state"
 check "run: ... and its output is kept in the attempt's install log" bash -c '[ -f "$1/attempt-1/install.log" ]' _ "$state"
+check "run: ... and its container is removed whatever happened" bash -c \
+    'n=$(grep "install.sh" "$1" | sed -n "s/.* --name \([^ ]*\) .*/\1/p"); [ -n "$n" ] && grep -qx "rm -f $n" "$1"' _ "$tmp/install/docker.log"
+run_case twoproviders '[{"claude":["quota-1"]},{"gpt":["noop-2"]}]'
+check "run: each provider installs into, and its attempts see, only its own tools directory" bash -c '
+    grep "install.sh" "$1" | grep "providers/gpt.sh\|/gpt.sh" >"$1.gi" && grep "attempt.sh" "$1" | grep "/gpt.sh" >"$1.ga" &&
+    grep -q -- "-v $2/tools/gpt:$2/tools/gpt " "$1.gi" && grep -q -- "-v $2/tools/gpt:$2/tools/gpt:ro " "$1.ga" &&
+    ! grep -q "tools/claude" "$1.gi" && ! grep -q "tools/claude" "$1.ga" && ! grep -qE -- "-v $2/tools(:| )" "$1"' \
+    _ "$tmp/twoproviders/docker.log" "$state"
 
 run_case names '[{"claude":["namesfail-1"]},{"gpt":["names-2"]}]' AI_FALLBACK_ON=any
 check "run: uploaded logs carry only fixed file names, for failed attempts too" bash -c '
@@ -566,7 +608,10 @@ done
 case "$sub" in
     api) f="$FAKE_GH/$(printf '%s' "${path%%\?*}" | tr '/' '_').json"
          [ -f "$f" ] || { echo "[]" >"$f"; }
-         jq -c "$filter" "$f" ;;
+         printf '%s\n' "${path%%\?*}" >>"$FAKE_GH/api-calls"
+         jq -c "$filter" "$f"
+         # A file's next version, if any, is what the following read sees.
+         [ ! -f "$f.next" ] || mv "$f.next" "$f" ;;
     pr) printf '%s\n' "${args[*]}" >>"$FAKE_GH/calls"
         case "${args[0]}" in
             create) echo "https://github.com/o/r/pull/42" ;;
@@ -612,7 +657,8 @@ watch() { # extra env...
 pr_json open ai-maintenance/20260201-1 o/r
 watch TRUSTED_BOTS="copilot-pull-request-reviewer[bot]"
 eq "watch: trusted feedback is reported up to its newest item" "0 feedback 2026-02-01T10:04:00Z#c-00000000000000000012" \
-    "$rc $(output status) $(output until)"
+    "$rc $(output status) $(output until | cut -d'|' -f1)"
+all_until=$(output until)
 fb=$tmp/feedback-out.md
 check "watch: owners, collaborators and listed bots count" bash -c \
     'grep -q "Please split this" "$1" && grep -q "Typo here" "$1" && grep -q "src/a.rs. line 12" "$1" && grep -q "Bot review" "$1"' _ "$fb"
@@ -623,13 +669,19 @@ check "watch: bots count only when listed" bash -c '! grep -q "Bot review" "$1"'
 watch SINCE="2026-02-01T10:04:00Z#c-00000000000000000011"
 check "watch: an item at the same second as the last one handed over is still new" bash -c \
     'grep -q "Same second" "$1" && ! grep -q "Typo here" "$1"' _ "$fb"
-watch FEEDBACK_BUDGET=600
-check "watch: within the size budget only whole items are handed over" bash -c \
-    'grep -q "Please split this" "$1" && ! grep -q "Same second" "$1" && grep -q "more feedback" "$1"' _ "$fb"
-eq "watch: ... and the cursor stops at the last one handed over" "2026-02-01T10:00:00Z#r-00000000000000000002" "$(output until)"
-watch FEEDBACK_BUDGET=600 SINCE="$(output until)"
-check "watch: the next round picks up where the last stopped" bash -c \
-    'grep -q "Typo here" "$1" && ! grep -q "Please split this" "$1"' _ "$fb"
+# Edits: an item handed over in full and edited afterwards comes again.
+watch SINCE="$all_until"
+eq "watch: nothing new after everything was handed over" "quiet" "$(output status)"
+cp "$gh_dir/repos_o_r_pulls_7_comments.json" "$tmp/comments7.json"
+jq '(.[] | select(.id == 11)) |= (.body = "Typo here, and rename it" | .updated_at = "2026-02-01T12:00:00Z")' \
+    "$tmp/comments7.json" >"$gh_dir/repos_o_r_pulls_7_comments.json"
+watch SINCE="$all_until"
+check "watch: an item edited after it was handed over is handed over again" bash -c \
+    '[ "$2" = feedback ] && grep -q "and rename it" "$1" && grep -q "inline comment, updated" "$1" && ! grep -q "Please split this\|Same second" "$1"' \
+    _ "$fb" "$(output status)"
+watch SINCE="$(output until)"
+eq "watch: ... once" "quiet" "$(output status)"
+cp "$tmp/comments7.json" "$gh_dir/repos_o_r_pulls_7_comments.json"
 watch SINCE=2026-03-01T00:00:00Z
 eq "watch: no new feedback for the quiet period ends the watch" "0 quiet" "$rc $(output status)"
 pr_json closed ai-maintenance/20260201-1 o/r
@@ -661,10 +713,58 @@ while [ "$rounds" -lt 6 ]; do
     grep -q "Small one after" "$fb" && break
     since=$(output until)
 done
+final_until=$(output until | cut -d'|' -f1)
 eq "watch: an item larger than the budget arrives in pieces within the budget" "ok" "$sizes"
 eq "watch: ... resuming where each round stopped, until all of it and what follows are handed over" \
     "3 START150000END 2026-02-02T09:01:00Z#c-00000000000000000032" \
-    "$rounds $(head -c 5 "$got")$(tr -cd y <"$got" | wc -c)$(tail -c 3 "$got") $(output until)"
+    "$rounds $(head -c 5 "$got")$(tr -cd y <"$got" | wc -c)$(tail -c 3 "$got") $final_until"
+
+# The budget holds exactly, down to the smallest one allowed; a smaller one
+# is a configuration error that names the minimum.
+# (The minimum depends on the introduction, which names the PR: 10 and 9
+# below, whose minimum is one byte lower, use the one for 10.)
+pr_json open ai-maintenance/20260203-2 o/r 10
+watch PR=10 FEEDBACK_BUDGET=100
+min=$(sed -n 's/.*FEEDBACK_BUDGET must be at least \([0-9]*\).*/\1/p' "$tmp/watch.log")
+check "watch: a budget too small for the headings is a configuration error naming the minimum" \
+    bash -c '[ "$1" = 2 ] && [ -n "$2" ] && [ "$2" -gt 100 ]' _ "$rc" "$min"
+mkcomments() { # pr file count size letter [updated]
+    jq -n --argjson n "$3" --argjson size "$4" --arg l "$5" --arg u "${6:-}" '[range($n) as $i | {id: (40 + $i),
+        user: {login: "carol"}, author_association: "COLLABORATOR", body: ("[\($i)]" + ($l * $size)), path: "src/x.rs", line: 1,
+        created_at: "2026-02-03T09:0\($i):00Z", updated_at: (if $u == "" then "2026-02-03T09:0\($i):00Z" else $u end), html_url: "u"}]' \
+        >"$gh_dir/repos_o_r_pulls_$1_$2.json"
+}
+pr_json open ai-maintenance/20260203-1 o/r 9
+mkcomments 9 comments 3 200 a
+watch PR=9 FEEDBACK_BUDGET="$min" SINCE=2026-02-03T00:00:00Z
+check "watch: at the smallest budget, whole items that fit are handed over, and no more" bash -c \
+    'grep -q "^\[0\]a" "$1" && ! grep -q "^\[1\]" "$1" && [ "$(wc -c <"$1")" -le "$2" ]' _ "$fb" "$min"
+watch PR=9 FEEDBACK_BUDGET="$min" SINCE="$(output until)"
+check "watch: ... and the next round picks up where the last stopped" bash -c \
+    'grep -q "^\[1\]a" "$1" && ! grep -q "^\[0\]" "$1"' _ "$fb"
+
+pr_json open ai-maintenance/20260203-2 o/r 10
+mkcomments 10 comments 1 2000 A
+watch PR=10 FEEDBACK_BUDGET="$min" SINCE=2026-02-03T00:00:00Z
+check "watch: one item larger than a small budget is cut to fit it exactly" bash -c \
+    '[ "$(wc -c <"$1")" -le "$2" ] && grep -q "^\[0\]AAAA" "$1" && grep -q "continued in the next round" "$1"' _ "$fb" "$min"
+first=$(grep -o '^\[0\]A*' "$fb")
+# The comment is rewritten before the next round: it starts over, in full.
+mkcomments 10 comments 1 2000 B 2026-02-03T10:00:00Z
+watch PR=10 FEEDBACK_BUDGET="$min" SINCE="$(output until)"
+check "watch: a partly handed-over item that was edited starts over from its beginning" bash -c \
+    '[ -n "$3" ] && [ "${#3}" -lt 2003 ] && grep -q "^\[0\]BBBB" "$1" && grep -q "inline comment, updated" "$1" && [ "$(wc -c <"$1")" -le "$2" ]' \
+    _ "$fb" "$min" "$first"
+
+# The settle period starts over when an item is edited while it runs.
+pr_json open ai-maintenance/20260203-3 o/r 11
+mkcomments 11 comments 1 10 c
+mkcomments 11 comments.json 1 10 d 2026-02-03T11:00:00Z
+mv "$gh_dir/repos_o_r_pulls_11_comments.json.json" "$gh_dir/repos_o_r_pulls_11_comments.json.next"
+: >"$gh_dir/api-calls"
+watch PR=11 SINCE=2026-02-03T00:00:00Z
+check "watch: an edit during the settle period is waited out and handed over" bash -c \
+    'grep -q "^\[0\]dddd" "$1" && [ "$(grep -c "pulls/11/comments" "$2")" = 3 ]' _ "$fb" "$gh_dir/api-calls"
 
 # --- gate.sh ------------------------------------------------------------------------
 gate() { # max

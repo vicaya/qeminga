@@ -54,7 +54,10 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    handed over in whole items up to 60,000 bytes per round; whatever does
    not fit is picked up by the next round, which starts after the last item
    handed over. A single item larger than that goes over in pieces, each
-   round continuing where the last stopped.
+   round continuing where the last stopped (or starting it over, if it was
+   edited meanwhile). A comment edited after it was handed over, or
+   submitted late as part of a pending review, is handed over again, and
+   an edit during the settle period restarts it.
 4. **Back to nightly.** The loop ends after `AI_MAINTENANCE_QUIET_MINUTES`
    (default 90) without feedback, when the pull request is closed or merged,
    or after `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` (default 5) rounds. By
@@ -83,8 +86,11 @@ nothing it downloads. Each attempt runs in its own container:
   next.
 - **Installs see nothing.** Each provider's CLI is installed (npm lifecycle
   scripts and downloads included) in a container of its own that sees only
-  the tools directory: no key, no prompt, no other file of the run. Only
-  the version pins the adapter names reach it.
+  that provider's own tools directory, created fresh for the run: no key,
+  no prompt, no other file of the run, no other provider's tools. Only the
+  version pins the adapter names reach it. That provider's attempts, and
+  only they, mount the directory read-only. The install container is
+  removed whatever happens, and a failed installation is discarded.
 - **No privileges.** The agent runs as an unprivileged user (never root,
   even on a root runner), without capabilities and with `no-new-privileges`.
   It can't install packages, so the image's setup installs everything the
@@ -124,7 +130,10 @@ Around the agent job:
   `true`. The PR description and replies are then a fixed text, the
   agent's output stays off the job log, and no transcripts are uploaded.
   A change that quotes a line of the instructions (20 or more characters)
-  in a file's contents or name is refused. What the instructions ask for
+  in a file's contents or name, or the whole instructions in a file, is
+  refused. Uploaded logs and log excerpts are cut to size at line ends,
+  so a key or a line of the instructions is never cut in two before it is
+  withheld. What the instructions ask for
   can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
   comments (possible prompt injection in a public repository) are ignored.
@@ -297,8 +306,9 @@ Copy [`providers/TEMPLATE.sh.example`](providers/TEMPLATE.sh.example) to
 
 Both run in containers of the sandbox image, as an unprivileged user.
 `provider_install` runs in one with network access and the runner's
-`node` and `npm`, but no key and no file of the run: only `$AI_TOOLS_DIR`
-is mounted, writable, and attempts later see it read-only. Of the runner's
+`node` and `npm`, but no key and no file of the run: only `$AI_TOOLS_DIR`,
+a fresh directory for this provider, is mounted, writable, and only this
+provider's attempts later see it, read-only. Of the runner's
 environment it gets only the variables listed in `PROVIDER_INSTALL_ENV`
 (version pins). `provider_run` runs inside the attempt's container, where
 `$AI_ATTEMPT_DIR` is the writable output directory and `node` is on

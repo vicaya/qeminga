@@ -8,7 +8,8 @@
 #
 # Isolation: this script holds the pool and runs neither agent code nor
 # anything it downloads. Each provider's CLI is installed in a container
-# that sees only the tools directory; each attempt gets its own container
+# that sees only that provider's own, fresh tools directory, which only
+# that provider's attempts then see, read-only; each attempt gets its own container
 # from an image built once per run, with only its own key, its own copy of
 # the checkout and an output directory; nothing of the runner (its files,
 # processes, credentials or the other keys) is visible inside, and the
@@ -83,8 +84,9 @@ attempt_timeout=${AI_ATTEMPT_TIMEOUT:-60m}
 providers_dir=$(cd "${AI_PROVIDERS_DIR:-$here/providers}" && pwd) || exit 2
 state=${AI_STATE_DIR:-${RUNNER_TEMP:-/tmp}/ai-maintenance}
 mkdir -p "$state" && state=$(cd "$state" && pwd) || exit 2
-export AI_TOOLS_DIR=$state/tools
-mkdir -p "$AI_TOOLS_DIR" || exit 2
+# One tools directory per provider, created by this run.
+tools_root=$state/tools
+{ rm -rf "$tools_root" && mkdir -p "$tools_root"; } || exit 2
 image=${AI_SANDBOX_IMAGE:-ubuntu:24.04}
 case "$image" in
     '' | *[!A-Za-z0-9._/:@-]*) ai_log "AI_SANDBOX_IMAGE must be an image reference"; exit 2 ;;
@@ -146,7 +148,7 @@ suspend_commands() {
 resume_commands() { [ "${GITHUB_ACTIONS:-}" != true ] || printf '\n::%s::\n' "$command_token"; }
 show_capture() { # FILE: the end of a captured output, scrubbed
     suspend_commands
-    tail -c 100000 "$1" | ai_scrub "$secrets"
+    ai_tail_lines "$1" 100000 | ai_scrub "$secrets"
     resume_commands
 }
 
@@ -223,11 +225,13 @@ adapter_var() (
     printf '%s' "${!2:-}"
 )
 
-# install_cli ADAPTER LOG: installs the provider's CLI into AI_TOOLS_DIR,
-# in a container that sees nothing else of the run (no key, no prompt, no
-# state), with only the variables the adapter lists in PROVIDER_INSTALL_ENV.
+# install_cli ADAPTER TOOLS LOG: installs the provider's CLI into TOOLS, a
+# fresh directory of its own, in a container that sees nothing else of the
+# run (no key, no prompt, no state, no other provider's tools), with only
+# the variables the adapter lists in PROVIDER_INSTALL_ENV. The container is
+# removed whatever happens, and a failed installation is discarded.
 install_cli() {
-    local v
+    local v name rc
     local -a pass=()
     for v in $(adapter_var "$1" PROVIDER_INSTALL_ENV); do
         case "$v" in
@@ -237,17 +241,24 @@ install_cli() {
         case "$v" in AI_*) continue ;; esac
         [ -z "${!v+x}" ] || pass+=(-e "$v")
     done
-    own "$AI_TOOLS_DIR" || return 1
-    container_args "ai-maintenance-${GITHUB_RUN_ID:-local}-$$-install-$n" /tmp
-    docker_args+=(-e "AI_TOOLS_DIR=$AI_TOOLS_DIR" -e HOME=/tmp/ai-maintenance-home
-        -v "$AI_TOOLS_DIR:$AI_TOOLS_DIR" "${providers_args[@]}" "${node_args[@]}" "${npm_args[@]}" "${pass[@]}"
+    { rm -rf "$2" && mkdir -p "$2" && own "$2"; } || return 1
+    name=ai-maintenance-${GITHUB_RUN_ID:-local}-$$-install-$n
+    container_args "$name" /tmp
+    docker_args+=(-e "AI_TOOLS_DIR=$2" -e HOME=/tmp/ai-maintenance-home
+        -v "$2:$2" "${providers_args[@]}" "${node_args[@]}" "${npm_args[@]}" "${pass[@]}"
         "$image_tag" bash "$here/install.sh" "$1")
-    timeout --kill-after=30s "${AI_INSTALL_TIMEOUT:-20m}" docker "${docker_args[@]}" >"$2" 2>&1
+    timeout --kill-after=30s "${AI_INSTALL_TIMEOUT:-20m}" docker "${docker_args[@]}" >"$3" 2>&1
+    rc=$?
+    # Stopping the client does not stop the container: it is removed before
+    # anything else runs, so nothing keeps writing to the directory.
+    docker rm -f "$name" >/dev/null 2>&1
+    [ "$rc" -eq 0 ] || rm -rf "$2"
+    return "$rc"
 }
 
 # --- attempts -------------------------------------------------------------
 n=0 winner='' winner_model='' winner_effort='' winner_dir=''
-declare -A install_failed=()
+declare -A install_failed=() installed=()
 while IFS=$'\t' read -r entry keyidx provider; do
     [ -n "$entry" ] || continue
     n=$((n + 1))
@@ -274,7 +285,12 @@ while IFS=$'\t' read -r entry keyidx provider; do
     case "$transcript" in '' | .* | *[!A-Za-z0-9._-]*) transcript='' ;; esac
     printf '%s\n' "$transcript" >"$dir/transcript-name"
 
-    if ! install_cli "$adapter" "$dir/install.log"; then
+    tools=$tools_root/$adapter_name
+    if [ -n "${installed[$adapter_name]:-}" ]; then
+        printf 'installed by an earlier attempt of this run\n' >"$dir/install.log"
+    elif install_cli "$adapter" "$tools" "$dir/install.log"; then
+        installed[$adapter_name]=1
+    else
         show_capture "$dir/install.log" >&2
         ai_log "attempt $n: could not install the $adapter_name CLI; skipping its keys"
         install_failed[$adapter_name]=1
@@ -290,9 +306,9 @@ while IFS=$'\t' read -r entry keyidx provider; do
     group "attempt $n: $label${model:+ model $model}${effort:+ effort $effort}"
     cname=ai-maintenance-${GITHUB_RUN_ID:-local}-$$-$n
     container_args "$cname" "$dir/tree/$subdir"
-    docker_args+=(-e AI_ATTEMPT_KEY -e "AI_ATTEMPT_DIR=$dir/out" -e "AI_TOOLS_DIR=$AI_TOOLS_DIR"
+    docker_args+=(-e AI_ATTEMPT_KEY -e "AI_ATTEMPT_DIR=$dir/out" -e "AI_TOOLS_DIR=$tools"
         -e "HOME=$dir/out/home" -v "$dir/tree:$dir/tree" -v "$dir/out:$dir/out"
-        -v "$AI_TOOLS_DIR:$AI_TOOLS_DIR:ro" -v "$prompt_dir:$prompt_dir:ro"
+        -v "$tools:$tools:ro" -v "$prompt_dir:$prompt_dir:ro"
         "${providers_args[@]}" "${node_args[@]}" "$image_tag"
         bash "$here/attempt.sh" "$adapter" "$prompt" "$model" "$options" "$effort")
     # The key reaches docker through its environment, never its arguments.
@@ -375,9 +391,9 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 logs=$state/logs
 rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
-upload() { # SOURCE DEST
+upload() { # SOURCE DEST: scrubbed, at most 20 MB, cut at a line end
     ai_regular_file "$1" || return 0
-    head -c 20000000 "$1" | ai_scrub "$secrets" >"$2"
+    ai_head_lines "$1" 20000000 | ai_scrub "$secrets" >"$2"
 }
 if [ "$private" = false ]; then
     for d in "$state"/attempt-*; do
@@ -452,8 +468,11 @@ if [ -s "$export_dir/changes.patch" ]; then
     ai_contains_key "$keys" "$result_dir/changes.patch" && refuse "the patch contains an API key from the pool"
     # Private instructions: the change may not quote a line of them either
     # (in its text, a file's contents or a file name).
-    quoted='[]'
-    [ "$private" = false ] || quoted=$(ai_scan_fragments "$secrets")
+    quoted='[]' quoted_whole='[]'
+    if [ "$private" = true ]; then
+        quoted=$(ai_scan_fragments "$secrets")
+        quoted_whole=$(ai_scan_texts "$secrets")
+    fi
     ai_contains_key "$quoted" "$result_dir/changes.patch" && refuse "the patch quotes the private instructions"
     verify=$state/verify
     { rm -rf "$verify" && cp -a "$top/." "$verify" && git -C "$verify" update-index -q --refresh; } ||
@@ -476,7 +495,8 @@ if [ -s "$export_dir/changes.patch" ]; then
         git -C "$verify" cat-file blob "$sha" >"$state/blob" ||
             refuse "could not read the new contents of $(ai_printable "$path")"
         ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key from the pool"
-        ai_contains_key "$quoted" "$state/blob" && refuse "a changed file quotes the private instructions"
+        { ai_contains_key "$quoted" "$state/blob" || ai_contains_text "$quoted_whole" "$state/blob"; } &&
+            refuse "a changed file quotes the private instructions"
     done <"$changed"
     rm -rf "$verify" "$state/blob" "$changed" "$state/names"
 else

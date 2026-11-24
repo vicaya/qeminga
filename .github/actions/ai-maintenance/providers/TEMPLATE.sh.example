@@ -4,8 +4,8 @@
 # the helpers in lib.sh (ai_log, ai_npm_install, ai_report_effort) and
 # these variables:
 #
-#   AI_TOOLS_DIR     install CLIs here (shared across attempts of one run;
-#                    read-only during attempts)
+#   AI_TOOLS_DIR     install CLIs here: this provider's own directory,
+#                    fresh for the run, read-only during its attempts
 #   AI_ATTEMPT_DIR   writable output directory of this attempt (outside the
 #                    checkout)
 #

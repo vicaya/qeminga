@@ -31,7 +31,8 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    container image (your repository setup on top of `container-image`) and
    the prompt from [`preamble.md`](preamble.md) and the instructions, then
    tries the pool's keys in routing order. Each attempt installs the
-   provider's CLI on the runner if needed and runs it in a fresh container,
+   provider's CLI if needed (in a container without keys) and runs it in a
+   fresh container,
    on a fresh copy of the checkout, with that single key. If the attempt
    fails with an exhaustion error (quota, rate limit, billing, overload, or
    an invalid or revoked key), the next key is tried. Any other failure ends
@@ -52,7 +53,8 @@ nightly (schedule)                      review round (workflow_dispatch, mode=re
    Each push starts a new watch, so the quiet period restarts. Feedback is
    handed over in whole items up to 60,000 bytes per round; whatever does
    not fit is picked up by the next round, which starts after the last item
-   handed over.
+   handed over. A single item larger than that goes over in pieces, each
+   round continuing where the last stopped.
 4. **Back to nightly.** The loop ends after `AI_MAINTENANCE_QUIET_MINUTES`
    (default 90) without feedback, when the pull request is closed or merged,
    or after `AI_MAINTENANCE_MAX_REVIEW_ROUNDS` (default 5) rounds. By
@@ -66,8 +68,8 @@ other workflows post with their `GITHUB_TOKEN`, which trigger no workflow
 
 ### Isolation
 
-The job that holds the API keys runs no agent code on the runner. Each
-attempt runs in its own container:
+The job that holds the API keys runs no agent code on the runner, and
+nothing it downloads. Each attempt runs in its own container:
 
 - **Only its own key.** The pool stays with `run.sh` on the runner. The
   container receives one key, through the environment, and nothing else:
@@ -76,9 +78,13 @@ attempt runs in its own container:
   service's included). A failure or a hostile change in one attempt can't
   reach the keys of another.
 - **A fresh start.** Every attempt gets a new container from the image built
-  for the run and a new copy of the checkout. The CLIs are installed on the
-  runner and mounted read-only, as is the action itself, so nothing one
-  attempt changes survives into the next.
+  for the run and a new copy of the checkout. The CLIs and the action itself
+  are mounted read-only, so nothing one attempt changes survives into the
+  next.
+- **Installs see nothing.** Each provider's CLI is installed (npm lifecycle
+  scripts and downloads included) in a container of its own that sees only
+  the tools directory: no key, no prompt, no other file of the run. Only
+  the version pins the adapter names reach it.
 - **No privileges.** The agent runs as an unprivileged user (never root,
   even on a root runner), without capabilities and with `no-new-privileges`.
   It can't install packages, so the image's setup installs everything the
@@ -86,11 +92,18 @@ attempt runs in its own container:
 - **Nothing read on the runner's side.** The agent's tree, git
   configuration included, is only read inside a container: a second
   container without a key or network exports the patch. The runner reads
-  only plain files the attempt left, never through a symlink, then checks
-  the patch by applying it to its own copy of the checkout and scanning
-  the patch and every added or modified file's bytes for pool keys. A
-  binary file can't smuggle a key past that scan, and a scan that fails
-  refuses as well.
+  only the plain files it expects the attempt to leave, never through a
+  symlink, and uploads them under names it chooses. It then checks the
+  patch by applying it to its own copy of the checkout and scanning the
+  patch and every added or modified file's bytes for pool keys. A binary
+  file can't smuggle a key past that scan, and a scan that fails refuses
+  as well. A patch that touches `.github/workflows/` is refused (see
+  [Limits](#limits)).
+- **No workflow commands.** Everything a container prints is captured in
+  files on the runner. When it is shown in the job log, the runner's
+  workflow commands (`::add-mask::`, `::set-env::`, ...) are suspended
+  with a one-time token that no container sees, so the agent can't issue
+  any.
 - **No cache.** The agent job restores and saves no cache, so nothing it
   builds can be restored by trusted CI.
 
@@ -128,14 +141,16 @@ with spending limits.
    pinned Rust toolchain that way). The runner needs Docker, which
    GitHub-hosted Linux runners have. Keep `container-image` on the runner's
    C library (the default `ubuntu:24.04` matches `ubuntu-24.04` runners):
-   the runner's Node.js and the provider CLIs are mounted into it.
+   the runner's Node.js and the provider CLIs are mounted into it. The
+   checkout must be a plain clone (`actions/checkout` makes one), not a
+   linked worktree.
 3. Add the secrets (Settings → Secrets and variables → Actions):
 
    | Secret | Required | Content |
    |---|---|---|
    | `AI_MAINTENANCE_PROMPT` | yes | The maintenance instructions, in Markdown. |
    | `AI_KEY_POOL` | yes | The key pool, as JSON (see [below](#key-pool)). |
-   | `AI_MAINTENANCE_TOKEN` | recommended | A GitHub App token or fine-grained PAT with *Contents* and *Pull requests* read/write on this repository. Branches pushed and pull requests opened with the default `GITHUB_TOKEN` start no workflows, so **CI would not run on the maintenance pull request** without it. |
+   | `AI_MAINTENANCE_TOKEN` | recommended | A GitHub App token or fine-grained PAT with *Contents* and *Pull requests* read/write on this repository, and nothing else: **not** *Workflows* (see [Limits](#limits)). Branches pushed and pull requests opened with the default `GITHUB_TOKEN` start no workflows, so **CI would not run on the maintenance pull request** without it. |
 
 4. Allow the workflow to open pull requests: Settings → Actions → General →
    Workflow permissions → **Allow GitHub Actions to create and approve pull
@@ -271,36 +286,47 @@ in the job's environment.
 Copy [`providers/TEMPLATE.sh.example`](providers/TEMPLATE.sh.example) to
 `providers/<name>.sh` and implement two functions:
 
-- `provider_install` installs the CLI. It must be idempotent and pin a
-  version.
+- `provider_install` installs the CLI into `$AI_TOOLS_DIR`. It must be
+  idempotent and pin a version.
 - `provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT` runs the
   agent headless in the checkout, writes its final message to
   `FINAL_FILE`, and returns 0 only on success.
 
-`provider_install` runs on the runner, with no key, and installs into
-`$AI_TOOLS_DIR`, which attempts see read-only. `provider_run` runs inside
-the attempt's container, where `$AI_ATTEMPT_DIR` is the writable output
-directory and `node` is on `PATH`. If the CLI runs with a different effort
-than the one requested, call `ai_report_effort LEVEL` so the result reports
-it.
+Both run in containers of the sandbox image, as an unprivileged user.
+`provider_install` runs in one with network access and the runner's
+`node` and `npm`, but no key and no file of the run: only `$AI_TOOLS_DIR`
+is mounted, writable, and attempts later see it read-only. Of the runner's
+environment it gets only the variables listed in `PROVIDER_INSTALL_ENV`
+(version pins). `provider_run` runs inside the attempt's container, where
+`$AI_ATTEMPT_DIR` is the writable output directory and `node` is on
+`PATH`. If the CLI runs with a different effort than the one requested,
+call `ai_report_effort LEVEL` so the result reports it.
 
-Optionally, set `PROVIDER_EXHAUSTED_REGEX` to extra error patterns that mean
-"try the next key". If the CLI is a variant of one already listed, an alias
-in `ai_canonical_provider` (`lib.sh`) is enough.
+Optional settings in the adapter:
+
+- `PROVIDER_EXHAUSTED_REGEX`: extra error patterns that mean "try the next
+  key".
+- `PROVIDER_INSTALL_ENV`: the runner variables `provider_install` reads.
+- `PROVIDER_TRANSCRIPT`: the file in `$AI_ATTEMPT_DIR` holding the CLI's
+  transcript, uploaded as `transcript.jsonl`. The uploaded logs hold only
+  `attempt.log`, `install.log`, `final.md`, `error.txt` and that transcript.
+
+If the CLI is a variant of one already listed, an alias in
+`ai_canonical_provider` (`lib.sh`) is enough.
 
 ## Files
 
 | File | Role |
 |---|---|
 | `action.yml`, `run.sh` | Agent run: pool, routing, the sandbox image, attempts, fallback, the checked patch artifact. |
-| `attempt.sh`, `export.sh` | Run inside the containers: one attempt with its key; the patch export, without a key. |
+| `install.sh`, `attempt.sh`, `export.sh` | Run inside the containers: a CLI install, without a key or the run's files; one attempt with its key; the patch export, without a key. |
 | `gate.sh` | Pauses nightly runs while maintenance pull requests are open. |
 | `lib.sh` | Pool and model parsing, routing strategies, aliases, failure classification, scrubbing, the leak scan. |
 | `providers/*.sh` | One adapter per provider. |
 | `preamble.md` | The fixed part of the prompt (unattended-run rules, PR description format). |
 | `watch/action.yml`, `watch.sh` | Polls a pull request for trusted review feedback. |
 | `publish/action.yml`, `publish.sh` | Applies the patch; opens the pull request or pushes and replies. |
-| `test/selftest.sh` | Offline self-test with fake adapters, fake `gh` and `docker` commands and a local remote; `--docker` runs attempts in real containers. |
+| `test/selftest.sh` | Offline self-test with fake adapters, fake `gh` and `docker` commands and a local remote; `--docker` runs attempts in real containers; `--image` builds the repository's sandbox image and runs repository checks in it. |
 
 Run the self-test after changing anything here (it needs bash, git and jq):
 
@@ -316,6 +342,14 @@ and for the runner's files:
 .github/actions/ai-maintenance/test/selftest.sh --docker
 ```
 
+To check the repository setup, build the sandbox image from the workflow's
+`container-setup` and run repository checks in an attempt there (several
+minutes):
+
+```bash
+.github/actions/ai-maintenance/test/selftest.sh --image
+```
+
 ## Limits
 
 - An attempt can use its own API key and the network (see
@@ -323,8 +357,12 @@ and for the runner's files:
 - A review round fails if someone pushes to the PR branch while the agent
   is working, because the patch would no longer apply cleanly. The next
   round (or a human) picks it up.
-- Changes under `.github/workflows/` can only be pushed with a token that
-  has the `workflows` permission. With the default `GITHUB_TOKEN`, such a
-  push is rejected.
+- Changes under `.github/workflows/` are never published: workflow files
+  run with the repository's secrets as soon as they are pushed, so they
+  take a separate, human-reviewed path. The agent run refuses a patch that
+  touches them, the publish job checks again, and the publishing token
+  should not have the *Workflows* permission, so GitHub rejects such a
+  push as well. If maintenance should change a workflow, the agent can
+  describe the change in its final message for a human to make.
 - A watch occupies a runner for up to the quiet period (90 minutes) per
   round.

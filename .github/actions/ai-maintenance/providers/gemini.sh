@@ -12,6 +12,10 @@
 
 # shellcheck disable=SC2034 # read by run.sh
 PROVIDER_EXHAUSTED_REGEX='"retryable":true|unavailable'
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_INSTALL_ENV='AGY_DOWNLOAD_URL AGY_SHA512 AGY_MANIFEST_BASE'
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_TRANSCRIPT=agy.jsonl
 AGY_MANIFEST_BASE=${AGY_MANIFEST_BASE:-https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests}
 
 gemini_dir() { printf '%s/agy' "$AI_TOOLS_DIR"; }

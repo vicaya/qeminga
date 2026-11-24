@@ -6,6 +6,10 @@
 
 # shellcheck disable=SC2034 # read by run.sh
 PROVIDER_EXHAUSTED_REGEX='credit balance is too low|rate_limit_error|overloaded_error|invalid x-api-key'
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_INSTALL_ENV='CLAUDE_CODE_VERSION'
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_TRANSCRIPT=claude.jsonl
 
 claude_dir() { printf '%s/claude' "$AI_TOOLS_DIR"; }
 

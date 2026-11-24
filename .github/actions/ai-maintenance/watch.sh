@@ -13,7 +13,8 @@
 #   PR                               pull request number
 #   SINCE                            feedback up to here is handled: an
 #                                    ISO-8601 time, or the cursor this script
-#                                    output last time ("<time>#<item>")
+#                                    output last time ("<time>#<item>", with
+#                                    "@<offset>" when an item was cut short)
 #   BRANCH_PREFIX                    the PR must come from this repository on
 #                                    a branch with this prefix
 #   QUIET_MINUTES (90)  POLL_SECONDS (300)  SETTLE_SECONDS (300)
@@ -25,7 +26,8 @@
 #
 # Outputs (GITHUB_OUTPUT): status=feedback|quiet|closed|ignored, until (the
 # cursor of the last item handed over, the next round's SINCE), head-ref,
-# head-sha. Items that do not fit the budget are left for the next round.
+# head-sha. Items that do not fit the budget are left for the next round;
+# an item that alone exceeds it is handed over in pieces, one per round.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -49,7 +51,15 @@ MARKER='<!-- ai-maintenance -->'
 # Every item has a cursor "<time>#<kind>-<zero-padded id>"; they sort in
 # the order the items arrived, ties broken by kind and id. A bare time
 # means everything at that time is handled ("~" sorts after any item).
+# "<cursor>@<n>": that item's body was handed over up to character n.
 case "$SINCE" in *'#'*) since=$SINCE ;; *) since="$SINCE#~" ;; esac
+offset=0
+case "${since#*#}" in
+    *@*)
+        offset=${since##*@} since=${since%@*}
+        case "$offset" in '' | *[!0-9]*) ai_log "SINCE: the offset after '@' must be a number"; exit 2 ;; esac
+        ;;
+esac
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
@@ -69,7 +79,7 @@ collect() {
     gh api --paginate "repos/$repo/pulls/$PR/comments?per_page=100" --jq "$project" >"$work/c.jsonl"
     gh api --paginate "repos/$repo/issues/$PR/comments?per_page=100" --jq "$project" >"$work/i.jsonl"
     jq -n --slurpfile r "$work/r.jsonl" --slurpfile c "$work/c.jsonl" --slurpfile i "$work/i.jsonl" \
-        --arg since "$since" --arg assoc "$associations" --arg bots "$bots" --arg marker "$MARKER" '
+        --arg since "$since" --argjson offset "$offset" --arg assoc "$associations" --arg bots "$bots" --arg marker "$MARKER" '
         ($assoc | split(",") | map(ascii_upcase | select(length > 0))) as $assoc
         | ($bots | split(",") | map(select(length > 0))) as $bots
         | def trusted: (.association // "" | ascii_upcase) as $a | (.login // "") as $l
@@ -82,7 +92,10 @@ collect() {
                 | item("r"; "review (\(.state | ascii_downcase | gsub("_"; " ")))") | .path = null | .line = null),
           ($c[] | item("c"; "inline comment")),
           ($i[] | item("i"; "comment") | .path = null | .line = null)
-        ] | map(select(.cursor > $since and trusted and (mine | not))) | sort_by(.cursor)' >"$work/found.json"
+        ] | map(select((.cursor > $since or ($offset > 0 and .cursor == $since)) and trusted and (mine | not))
+                | .offset = 0
+                | if .cursor == $since then .body |= .[$offset:] | .offset = $offset | .kind += ", continued" else . end)
+          | sort_by(.cursor)' >"$work/found.json"
 }
 
 pr_state
@@ -124,29 +137,34 @@ while :; do
             collect
             [ "$(jq -r 'last.cursor' "$work/found.json")" = "$newest" ] && break
         done
-        # Whole items, oldest first, as many as fit the budget (at least
-        # one, cut short if it alone is too long); the cursor of the last
-        # one handed over is where the next round starts.
+        # Whole items, oldest first, as many as fit the budget. When the
+        # first one alone does not fit, as much of its body as fits goes
+        # now and the cursor records where it stopped ("@<offset>"), so the
+        # next round continues it. The cursor is where the next round starts.
         jq --arg intro "$intro" --argjson budget "$budget" '
             def md: "### \(.kind) by @\(.author) at \(.at)"
                 + (if .path then "\n\nOn `\(.path)`" + (if .line then " line \(.line)" else "" end) else "" end)
                 + "\n\n\(.body)\n";
             def cut($n): if utf8bytelength <= $n then . else .[: (length * $n / utf8bytelength | floor)] | cut($n) end;
+            def note: "\n_There is more feedback; it follows in the next round._\n";
             length as $total
-            | reduce .[] as $it ({used: ($intro | utf8bytelength), parts: [], cursor: null, full: false};
+            | reduce .[] as $it ({used: ($intro | utf8bytelength + (note | utf8bytelength)), parts: [],
+                                  cursor: null, full: false, partial: false};
                 if .full then .
-                else ($it | md) as $m
-                | if .used + ($m | utf8bytelength) + 1 <= $budget then
+                else ($it | md) as $m | .used as $used
+                | if $used + ($m | utf8bytelength) + 1 <= $budget then
                       .used += ($m | utf8bytelength) + 1 | .parts += [$m] | .cursor = $it.cursor
                   elif (.parts | length) == 0 then
-                      .parts += [($m | cut([$budget - .used - 64, 256] | max)) + "\n\n[cut short: too long]\n"]
-                      | .cursor = $it.cursor | .full = true
+                      ($it | .body = "" | md | utf8bytelength) as $head
+                      | ($it.body | cut([$budget - $used - $head - 64, 256] | max)) as $chunk
+                      | .parts += [($it | .body = $chunk | md) + "\n[continued in the next round]\n"]
+                      | .cursor = "\($it.cursor)@\($it.offset + ($chunk | length))" | .full = true | .partial = true
                   else .full = true end
                 end)
             | (.parts | length) as $n
-            | {cursor, delivered: $n, remaining: ($total - $n),
-               markdown: (([$intro] + .parts | join("\n"))
-                   + (if $total > $n then "\n_There is more feedback; it follows in the next round._\n" else "" end))}
+            | ($total - $n + (if .partial then 1 else 0 end)) as $left
+            | {cursor, delivered: $n, remaining: $left,
+               markdown: (([$intro] + .parts | join("\n")) + (if $left > 0 then note else "" end))}
         ' "$work/found.json" >"$work/handover.json"
         jq -r .markdown "$work/handover.json" >"$feedback_file"
         ai_log "PR #$PR: $(jq .delivered "$work/handover.json") feedback item(s) handed over, $(jq .remaining "$work/handover.json") left for the next round"

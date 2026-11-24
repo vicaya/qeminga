@@ -70,10 +70,13 @@ ai_normalize_pool() {
     fi
     # Every entry's model setting, parsed exactly as at attempt time, before
     # any attempt runs.
+    # The parser's own message quotes the value, which may hold a key
+    # pasted into the wrong field: only the entry number, the field and the
+    # expected format are shown.
     local i provider
     while IFS=$'\t' read -r i provider; do
-        if ! ai_parse_model_spec "$(jq -r --argjson i "$i" '.[$i].options.model // ""' <<<"$out")" >/dev/null; then
-            ai_log "invalid AI_KEY_POOL: entry $((i + 1)) ($provider) has an invalid \"model\""
+        if ! ai_parse_model_spec "$(jq -r --argjson i "$i" '.[$i].options.model // ""' <<<"$out")" >/dev/null 2>&1; then
+            ai_log "invalid AI_KEY_POOL: entry $((i + 1)) ($provider): \"model\" must be one line of \"<model> [effort]\", the effort one of: $AI_EFFORT_LEVELS"
             return 2
         fi
     done < <(jq -r 'to_entries[] | [.key, .value.provider] | @tsv' <<<"$out")
@@ -195,6 +198,25 @@ ai_secret_fragments() {
         [(trim), (split("\n")[] | trim | select(length >= 20))] | map(select(length > 0))'
 }
 
+# Paths a maintenance change may not touch: workflow files run with the
+# repository's secrets as soon as they are pushed, so they take a separate,
+# reviewed path (see README, Limits). Compared case-insensitively.
+AI_PROTECTED_PATHS=".github/workflows/"
+
+# ai_protected_path PATH: success when PATH is under a protected prefix.
+ai_protected_path() {
+    local p=${1,,} prefix
+    for prefix in $AI_PROTECTED_PATHS; do
+        case "$p" in "${prefix,,}"*) return 0 ;; esac
+    done
+    return 1
+}
+
+# ai_printable TEXT -> TEXT with control characters (newlines included)
+# replaced by "?", at most 200 characters: for names the agent chose
+# (file paths) in log lines, which must stay one line.
+ai_printable() { local t=${1//[[:cntrl:]]/?}; printf '%s' "${t:0:200}"; }
+
 # ai_regular_file PATH: success for a regular file that is not a symlink.
 # Files an attempt wrote are read only through this check.
 ai_regular_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
@@ -271,14 +293,33 @@ ai_model() {
 }
 
 # ai_npm_install DIR SPEC: installs an npm CLI (SPEC = package@version)
-# into DIR once per run; DIR/node_modules/.bin then holds its binary.
+# into DIR once per run; DIR/node_modules/.bin then holds its binary. In
+# the install container, npm is the runner's, mounted as AI_NPM_CLI.
 ai_npm_install() {
     local dir=$1 spec=$2
+    local -a npm=(npm)
+    [ -z "${AI_NPM_CLI:-}" ] || npm=(node "$AI_NPM_CLI")
     if [ -f "$dir/.installed" ] && [ "$(cat "$dir/.installed")" = "$spec" ]; then
         return 0
     fi
-    command -v npm >/dev/null || { ai_log "npm is required to install $spec"; return 1; }
+    command -v "${npm[0]}" >/dev/null || { ai_log "npm is required to install $spec"; return 1; }
     mkdir -p "$dir"
-    npm install --prefix "$dir" --no-audit --no-fund --loglevel=error "$spec" >&2 || return 1
+    "${npm[@]}" install --prefix "$dir" --no-audit --no-fund --loglevel=error "$spec" >&2 || return 1
     printf '%s\n' "$spec" >"$dir/.installed"
+}
+
+# ai_sandbox_env: for the scripts that run inside the sandbox image
+# (attempt.sh, install.sh): loads the variables the image's repository
+# setup left in /etc/ai-maintenance/env (PATH, CARGO_HOME, ...), puts the
+# mounted Node.js first on PATH and creates HOME.
+ai_sandbox_env() {
+    if [ -f /etc/ai-maintenance/env ]; then
+        set -a
+        # shellcheck source=/dev/null
+        . /etc/ai-maintenance/env
+        set +a
+    fi
+    [ -z "${AI_NODE_BIN:-}" ] || PATH=$AI_NODE_BIN:$PATH
+    export PATH
+    mkdir -p "$HOME"
 }

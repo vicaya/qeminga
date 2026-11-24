@@ -6,15 +6,18 @@
 # agent's changes as a patch (result-dir) for publish.sh, which runs in a
 # separate job without the keys. See README.md.
 #
-# Isolation: this script holds the pool and never runs agent code. Each
-# attempt gets its own container from an image built once per run, with
-# only its own key, its own copy of the checkout and an output directory;
-# nothing of the runner (its files, processes, credentials or the other
-# keys) is visible inside, and the agent is an unprivileged user there.
-# The agent's tree, git configuration included, is only ever read inside a
-# container; the runner reads the plain files the attempt left (never
-# through a symlink) and checks the exported patch by applying it to its
-# own copy.
+# Isolation: this script holds the pool and runs neither agent code nor
+# anything it downloads. Each provider's CLI is installed in a container
+# that sees only the tools directory; each attempt gets its own container
+# from an image built once per run, with only its own key, its own copy of
+# the checkout and an output directory; nothing of the runner (its files,
+# processes, credentials or the other keys) is visible inside, and the
+# agent is an unprivileged user there. The agent's tree, git configuration
+# included, is only ever read inside a container; the runner reads the
+# plain files the attempt left (never through a symlink, and only those it
+# expects, under names it chooses) and checks the exported patch by
+# applying it to its own copy. Container output reaches the job log with
+# workflow commands suspended, or not at all with private instructions.
 #
 # Environment:
 #   AI_KEY_POOL            required, JSON (lib.sh)
@@ -92,6 +95,14 @@ candidates=$(ai_route "$pool" "$routing" "${AI_ROUTING_SEED:-${GITHUB_RUN_NUMBER
 
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || { ai_log "not inside a git checkout"; exit 2; }
 top=$(git rev-parse --show-toplevel)
+# Every copy of the checkout must be self-contained. The .git of a linked
+# worktree or a submodule is a file naming a repository elsewhere, which a
+# copy would share: the credential cleanup below would edit the original,
+# and the container would not see it.
+if [ ! -d "$top/.git" ] || [ -L "$top/.git" ] || [ -e "$top/.git/commondir" ]; then
+    ai_log "$top is a linked worktree or a submodule (its .git is not a repository directory); run on a plain clone"
+    exit 2
+fi
 subdir=$(git rev-parse --show-prefix)
 base=$(git rev-parse HEAD)
 out base-sha "$base"
@@ -116,16 +127,34 @@ build_image() {
 FROM $image
 RUN if command -v apt-get >/dev/null; then \\
       apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \\
-        bash ca-certificates git jq procps >/dev/null && rm -rf /var/lib/apt/lists/*; \\
+        bash ca-certificates curl git jq procps >/dev/null && rm -rf /var/lib/apt/lists/*; \\
     fi; mkdir -p /etc/ai-maintenance && touch /etc/ai-maintenance/env
 COPY setup.sh /usr/local/share/ai-maintenance/setup.sh
 RUN --mount=type=bind,from=repo,target=/repo,rw cd /repo && bash -euo pipefail /usr/local/share/ai-maintenance/setup.sh
 EOF
     docker build -t "$image_tag" --build-context repo="$top" "$ctx"
 }
+# Output of anything that ran in a container (or on the checkout, which
+# a review round's agent wrote) reaches the job log only between these:
+# the runner obeys no workflow command ("::...") until it sees the
+# one-time token again, which nothing inside a container is given.
+suspend_commands() {
+    [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+    command_token=$(od -An -N24 -tx1 /dev/urandom | tr -d ' \n')
+    printf '::stop-commands::%s\n' "$command_token"
+}
+resume_commands() { [ "${GITHUB_ACTIONS:-}" != true ] || printf '\n::%s::\n' "$command_token"; }
+show_capture() { # FILE: the end of a captured output, scrubbed
+    suspend_commands
+    tail -c 100000 "$1" | ai_scrub "$secrets"
+    resume_commands
+}
+
 group "building the sandbox image from $image"
-build_image
+suspend_commands
+build_image 2>&1
 build_rc=$?
+resume_commands
 endgroup
 if [ "$build_rc" -ne 0 ]; then
     ai_log "the sandbox image did not build; no attempt was made"
@@ -147,10 +176,16 @@ container_args() { # NAME WORKDIR -> sets docker_args
     docker_args=(run --rm --init --name "$1" --user "$uid_gid" --cap-drop ALL
         --security-opt no-new-privileges -v "$here:$here:ro" -w "$2")
 }
-# The runner's Node.js, for the npm-installed CLIs, as one read-only file.
-node_args=()
+# The runner's Node.js, for the npm-installed CLIs, as one read-only file,
+# and its npm for the install containers.
+node_args=() npm_args=()
 if node=$(command -v node 2>/dev/null) && node=$(readlink -f "$node") && [ -f "$node" ]; then
     node_args=(-v "$node:/opt/ai-maintenance/node/bin/node:ro" -e AI_NODE_BIN=/opt/ai-maintenance/node/bin)
+    if npm_js=$(command -v npm 2>/dev/null) && npm_js=$(readlink -f "$npm_js") && [ -f "$npm_js" ] &&
+        [ "${npm_js##*/}" = npm-cli.js ]; then
+        npm_args=(-v "${npm_js%/bin/npm-cli.js}:/opt/ai-maintenance/npm:ro"
+            -e AI_NPM_CLI=/opt/ai-maintenance/npm/bin/npm-cli.js)
+    fi
 fi
 providers_args=()
 case "$providers_dir/" in "$here/"*) ;; *) providers_args=(-v "$providers_dir:$providers_dir:ro") ;; esac
@@ -181,6 +216,35 @@ fresh_tree() { # dir
     return 0
 }
 
+# adapter_var ADAPTER NAME -> a setting the adapter declares.
+adapter_var() (
+    # shellcheck source=/dev/null
+    . "$1" >/dev/null 2>&1
+    printf '%s' "${!2:-}"
+)
+
+# install_cli ADAPTER LOG: installs the provider's CLI into AI_TOOLS_DIR,
+# in a container that sees nothing else of the run (no key, no prompt, no
+# state), with only the variables the adapter lists in PROVIDER_INSTALL_ENV.
+install_cli() {
+    local v
+    local -a pass=()
+    for v in $(adapter_var "$1" PROVIDER_INSTALL_ENV); do
+        case "$v" in
+            [A-Z_]*) case "$v" in *[!A-Z0-9_]*) continue ;; esac ;;
+            *) continue ;;
+        esac
+        case "$v" in AI_*) continue ;; esac
+        [ -z "${!v+x}" ] || pass+=(-e "$v")
+    done
+    own "$AI_TOOLS_DIR" || return 1
+    container_args "ai-maintenance-${GITHUB_RUN_ID:-local}-$$-install-$n" /tmp
+    docker_args+=(-e "AI_TOOLS_DIR=$AI_TOOLS_DIR" -e HOME=/tmp/ai-maintenance-home
+        -v "$AI_TOOLS_DIR:$AI_TOOLS_DIR" "${providers_args[@]}" "${node_args[@]}" "${npm_args[@]}" "${pass[@]}"
+        "$image_tag" bash "$here/install.sh" "$1")
+    timeout --kill-after=30s "${AI_INSTALL_TIMEOUT:-20m}" docker "${docker_args[@]}" >"$2" 2>&1
+}
+
 # --- attempts -------------------------------------------------------------
 n=0 winner='' winner_model='' winner_effort='' winner_dir=''
 declare -A install_failed=()
@@ -205,14 +269,13 @@ while IFS=$'\t' read -r entry keyidx provider; do
     dir=$state/attempt-$n
     rm -rf "$dir" && mkdir -p "$dir/out/home"
 
-    # The CLI is installed on the runner (no key involved) and mounted
-    # read-only.
-    if ! (
-        # shellcheck source=/dev/null
-        . "$adapter"
-        provider_install
-    ) >"$dir/install.log" 2>&1; then
-        cat "$dir/install.log" >&2
+    # The adapter's transcript, uploaded under a fixed name.
+    transcript=$(adapter_var "$adapter" PROVIDER_TRANSCRIPT)
+    case "$transcript" in '' | .* | *[!A-Za-z0-9._-]*) transcript='' ;; esac
+    printf '%s\n' "$transcript" >"$dir/transcript-name"
+
+    if ! install_cli "$adapter" "$dir/install.log"; then
+        show_capture "$dir/install.log" >&2
         ai_log "attempt $n: could not install the $adapter_name CLI; skipping its keys"
         install_failed[$adapter_name]=1
         record "$provider" "$entry" "$keyidx" "$model" "$effort" "" install-failed
@@ -233,16 +296,20 @@ while IFS=$'\t' read -r entry keyidx provider; do
         "${providers_args[@]}" "${node_args[@]}" "$image_tag"
         bash "$here/attempt.sh" "$adapter" "$prompt" "$model" "$options" "$effort")
     # The key reaches docker through its environment, never its arguments.
-    # Private instructions: the agent's output goes to the log file only.
+    # Both output streams go to the attempt log, a file of the runner, and
+    # are shown with workflow commands suspended; with private
+    # instructions, not at all.
     if [ "$private" = true ]; then
         echo "(agent output not shown: the instructions are private)"
         AI_ATTEMPT_KEY=$(ai_key "$pool" "$entry" "$keyidx") \
             timeout --kill-after=30s "$attempt_timeout" docker "${docker_args[@]}" >"$dir/attempt.log" 2>&1
         rc=$?
     else
+        suspend_commands
         AI_ATTEMPT_KEY=$(ai_key "$pool" "$entry" "$keyidx") \
             timeout --kill-after=30s "$attempt_timeout" docker "${docker_args[@]}" 2>&1 | tee "$dir/attempt.log"
         rc=${PIPESTATUS[0]}
+        resume_commands
     fi
     docker rm -f "$cname" >/dev/null 2>&1
     endgroup
@@ -266,11 +333,7 @@ while IFS=$'\t' read -r entry keyidx provider; do
         ai_regular_file "$dir/out/error.txt" && head -c 100000 "$dir/out/error.txt"
         tail -n 200 "$dir/attempt.log"
     } >"$dir/classify.txt"
-    extra=$(
-        # shellcheck source=/dev/null
-        . "$adapter" >/dev/null 2>&1
-        printf '%s' "${PROVIDER_EXHAUSTED_REGEX:-}"
-    )
+    extra=$(adapter_var "$adapter" PROVIDER_EXHAUSTED_REGEX)
     if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
         result=timeout
     elif ai_is_exhausted "$dir/classify.txt" "$extra"; then
@@ -306,18 +369,27 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 } | ai_scrub "$secrets" | head -c 60000 >"$summary"
 
 # Logs for upload, with every key and the instructions withheld (GitHub
-# masks secrets in the console only, not in files). Private instructions:
-# the attempts table only.
+# masks secrets in the console only, not in files). Only the files the run
+# expects are uploaded, under names it chooses: the agent names nothing in
+# the artifact. Private instructions: the attempts table only.
 logs=$state/logs
 rm -rf "$logs" && mkdir -p "$logs"
 cp "$attempts" "$logs/attempts.jsonl"
+upload() { # SOURCE DEST
+    ai_regular_file "$1" || return 0
+    head -c 20000000 "$1" | ai_scrub "$secrets" >"$2"
+}
 if [ "$private" = false ]; then
     for d in "$state"/attempt-*; do
         [ -d "$d" ] || continue
-        mkdir -p "$logs/${d##*/}"
-        for f in "$d"/attempt.log "$d"/install.log "$d"/out/*.jsonl "$d"/out/*.txt "$d"/out/final.md; do
-            ai_regular_file "$f" && ai_scrub "$secrets" <"$f" >"$logs/${d##*/}/${f##*/}"
-        done
+        l=$logs/${d##*/}
+        mkdir -p "$l"
+        upload "$d/attempt.log" "$l/attempt.log"
+        upload "$d/install.log" "$l/install.log"
+        upload "$d/out/final.md" "$l/final.md"
+        upload "$d/out/error.txt" "$l/error.txt"
+        t=$(head -n 1 "$d/transcript-name" 2>/dev/null)
+        [ -z "$t" ] || upload "$d/out/$t" "$l/transcript.jsonl"
     done
 fi
 out logs-dir "$logs"
@@ -351,7 +423,7 @@ refuse() {
 }
 
 # Title: the first non-empty line of the agent's final message.
-title=$(sed -e 's/^#* *//' -e 's/[[:space:]]*$//' "$summary" | grep -m1 -v '^$' | cut -c1-72)
+title=$(sed -e 's/^#* *//' -e 's/[[:space:]]*$//' "$summary" | grep -m1 -v '^$' | tr -d '[:cntrl:]' | cut -c1-72)
 [ -n "$title" ] || title="Nightly maintenance"
 
 # The result travels to the pull-request job as files: the agent's work as
@@ -363,7 +435,12 @@ rm -rf "$export_dir" && mkdir -p "$export_dir" && own "$export_dir"
 container_args "ai-maintenance-${GITHUB_RUN_ID:-local}-$$-export" "$winner_dir/tree"
 docker_args+=(--network none -v "$winner_dir/tree:$winner_dir/tree" -v "$export_dir:$export_dir"
     "$image_tag" bash "$here/export.sh" "$base" "$export_dir/changes.patch")
-docker "${docker_args[@]}" || refuse "the changes could not be exported"
+# The export runs git on the agent's tree, whose configuration can run
+# commands: its output is captured like the agent's.
+if ! docker "${docker_args[@]}" >"$state/export.log" 2>&1; then
+    [ "$private" = true ] || show_capture "$state/export.log" >&2
+    refuse "the changes could not be exported"
+fi
 ai_regular_file "$export_dir/changes.patch" || refuse "the export left no patch"
 if [ -s "$export_dir/changes.patch" ]; then
     status=changed
@@ -376,17 +453,25 @@ if [ -s "$export_dir/changes.patch" ]; then
     verify=$state/verify
     { rm -rf "$verify" && cp -a "$top/." "$verify" && git -C "$verify" update-index -q --refresh; } ||
         refuse "no copy to check the changes in"
-    git -C "$verify" apply --index --binary --whitespace=nowarn "$result_dir/changes.patch" ||
+    git -C "$verify" apply --index --binary --whitespace=nowarn "$result_dir/changes.patch" >/dev/null 2>&1 ||
         refuse "the exported patch does not apply to $base"
+    # Workflow files run with the repository's secrets once pushed: they
+    # are never part of a maintenance change (README, Limits).
+    git -C "$verify" diff --cached --name-only -z --no-renames "$base" >"$state/names" ||
+        refuse "could not list the changed files"
+    while IFS= read -r -d '' path; do
+        ai_protected_path "$path" && refuse "the changes touch $(ai_printable "$path") (under $AI_PROTECTED_PATHS)"
+    done <"$state/names"
     changed=$state/changed
     git -C "$verify" diff --cached --raw -z --no-abbrev --no-renames --diff-filter=AMT "$base" >"$changed" ||
         refuse "could not list the changed files"
     while IFS= read -r -d '' meta && IFS= read -r -d '' path; do
         sha=$(cut -d' ' -f4 <<<"$meta")
-        git -C "$verify" cat-file blob "$sha" >"$state/blob" || refuse "could not read the new contents of $path"
-        ai_contains_key "$keys" "$state/blob" && refuse "$path contains an API key from the pool"
+        git -C "$verify" cat-file blob "$sha" >"$state/blob" ||
+            refuse "could not read the new contents of $(ai_printable "$path")"
+        ai_contains_key "$keys" "$state/blob" && refuse "$(ai_printable "$path") contains an API key from the pool"
     done <"$changed"
-    rm -rf "$verify" "$state/blob" "$changed"
+    rm -rf "$verify" "$state/blob" "$changed" "$state/names"
 else
     status=unchanged
 fi

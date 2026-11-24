@@ -9,10 +9,13 @@
 #   AI_ATTEMPT_DIR   writable output directory of this attempt (outside the
 #                    checkout)
 #
-# provider_install runs on the runner, without a key. provider_run runs in
-# the attempt's container, as an unprivileged user, in a copy of the
-# repository checkout, with Node.js on PATH; nothing else of the runner is
-# visible there.
+# Both functions run in containers of the sandbox image, as an
+# unprivileged user. provider_install runs once per run, with network
+# access but without any key, prompt or file of the run: only AI_TOOLS_DIR
+# is mounted (writable), with the runner's Node.js and npm. provider_run
+# runs in the attempt's container, in a copy of the repository checkout,
+# with Node.js on PATH and AI_TOOLS_DIR read-only; nothing else of the
+# runner is visible there.
 
 # Optional: extra extended regex (case-insensitive) for errors that mean
 # "this key is exhausted, try the next one". The common patterns (429,
@@ -20,9 +23,20 @@
 # shellcheck disable=SC2034 # read by run.sh
 PROVIDER_EXHAUSTED_REGEX=''
 
+# Optional: variables of the runner the install step needs (versions,
+# download pins), space-separated; nothing else reaches it.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_INSTALL_ENV='PROVIDER2_VERSION'
+
+# Optional: the file in AI_ATTEMPT_DIR holding the CLI's transcript; it is
+# uploaded (scrubbed) as transcript.jsonl. No other file the attempt
+# writes is uploaded, except final.md and error.txt.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_TRANSCRIPT=''
+
 # Install the CLI (idempotent). Pin a version.
 provider_install() {
-    ai_npm_install "$AI_TOOLS_DIR/provider2" "provider2-cli@1.2.3"
+    ai_npm_install "$AI_TOOLS_DIR/provider2" "provider2-cli@${PROVIDER2_VERSION:-1.2.3}"
 }
 
 # provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT

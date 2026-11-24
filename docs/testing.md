@@ -266,5 +266,17 @@ network access to build the image, so it runs in the privileged suite as
 .github/actions/ai-maintenance/test/selftest.sh --docker
 ```
 
+With `--image`, it builds the agent's image with the workflow's
+`container-setup` (this repository's Rust toolchain and `python3`) and runs
+repository checks in an attempt there as the agent's user. It takes several
+minutes and runs in the privileged suite as
+`privileged_ai_maintenance_image_runs_the_repository_checks`. Behind a
+TLS-intercepting proxy, point `AI_SELFTEST_IMAGE` at a base image that
+trusts the proxy's CA:
+
+```sh
+.github/actions/ai-maintenance/test/selftest.sh --image
+```
+
 Setup, the key-pool format and the security model are in
 `.github/actions/ai-maintenance/README.md`.

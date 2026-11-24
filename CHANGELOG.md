@@ -72,9 +72,11 @@ semantic versioning.
   addressed in rounds until the pull request has been quiet for 90
   minutes. Each attempt runs in its own container with only its own key,
   on a fresh copy of the checkout, out of reach of the runner's files and
-  credentials; the agent job uses no cache. The agent's work leaves its job
-  only as a patch, checked byte for byte for pool keys, and a job with write
-  access but no keys publishes it. Developer tooling only, with no change to
+  credentials; CLIs are installed in containers without keys; the agent job
+  uses no cache, and container output can't issue workflow commands. The
+  agent's work leaves its job only as a patch, checked byte for byte for
+  pool keys and refused if it touches `.github/workflows/`, and a job with
+  write access but no keys publishes it. Developer tooling only, with no change to
   the daemon.
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
   part): on GitHub-hosted runners, natively on x86-64 and aarch64, the

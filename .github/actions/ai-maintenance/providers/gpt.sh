@@ -7,6 +7,8 @@
 
 # shellcheck disable=SC2034 # read by run.sh
 PROVIDER_EXHAUSTED_REGEX='insufficient_quota|exceeded your current quota|incorrect api key'
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_INSTALL_ENV='CODEX_VERSION'
 
 gpt_dir() { printf '%s/codex' "$AI_TOOLS_DIR"; }
 

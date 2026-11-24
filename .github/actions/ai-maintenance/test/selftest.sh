@@ -11,7 +11,11 @@
 #
 # With --docker it instead runs attempts in real containers (needs a Docker
 # daemon and network access to build the image) and checks from inside an
-# attempt that nothing of the other keys or the runner is reachable.
+# attempt that nothing of the other keys or the runner is reachable. With
+# --image it builds the sandbox image with the repository setup of
+# .github/workflows/ai-maintenance.yml and runs repository checks in an
+# attempt there, as the agent would (several minutes). AI_SELFTEST_IMAGE
+# replaces the base image in both.
 set -uo pipefail
 
 action=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -20,9 +24,11 @@ action=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # The caller's own settings (the maintenance workflow exports AI_MODELS,
 # for one) must not leak into the cases below.
+selftest_image=${AI_SELFTEST_IMAGE:-ubuntu:24.04}
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^AI_')
-docker_mode=
+docker_mode='' image_mode=''
 [ "${1:-}" = --docker ] && docker_mode=1
+[ "${1:-}" = --image ] && image_mode=1
 
 tmp=$(mktemp -d)
 export TMPDIR=$tmp
@@ -46,7 +52,15 @@ fakes=$tmp/providers
 mkdir -p "$fakes"
 cat >"$fakes/claude.sh" <<'EOF'
 # Fake adapter: behaviour by key prefix.
-provider_install() { :; }
+PROVIDER_TRANSCRIPT=stream.jsonl
+provider_install() {
+    # What the install step sees: its environment, and whether the run's
+    # private files are reachable (only meaningful in real containers).
+    env >"$AI_TOOLS_DIR/install.env"
+    for p in "$AI_TOOLS_DIR/../prompt/prompt.md" "$AI_TOOLS_DIR/../attempts.jsonl"; do
+        [ ! -e "$p" ] || echo "visible: $p"
+    done >"$AI_TOOLS_DIR/install-probe"
+}
 provider_run() {
     local key=$1 prompt=$2 final=$3 model=$4 effort=${6:-}
     printf 'pool=%s instructions=%s model=%s effort=%s\n' "${AI_KEY_POOL:-unset}" "${AI_INSTRUCTIONS:-unset}" \
@@ -67,6 +81,19 @@ provider_run() {
         symlink-*) ln -sf /etc/hostname "$final" ;;
         effort-*) printf 'Done\n' >"$final"; printf 'low\n' >"$AI_ATTEMPT_DIR/effort" ;;
         probe-*) . "$(dirname "${BASH_SOURCE[0]}")/probe.sh" "$key" >"$final" 2>&1 ;;
+        names*) # output files named by the agent, one of them after its key
+            printf 'x\n' >"$AI_ATTEMPT_DIR/$key.txt"
+            printf 'x\n' >"$AI_ATTEMPT_DIR/::warning::named.jsonl"
+            printf '{"type":"stream"}\n' >"$AI_ATTEMPT_DIR/stream.jsonl"
+            printf 'error text\n' >"$AI_ATTEMPT_DIR/error.txt"
+            printf 'done\n' >"$final"
+            [ "${key#namesfail}" = "$key" ] || return 1 ;;
+        cmd-*) echo "::warning::from-agent"; printf '::error::without a newline'; printf 'done\n' >"$final" ;;
+        exportcmd-*) # agent-controlled git configuration runs in the export
+            git config filter.x.clean 'echo "::warning::from-export" >&2; cat'
+            echo '*.txt filter=x' >.gitattributes
+            echo changed >>file.txt; printf 'done\n' >"$final" ;;
+        workflow-*) mkdir -p .github/workflows && echo 'on: push' >.github/workflows/new.yml; printf 'done\n' >"$final" ;;
     esac
 }
 EOF
@@ -138,13 +165,52 @@ EOF
     sed -i -e "s|@RUNNER_DIR@|$runner_dir|" -e "s|@OTHERS@|$(rev <<<"$k1") $(rev <<<"$k3")|" "$fakes/probe.sh"
     # Real docker, not the fake: run_case puts $bin first on PATH.
     run_case docker "[{\"claude\":[\"$k1\",\"probe-BBBB2222\"]},{\"gpt\":[\"$k3\"]}]" \
-        PATH="$PATH" AI_SANDBOX_IMAGE="${AI_SELFTEST_IMAGE:-ubuntu:24.04}"
+        PATH="$PATH" AI_SANDBOX_IMAGE="$selftest_image"
     eq "docker: falls back to the second key, which completes" "0 exhausted success changed" "$rc $(results) $(output status)"
     check "docker: the attempt sees neither other keys nor the runner" contains "$state/result/summary.md" "probe: 0 problems"
     check "docker: the change comes back as a patch" contains "$state/result/changes.patch" "change by probe"
+    check "docker: the CLI install sees neither the prompt nor the run's state" bash -c \
+        '[ -f "$1" ] && [ ! -s "$1" ]' _ "$state/tools/install-probe"
     check "docker: the checkout the run started from is untouched" bash -c \
         '[ -z "$(git -C "$1" status --porcelain)" ] && ! grep -q dirty "$1/file.txt"' _ "$repo"
     [ "$failures" -eq 0 ] || sed 's/^/     | /' "$tmp/docker/log"
+    echo
+    echo "$passes passed, $failures failed"
+    [ "$failures" -eq 0 ]
+    exit
+fi
+
+# --- the repository's sandbox image (--image) ------------------------------------
+if [ -n "$image_mode" ]; then
+    root=$(cd "$action/../../.." && pwd)
+    # The workflow's container-setup block, as the action receives it.
+    setup=$(awk '
+        found && /^[[:space:]]*$/ { print ""; next }
+        found { match($0, /^ */); if (RLENGTH <= ind) exit; if (!bi) bi = RLENGTH; print substr($0, bi + 1); next }
+        /^ *container-setup: \|$/ { match($0, /^ */); ind = RLENGTH; found = 1 }' \
+        "$root/.github/workflows/ai-maintenance.yml")
+    check "image: the workflow has a container-setup script" test -n "$setup"
+    # The committed tree, without build output, as the agent job checks it out.
+    clone=$tmp/image/repo
+    mkdir -p "$clone"
+    git -c safe.directory='*' -C "$root" archive HEAD | tar -x -C "$clone"
+    git -C "$clone" init -q -b main && git -C "$clone" add -A &&
+        git -C "$clone" -c user.name=t -c user.email=t@t commit -qm image
+    cat >"$fakes/repocheck.sh" <<'EOF'
+provider_install() { :; }
+provider_run() {
+    { cargo test --locked --test coverage_gate --test badges 2>&1 | tail -n 40; echo "checks exit ${PIPESTATUS[0]}"; } >"$3"
+}
+EOF
+    state=$tmp/image/state outf=$tmp/image/out
+    (cd "$clone" && env AI_KEY_POOL='[{"repocheck":["image-key-1"]}]' AI_INSTRUCTIONS="Run the repository checks." \
+        AI_STATE_DIR="$state" AI_PROVIDERS_DIR="$fakes" GITHUB_OUTPUT="$outf" GITHUB_ACTIONS= \
+        AI_SANDBOX_IMAGE="$selftest_image" AI_SANDBOX_SETUP="$setup" "$action/run.sh") >"$tmp/image/log" 2>&1
+    rc=$?
+    eq "image: the image builds and the attempt completes" "0 unchanged" "$rc $(output status)"
+    check "image: the repository's checks pass in it, as the agent's user" bash -c \
+        'grep -q "checks exit 0" "$1" && [ "$(grep -c "test result: ok" "$1")" = 2 ]' _ "$state/result/summary.md"
+    [ "$failures" -eq 0 ] || { tail -n 60 "$tmp/image/log" | sed 's/^/     | /'; sed 's/^/     | /' "$state/result/summary.md" 2>/dev/null; }
     echo
     echo "$passes passed, $failures failed"
     [ "$failures" -eq 0 ]
@@ -216,6 +282,9 @@ for bad in '"m turbo"' '"demo med"' '"demo hig"' '"demo\nhigh"' '["demo","high"]
     ai_normalize_pool "[{\"claude\":[\"k0\"]},{\"gpt\":{\"keys\":[\"k\"],\"model\":$bad}}]" >/dev/null 2>&1
     eq "pool: rejects the model $bad, in any entry" 2 $?
 done
+err=$(ai_normalize_pool '[{"claude":["k0"]},{"gpt":{"keys":["k"],"model":"sk-pasted-here extra words"}}]' 2>&1 >/dev/null)
+check "pool: a bad model is reported by entry and field, never by its value" bash -c \
+    '! grep -q "sk-pasted" <<<"$1" && grep -q "entry 2 (gpt)" <<<"$1" && grep -q "<model> \[effort\]" <<<"$1"' _ "$err"
 err=$(ai_normalize_pool '[{"claude":{"keys":["k"],"effort":"high"}}]' 2>&1 >/dev/null)
 eq "pool: a separate effort key points to the model string" 2 $?
 check "pool: ... with a hint" contains <(printf '%s' "$err") '"model": "<model> <effort>"'
@@ -272,7 +341,7 @@ eq "run: the base commit is recorded" "$(git -C "$repo" rev-parse HEAD)" "$(jq -
 check "run: the checkout the run started from is untouched" bash -c \
     '[ -z "$(git -C "$1" status --porcelain)" ] && [ "$(cat "$1/file.txt")" = base ]' _ "$repo"
 check "run: each attempt runs in a container with only its own key, tree and output mounted" bash -c '
-    grep "^run " "$1" | grep -v "export.sh" >"$1.runs"
+    grep "^run " "$1" | grep -v "export.sh\|install.sh" >"$1.runs"
     [ "$(wc -l <"$1.runs")" = 2 ] &&
     grep -q -- "-e AI_ATTEMPT_KEY " "$1.runs" && ! grep -q "AI_ATTEMPT_KEY=" "$1.runs" &&
     sed -n 2p "$1.runs" | grep -q -- "-v $2/attempt-2/tree:$2/attempt-2/tree " &&
@@ -303,7 +372,7 @@ run_case timeout '[{"claude":["slow-1","ok-2"]}]' AI_ATTEMPT_TIMEOUT=2s
 eq "run: a timed-out attempt fails without falling back" "1 timeout" "$rc $(results)"
 check "run: the timed-out container is removed" grep -q "^rm -f ai-maintenance-" "$tmp/timeout/docker.log"
 
-run_case install '[{"broken":["ok-1","ok-2"]},{"gpt":["ok-3"]}]'
+run_case noinstall '[{"broken":["ok-1","ok-2"]},{"gpt":["ok-3"]}]'
 eq "run: a provider whose CLI will not install is skipped" "0 install-failed install-failed success gpt" "$rc $(results) $(output provider)"
 
 run_case nobuild '[{"claude":["ok-1"]}]' FAKE_DOCKER_BUILD_FAIL=1
@@ -389,6 +458,65 @@ check "agy: an effort the model lacks steps down, and the step is reported" bash
      grep -q "| max (used high) |" "$2"' _ "$state" "$tmp/agy-summary.md"
 run_case effortfile '[{"claude":["effort-1"]}]' AI_MODELS='{"claude":"m max"}'
 eq "run: the effort an adapter reports wins over the one requested" "low" "$(jq -r .effort "$state/result/meta.json")"
+
+# Workflow commands: a line starting with "::" outside a stop-commands
+# region (other than the run's own grouping and masks) would be obeyed by
+# the runner.
+raw_commands() {
+    awk 't == "" && /^::stop-commands::/ { t = substr($0, 18); next }
+         t != "" { if ($0 == "::" t "::") t = ""; next }
+         /^::(group|endgroup|add-mask)::/ { next }
+         /^::/ { print }' "$1"
+}
+export -f raw_commands
+run_case install '[{"claude":["noop-1"]}]'
+check "run: the CLI is installed in a container without a key, the prompt or the run's state" bash -c '
+    grep "install.sh" "$1" >"$1.install" && [ "$(wc -l <"$1.install")" = 1 ] &&
+    grep -q -- "-v $2/tools:$2/tools " "$1.install" && ! grep -qE -- "-v $2/(prompt|attempt|logs)" "$1.install" &&
+    ! grep -qE -- "-v $2(:| )" "$1.install" && ! grep -q AI_ATTEMPT_KEY "$1.install" &&
+    grep -q -- "--cap-drop ALL" "$1.install" &&
+    ! grep -qE "^(AI_KEY_POOL|AI_INSTRUCTIONS|AI_ATTEMPT_KEY)=" "$2/tools/install.env"' _ "$tmp/install/docker.log" "$state"
+check "run: ... and its output is kept in the attempt's install log" bash -c '[ -f "$1/attempt-1/install.log" ]' _ "$state"
+
+run_case names '[{"claude":["namesfail-1"]},{"gpt":["names-2"]}]' AI_FALLBACK_ON=any
+check "run: uploaded logs carry only fixed file names, for failed attempts too" bash -c '
+    [ "$(cd "$1/logs" && find . -type f | sort | paste -sd" ")" = \
+      "./attempt-1/attempt.log ./attempt-1/error.txt ./attempt-1/final.md ./attempt-1/install.log ./attempt-1/transcript.jsonl ./attempt-2/attempt.log ./attempt-2/error.txt ./attempt-2/final.md ./attempt-2/install.log ./attempt-2/transcript.jsonl ./attempts.jsonl" ]' _ "$state"
+check "run: ... the transcript the adapter names is uploaded under a fixed name" \
+    contains "$state/logs/attempt-2/transcript.jsonl" '"type":"stream"'
+
+run_case cmdout '[{"claude":["cmd-1"]}]' GITHUB_ACTIONS=true
+check "run: the agent's output reaches the job log with workflow commands suspended" bash -c \
+    'grep -q "from-agent" "$1" && [ -z "$(raw_commands "$1")" ]' _ "$tmp/cmdout/log"
+check "run: ... behind a token no container is given" bash -c \
+    't=$(sed -n "s/^::stop-commands:://p" "$1" | head -1); [ ${#t} -ge 32 ] && grep -qx "::$t::" "$1" && ! grep -qF -- "$t" "$2"' \
+    _ "$tmp/cmdout/log" "$tmp/cmdout/docker.log"
+run_case cmdpriv '[{"claude":["cmd-1"]}]' GITHUB_ACTIONS=true AI_PRIVATE_INSTRUCTIONS=true
+check "run: private instructions keep the agent's output off the job log" bash -c \
+    '! grep -q "from-agent\|without a newline" "$1" && [ -z "$(raw_commands "$1")" ]' _ "$tmp/cmdpriv/log"
+run_case exportcmd '[{"claude":["exportcmd-1"]}]' GITHUB_ACTIONS=true
+check "run: output of the export container is captured, not obeyed" bash -c \
+    '[ "$2" = 0 ] && [ -z "$(raw_commands "$1")" ]' _ "$tmp/exportcmd/log" "$rc"
+run_case exportpriv '[{"claude":["exportcmd-1"]}]' GITHUB_ACTIONS=true AI_PRIVATE_INSTRUCTIONS=true
+check "run: ... and not shown with private instructions" bash -c '! grep -q "from-export" "$1"' _ "$tmp/exportpriv/log"
+
+run_case workflow '[{"claude":["workflow-1"]}]'
+eq "run: changes to workflow files are not published" "1 failed" "$rc $(output status)"
+check "run: ... no patch is left, and the log says why" bash -c \
+    '[ ! -e "$1/result/changes.patch" ] && grep -q ".github/workflows/new.yml" "$2"' _ "$state" "$tmp/workflow/log"
+
+# A linked worktree shares its repository with the main checkout: copying
+# it would hand the agent (and the credential cleanup) the original.
+repo=$tmp/wt/repo
+newrepo "$repo"
+git -C "$repo" config http.https://github.com/.extraheader "AUTHORIZATION: basic c2VjcmV0"
+git -C "$repo" worktree add -q "$tmp/wt/linked" 2>/dev/null
+(cd "$tmp/wt/linked" && env PATH="$bin:$PATH" FAKE_DOCKER_LOG="$tmp/wt/docker.log" AI_KEY_POOL='[{"claude":["ok-1"]}]' \
+    AI_INSTRUCTIONS=x AI_STATE_DIR="$tmp/wt/state" AI_PROVIDERS_DIR="$fakes" "$action/run.sh") >"$tmp/wt/log" 2>&1
+eq "run: a linked worktree is refused as a configuration error" 2 "$?"
+check "run: ... before anything runs, and the main checkout's configuration is untouched" bash -c \
+    '[ ! -s "$1" ] && git -C "$2" config --get http.https://github.com/.extraheader >/dev/null && grep -q worktree "$3"' \
+    _ "$tmp/wt/docker.log" "$repo" "$tmp/wt/log"
 
 repo=$tmp/creds/repo
 newrepo "$repo"
@@ -481,11 +609,11 @@ check "watch: bots count only when listed" bash -c '! grep -q "Bot review" "$1"'
 watch SINCE="2026-02-01T10:04:00Z#c-00000000000000000011"
 check "watch: an item at the same second as the last one handed over is still new" bash -c \
     'grep -q "Same second" "$1" && ! grep -q "Typo here" "$1"' _ "$fb"
-watch FEEDBACK_BUDGET=520
+watch FEEDBACK_BUDGET=600
 check "watch: within the size budget only whole items are handed over" bash -c \
     'grep -q "Please split this" "$1" && ! grep -q "Same second" "$1" && grep -q "more feedback" "$1"' _ "$fb"
 eq "watch: ... and the cursor stops at the last one handed over" "2026-02-01T10:00:00Z#r-00000000000000000002" "$(output until)"
-watch FEEDBACK_BUDGET=520 SINCE="$(output until)"
+watch FEEDBACK_BUDGET=600 SINCE="$(output until)"
 check "watch: the next round picks up where the last stopped" bash -c \
     'grep -q "Typo here" "$1" && ! grep -q "Please split this" "$1"' _ "$fb"
 watch SINCE=2026-03-01T00:00:00Z
@@ -499,6 +627,30 @@ eq "watch: other pull requests are ignored" "ignored" "$(output status)"
 pr_json open ai-maintenance/x fork/r
 watch
 eq "watch: pull requests from forks are ignored" "ignored" "$(output status)"
+
+# One item larger than the whole budget is handed over in pieces, each
+# round resuming where the last stopped.
+head -c 150000 /dev/zero | tr '\0' y >"$tmp/huge.txt"
+jq -n --rawfile big "$tmp/huge.txt" '[{id: 31, user: {login: "alice"}, author_association: "OWNER", state: "CHANGES_REQUESTED",
+    body: ("START" + $big + "END"), submitted_at: "2026-02-02T09:00:00Z", html_url: "u9"}]' >"$gh_dir/repos_o_r_pulls_8_reviews.json"
+echo '[{"id":32,"user":{"login":"carol"},"author_association":"COLLABORATOR","body":"Small one after","path":"a","line":1,"created_at":"2026-02-02T09:01:00Z","html_url":"u10"}]' \
+    >"$gh_dir/repos_o_r_pulls_8_comments.json"
+pr_json open ai-maintenance/20260202-1 o/r 8
+since=2026-02-01T00:00:00Z rounds=0 got=$tmp/huge-got.txt sizes=ok
+: >"$got"
+while [ "$rounds" -lt 6 ]; do
+    watch PR=8 SINCE="$since"
+    [ "$rc" = 0 ] && [ "$(output status)" = feedback ] || break
+    rounds=$((rounds + 1))
+    [ "$(wc -c <"$fb")" -le 60000 ] || sizes="round $rounds: $(wc -c <"$fb") bytes"
+    grep -oE '^(START)?y+(END)?$' "$fb" | tr -d '\n' >>"$got"
+    grep -q "Small one after" "$fb" && break
+    since=$(output until)
+done
+eq "watch: an item larger than the budget arrives in pieces within the budget" "ok" "$sizes"
+eq "watch: ... resuming where each round stopped, until all of it and what follows are handed over" \
+    "3 START150000END 2026-02-02T09:01:00Z#c-00000000000000000032" \
+    "$rounds $(head -c 5 "$got")$(tr -cd y <"$got" | wc -c)$(tail -c 3 "$got") $(output until)"
 
 # --- gate.sh ------------------------------------------------------------------------
 gate() { # max
@@ -582,6 +734,22 @@ check "publish: update pushes to the PR branch and replies with the marker" bash
     _ "$remote" "$branch" "$gh_dir/comments"
 publish MODE=update PR=42
 eq "publish: refuses when the branch moved since the agent ran" 1 "$rc"
+
+# Workflow files are never pushed, whatever the result says.
+git -C "$work" checkout -q main
+main=$(git -C "$work" rev-parse HEAD)
+mkdir -p "$tmp/result3" "$work/.github/workflows"
+cp "$tmp/result2/summary.md" "$tmp/result3/"
+echo 'on: push' >"$work/.github/workflows/evil.yml"
+git -C "$work" add -N .github/workflows/evil.yml
+git -C "$work" diff --binary >"$tmp/result3/changes.patch"
+git -C "$work" rm -q --cached .github/workflows/evil.yml && rm -rf "$work/.github"
+jq --arg b "$main" '.base_sha = $b | .status = "changed"' "$result/meta.json" >"$tmp/result3/meta.json"
+result=$tmp/result3
+publish MODE=create BASE_BRANCH=main GITHUB_RUN_ID=97
+check "publish: a patch touching .github/workflows/ is refused before any push" bash -c \
+    '[ "$3" = 1 ] && ! git -C "$1" rev-parse -q --verify "refs/heads/ai-maintenance/$2-97" >/dev/null && grep -q "workflows" "$4"' \
+    _ "$remote" "$(date -u +%Y%m%d)" "$rc" "$tmp/pub.log"
 
 echo
 echo "$passes passed, $failures failed"

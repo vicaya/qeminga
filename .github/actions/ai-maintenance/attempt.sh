@@ -12,19 +12,9 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# The image's repository setup may leave variables here (PATH, CARGO_HOME, ...).
-if [ -f /etc/ai-maintenance/env ]; then
-    set -a
-    # shellcheck source=/dev/null
-    . /etc/ai-maintenance/env
-    set +a
-fi
-[ -z "${AI_NODE_BIN:-}" ] || PATH=$AI_NODE_BIN:$PATH
-export PATH
-mkdir -p "$HOME"
-
 # shellcheck source=lib.sh
 . "$here/lib.sh"
+ai_sandbox_env
 # shellcheck source=/dev/null
 . "$1"
 key=${AI_ATTEMPT_KEY:-}

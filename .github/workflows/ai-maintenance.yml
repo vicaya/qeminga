@@ -147,10 +147,12 @@ jobs:
           # installed into its container image (as root, in a throwaway
           # copy of the checkout; the agent itself cannot install anything).
           # Adapt this when copying the workflow to another repository.
+          # (python3: scripts/ci/coverage-gate.py and its test. The
+          # privileged test suite builds this image and runs a check in it.)
           container-image: ubuntu:24.04
           container-setup: |
             apt-get update -qq
-            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential curl >/dev/null
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential curl python3 >/dev/null
             export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
             curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
               "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"

@@ -110,25 +110,57 @@ fn only_the_agent_job_sees_the_key_pool_and_it_cannot_write() {
     assert!(maintain.contains("container-setup: |"));
 }
 
+#[test]
+fn the_agent_image_has_what_the_repository_checks_run() {
+    let text = workflow();
+    let maintain = job(&text, "maintain");
+    let setup = &maintain[maintain
+        .find("container-setup: |")
+        .expect("container-setup")..];
+    // tests/coverage_gate.rs and scripts/ci/coverage.sh run python3.
+    let install = setup
+        .lines()
+        .find(|l| l.contains("apt-get install"))
+        .expect("an apt-get install line");
+    assert!(install.contains(" python3"), "{install}");
+}
+
+/// Runs `selftest.sh MODE` and expects `PASSED` checks, all passing.
+fn selftest_mode(mode: &str, passed: usize) {
+    let script = root().join(".github/actions/ai-maintenance/test/selftest.sh");
+    let output = Command::new("bash")
+        .arg(&script)
+        .arg(mode)
+        .output()
+        .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "selftest.sh {mode} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(&format!("{passed} passed, 0 failed")),
+        "{stdout}"
+    );
+}
+
 /// Runs attempts in real containers (`selftest.sh --docker`): needs a
 /// Docker daemon, which needs root or the docker group, and network access
 /// to build the image.
 #[test]
 #[ignore = "needs a Docker daemon (privileged suite)"]
 fn privileged_ai_maintenance_attempts_see_only_their_own_key() {
-    let script = root().join(".github/actions/ai-maintenance/test/selftest.sh");
-    let output = Command::new("bash")
-        .arg(&script)
-        .arg("--docker")
-        .output()
-        .unwrap_or_else(|e| panic!("{}: {e}", script.display()));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "selftest.sh --docker failed:\n{stdout}\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(stdout.contains("4 passed, 0 failed"), "{stdout}");
+    selftest_mode("--docker", 5);
+}
+
+/// Builds the agent's image with the workflow's repository setup and runs
+/// repository checks in an attempt there (`selftest.sh --image`): needs a
+/// Docker daemon and network access, and takes several minutes.
+#[test]
+#[ignore = "needs a Docker daemon (privileged suite)"]
+fn privileged_ai_maintenance_image_runs_the_repository_checks() {
+    selftest_mode("--image", 3);
 }
 
 #[test]

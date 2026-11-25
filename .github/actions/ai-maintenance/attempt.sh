@@ -15,7 +15,7 @@
 set -uo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=lib.sh
+# shellcheck source=.github/actions/ai-maintenance/lib.sh
 . "$here/lib.sh"
 ai_sandbox_env
 # shellcheck source=/dev/null

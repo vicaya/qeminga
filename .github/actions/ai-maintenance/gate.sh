@@ -8,7 +8,7 @@
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# shellcheck source=lib.sh
+# shellcheck source=.github/actions/ai-maintenance/lib.sh
 . "$here/lib.sh"
 
 : "${GITHUB_REPOSITORY:?}" "${BRANCH_PREFIX:?}" "${MAX:?}"

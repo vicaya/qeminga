@@ -19,7 +19,7 @@
 set -uo pipefail
 
 action=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-# shellcheck source-path=SCRIPTDIR/..
+# shellcheck source=.github/actions/ai-maintenance/lib.sh
 . "$action/lib.sh"
 
 # The caller's own settings (the maintenance workflow exports AI_MODELS,

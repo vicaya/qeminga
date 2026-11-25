@@ -1,4 +1,4 @@
-# shellcheck shell=bash
+#!/usr/bin/env bash
 # Shared helpers for the ai-maintenance action: key-pool parsing, routing
 # strategies, provider resolution, failure classification and secret
 # scrubbing. Sourced by run.sh and test/selftest.sh; needs bash and jq.

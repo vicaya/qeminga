@@ -269,10 +269,13 @@ command -v docker >/dev/null || { ai_log "docker is required: every attempt runs
 candidates=$(ai_route "$pool" "$routing" "${AI_ROUTING_SEED:-${GITHUB_RUN_NUMBER:-0}}") || exit 2
 
 attempts=$state/attempts.jsonl
-: >"$attempts"
+# Whether the table holds every attempt: it is published only then.
+attempts_whole=true
+: >"$attempts" || attempts_whole=false
 record() { # provider entry key model effort effort_used result
     jq -nc --arg p "$1" --argjson e "$2" --argjson k "$3" --arg m "$4" --arg f "$5" --arg u "$6" --arg r "$7" \
-        '{provider: $p, entry: $e, key: $k, model: $m, effort: $f, effort_used: $u, result: $r}' >>"$attempts"
+        '{provider: $p, entry: $e, key: $k, model: $m, effort: $f, effort_used: $u, result: $r}' >>"$attempts" ||
+        attempts_whole=false
 }
 
 # --- the sandbox image ---------------------------------------------------------
@@ -542,37 +545,45 @@ agent'"'"'s own summary is not published: see the changes and their checks.'
 # expects are uploaded, under names it chooses: the agent names nothing in
 # the artifact. Private instructions: the attempts table only.
 logs=$state/logs
-rm -rf "$logs" && mkdir -p "$logs"
-cp "$attempts" "$logs/attempts.jsonl"
 # A log that cannot be published is left out and listed in INCOMPLETE.txt,
-# and the logs-complete output is false; the run's result stands.
+# and the logs-complete output is false; the run's result stands. Without
+# a logs directory there is nothing to announce: logs-dir stays unset.
 unpublished=()
 upload() { # SOURCE DEST [jsonl]: scrubbed, at most AI_UPLOAD_LIMIT bytes, in whole lines
     ai_regular_file "$1" || return 0
     ai_publish_lines "$1" "$2" "$upload_limit" "$secrets_file" head "${3:-}" || unpublished+=("${2#"$logs"/}")
 }
-if [ "$private" = false ]; then
-    for ((i = 1; i <= n; i++)); do
-        d=$state/attempt-$i
-        [ -d "$d" ] || continue
-        l=$logs/${d##*/}
-        mkdir -p "$l"
-        upload "$d/attempt.log" "$l/attempt.log"
-        upload "$d/install.log" "$l/install.log"
-        upload "$d/out/final.md" "$l/final.md"
-        upload "$d/out/error.txt" "$l/error.txt"
-        t=$(head -n 1 "$d/transcript-name" 2>/dev/null)
-        [ -z "$t" ] || upload "$d/out/$t" "$l/transcript.jsonl" jsonl
-    done
-fi
-if [ "${#unpublished[@]}" -gt 0 ]; then
-    ai_log "logs that could not be published, left out: ${unpublished[*]}"
-    printf '%s\n' "${unpublished[@]}" >"$logs/INCOMPLETE.txt"
-    out logs-complete false
+if rm -rf "$logs" && mkdir -p "$logs"; then
+    if ! { [ "$attempts_whole" = true ] && cp "$attempts" "$logs/attempts.jsonl"; }; then
+        rm -f "$logs/attempts.jsonl"
+        unpublished+=(attempts.jsonl)
+    fi
+    if [ "$private" = false ]; then
+        for ((i = 1; i <= n; i++)); do
+            d=$state/attempt-$i
+            [ -d "$d" ] || continue
+            l=$logs/${d##*/}
+            if ! mkdir -p "$l"; then unpublished+=("${d##*/}/"); continue; fi
+            upload "$d/attempt.log" "$l/attempt.log"
+            upload "$d/install.log" "$l/install.log"
+            upload "$d/out/final.md" "$l/final.md"
+            upload "$d/out/error.txt" "$l/error.txt"
+            t=$(head -n 1 "$d/transcript-name" 2>/dev/null)
+            [ -z "$t" ] || upload "$d/out/$t" "$l/transcript.jsonl" jsonl
+        done
+    fi
+    if [ "${#unpublished[@]}" -gt 0 ]; then
+        ai_log "logs that could not be published, left out: ${unpublished[*]}"
+        printf '%s\n' "${unpublished[@]}" >"$logs/INCOMPLETE.txt"
+        out logs-complete false
+    else
+        out logs-complete true
+    fi
+    out logs-dir "$logs"
 else
-    out logs-complete true
+    ai_log "the logs directory could not be made: no logs are published"
+    out logs-complete false
 fi
-out logs-dir "$logs"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
     {

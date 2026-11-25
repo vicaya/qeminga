@@ -531,6 +531,36 @@ eq "cut: ... nor from the tail" "line 6|line 7|line 8|line 9" \
     "$(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-long.json" | paste -sd'|')"
 eq "cut: ... also when the lookahead does not reach the end of the log" "line 1|line 2|line 3|line 4 line 6|line 7|line 8|line 9" \
     "$(ai_cut_lines "$tmp/cut7" 28 head "$tmp/cut-20.json" | paste -sd'|') $(ai_cut_lines "$tmp/cut7" 28 tail "$tmp/cut-20.json" | paste -sd'|')"
+# Values that overlap one another (or themselves) are found in the text as
+# it is and withheld as one span: replaced one after the other, the first
+# would leave the rest of the second.
+jq -cn '["alpha1\nbeta22\ngamma3", "beta22\ngamma3\ndelta4\nepsil5"]' >"$tmp/ovl.json"
+eq "scrub: values that overlap across a line are withheld as one" "start|***|end" \
+    "$(printf 'start\nalpha1\nbeta22\ngamma3\ndelta4\nepsil5\nend\n' | ai_scrub "$tmp/ovl.json" | paste -sd'|')"
+eq "scrub (JSON lines): ... in the raw text and inside a JSON string" '***|{"t":"x *** y"}' \
+    "$(printf 'alpha1\nbeta22\ngamma3\ndelta4\nepsil5\n{"t":"x alpha1\\nbeta22\\ngamma3\\ndelta4\\nepsil5 y"}\n' |
+        ai_scrub_jsonl "$tmp/ovl.json" | paste -sd'|')"
+printf '%s' '["abXab"]' >"$tmp/self.json"
+eq "scrub: a value that overlaps itself is withheld whole" "<***> <***>" "$(printf '<abXabXab> <abXab>' | ai_scrub "$tmp/self.json")"
+printf 'start line\n%s\nalpha1\nbeta22\ngamma3\ndelta4\nepsil5\n%s\nend line\n' "$x60" "$x60" >"$tmp/cut-ovl"
+check "cut: at every limit, head and tail keep no part of values that overlap one another" bash -c '
+    . "$1/lib.sh"
+    for ((n = 1; n <= $(wc -c <"$2/cut-ovl") + 1; n++)); do
+        for end in head tail; do
+            ai_publish_lines "$2/cut-ovl" "$2/ovl.pub" "$n" "$2/ovl.json" "$end"
+            if grep -qE "alpha1|beta22|gamma3|delta4|epsil5" "$2/ovl.pub"; then echo "$n $end: $(paste -sd"|" "$2/ovl.pub")"; exit 1; fi
+            if grep -vqxE "start line|end line|x+|\\*\\*\\*|" "$2/ovl.pub"; then echo "$n $end: partial line"; exit 1; fi
+        done
+    done' _ "$action" "$tmp"
+# Scrubbing is linear in the size of the log, also when a value occurs on
+# every line (jq's own join is quadratic: minutes for this log).
+yes 'an ordinary log line, with ab12 in it' | head -c 10000000 >"$tmp/many.log"
+printf '%s' '["ab12"]' >"$tmp/many.json"
+check "publish: a value on every line of a 10 MB log is scrubbed in linear time" bash -c '
+    . "$1/lib.sh"; SECONDS=0
+    ai_publish_lines "$2/many.log" "$2/many.out" 20000000 "$2/many.json" head &&
+        ! grep -q ab12 "$2/many.out" && [ "$SECONDS" -lt 30 ]' _ "$action" "$tmp"
+rm -f "$tmp/many.log" "$tmp/many.out"
 # Limits and lookahead are counted in bytes, also for multibyte text.
 for i in $(seq 40); do printf '測試行\n'; done >"$tmp/cut-mb"
 jq -cn --arg l "$(head -c 40 /dev/zero | tr '\0' L)"$'\n'"$(head -c 42 /dev/zero | tr '\0' M)" '[$l]' >"$tmp/cut-ml.json"
@@ -542,14 +572,18 @@ done
 r20=$(printf '測%.0s' $(seq 20))
 printf '前言行\n%s\nab12\n測試QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34 測\n%s\n結束行\n' "$r20" "$r20" >"$tmp/cut-mbk"
 jq -cn '["ab12\n測試QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVph\ncd34 測\n"]' >"$tmp/cut-mbk.json"
-check "cut: at every limit, head and tail keep no part of a multibyte credential, and whole public lines" bash -c '
+check "cut: at every limit, head and tail keep no part of a multibyte credential, whole public lines, and the limit in bytes" bash -c '
     . "$1/lib.sh"
-    for ((n = 1; n <= $(wc -c <"$2/cut-mbk"); n++)); do
+    for ((n = 1; n <= $(wc -c <"$2/cut-mbk") + 1; n++)); do
         for end in head tail; do
-            out=$(ai_cut_lines "$2/cut-mbk" "$n" "$end" "$2/cut-mbk.json" | ai_scrub "$2/cut-mbk.json")
-            if grep -qE "ab12|cd34|QUJDREVG" <<<"$out"; then echo "$n $end"; exit 1; fi
-            if grep -vqxE "前言行|結束行|(測)+|\\*\\*\\*|" <<<"$out"; then echo "$n $end: $out"; exit 1; fi
-            if [ "$(printf "%s" "$out" | wc -c)" -gt "$n" ] && [ "$out" != "$(cat "$2/cut-mbk")" ]; then echo "$n $end: over"; exit 1; fi
+            ai_cut_lines "$2/cut-mbk" "$n" "$end" "$2/cut-mbk.json" >"$2/mbk.cut"
+            ai_publish_lines "$2/cut-mbk" "$2/mbk.pub" "$n" "$2/cut-mbk.json" "$end"
+            for f in "$2/mbk.cut" "$2/mbk.pub"; do
+                [ "$(wc -c <"$f")" -le "$n" ] || { echo "$n $end $f: $(wc -c <"$f") bytes"; exit 1; }
+            done
+            ai_scrub "$2/cut-mbk.json" <"$2/mbk.cut" >"$2/mbk.out"
+            if grep -qE "ab12|cd34|QUJDREVG" "$2/mbk.out" "$2/mbk.pub"; then echo "$n $end"; exit 1; fi
+            if grep -vhqxE "前言行|結束行|(測)+|\\*\\*\\*|" "$2/mbk.out" "$2/mbk.pub"; then echo "$n $end: partial line"; exit 1; fi
         done
     done' _ "$action" "$tmp"
 # The limit holds for what is published, after the scrubber, which can
@@ -730,6 +764,23 @@ check "run: a log that cannot be published is left out, listed, and the run's re
      [ ! -e "$l/attempt-1/transcript.jsonl" ] && grep -qx "attempt-1/transcript.jsonl" "$l/INCOMPLETE.txt" &&
      ! ls "$l"/attempt-1/*.part >/dev/null 2>&1' \
     _ "$state" "$rc" "$(output status)" "$(output logs-complete)"
+# The attempts table counts too (in a private run it is all the logs), and
+# a logs directory that cannot be made is not announced.
+failcmd=$tmp/failcmd
+mkdir -p "$failcmd"
+for c in cp mkdir; do
+    printf '#!/usr/bin/env bash\nfor a; do case "$a" in $FAIL_CMD_ON) exit 5 ;; esac; done\nexec %s "$@"\n' \
+        "$(command -v "$c")" >"$failcmd/$c"
+    chmod +x "$failcmd/$c"
+done
+run_case failtable '[{"claude":["ok-1"]}]' PATH="$failcmd:$bin:$PATH" FAIL_CMD_ON='*/logs/attempts.jsonl' \
+    AI_PRIVATE_INSTRUCTIONS=true
+check "run: an attempts table that cannot be published is listed, and logs-complete is false" bash -c \
+    'l=$1/logs; [ "$2" = 0 ] && [ "$3" = false ] && [ ! -e "$l/attempts.jsonl" ] && grep -qx attempts.jsonl "$l/INCOMPLETE.txt"' \
+    _ "$state" "$rc" "$(output logs-complete)"
+run_case faillogsdir '[{"claude":["ok-1"]}]' PATH="$failcmd:$bin:$PATH" FAIL_CMD_ON='*/ai-maintenance-run.*/logs'
+eq "run: a logs directory that cannot be made is not announced" "0 changed | false" \
+    "$rc $(output status) |$(output logs-dir) $(output logs-complete)"
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"

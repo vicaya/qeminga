@@ -172,20 +172,68 @@ ai_is_exhausted() {
 # matched without its leading and trailing white space, so the line break
 # after it, which may separate it from the next line or event, stays.
 # Inside a decoded JSON string there is no such separator to keep:
-# patterns_and_values also has each value as configured, matched first.
+# patterns_and_values also has each value as configured.
+#
+# spans(PATTERNS) finds every occurrence of every pattern in the input
+# string as it is, overlapping ones included (of one pattern with another,
+# or with itself), and combines those that overlap into one span: [{s, e,
+# t}], in characters, t the span's text. Replacing the patterns one after
+# the other would not do: the first replaced would hide the rest of one
+# that overlaps it. redact(PATTERNS) replaces every span with "***", the
+# longest first (a span's text found elsewhere is withheld there too).
 # shellcheck disable=SC2016 # jq text
 AI_PATTERNS_JQ='def patterns: map(if test("\n") then gsub("^\\s+|\\s+$"; "") else . end)
     | map(select(length > 0)) | unique | sort_by(-length);
   def patterns_and_values: map(., (select(test("\n")) | gsub("^\\s+|\\s+$"; "")))
-    | map(select(length > 0)) | unique | sort_by(-length);'
+    | map(select(length > 0)) | unique | sort_by(-length);
+  # The occurrences of $k: split finds them left to right without overlap;
+  # one it skips overlaps the one before it, by a period of $k, and lies
+  # within the next $n characters (or the next occurrence found).
+  def occurrences($k):
+    ($k | length) as $n
+    | [range(1; $n) | . as $d | select($k[$d:] == $k[:$n - $d])] as $ds
+    | split($k) as $parts | ($parts | length) as $np
+    | if $np < 2 then empty else
+        foreach range(0; $np - 1) as $i ({end: 0};
+          .pos = .end + ($parts[$i] | length) | .end = .pos + $n;
+          .pos as $pos
+          | (if $ds == [] then $k else
+              ($parts[$i + 1][:$n] | if length < $n and $i + 2 < $np then . + $k else . end) as $rest
+              | {c: 0, t: $k, stop: false}
+              | until(.stop;
+                  .c as $c
+                  | ([$ds[] | . as $d | select($rest[$c:] | startswith($k[$n - $d:]))] | max) as $d
+                  | if $d == null then .stop = true else .c += $d | .t += $k[$n - $d:] end)
+              | .t end) as $t
+          | {s: $pos, e: ($pos + ($t | length)), t: $t})
+      end;
+  def spans($ks):
+    [$ks[] as $k | occurrences($k)] | sort_by(.s)
+    | [foreach (.[], null) as $o ({cur: null, done: null};
+        if $o == null then .done = .cur
+        elif .cur != null and .cur.e > $o.s then
+          .done = null
+          | if $o.e > .cur.e then .cur.t += $o.t[(.cur.e - $o.s):] | .cur.e = $o.e else . end
+        else .done = .cur | .cur = $o end;
+        .done // empty)];
+  # join, linear in the length of the text (jq 1.7 joins in quadratic time).
+  def join_with($s): if length == 0 then "" else [.[0], (.[1:][] | $s, .)] | add end;
+  # The values the input holds at all (a quick test), for spans.
+  def held($ks): . as $in | [$ks[] | select(. as $k | $in | contains($k))];
+  def redact($ks):
+    held($ks) as $h
+    | if $h == [] then . else
+        reduce (spans($h) | map(.t) | unique | sort_by(-length) | .[]) as $t (.; split($t) | join_with("***"))
+      end;
+  # The spans that run across lines, for the passes over whole text.
+  def multiline_spans($ks): spans(held($ks)) | map(.t | select(test("\n"))) | unique | sort_by(-length);'
 
 # ai_scrub SECRETS_FILE < in > out: replaces every secret (pool keys, the
 # instructions) with "***", longest first (AI_PATTERNS_JQ). The secrets
 # come from a file (a JSON array), never from an argument, which other
 # accounts can read.
 ai_scrub() {
-    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
-        reduce ($keys[0] | patterns | .[]) as $k (.; split($k) | join("***"))'
+    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"' redact($keys[0] | patterns)'
 }
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
@@ -283,8 +331,8 @@ ai_cut_lines() {
     if [ "$3" = head ]; then head -c "$window" -- "$1"; else tail -c "$window" -- "$1"; fi |
         jq -Rjs --arg end "$3" --argjson limit "$2" --argjson eof "$eof" --slurpfile keys "$4" "$AI_PATTERNS_JQ"'
             . as $raw
-            | (reduce ($keys[0] | patterns | map(select(test("\n"))) | .[]) as $k
-                (.; split($k) | join($k | gsub("\n"; " ")))) as $m
+            | (reduce multiline_spans($keys[0] | patterns)[] as $t
+                (.; split($t) | join_with($t | gsub("\n"; " ")))) as $m
             | ($m | split("\n")) as $p | ($m | length) as $mlen
             | if $end == "head" then
                 # The lines, each with its line end, that fit in the limit.
@@ -556,11 +604,11 @@ ai_json_forms() {
 # keep their types), and written back as JSON; any other line as text.
 ai_scrub_jsonl() {
     jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
-        reduce ($keys[0] | patterns | map(select(test("\n"))) | .[]) as $k (.; split($k) | join("***"))' |
+        reduce multiline_spans($keys[0] | patterns)[] as $t (.; split($t) | join_with("***"))' |
         jq -Rr --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
             ($keys[0] | patterns_and_values) as $ks
             | ($ks | map({(.): true}) | add // {}) as $set
-            | def scrub: reduce $ks[] as $k (.; split($k) | join("***"));
+            | def scrub: redact($ks);
               def deep: if type == "string" then scrub
                         elif type == "number" and $set[tostring] then "***"
                         elif type == "object" then with_entries(.key |= scrub | .value |= deep)

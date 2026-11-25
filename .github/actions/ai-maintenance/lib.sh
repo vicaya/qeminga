@@ -451,7 +451,26 @@ ai_nearest_effort() {
           else (([$allowed[] | select(. <= $ri)] | last) // $allowed[0]) as $i | $levels[$i] end'
 }
 
-ai_is_effort() { case " $AI_EFFORT_LEVELS " in *" ${1:-} "*) return 0 ;; esac; return 1; }
+ai_is_effort() {
+    case "${1:-}" in '' | *[!a-z]*) return 1 ;; esac
+    case " $AI_EFFORT_LEVELS " in *" $1 "*) return 0 ;; esac
+    return 1
+}
+
+# ai_effort_file FILE: the effort level FILE reports (ai_report_effort), when
+# it holds exactly one level, with or without its newline, and nothing else;
+# otherwise nothing, status 1. The file is the agent's to write.
+ai_effort_file() {
+    local l
+    ai_regular_file "$1" || return 1
+    for l in $AI_EFFORT_LEVELS; do
+        if cmp -s -- "$1" <(printf '%s\n' "$l") || cmp -s -- "$1" <(printf '%s' "$l"); then
+            printf '%s\n' "$l"
+            return 0
+        fi
+    done
+    return 1
+}
 
 # ai_parse_model_spec SPEC -> "MODEL<TAB>EFFORT". A spec is a model with an
 # optional trailing effort level ("claude-opus-5-5 high"), a model alone,

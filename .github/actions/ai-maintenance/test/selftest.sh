@@ -416,6 +416,28 @@ eq "spec: model only" "claude-opus-5-5|" "$(ai_parse_model_spec 'claude-opus-5-5
 eq "spec: a lone level is an effort, the model stays the CLI's" "|high" "$(ai_parse_model_spec 'high' | tr '\t' '|')"
 eq "spec: extra spaces are ignored" "m|max" "$(ai_parse_model_spec '  m   max ' | tr '\t' '|')"
 eq "spec: empty means both defaults" "|" "$(ai_parse_model_spec '' | tr '\t' '|')"
+# An effort level is one whole word of AI_EFFORT_LEVELS, nothing more.
+for bad in 'low medium' 'medium high' ' high' 'high ' $'high\n' 'hig' '' 'high*'; do
+    ai_is_effort "$bad"
+    eq "effort: '${bad//$'\n'/\\n}' is no effort level" 1 $?
+done
+# The effort an adapter reports: one record that is a level, with or
+# without its newline. Anything else is not reported.
+for good in 'high' $'high\n' 'xhigh' $'max\n'; do
+    printf '%s' "$good" >"$tmp/effort-file"
+    eq "effort: the file '${good//$'\n'/\\n}' reports its level" "${good%$'\n'}" "$(ai_effort_file "$tmp/effort-file")"
+done
+for bad in $'low medium\n' $'medium high' $'high\nlow\n' $'high\n\n' $'\nhigh' $'high\r\n' 'hi' '' \
+    "high$(printf '%20s' '')" $'high\n'"$(printf '%040d' 0)"; do
+    printf '%s' "$bad" >"$tmp/effort-file"
+    out=$(ai_effort_file "$tmp/effort-file")
+    eq "effort: the file '${bad//$'\n'/\\n}' reports nothing" "1 " "$? $out"
+done
+printf 'hi\0gh\n' >"$tmp/effort-file"
+eq "effort: a file with a NUL byte reports nothing" "1 " "$(ai_effort_file "$tmp/effort-file" 2>/dev/null; echo "$? ")"
+ln -s "$tmp/effort-target" "$tmp/effort-link" && printf 'high\n' >"$tmp/effort-target"
+eq "effort: a symbolic link reports nothing" "1 " "$(ai_effort_file "$tmp/effort-link"; echo "$? ")"
+eq "effort: a missing file reports nothing" "1 " "$(ai_effort_file "$tmp/no-effort"; echo "$? ")"
 for bad in 'm turbo' 'a b c' 'high low' 'demo med' 'demo hig' $'demo\nhigh' $'demo low\nextra' $'demo\r'; do
     ai_parse_model_spec "$bad" >/dev/null 2>&1
     eq "spec: rejects '${bad//$'\n'/\\n}'" 2 $?
@@ -580,11 +602,11 @@ rm -f "$tmp/many.log" "$tmp/many.out"
 # known about it is worked out once, not in every field.
 long=$(for i in $(seq 128); do printf 'line %03d of long private maintenance instructions xx\n' "$i"; done)
 jq -cn --arg l "$long" '[$l]' >"$tmp/long.json"
-for i in $(seq 100); do jq -cn --arg l "$long" '{type: "user", text: ("quoted: " + $l)}'; done >"$tmp/long.jsonl"
+for i in $(seq 100); do jq -cn --arg l "$long" --arg i "$i" '{type: "user", text: ("quoted \($i): " + $l)}'; done >"$tmp/long.jsonl"
 check "scrub (JSON lines): a long value in many fields is withheld quickly" bash -c '
     . "$1/lib.sh"; SECONDS=0
     out=$(ai_scrub_jsonl "$2/long.json" <"$2/long.jsonl") && [ "$SECONDS" -lt 20 ] &&
-        [ "$(jq -r .text <<<"$out" | sort -u)" = "quoted: ***" ]' _ "$action" "$tmp"
+        [ "$(jq -r .text <<<"$out")" = "$(seq -f "quoted %g: ***" 100)" ]' _ "$action" "$tmp"
 # Limits and lookahead are counted in bytes, also for multibyte text.
 for i in $(seq 40); do printf '測試行\n'; done >"$tmp/cut-mb"
 jq -cn --arg l "$(head -c 40 /dev/zero | tr '\0' L)"$'\n'"$(head -c 42 /dev/zero | tr '\0' M)" '[$l]' >"$tmp/cut-ml.json"

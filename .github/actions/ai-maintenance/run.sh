@@ -494,12 +494,7 @@ while IFS=$'\t' read -r entry keyidx provider; do
     # The effort the CLI ran with, when the adapter had to change it: an
     # effort level, or else the one requested (the file is the agent's to
     # write, so nothing else from it is published).
-    used=''
-    if ai_regular_file "$dir/out/effort"; then
-        used=$(head -c 16 "$dir/out/effort" | tr -d '\n')
-        ai_is_effort "$used" || used=''
-    fi
-    [ -n "$used" ] || used=$effort
+    used=$(ai_effort_file "$dir/out/effort") || used=$effort
     if [ "$rc" -eq 0 ]; then
         ai_log "attempt $n: $label finished"
         record "$provider" "$entry" "$keyidx" "$model" "$effort" "$used" success

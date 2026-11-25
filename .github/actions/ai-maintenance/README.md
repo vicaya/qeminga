@@ -324,8 +324,8 @@ checked before the first attempt.
 The attempts table in the run summary shows the effort each attempt asked
 for and, when its adapter changed it, the one it ran with
 (`max (used high)`). The result, the PR footer and the commit message report
-the effort the CLI ran with; an adapter that reports anything other than an
-effort level is taken to have run with the one asked for.
+the effort the CLI ran with; an adapter that reports anything other than exactly
+one effort level is taken to have run with the one asked for.
 
 | Provider | Model | Effort |
 |---|---|---|

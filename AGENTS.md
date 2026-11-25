@@ -90,14 +90,19 @@ or run the tests unprivileged.
 A separate workflow (`.github/workflows/libvirt-tcg.yml`) runs AC16
 against real libvirt under QEMU's TCG accelerator on both architectures:
 it installs the release candidate of the same run in a disposable guest
-and never builds in the lane. A companion `workflow_dispatch`-only
-workflow (`.github/workflows/libvirt-kvm.yml`) runs the same release
-candidate under real KVM on self-hosted `x86_64` and `aarch64` runners
+and never builds in the lane. A hosted KVM workflow
+(`.github/workflows/libvirt-kvm-hosted.yml`) exercises the `x86_64`
+release candidate under real KVM (`qemu:///session`, zero `sudo` during
+the run) on GitHub-hosted `ubuntu-24.04` runners using the
+`99-kvm4all.rules` udev workaround (`OPTIONS+="static_node=kvm"`). A
+companion `workflow_dispatch`-only workflow
+(`.github/workflows/libvirt-kvm.yml`) runs the same release candidate
+under real KVM on self-hosted `x86_64` and `aarch64` runners
 provisioned with `scripts/setup-kvm-runner.sh` (unprivileged
 `qemu:///session`, zero `sudo`, hardened systemd sandbox and pre-job
-allowlist hook). Neither workflow is part of the local checks above;
-recipes for running them locally and donating a KVM runner are in
-`docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`,
+allowlist hook). None of those workflows is part of the local checks
+above; recipes for running them locally and donating a KVM runner are
+in `docs/testing.md`, and `tests/libvirt_tcg_smoke.rs`,
 `tests/libvirt_kvm.rs`, and `tests/kvm_runner_setup.rs` (part of
 `cargo test`) cover their scripts and workflow shapes.
 

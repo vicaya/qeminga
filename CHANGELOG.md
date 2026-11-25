@@ -60,6 +60,21 @@ semantic versioning.
 
 ### Added
 
+- GitHub-hosted `x86_64` libvirt KVM smoke lane
+  (`.github/workflows/libvirt-kvm-hosted.yml`, T6.11, #53 in part): on
+  GitHub-hosted `ubuntu-24.04` runners, enables `/dev/kvm` for the
+  unprivileged `runner` user via the `99-kvm4all.rules` udev workaround
+  (`OPTIONS+="static_node=kvm"`, with mode checks both fail-fast before
+  package installation and inside `preflight` afterwards), reuses
+  `scripts/ci/libvirt-kvm-smoke.sh` in unprivileged `qemu:///session`
+  mode (no `sudo` during the run, no `libvirt-daemon-system`), proves
+  hardware KVM acceleration (`info kvm` enabled, `-accel kvm`, no TCG
+  fallback), installs the SHA-256-anchored release candidate inside a
+  pinned Ubuntu 24.04 guest, runs `scripts/e2e-libvirt.sh` (AC16), shuts
+  down via the agent, and records `suite: "libvirt-kvm-smoke-v1"` with
+  `accelerator: "kvm"` (emitting a structured failure `result.json` even
+  when an early `/dev/kvm` or setup step fails before `run` starts).
+
 - libvirt TCG smoke lane (`.github/workflows/libvirt-tcg.yml`, #53 in
   part): on GitHub-hosted runners, natively on x86-64 and aarch64, the
   release candidate built in the same run is installed with the shipped
@@ -127,6 +142,30 @@ semantic versioning.
 
 ### Fixed
 
+- Virtio-serial startup and host-disconnect race under fast KVM guests
+  (`src/channel.rs`, `src/kernel/async_fd.rs`, design §5.7, §5.10): once the
+  reactor latches hangup closed readiness (`WRITE_CLOSED` on writes, or
+  `READ_CLOSED` on a non-closed virtio port), the old registration ends the
+  departed session *before* calling `write(2)` or `read(2)` so undelivered
+  replies cannot leak to a reconnected peer and the new peer's first request
+  cannot join onto an old partial frame; when Linux `virtio_console` reports
+  an open port whose host side is not yet connected or has disconnected
+  (`POLLIN | POLLHUP` without `POLLOUT`, `POLLERR`, `POLLNVAL`, or
+  `POLLRDHUP`), `qeminga` abandons undelivered replies for the departed
+  session while letting accepted commands finish, deregisters the old Tokio
+  reactor registration while retaining the underlying descriptor together
+  with its input-queue boundary state (preventing `VSERPORT_CHANGE
+  (open=false)` from racing `libvirtd`), drains unread stale driver bytes
+  while disconnected until EOF/`EAGAIN` proves an empty receive queue
+  (resetting the port via close-and-reopen whenever ambiguous drain bytes or
+  a reconnect occurs before a clean boundary is established), polls
+  readiness with `ppoll(2)` under bounded backoff (`10 ms` doubling to
+  `500 ms`), and opens each connected session on a fresh reactor
+  registration and fresh `FrameDecoder` (avoiding sticky `EPOLLHUP`
+  closed-readiness spins on idle ports and keeping idle fast reconnects open
+  under bounded empty-EOF pacing). Hot-unplugged ports (bare `POLLHUP`),
+  closed PTY/socket peers, and other I/O errors still close and reopen with
+  the `1 s` to `30 s` reopen backoff.
 - The thaw of a freeze operation this process completed drains the
   descriptors the operation published (its frozen targets and the
   `EBUSY` ones it retained) and nothing else, reading no mount table: a

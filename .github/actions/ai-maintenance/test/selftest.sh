@@ -123,6 +123,7 @@ provider_run() {
         creds-*) { git config --get-regexp 'extraheader|includeif' || echo "no credentials"; } >"$final" 2>&1 ;;
         symlink-*) ln -sf /etc/hostname "$final" ;;
         effort-*) printf 'Done\n' >"$final"; printf 'low\n' >"$AI_ATTEMPT_DIR/effort" ;;
+        effortword-*) printf 'Done\n' >"$final"; printf 'leakedword\n' >"$AI_ATTEMPT_DIR/effort" ;;
         probe-*) . "$(dirname "${BASH_SOURCE[0]}")/probe.sh" "$key" >"$final" 2>&1 ;;
         names*) # output files named by the agent, one of them after its key
             printf 'x\n' >"$AI_ATTEMPT_DIR/$key.txt"
@@ -540,18 +541,32 @@ eq "scrub: values that overlap across a line are withheld as one" "start|***|end
 eq "scrub (JSON lines): ... in the raw text and inside a JSON string" '***|{"t":"x *** y"}' \
     "$(printf 'alpha1\nbeta22\ngamma3\ndelta4\nepsil5\n{"t":"x alpha1\\nbeta22\\ngamma3\\ndelta4\\nepsil5 y"}\n' |
         ai_scrub_jsonl "$tmp/ovl.json" | paste -sd'|')"
+# Each span is replaced where it was found: a value that holds the marker
+# itself ("***") never matches across a marker put in for another.
+printf '%s' '["SECRET1", "***ab", "abZZ"]' >"$tmp/marker.json"
+eq "scrub: spans are replaced at the offsets where they were found" 'x*** y ******' \
+    "$(printf 'x***ab y SECRET1abZZ' | ai_scrub "$tmp/marker.json")"
+eq "scrub (JSON lines): ... in JSON strings too" '{"t":"x*** y ******"}' \
+    "$(printf '{"t":"x***ab y SECRET1abZZ"}\n' | ai_scrub_jsonl "$tmp/marker.json")"
 printf '%s' '["abXab"]' >"$tmp/self.json"
 eq "scrub: a value that overlaps itself is withheld whole" "<***> <***>" "$(printf '<abXabXab> <abXab>' | ai_scrub "$tmp/self.json")"
+# Only a real self-overlap extends a span: the text after a value that
+# cannot overlap itself stays.
+printf '%s' '["abcd", "aab"]' >"$tmp/noself.json"
+eq "scrub: a value that does not overlap itself is withheld alone" "<***d> <***b> <a***>" \
+    "$(printf '<abcdd> <aabb> <aaab>' | ai_scrub "$tmp/noself.json")"
 printf 'start line\n%s\nalpha1\nbeta22\ngamma3\ndelta4\nepsil5\n%s\nend line\n' "$x60" "$x60" >"$tmp/cut-ovl"
 check "cut: at every limit, head and tail keep no part of values that overlap one another" bash -c '
     . "$1/lib.sh"
     for ((n = 1; n <= $(wc -c <"$2/cut-ovl") + 1; n++)); do
         for end in head tail; do
-            ai_publish_lines "$2/cut-ovl" "$2/ovl.pub" "$n" "$2/ovl.json" "$end"
+            ai_publish_lines "$2/cut-ovl" "$2/ovl.pub" "$n" "$2/ovl.json" "$end" || { echo "$n $end: failed"; exit 1; }
+            if [ "$n" -gt "$(wc -c <"$2/cut-ovl")" ] &&
+                [ "$(paste -sd"|" "$2/ovl.pub")" != "start line|$3|***|$3|end line" ]; then echo "$n $end: whole"; exit 1; fi
             if grep -qE "alpha1|beta22|gamma3|delta4|epsil5" "$2/ovl.pub"; then echo "$n $end: $(paste -sd"|" "$2/ovl.pub")"; exit 1; fi
             if grep -vqxE "start line|end line|x+|\\*\\*\\*|" "$2/ovl.pub"; then echo "$n $end: partial line"; exit 1; fi
         done
-    done' _ "$action" "$tmp"
+    done' _ "$action" "$tmp" "$x60"
 # Scrubbing is linear in the size of the log, also when a value occurs on
 # every line (jq's own join is quadratic: minutes for this log).
 yes 'an ordinary log line, with ab12 in it' | head -c 10000000 >"$tmp/many.log"
@@ -561,6 +576,15 @@ check "publish: a value on every line of a 10 MB log is scrubbed in linear time"
     ai_publish_lines "$2/many.log" "$2/many.out" 20000000 "$2/many.json" head &&
         ! grep -q ab12 "$2/many.out" && [ "$SECONDS" -lt 30 ]' _ "$action" "$tmp"
 rm -f "$tmp/many.log" "$tmp/many.out"
+# A long value (long instructions) found in many JSON fields: what is
+# known about it is worked out once, not in every field.
+long=$(for i in $(seq 128); do printf 'line %03d of long private maintenance instructions xx\n' "$i"; done)
+jq -cn --arg l "$long" '[$l]' >"$tmp/long.json"
+for i in $(seq 100); do jq -cn --arg l "$long" '{type: "user", text: ("quoted: " + $l)}'; done >"$tmp/long.jsonl"
+check "scrub (JSON lines): a long value in many fields is withheld quickly" bash -c '
+    . "$1/lib.sh"; SECONDS=0
+    out=$(ai_scrub_jsonl "$2/long.json" <"$2/long.jsonl") && [ "$SECONDS" -lt 20 ] &&
+        [ "$(jq -r .text <<<"$out" | sort -u)" = "quoted: ***" ]' _ "$action" "$tmp"
 # Limits and lookahead are counted in bytes, also for multibyte text.
 for i in $(seq 40); do printf '測試行\n'; done >"$tmp/cut-mb"
 jq -cn --arg l "$(head -c 40 /dev/zero | tr '\0' L)"$'\n'"$(head -c 42 /dev/zero | tr '\0' M)" '[$l]' >"$tmp/cut-ml.json"
@@ -781,6 +805,15 @@ check "run: an attempts table that cannot be published is listed, and logs-compl
 run_case faillogsdir '[{"claude":["ok-1"]}]' PATH="$failcmd:$bin:$PATH" FAIL_CMD_ON='*/ai-maintenance-run.*/logs'
 eq "run: a logs directory that cannot be made is not announced" "0 changed | false" \
     "$rc $(output status) |$(output logs-dir) $(output logs-complete)"
+# tee that cannot write the attempt log (it still passes the output on).
+failtee=$tmp/failtee
+mkdir -p "$failtee"
+printf '#!/usr/bin/env bash\ncat\nexit 1\n' >"$failtee/tee"
+chmod +x "$failtee/tee"
+run_case failtee '[{"claude":{"keys":["ok-1"]}}]' PATH="$failtee:$bin:$PATH"
+check "run: an attempt log that could not be captured is listed, and the attempt's result stands" bash -c \
+    'l=$1/logs; [ "$2" = 0 ] && [ "$3" = changed ] && [ "$4" = false ] && [ ! -e "$l/attempt-1/attempt.log" ] &&
+     grep -qx attempt-1/attempt.log "$l/INCOMPLETE.txt"' _ "$state" "$rc" "$(output status)" "$(output logs-complete)"
 run_case binleak '[{"claude":["binleak-1"]}]'
 eq "run: a binary file containing a pool key is not published" "1 failed" "$rc $(output status)"
 check "run: ... and no patch is left" bash -c '[ ! -e "$1/result/changes.patch" ]' _ "$state"
@@ -1083,6 +1116,12 @@ check "adapters: the CLIs get their keys in the environment, never in a command'
     '! grep -qa "$1" "$2" "$3"/* "$4"/* "$5"/*' _ "$argv_secrets" "$tmp/argv-real.log" "$tmp/codex-ctr" "$tmp/agy-ctr" "$tmp/claude-ctr"
 run_case effortfile '[{"claude":["effort-1"]}]' AI_MODELS='{"claude":"m max"}'
 eq "run: the effort an adapter reports wins over the one requested" "low" "$(jq -r .effort "$state/result/meta.json")"
+run_case effortword '[{"claude":["effortword-1"]}]' AI_MODELS='{"claude":"m high"}' AI_PRIVATE_INSTRUCTIONS=true \
+    GITHUB_STEP_SUMMARY="$tmp/effortword-summary.md"
+check "run: a reported effort that is no effort level is replaced by the requested one, everywhere" bash -c \
+    '[ "$(jq -r .effort "$1/result/meta.json")" = high ] && [ "$(jq -r .effort_used "$1/logs/attempts.jsonl")" = high ] &&
+     [ "$2" = high ] && ! grep -rqa leakedword "$1/result" "$1/logs" "$3"' \
+    _ "$state" "$(output effort)" "$tmp/effortword-summary.md"
 
 # Workflow commands: a line starting with "::" outside a stop-commands
 # region (other than the run's own grouping and masks) would be obeyed by

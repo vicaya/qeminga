@@ -174,24 +174,40 @@ ai_is_exhausted() {
 # Inside a decoded JSON string there is no such separator to keep:
 # patterns_and_values also has each value as configured.
 #
-# spans(PATTERNS) finds every occurrence of every pattern in the input
-# string as it is, overlapping ones included (of one pattern with another,
-# or with itself), and combines those that overlap into one span: [{s, e,
-# t}], in characters, t the span's text. Replacing the patterns one after
-# the other would not do: the first replaced would hide the rest of one
-# that overlaps it. redact(PATTERNS) replaces every span with "***", the
-# longest first (a span's text found elsewhere is withheld there too).
+# prepare turns PATTERNS into what the passes below use, worked out once
+# per run: each pattern with its length and its periods (the shifts at
+# which it overlaps itself). spans(PREPARED) finds every occurrence of
+# every pattern in the input string as it is, overlapping ones included
+# (of one pattern with another, or with itself), and combines those that
+# overlap into one span: [{s, e, t}], in characters, t the span's text.
+# splice(SPANS; f) rebuilds the string from the untouched text between the
+# spans' offsets and f applied to each span's text, in order: nothing is
+# searched again once a replacement is made, so a value that holds the
+# marker ("***") can never match across one. redact(PREPARED) replaces
+# every span with "***".
 # shellcheck disable=SC2016 # jq text
 AI_PATTERNS_JQ='def patterns: map(if test("\n") then gsub("^\\s+|\\s+$"; "") else . end)
     | map(select(length > 0)) | unique | sort_by(-length);
   def patterns_and_values: map(., (select(test("\n")) | gsub("^\\s+|\\s+$"; "")))
     | map(select(length > 0)) | unique | sort_by(-length);
-  # The occurrences of $k: split finds them left to right without overlap;
-  # one it skips overlaps the one before it, by a period of $k, and lies
-  # within the next $n characters (or the next occurrence found).
-  def occurrences($k):
-    ($k | length) as $n
-    | [range(1; $n) | . as $d | select($k[$d:] == $k[:$n - $d])] as $ds
+  # The shifts at which a string overlaps itself, from its prefix function
+  # (linear; jq 1.7 compares array slices wrongly, so only elements are).
+  def periods:
+    explode as $a | ($a | length) as $n
+    | if $n < 2 then [] else
+        reduce range(1; $n) as $i ([0];
+          .[$i] = (. as $pi | $pi[$i - 1]
+            | until(. == 0 or $a[.] == $a[$i]; $pi[. - 1])
+            | if $a[.] == $a[$i] then . + 1 else . end))
+        | . as $pi
+        | [$pi[$n - 1] | recurse(if . > 0 then $pi[. - 1] else empty end) | select(. > 0) | $n - .]
+      end;
+  def prepare: map({k: ., n: length, ds: periods});
+  # The occurrences of a prepared pattern: split finds them left to right
+  # without overlap; one it skips overlaps the one before it, by a period,
+  # and lies within the next n characters (or the next occurrence found).
+  def occurrences($p):
+    $p.k as $k | $p.n as $n | $p.ds as $ds
     | split($k) as $parts | ($parts | length) as $np
     | if $np < 2 then empty else
         foreach range(0; $np - 1) as $i ({end: 0};
@@ -207,8 +223,11 @@ AI_PATTERNS_JQ='def patterns: map(if test("\n") then gsub("^\\s+|\\s+$"; "") els
               | .t end) as $t
           | {s: $pos, e: ($pos + ($t | length)), t: $t})
       end;
-  def spans($ks):
-    [$ks[] as $k | occurrences($k)] | sort_by(.s)
+  # The prepared patterns the input holds at all (a quick test).
+  def held($ps): . as $in | [$ps[] | select(.k as $k | $in | contains($k))];
+  def spans($ps):
+    held($ps) as $h
+    | [$h[] as $p | occurrences($p)] | sort_by(.s)
     | [foreach (.[], null) as $o ({cur: null, done: null};
         if $o == null then .done = .cur
         elif .cur != null and .cur.e > $o.s then
@@ -216,24 +235,42 @@ AI_PATTERNS_JQ='def patterns: map(if test("\n") then gsub("^\\s+|\\s+$"; "") els
           | if $o.e > .cur.e then .cur.t += $o.t[(.cur.e - $o.s):] | .cur.e = $o.e else . end
         else .done = .cur | .cur = $o end;
         .done // empty)];
-  # join, linear in the length of the text (jq 1.7 joins in quadratic time).
-  def join_with($s): if length == 0 then "" else [.[0], (.[1:][] | $s, .)] | add end;
-  # The values the input holds at all (a quick test), for spans.
-  def held($ks): . as $in | [$ks[] | select(. as $k | $in | contains($k))];
-  def redact($ks):
-    held($ks) as $h
-    | if $h == [] then . else
-        reduce (spans($h) | map(.t) | unique | sort_by(-length) | .[]) as $t (.; split($t) | join_with("***"))
-      end;
+  # Line by line, so that only the lines a span touches are exploded into
+  # characters. The spans are in order and apart; j is the first that ends
+  # after the start of the line, o0 (one may run on from lines before).
+  def splice($sp; f):
+    if $sp == [] then . else
+      ($sp | length) as $m | split("\n") as $L | ($L | length) as $nl
+      | [foreach range(0; $nl) as $i ({j: 0, o: 0, out: ""};
+          .j as $j | .o as $o0
+          | ($L[$i] + (if $i < $nl - 1 then "\n" else "" end)) as $line
+          | ($o0 + ($line | length)) as $o
+          | (first(range($j; $m) | select($sp[.].s >= $o)) // $m) as $k
+          | if $k == $j then {j: $k, o: $o, out: $line} else
+              ($line | explode) as $c
+              # Offsets in the line: a span from the lines before starts at 0.
+              | ([$o0] + [$sp[$j:$k][] | .s, .e] + [$o] | map(. - $o0 | if . < 0 then 0 end)) as $b
+              | {j: (if $sp[$k - 1].e > $o then $k - 1 else $k end), o: $o,
+                 out: ([range(0; $k - $j + 1) as $q
+                        | ($c[$b[2 * $q]:$b[2 * $q + 1]] | implode),
+                          (if $q < $k - $j and $sp[$j + $q].s >= $o0 then $sp[$j + $q].t | f else empty end)]
+                       | add)}
+            end;
+          .out)]
+      | add
+    end;
+  def redact($ps): if held($ps) == [] then . else splice(spans($ps); "***") end;
   # The spans that run across lines, for the passes over whole text.
-  def multiline_spans($ks): spans(held($ks)) | map(.t | select(test("\n"))) | unique | sort_by(-length);'
+  def multiline_spans($ps):
+    if held([$ps[] | select(.k | contains("\n"))]) == [] then []
+    else [spans($ps)[] | select(.t | contains("\n"))] end;'
 
 # ai_scrub SECRETS_FILE < in > out: replaces every secret (pool keys, the
 # instructions) with "***", longest first (AI_PATTERNS_JQ). The secrets
 # come from a file (a JSON array), never from an argument, which other
 # accounts can read.
 ai_scrub() {
-    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"' redact($keys[0] | patterns)'
+    jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"' redact($keys[0] | patterns | prepare)'
 }
 
 # ai_contains_key KEYS_JSON FILE: success when FILE's bytes hold any key,
@@ -331,8 +368,7 @@ ai_cut_lines() {
     if [ "$3" = head ]; then head -c "$window" -- "$1"; else tail -c "$window" -- "$1"; fi |
         jq -Rjs --arg end "$3" --argjson limit "$2" --argjson eof "$eof" --slurpfile keys "$4" "$AI_PATTERNS_JQ"'
             . as $raw
-            | (reduce multiline_spans($keys[0] | patterns)[] as $t
-                (.; split($t) | join_with($t | gsub("\n"; " ")))) as $m
+            | splice(multiline_spans($keys[0] | patterns | prepare); gsub("\n"; " ")) as $m
             | ($m | split("\n")) as $p | ($m | length) as $mlen
             | if $end == "head" then
                 # The lines, each with its line end, that fit in the limit.
@@ -604,16 +640,16 @@ ai_json_forms() {
 # keep their types), and written back as JSON; any other line as text.
 ai_scrub_jsonl() {
     jq -Rjs --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
-        reduce multiline_spans($keys[0] | patterns)[] as $t (.; split($t) | join_with("***"))' |
-        jq -Rr --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
-            ($keys[0] | patterns_and_values) as $ks
+        splice(multiline_spans($keys[0] | patterns | prepare); "***")' |
+        jq -nRr --slurpfile keys "$1" "$AI_PATTERNS_JQ"'
+            ($keys[0] | patterns_and_values) as $ks | ($ks | prepare) as $ps
             | ($ks | map({(.): true}) | add // {}) as $set
-            | def scrub: redact($ks);
+            | def scrub: redact($ps);
               def deep: if type == "string" then scrub
                         elif type == "number" and $set[tostring] then "***"
                         elif type == "object" then with_entries(.key |= scrub | .value |= deep)
                         elif type == "array" then map(deep) else . end;
-              . as $line | try (fromjson | deep | tojson) catch ($line | scrub)'
+              inputs as $line | $line | try (fromjson | deep | tojson) catch ($line | scrub)'
 }
 
 # ai_mask_lines CREDENTIALS SECRETS -> the runner's ::add-mask:: values, in

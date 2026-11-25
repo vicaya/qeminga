@@ -409,6 +409,8 @@ install_cli() {
 
 # --- attempts -------------------------------------------------------------
 n=0 winner='' winner_model='' winner_effort='' winner_dir=''
+# Attempt logs the runner failed to write (tee failed): not published.
+uncaptured=()
 declare -A install_failed=() installed=()
 while IFS=$'\t' read -r entry keyidx provider; do
     [ -n "$entry" ] || continue
@@ -479,18 +481,23 @@ while IFS=$'\t' read -r entry keyidx provider; do
         suspend_commands
         AI_ATTEMPT_KEY=$(ai_key "$pool" "$entry" "$keyidx") \
             timeout --kill-after=30s "$attempt_timeout" docker "${docker_args[@]}" 2>&1 | tee "$dir/attempt.log"
-        rc=${PIPESTATUS[0]}
+        st=("${PIPESTATUS[@]}")
+        rc=${st[0]}
+        # The provider's result stands; only its log is incomplete.
+        [ "${st[1]}" -eq 0 ] || uncaptured+=("attempt-$n/attempt.log")
         resume_commands
     fi
     docker rm -f "$cname" >/dev/null 2>&1
     rm -rf "$dir/in"
     endgroup
 
-    # The effort the CLI ran with, when the adapter had to change it.
+    # The effort the CLI ran with, when the adapter had to change it: an
+    # effort level, or else the one requested (the file is the agent's to
+    # write, so nothing else from it is published).
     used=''
     if ai_regular_file "$dir/out/effort"; then
         used=$(head -c 16 "$dir/out/effort" | tr -d '\n')
-        case "$used" in *[!a-z]*) used='' ;; esac
+        ai_is_effort "$used" || used=''
     fi
     [ -n "$used" ] || used=$effort
     if [ "$rc" -eq 0 ]; then
@@ -564,7 +571,10 @@ if rm -rf "$logs" && mkdir -p "$logs"; then
             [ -d "$d" ] || continue
             l=$logs/${d##*/}
             if ! mkdir -p "$l"; then unpublished+=("${d##*/}/"); continue; fi
-            upload "$d/attempt.log" "$l/attempt.log"
+            case " ${uncaptured[*]} " in
+                *" ${d##*/}/attempt.log "*) unpublished+=("${d##*/}/attempt.log") ;;
+                *) upload "$d/attempt.log" "$l/attempt.log" ;;
+            esac
             upload "$d/install.log" "$l/install.log"
             upload "$d/out/final.md" "$l/final.md"
             upload "$d/out/error.txt" "$l/error.txt"

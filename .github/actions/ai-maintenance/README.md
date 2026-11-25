@@ -171,9 +171,10 @@ Around the agent job:
   bytes, changes it) at line ends that fall outside every withheld value,
   so no key, multiline credential or line of the instructions is cut in
   two before it is withheld; the scrubbed file is then held to that size
-  in whole lines (sizes in UTF-8 bytes). A log that cannot be published
-  is left out of the logs artifact and listed in its `INCOMPLETE.txt`,
-  and the action's `logs-complete` output is `false`. What the
+  in whole lines (sizes in UTF-8 bytes). A log that cannot be published,
+  or an attempt log the runner failed to write, is left out of the logs
+  artifact and listed in its `INCOMPLETE.txt`, and the action's
+  `logs-complete` output is `false`; the attempt's result stands. What the
   instructions ask for
   can still be inferred from the change itself.
 - Review feedback is passed on only from trusted authors. Anyone else's
@@ -253,7 +254,9 @@ with spending limits.
   Uploaded transcripts are scrubbed first as written, of every multiline
   value printed as plain text (matched without its leading and trailing
   white space, so the line break after it stays), and then as JSON, value
-  by value (a number that is a withheld value becomes `"***"`). `model`
+  by value (a number that is a withheld value becomes `"***"`). Withheld
+  values are found in the text as written, overlapping ones as one span,
+  and each span is replaced by one `***` where it was found. `model`
   and other settings stay public.
 - A provider may appear more than once, e.g. primary Claude keys, then GPT,
   then backup Claude keys.
@@ -321,7 +324,8 @@ checked before the first attempt.
 The attempts table in the run summary shows the effort each attempt asked
 for and, when its adapter changed it, the one it ran with
 (`max (used high)`). The result, the PR footer and the commit message report
-the effort the CLI ran with.
+the effort the CLI ran with; an adapter that reports anything other than an
+effort level is taken to have run with the one asked for.
 
 | Provider | Model | Effort |
 |---|---|---|

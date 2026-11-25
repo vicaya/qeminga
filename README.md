@@ -14,9 +14,11 @@ the guest.
 **Status:** 0.1.0. Every command in the design is implemented and tested
 (unit, property, fuzz, end-to-end over a pty, and privileged tests on
 loop-mounted filesystems, natively on x86-64 and aarch64) and exercised
-against real libvirt in CI under QEMU's TCG emulator on both
-architectures. One item stays open, tracked in
-[`docs/tasks.md`](docs/tasks.md) §7: a libvirt run under KVM (AC16).
+against real libvirt in CI under real KVM on GitHub-hosted x86-64
+(`ubuntu-24.04`) and under QEMU's TCG emulator on both architectures.
+The remaining release-qualification items (`libvirt-release-v1` suite
+and evidence verifier; native aarch64 KVM is tracked separately as
+optional coverage) are in [`docs/tasks.md`](docs/tasks.md) §7.
 
 ## Commands
 
@@ -53,8 +55,10 @@ confidential VM (CVM) deployment guidance — using the data-protection
 profile (`packaging/config-data-protection.toml`) as the CVM default and
 noting the v1 single-freezer assumption — are in
 [`packaging/README.md`](packaging/README.md). The libvirt
-interoperability checks (the TCG smoke lane in CI and the manual KVM
-recipe) are described in [`docs/testing.md`](docs/testing.md).
+interoperability checks (the TCG smoke lane in CI, the GitHub-hosted
+`x86_64` KVM smoke lane, the self-hosted `x86_64` / `arm64` KVM lane
+and community runner setup script `scripts/setup-kvm-runner.sh`, and the
+manual KVM recipe) are described in [`docs/testing.md`](docs/testing.md).
 
 - [`docs/design.md`](docs/design.md) — the design document (normative).
 - [`docs/tasks.md`](docs/tasks.md) — the implementation task list, with
@@ -71,6 +75,7 @@ cargo build --release --features seccomp   # panic=abort, LTO; the release confi
 cargo test --all-features                  # unit, property, integration and E2E tests
 cargo clippy --all-targets --all-features -- -D warnings
 scripts/check-unsafe.sh                    # no `unsafe` outside src/kernel/
+scripts/check-shell.sh                     # shellcheck over every shell script
 ```
 
 Cargo features (compile-time half of the two-level switches in the design):

@@ -1,0 +1,250 @@
+# libvirt + QEMU KVM smoke lane (#53, AC16) on GitHub-hosted x86_64 runners.
+#
+# GitHub-hosted standard Linux x86_64 runners (`ubuntu-24.04`) expose /dev/kvm
+# (nested virtualization on Azure, enabled for Android virtualization since
+# 2024-04-02), whereas GitHub-hosted arm64 runners (`ubuntu-24.04-arm`) do not
+# expose KVM at any tier. On `ubuntu-24.04`, the `runner` user is not in the
+# `kvm` group (and `usermod` cannot take effect inside the running session), so
+# this workflow installs `99-kvm4all.rules` with `OPTIONS+="static_node=kvm"`
+# (applying the rule's permissions to the static `/dev/kvm` node). Because a
+# normal `MODE="0666"` assignment can still be overridden by a later matching
+# udev rule, both this workflow (fail-fast `test -r /dev/kvm && test -w
+# /dev/kvm` before package installation) and `scripts/ci/libvirt-kvm-smoke.sh`
+# (`preflight` after package installation) verify `/dev/kvm` permissions and
+# fail closed on any regression.
+#
+# Because GitHub-hosted runners are ephemeral, this workflow safely runs on
+# `push` to `main`, `pull_request`, and `workflow_dispatch` (gated on
+# `scripts/ci/docs-only.sh`). It reuses `scripts/ci/libvirt-kvm-smoke.sh` in
+# unprivileged `qemu:///session` mode (zero `sudo` during the smoke run, no
+# `libvirt-daemon-system`, user-mode networking via libslirp) and anchors the
+# tested binary to the build job's reported SHA-256. If an early step fails
+# before `libvirt-kvm-smoke.sh run` installs its result-writing trap, a
+# fallback `if: always()` step writes a structured `libvirt-kvm-smoke-v1`
+# failure `result.json` (`accelerator: unknown`, unexecuted checks `not_run`,
+# unverified-digest sentinel), and a gated `stage-evidence` step copies only
+# verified allowlisted regular files into a fresh `0700` staging directory
+# before the summary and artifact upload.
+# Self-hosted x86_64 and aarch64 KVM runners remain in
+# `.github/workflows/libvirt-kvm.yml` (`workflow_dispatch` only).
+# `tests/libvirt_kvm.rs` checks this file's shape.
+name: libvirt KVM smoke (hosted x86_64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: libvirt-kvm-hosted-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # Same classification as ci.yml and libvirt-tcg.yml: a change touching only
+  # Markdown no check reads skips the lane.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: classify
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          code=true
+          if { [ "$EVENT" = pull_request ] || [ "$EVENT" = push ]; } \
+              && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git diff --name-only "$BASE" "$GITHUB_SHA" | tee changed.txt
+            if scripts/ci/docs-only.sh < changed.txt; then code=false; fi
+          fi
+          echo "code=$code" | tee -a "$GITHUB_OUTPUT"
+
+  candidate:
+    name: candidate (x86_64)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain (rust-toolchain.toml)
+        run: rustup toolchain install && rustup show active-toolchain
+      - name: The runner is a native x86_64 machine
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$RUNNER_ARCH" = "X64"
+          rustc -vV | grep -qx "host: x86_64-unknown-linux-gnu"
+      - name: Release build
+        run: cargo build --release --locked --features seccomp
+      # Taken from the built file, not from the manifest, and handed to the
+      # smoke job through the job output, not through the artifact.
+      - name: Digest of the built binary
+        id: digest
+        run: echo "sha256=$(sha256sum target/release/qeminga | cut -d' ' -f1)" | tee -a "$GITHUB_OUTPUT"
+      - name: Candidate and manifest
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "qeminga") | .version')
+          scripts/ci/libvirt-kvm-smoke.sh manifest --out candidate \
+            --binary target/release/qeminga --arch x86_64 --source-sha "$GITHUB_SHA" \
+            --version "$version" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --runner ubuntu-24.04
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate-kvm-hosted-x86_64
+          path: candidate/
+          if-no-files-found: error
+
+  smoke:
+    name: libvirt KVM smoke (hosted x86_64)
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      ARCH: x86_64
+      QEMINGA_E2E_CONNECT: qemu:///session
+      IMAGE_CACHE: ${{ github.workspace }}/libvirt-kvm-image-cache
+    steps:
+      - name: Prepare per-run output directory
+        id: prep_out
+        run: |
+          out="${RUNNER_TEMP:?}/libvirt-kvm-hosted-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          rm -rf -- "$out"
+          mkdir -p -m 0700 "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+      - id: checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The runner is a native x86_64 machine
+        run: |
+          test "$(uname -m)" = "x86_64"
+          test "$RUNNER_ARCH" = "X64"
+      # Fail fast if a runner-image rollout drops /dev/kvm, and grant the
+      # unprivileged runner user rw access without a new login session.
+      # OPTIONS+="static_node=kvm" applies the rule's permissions to the static
+      # /dev/kvm node; because a later matching udev rule could still override
+      # MODE="0666", both the check below and libvirt-kvm-smoke.sh's preflight
+      # after package installation verify /dev/kvm remains rw for runner.
+      - name: Enable /dev/kvm for the runner user
+        run: |
+          test -c /dev/kvm || { echo "::error::/dev/kvm is absent on this GitHub-hosted runner"; exit 1; }
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          sudo udevadm settle --timeout=30
+          ls -la /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm || {
+            echo "::error::/dev/kvm is not readable and writable by $(id -un) after udev workaround"
+            exit 1
+          }
+      - uses: actions/download-artifact@v4
+        with:
+          name: candidate-kvm-hosted-x86_64
+          path: candidate
+      # Keyed with a distinct prefix so the cache path never collides with
+      # libvirt-tcg-lane.yml's libvirt-tcg-image-cache directory; the script
+      # verifies the pinned SHA-256 again after restore.
+      - name: Guest image cache key
+        id: image
+        run: echo "key=kvm-hosted-$(scripts/ci/libvirt-kvm-smoke.sh image-key "$ARCH")" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.IMAGE_CACHE }}
+          key: ${{ steps.image.outputs.key }}
+      - name: Install session libvirt and QEMU
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+            libvirt-daemon libvirt-daemon-driver-qemu libvirt-clients \
+            qemu-system-x86 qemu-utils genisoimage
+      - name: Boot, prove KVM, install, AC16, agent shutdown
+        run: |
+          mkdir -p "$IMAGE_CACHE"
+          scripts/ci/libvirt-kvm-smoke.sh run --arch "$ARCH" \
+            --candidate candidate --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}" \
+            --image-cache "$IMAGE_CACHE" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      - name: Clean up this run's domain and disks
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && env.OUT != ''
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$ARCH" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --out "$OUT"
+      # If an early step (such as the /dev/kvm check or package installation)
+      # failed before `libvirt-kvm-smoke.sh run` installed its EXIT trap — or an
+      # interrupted write left a missing, corrupt, or foreign file — ensure a
+      # valid run-bound `libvirt-kvm-smoke-v1` record exists so the summary and
+      # evidence artifact always carry valid JSON identifying this run.
+      - name: Record structured failure if run did not produce result.json
+        id: ensure_result
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && env.OUT != ''
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh ensure-result --out "$OUT" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
+      # Copy only verified allowlisted regular files (plus verified `tests/*`
+      # markers) into a fresh per-run `0700` staging directory so neither the
+      # summary nor `actions/upload-artifact` can ever read symlinks or widen
+      # traversal outside verified run outputs.
+      - name: Stage verified allowlisted evidence for upload
+        id: stage_evidence
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && steps.ensure_result.outcome == 'success' && env.OUT != ''
+        run: |
+          stage="${RUNNER_TEMP:?}/libvirt-kvm-hosted-stage-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$$"
+          scripts/ci/libvirt-kvm-smoke.sh stage-evidence --out "$OUT" --stage "$stage" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"
+          echo "dir=$stage" >> "$GITHUB_OUTPUT"
+      - name: Result summary
+        if: always() && steps.prep_out.outcome == 'success' && steps.checkout.outcome == 'success' && steps.ensure_result.outcome == 'success' && steps.stage_evidence.outcome == 'success' && steps.stage_evidence.outputs.dir != ''
+        env:
+          STAGE_DIR: ${{ steps.stage_evidence.outputs.dir }}
+        run: |
+          result_json="$(python3 -IB scripts/ci/libvirt_kvm_sysfs.py read-session-evidence-stdout "$STAGE_DIR" result.json)"
+          {
+            echo "## libvirt KVM smoke (hosted $ARCH)"
+            echo
+            echo '```json'
+            printf '%s\n' "$result_json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload evidence
+        if: always() && steps.prep_out.outcome == 'success' && steps.ensure_result.outcome == 'success' && steps.stage_evidence.outcome == 'success' && steps.stage_evidence.outputs.dir != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: libvirt-kvm-hosted-x86_64
+          path: ${{ steps.stage_evidence.outputs.dir }}/
+          if-no-files-found: error
+      # Runs only when every preceding step succeeded (no `if: always()`):
+      # turns the job red if `ensure-result` had to synthesize/replace invalid
+      # evidence or if the uploaded verdict is not a validated run-bound pass.
+      - name: Require validated passing result.json
+        env:
+          STAGE_DIR: ${{ steps.stage_evidence.outputs.dir }}
+        run: |
+          scripts/ci/libvirt-kvm-smoke.sh verify-pass --out "$STAGE_DIR" \
+            --arch "$ARCH" --source-sha "$GITHUB_SHA" \
+            --expect-sha256 "${{ needs.candidate.outputs.sha256 }}"

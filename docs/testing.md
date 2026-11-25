@@ -8,10 +8,13 @@ supported architectures (`ubuntu-24.04` for x86-64, `ubuntu-24.04-arm`
 for aarch64; #51): the aarch64 privileged leg is the execution evidence
 for the aarch64 seccomp profile (AC15), and each leg proves its
 architecture (`uname -m`, `RUNNER_ARCH`, the rustc host triple) before
-it builds anything. This page also covers interoperability with a real
-libvirt/QEMU host (AC16, T5.4): an automated smoke lane under QEMU's TCG
-accelerator on both architectures (below), and the manual recipe for a
-KVM host.
+it builds anything. This page also covers interoperability with a real libvirt/QEMU host
+(AC16, T5.4): an automated smoke lane under QEMU's TCG accelerator on
+both architectures, an automated KVM smoke lane on GitHub-hosted x86-64
+runners (`ubuntu-24.04`), a `workflow_dispatch`-only KVM smoke lane on
+self-hosted x86-64 and aarch64 (arm64) runners with a hardened community
+runner setup script (`scripts/setup-kvm-runner.sh`), and the manual
+recipe for a KVM host.
 
 ## libvirt TCG smoke lane (CI)
 
@@ -92,7 +95,7 @@ line carries `-accel tcg`) before it counts any result.
 This is smoke evidence on an emulated CPU, not KVM evidence and not a
 release qualification. Not covered yet (the rest of #53): ext4/XFS data
 disks, FSTRIM, a quiesced snapshot and its restore, the idle watchdog
-through libvirt, the x86-64 KVM lane and release verification. Timeouts
+through libvirt, and the private-controller release verification. Timeouts
 are explicit: `QEMINGA_E2E_BOOT_TIMEOUT_SECS` (default 1800) bounds boot
 plus install under emulation, `QEMINGA_E2E_SHUTDOWN_TIMEOUT_SECS`
 (default 300) the agent shutdown, and the job has `timeout-minutes`.
@@ -109,6 +112,498 @@ sudo scripts/ci/libvirt-tcg-smoke.sh run --arch "$(uname -m)" --candidate /tmp/c
   --source-sha "$sha" --run-id 1 --run-attempt 1 --out /tmp/tcg-out \
   --expect-sha256 "$(sha256sum target/release/qeminga | cut -d' ' -f1)"
 sudo scripts/ci/libvirt-tcg-smoke.sh cleanup --arch "$(uname -m)" --run-id 1 --run-attempt 1
+```
+
+## libvirt KVM smoke lanes & community runner setup (hosted x86_64; self-hosted x86_64 and arm64)
+
+### GitHub-hosted x86_64 KVM smoke lane (CI)
+
+`.github/workflows/libvirt-kvm-hosted.yml` (#53, part) exercises real
+hardware-accelerated KVM on GitHub-hosted `ubuntu-24.04` (`x86_64`)
+runners on every code-changing push to `main`, pull request, and
+`workflow_dispatch` (gated on `scripts/ci/docs-only.sh`):
+
+- **Why `x86_64` only on hosted runners:** standard GitHub-hosted Linux
+  `x86_64` runners expose `/dev/kvm` via Azure nested virtualization
+  (enabled since 2024-04-02), whereas GitHub-hosted `ubuntu-24.04-arm`
+  runners do not expose `/dev/kvm` at any tier (Azure Arm VM SKUs do
+  not yet offer nested virtualization).
+- **`/dev/kvm` udev workaround, mode checks, and early-failure result:** on
+  `ubuntu-24.04`, the `runner` user is not in the `kvm` group (and `usermod`
+  cannot take effect inside an already-running Actions job). Before installing
+  any packages or booting a guest, the `smoke` job checks `test -c /dev/kvm`,
+  installs `/etc/udev/rules.d/99-kvm4all.rules` with
+  `KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"`
+  (`OPTIONS+="static_node=kvm"` applies the rule's permissions to the named
+  static device node), runs `udevadm control --reload-rules`,
+  `udevadm trigger --name-match=kvm`, and `udevadm settle`, and checks
+  `test -r /dev/kvm && test -w /dev/kvm` as the unprivileged `runner` user.
+  Because a normal `MODE="0666"` assignment can still be overridden by a later
+  matching udev rule, both that fail-fast check before package installation and
+  `scripts/ci/libvirt-kvm-smoke.sh`'s own `preflight` check after package
+  installation detect any permissions regression. If an early step exits before
+  `libvirt-kvm-smoke.sh run` installs its `EXIT` trap, an `if: always()` step
+  invokes `scripts/ci/libvirt-kvm-smoke.sh ensure-result` before the summary
+  and evidence upload — preserving any already-written valid run-bound report
+  and otherwise writing a structured `libvirt-kvm-smoke-v1` failure
+  `result.json` (`accelerator: "unknown"`, unexecuted checks `"not_run"`,
+  unverified-digest sentinel). On the success path after evidence upload,
+  `scripts/ci/libvirt-kvm-smoke.sh verify-pass` requires a validated passing
+  `result.json` matching the run's architecture, source SHA, and candidate
+  digest.
+- **Unprivileged `qemu:///session` reuse:** the `candidate` job builds
+  `cargo build --release --locked --features seccomp` on `ubuntu-24.04`
+  and reports the binary's SHA-256 as a job output; the `smoke` job has
+  no Rust toolchain, installs only minimal session virtualization
+  packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
+  `libvirt-clients`, `qemu-system-x86`, `qemu-utils`, `genisoimage` —
+  no `libvirt-daemon-system`), and runs `scripts/ci/libvirt-kvm-smoke.sh`
+  completely unprivileged under `QEMINGA_E2E_CONNECT=qemu:///session`
+  with `<interface type='user'>` (libslirp), proving KVM acceleration
+  (refusing any TCG fallback) and producing `suite: "libvirt-kvm-smoke-v1"`
+  with `accelerator: "kvm"`. Because KVM on GitHub-hosted runners is an
+  undocumented capability without an SLA, the hosted TCG smoke lane
+  (`.github/workflows/libvirt-tcg.yml`) stays alongside it.
+
+### Self-hosted KVM smoke lane & community runner setup (x86_64 and arm64)
+
+`.github/workflows/libvirt-kvm.yml` (calling `.github/workflows/libvirt-kvm-lane.yml`
+independently per architecture) exercises real hardware-accelerated KVM on
+self-hosted `x86_64` and `aarch64` (`arm64`) Linux servers alongside the
+hosted TCG and hosted `x86_64` KVM lanes:
+
+- **Trust boundary:** `libvirt-kvm.yml` is triggered **only** via
+  `workflow_dispatch` (never `pull_request`, `pull_request_target`, or
+  comments), with `permissions: contents: read` and zero secrets passed to
+  the self-hosted runner. Inside the reusable `libvirt-kvm-lane.yml` itself,
+  every job requires `workflow_dispatch`, `refs/heads/main`, and caller
+  `.github/workflows/libvirt-kvm.yml`; a fixed GitHub-hosted `verify` job
+  (`ubuntu-24.04`) proves `target_rev` is a 40-hex commit reachable from
+  `vicaya/qeminga` `refs/heads/main` before either `candidate` or `kvm`
+  schedules, and `candidate` derives its hosted runner label
+  (`ubuntu-24.04` / `ubuntu-24.04-arm`) from a fixed architecture mapping
+  (never a caller input). The `candidate` job builds
+  `cargo build --release --locked --features seccomp`, and the `kvm` job
+  verifies the binary against
+  `--expect-sha256 "${{ needs.candidate.outputs.sha256 }}"` with no Rust
+  toolchain, no `apt-get`, and no `sudo` on the self-hosted runner.
+- **Native KVM on both architectures:** `scripts/ci/libvirt-kvm-smoke.sh`
+  (sharing candidate manifest/digest checks, pinned Ubuntu cloud image
+  digests, and verified image fetch with `scripts/ci/libvirt-tcg-smoke.sh`
+  via `scripts/ci/libvirt-smoke-common.sh`) boots a disposable guest with
+  `<domain type='kvm'>` and `<cpu mode='host-passthrough' check='none'/>`
+  (`x86_64`: `q35`, SeaBIOS, `<apic/>`; `aarch64`: `virt`, UEFI from
+  `qemu-efi-aarch64` / `edk2-aarch64`, `<gic version='host'/>` to match
+  GICv2 or GICv3 arm64 servers automatically), proves KVM via `virsh dumpxml`,
+  HMP `info kvm` (`kvm support: enabled`), and the QEMU command line
+  (`-accel kvm` / `accel=kvm`, refusing any TCG fallback), installs the
+  candidate via `scripts/ci/libvirt-tcg-guest.sh`, runs
+  `scripts/e2e-libvirt.sh`, and records `suite: "libvirt-kvm-smoke-v1"`
+  with `accelerator: "kvm"`.
+- **Unprivileged by default:** defaults to `QEMINGA_E2E_CONNECT=qemu:///session`
+  with QEMU user-mode networking (`<interface type='user'>` via `libslirp`)
+  and refuses to run as root in session mode.
+
+### Setting up a community-donated KVM runner (`x86_64` or `arm64`)
+
+Community members with a Linux KVM server (bare metal or nested-KVM VPS,
+`x86_64` or `aarch64`/`arm64`, Ubuntu/Debian or Fedora/RHEL with systemd
+and cgroup v2) can check readiness and provision a hardened runner with
+`scripts/setup-kvm-runner.sh`.
+
+**GitHub-side dispatch restriction is mandatory:** never register a donated
+runner directly on public `vicaya/qeminga`. In `actions/runner`, action
+preparation runs before `ACTIONS_RUNNER_HOOK_JOB_STARTED`, and steps with
+`if: always()` or `if: failure()` still execute after a hook failure, so a
+hook alone cannot keep untrusted jobs off the runner. Register the runner
+against either:
+
+1. **Private controller repository (default, #53):** a private repository
+   containing `.github/workflows/libvirt-kvm.yml` and
+   `.github/workflows/libvirt-kvm-lane.yml` (optionally pinning a 40-hex
+   commit in `qeminga-target.rev`; otherwise resolving `vicaya/qeminga`
+   `refs/heads/main`). `install` checks repository visibility and refuses
+   public repositories (including `vicaya/qeminga`).
+2. **Restricted organization runner group:** an organization runner group
+   (`--org https://github.com/<org> --runner-group <GROUP> --allow-repo vicaya/qeminga`)
+   restricted in GitHub's runner-group settings to the reviewed repository
+   and workflow/ref.
+
+```sh
+# 1. Read-only check (architecture, /dev/kvm, cgroup v2, libvirt/QEMU, AAVMF on arm64, RAM/disk, DNS)
+scripts/setup-kvm-runner.sh preflight
+
+# 2. One-command hardened setup against the private controller repository
+#    (prompts for the 1-hour GitHub registration token with hidden input, or
+#    pass --token-file /path/to/mode-0600-token or --token-file -)
+sudo scripts/setup-kvm-runner.sh install \
+  --repo https://github.com/<owner>/qeminga-kvm-controller
+
+# Alternative: restricted GitHub organization runner group
+# sudo scripts/setup-kvm-runner.sh install \
+#   --org https://github.com/<org> \
+#   --runner-group <restricted-group> \
+#   --allow-repo vicaya/qeminga
+
+# Inspect active hardening score, policy, and logs:
+scripts/setup-kvm-runner.sh status
+journalctl -u qeminga-kvm-runner.service -f
+```
+
+For one-shot ephemeral runs, pass `--ephemeral` or (with a private `--repo`
+controller) `--jitconfig-file /path/to/jitconfig` (mode `0600`; organization
+JIT provisioning is refused because JIT blobs do not cryptographically bind
+the GitHub runner group, and unbound JIT blobs omitting or emptying
+`gitHubUrl` are refused in favor of `--token-file` / interactive token
+registration because shared `actions.githubusercontent.com` endpoints do
+not identify the repository; the single-use credential is decoded after
+package installation supplies `jq`, validated for its exact matching
+`gitHubUrl` and direct-child workspace path `$INSTALL_DIR/<name>` or exact
+`$STATE_DIR/work`, delivered via systemd `LoadCredential=`, and removed
+automatically on service stop). You can inspect the generated unit and
+hooks before touching the host with `render-unit` and `render-hooks`.
+
+### Security-by-default controls on donated runners
+
+1. **Dedicated locked account (`qeminga-runner`) and scoped ownership:**
+   system user with `/usr/sbin/nologin`, no `sudo`, no `libvirt`, `docker`,
+   or `adm` group; only supplementary group `kvm` (to open `/dev/kvm`).
+   `install` validates every ancestor component from `/` down to each
+   managed directory (refusing symlinks, non-root owners, and group- or
+   world-writable modes), refuses to adopt unrelated pre-existing accounts
+   (or accounts in any group beyond `{qeminga-runner, kvm}`), unmanaged
+   pre-existing directories, or existing systemd units (including vendor
+   units) without a matching unit ownership record. It reserves a fresh
+   config directory exclusively as root before creating the service account
+   (rolling back both the empty directory and newly created account if the
+   initial record cannot be written), claims each remaining top-level
+   managed directory exclusively via `mkdir` and publishes fresh systemd
+   units via hard link (`link(2)`) so concurrent creations or systemd mask
+   symlinks (`/dev/null`) fail atomically without mutating foreign files,
+   and records the provisioned UID/GID, dedicated non-overlapping paths,
+   and per-resource acquisition markers (`OWNED_CONFIG_DIR`,
+   `OWNED_STATE_DIR`, `OWNED_INSTALL_DIR`, `OWNED_HOOK_DIR`, `OWNED_UNIT`)
+   in root-owned `/etc/qeminga-runner/install.env` (`0600`) immediately
+   upon creation and before initializing contents
+   (`RECORD_STATE=installing`, finalized to `installed` only after startup
+   readiness succeeds unless `--no-start` is set), so an interrupted first
+   install (including a failure while initializing state subdirectories)
+   stays recoverable without ever claiming a unit name or directory created
+   independently afterwards, stops an existing runner service only when
+   owned by this installation, and creates runtime state subdirectories
+   (`work/`, `images/`, `image-cache/`, etc.) as the unprivileged runner
+   user rather than root.
+2. **Unprivileged `qemu:///session` isolation:** installs only minimal
+   session packages (`libvirt-daemon`, `libvirt-daemon-driver-qemu`,
+   `libvirt-clients`, `qemu-system-x86` or `qemu-system-arm` +
+   `qemu-efi-aarch64`, `qemu-utils`, `genisoimage`, `git`, `jq`, `curl`,
+   `python3`); no `libvirt-daemon-system`, no host bridge, no `docker`, and
+   no access to the donor's own `qemu:///system` VMs.
+3. **Kernel-enforced systemd sandbox:** `NoNewPrivileges=yes`, empty
+   `CapabilityBoundingSet=` / `AmbientCapabilities=`, `ProtectSystem=strict`,
+   `ProtectHome=yes`, `PrivateTmp=yes`, `ProtectProc=invisible`,
+   `DevicePolicy=closed` with `DeviceAllow=/dev/kvm rw` only,
+   `RestrictNamespaces=yes`, `RestrictSUIDSGID=yes`, `LockPersonality=yes`,
+   `RestrictRealtime=yes`, `SystemCallArchitectures=native`,
+   `SystemCallFilter=@system-service` (blocking mount, module, reboot, swap,
+   raw I/O, clock, and debug syscalls), `UMask=0077`, `KillMode=control-group`,
+   and host-protecting bounds (`MemoryMax=80%`, `TasksMax=512`, optional
+   `--cpu-quota`). (`MemoryDenyWriteExecute` is omitted because `.NET`,
+   Node.js, and QEMU need JIT mappings.)
+4. **Verified cgroup BPF egress firewall:** denies a unit-specific loopback
+   sentinel (`127.255.255.254/32`), cloud instance metadata
+   (`169.254.0.0/16`, `fe80::/10`, and AWS IPv6 IMDS `fd00:ec2::254/128`
+   unconditionally, even with `--no-lan-deny`), multicast, and private LANs
+   (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10`,
+   `fc00::/7`) by default while allowing `127.0.0.0/9` (`127.0.0.1`,
+   `systemd-resolved` at `127.0.0.53`) and `::1/128`. Because systemd
+   silently skips `IPAddressDeny=` on hosts or containers without cgroup
+   BPF firewalling (and excludes `ExecStartPre=` from
+   `RestartPreventExitStatus=`), the unit uses `Type=notify` with
+   `NotifyAccess=main` and `TimeoutStartSec=60s`: the root-owned
+   main-process launcher (`run-runner.sh` or `run-jit.sh`) invokes
+   `check-egress-firewall.sh` before signaling `READY=1` as MainPID and
+   `exec`'ing the runner listener (stripping `NOTIFY_SOCKET`). That check
+   runs `/usr/bin/python3` in isolated mode (`-I -S`) under `env -i` so
+   runner-writable `HOME` / user-site configuration cannot influence the
+   verdict, proves this unit's cgroup BPF policy rejects the loopback
+   sentinel (`127.255.255.254`), IMDS, and configured private LANs with
+   `EPERM` (distinguishing unit policy from host-wide IMDS blocks), and
+   exits `78` directly in the main process without sending `READY=1` so
+   `systemctl start` / `install` fails immediately and
+   `RestartPreventExitStatus=78` stops restarts on unsupported hosts.
+   Because QEMU runs in the same cgroup, disposable guest VMs inherit the
+   same block. Hosts with a private DNS resolver can pass
+   `--allow-ip <ip>/32` (IMDS ranges, the loopback sentinel, and default
+   routes are always refused).
+5. **Host-enforced pre- and post-job hooks (defense-in-depth):** root-owned
+   `/usr/local/libexec/qeminga-runner/hook-job-{started,completed}.sh`
+   wired via systemd `Environment=` and configured by root-owned
+   `/etc/qeminga-runner/policy.env` (`0640`). As a second check behind
+   GitHub-side repo/runner-group restriction, `hook-job-started.sh`
+   enforces exact whole-string allowlists on `GITHUB_REPOSITORY`,
+   `GITHUB_EVENT_NAME` (default `workflow_dispatch` only; `pull_request`
+   and `pull_request_target` are unconditionally refused), `GITHUB_REF`
+   (default `refs/heads/main`), `GITHUB_WORKFLOW_REF` (default
+   `.github/workflows/libvirt-kvm.yml`), and optional `--allow-actor`, plus
+   checks `/dev/kvm` and stale `qeminga-e2e-*` domains. After every job,
+   `hook-job-completed.sh` destroys/undefines any stray `qeminga-e2e-*`
+   session domains (leaving unrelated domains alone and keeping disks if
+   state is unknown), anchors image verification and recursive same-mount
+   run-directory and `WORK_DIR` removal strictly to their trusted parent
+   FDs via kernel `O_PATH | O_DIRECTORY | O_NOFOLLOW` ancestor traversal
+   (supporting search-only `0711` parents), requires a non-empty
+   `STATE_VOL` / `INSTALL_VOL` volume fingerprint recorded in root-owned
+   `policy.env` (failing closed on legacy empty values and directing to
+   `migrate-record --confirm-volumes`), verifies the opened parent FD
+   against that unprivileged-verifiable fingerprint (matching filesystem
+   type, filesystem-relative root path, `/dev/disk/by-uuid` UUID or mount
+   source, and `f_fsid` — tolerating systemd's own `ProtectSystem=strict`
+   self-bind-mounts while failing closed on parent overmounts or
+   replacement bind mounts), plus `O_RDONLY | O_DIRECTORY | O_NOFOLLOW` on
+   the enumerated directory and `/proc/self/mountinfo` +
+   `/proc/self/fdinfo` `mnt_id` verification (so symlinks, cross-device
+   mounts, and same-filesystem bind mounts — whether directly at
+   `WORK_DIR`/`$STATE_DIR/images` or beneath them — fail closed without
+   touching external targets), restricts `WORK_DIR` to exact
+   `$STATE_DIR/work` or a single non-reserved child under `$INSTALL_DIR`,
+   and keeps the SHA-256-verified image cache.
+6. **Pinned, read-only runner binaries & safe update/reinstall/uninstall:**
+   downloads official `actions/runner` over HTTPS TLS 1.2+ and checks the
+   pinned SHA-256 digest for `linux-x64` or `linux-arm64` before
+   extraction into a private `0700` root-owned sibling staging tree
+   (`.qeminga-extract.*/payload`), where internal archive hard links are
+   materialized into independent `st_nlink == 1` files, special files are
+   refused, `bin/installdependencies.sh` executes FD-pinned relative to
+   the staging descriptor (`./bin/installdependencies.sh`) without reopening
+   pathnames in the live tree, and verified entries are published
+   atomically via `rename(2)` into a volume-verified directory FD.
+   `install`, `update`, `migrate-record`, and `uninstall` serialize
+   overlapping invocations for the same `--config-dir` with an exclusive
+   root-owned `flock` under `/run/.qeminga-runner.locks` (a hidden path
+   outside the service `RuntimeDirectory=` namespace, with explicit
+   collision checks against `--service` and any custom `QEMINGA_LOCK_DIR`)
+   before reading `install.env`. Fresh installs write a durable
+   `RECORD_STATE=user-pending` record with a unique `INSTALL_ID` before
+   `useradd`, stamp `qeminga-runner-<INSTALL_ID>` into the new account's
+   GECOS (verified via strict `getent passwd` lookup alongside numeric
+   UID/GID across bootstrap, `install`, `update`, and `uninstall`, so an
+   unavailable lookup or unrelated/recycled-UID account is never adopted,
+   modified, or purged while legacy records without `INSTALL_ID` remain
+   distinguishable during migration), record each owned path's backing
+   volume fingerprint (`VOL_*`) using unprivileged-verifiable
+   `/proc/self/mountinfo` + `/dev/disk/by-uuid` (never root-only `blkid`)
+   or mount source + kernel `fstatvfs` `f_fsid` (catching directory
+   overmounts and reusable `/dev/sdX` device names while ensuring the
+   unprivileged cleanup hook agrees with the installer), enforce
+   mount-bounded and strict `st_nlink == 1` ownership changes
+   (`fs_ops safe-chown-tree` / `safe-chown-file`, rejecting multiply linked
+   files and special files on both scan and still-open `os.fchown` FDs),
+   render managed hooks, launchers, `policy.env`, `jitconfig`,
+   `install.env`, and updated units completely to private sibling temp
+   files and check producer exit status before `fsync`ing the staged file,
+   calling mount-checked `rename(2)`, and `fsync`ing the parent directory
+   (`fs_ops replace-file`, never piping concurrent producers or
+   opening/truncating an existing destination file), and publish fresh
+   systemd units with `ln -T` so an existing file, mask symlink, or
+   directory destination fails closed. Registration tokens are refused on
+   the command line (`--token` is rejected) and passed solely via the
+   inherited `ACTIONS_RUNNER_INPUT_TOKEN` environment variable. Reinstalls
+   require non-empty recorded `VOL_*` fingerprints for every owned
+   directory and owned systemd unit (directing legacy empty records and
+   preceding phased journals to `migrate-record --confirm-volumes` before
+   downloading, stopping the service, or mutating files), check owned
+   directories/unit for active mounts upfront, and inspect existing
+   `.runner` registrations before stopping the service: matching persistent
+   registrations are reused, incompatible ones are refused, provisioning
+   `--jitconfig-file` refuses any leftover `.runner`/`.credentials`/
+   `.credentials_rsaparams`/`.path`, and in-place persistent re-enrollment
+   (`config.sh --replace`) over an already-`installed` runner lacking a
+   matching `.runner` (including when the runner directory itself was
+   deleted on the recorded volume) is refused — run
+   `sudo scripts/setup-kvm-runner.sh uninstall --config-dir <dir>` (with
+   `--token-file` when an executable local `config.sh` is still present to
+   run `config.sh remove`; if the runner directory or `config.sh` is gone,
+   `uninstall` clears local state and reports the recorded runner name and
+   target so you can remove the registration manually in the repository or
+   organization's **Settings → Actions → Runners** on GitHub) before
+   re-enrolling so remote GitHub registration state is never mutated without
+   rollback. For an existing
+   owned `installed` runner, reinstall downloads, stages, validates, and
+   prepares dependencies for the replacement bundle, durably journals
+   `UPDATE_PHASE=preparing` with the verified stage and backup directory
+   identities BEFORE copying pre-reinstall `policy.env`, `jitconfig`,
+   hooks, launcher, and systemd unit (bytes, modes, and ownership) into the
+   verified backup container (so a crash mid-snapshot is cleanly prunable
+   by retrying `install`, `update`, or `uninstall` without touching
+   originals), advances to `UPDATE_PHASE=publishing`, and shares `update`'s
+   recoverable transactional replacement — restoring both binaries and
+   snapshotted config/policy/unit (retaining `cfg_old/` and
+   `config-manifest.json` until `UPDATE_PHASE=restored` is durably saved,
+   with `systemctl daemon-reload`) before restarting the previous release
+   if publication or service startup fails. Auto-updates are disabled by
+   default (`--disableupdate`) so runner binaries stay kernel-read-only;
+   GitHub requires runner updates within 30 days of a new release — update
+   cleanly with `sudo scripts/setup-kvm-runner.sh update` (which requires a
+   valid root-owned `install.env` in `installed` state — or retries an
+   interrupted `updating` record — with non-empty recorded
+   `VOL_INSTALL_DIR` and `VOL_UNIT`, directing legacy empty records,
+   legacy pre-phase `updating` records, and preceding `376eed2`-format
+   phased journals to `migrate-record --confirm-volumes` before download or
+   service stop; verifies live numeric UID/GID, `INSTALL_ID` marker,
+   recorded backing volumes, absence of nested mounts, and a working
+   `systemctl` client / confirmed service state for any owned unit both
+   before and after download; stages, sanitizes, and validates the complete
+   bundle in a private `0700` sibling before stopping the service; records
+   `UPDATE_PHASE=publishing`, the original `UPDATE_WAS_ACTIVE`, and both
+   `.qeminga-extract.*` stage and `.qeminga-update-backup.*` backup paths
+   with reboot/remount-surviving directory identities binding parent/target
+   inodes, persistent volume fingerprint, and a root-owned `0600`
+   `.qeminga-tx-id` marker published atomically via temp file + `fsync` +
+   `link` in `install.env` (preserving recorded containers in exit traps if
+   post-rename directory `fsync` fails or the journal cannot be read);
+   publishes `manifest.json` atomically via
+   `manifest.json.tmp` + `fsync` + `rename`, moves live entries into the
+   verified backup container and `fsync`s the backup before placing
+   replacements, and `fsync`s all published package files and directories
+   before returning; keeps the complete backup through permission locking
+   and service activation so a startup failure rolls back and restarts the
+   previous release; durably records `UPDATE_PHASE=committed` after
+   startup succeeds — or after permission locking with `--no-start` —
+   BEFORE pruning the backup (enforcing `euid`/`0700` ownership and syncing
+   the emptied container before unlinking `.qeminga-tx-id` last); and on
+   retrying an `updating` record durably re-saves `preparing`, `committed`,
+   or `restored` phases before pruning any backup (preserving backups across
+   persistent config-directory sync errors), prunes an interrupted
+   `preparing` stage/snapshot without touching live files, finishes pruning
+   a `committed` backup without rolling back, or confirms any active owned
+   service is stopped first (in both `publishing` and `restored` recovery,
+   before re-locking permissions and while retaining restart intent),
+   reclaims the recorded stage, restores the verified `publishing` backup
+   (retaining the verified backup container and config blobs on disk until
+   `UPDATE_PHASE=restored` is durably saved, and only then pruning it with
+   parent-directory `fsync` — retrying the parent `fsync` on absent-path
+   retries as well), re-locks permissions, reloads systemd, and preserves
+   `UPDATE_WAS_ACTIVE`; and refuses mismatched flags, or opt in to GitHub
+   self-updates with `--allow-auto-update`). Deliberate fail-closed
+   exception to automatic container verification and pruning: every stage
+   and backup verification or removal requires a matching `.qeminga-tx-id`
+   marker rather than accepting or auto-removing a markerless directory
+   (which cannot be reliably distinguished from filesystem inode reuse
+   after removal). If recovery or cleanup stops with
+   `missing transaction identity marker '.qeminga-tx-id' (leaving for inspection)`,
+   preserve `install.env` untouched and check both `UPDATE_PHASE` in
+   `install.env` and whether the diagnostic names a staging container
+   (`.qeminga-extract.*`) or a backup container
+   (`.qeminga-update-backup.*`). When `UPDATE_PHASE=publishing` and the
+   diagnostic names the backup container, do **not** move or delete it:
+   both `update` and `uninstall` require that backup and its contents at
+   its recorded path to restore the previous installation, so keep the
+   backup intact for restoration. Only when the container's sole remaining
+   operation is pruning — any staging container, or a backup container in
+   `preparing`, `committed`, or `restored` (for example if a crash stopped
+   after unlinking `.qeminga-tx-id` and before `rmdir`, leaving rollback to
+   retain the reference in `UPDATE_PHASE=restored`) — inspect the directory
+   to confirm nothing needs to be kept, set it aside (for example `mv` it
+   to an inspection path, or `rmdir` it once confirmed empty), and then
+   re-run `sudo scripts/setup-kvm-runner.sh update` or `uninstall` so
+   recovery syncs the parent directory and finishes cleanly.
+   Operators upgrading legacy empty/4-field or verified root-only `blkid`
+   UUID `VOL_*` records, pre-marker managed accounts, pre-phase `updating`
+   journals, or preceding `376eed2`-format phased journals (using 7-field
+   `p_dev/p_ino/p_mnt/t_dev/t_ino/t_mnt/vol` identities) can run
+   `sudo scripts/setup-kvm-runner.sh migrate-record --confirm-volumes`
+   and/or `--confirm-account-marker` after confirming the host storage and
+   account (`migrate-record` refuses `user-pending` records, failed
+   `getent passwd` lookups, mismatched legacy or strong UUID/fsid volumes,
+   absent owned paths, and any non-empty GECOS including comma-separated
+   contact metadata; upgrades legacy pre-phase `updating` records to
+   `UPDATE_PHASE=restored` when `UPDATE_BACKUP_DIR` is empty or atomically
+   publishes and container-`fsync`s `.qeminga-tx-id` and
+   `UPDATE_PHASE=publishing` + `UPDATE_BACKUP_ID` after verifying a
+   root-owned `0700` same-volume backup container;
+   atomically verifies preceding `376eed2` `publishing`/`committed`/
+   `restored` stage and backup containers on the same open directory
+   descriptor and atomically publishes/syncs `.qeminga-tx-id` (including
+   container `fsync` on reuse retries) while preserving `UPDATE_PHASE` —
+   or, for a `376eed2` `committed` journal whose backup was already pruned
+   before `RECORD_STATE=installed` was written, verifies the recorded
+   parent inode and backing volume and finalizes the completed transaction
+   as `installed`; checks moved `STAGED_*` payloads before vacated public
+   paths during interrupted `partial-uninstall` recovery across all four
+   slots — and when a released `OWNED_*=0` slot's `STAGED_*` directory was
+   already deleted before clearing `STAGED_*`, verifies its recorded legacy
+   volume fingerprint against the trusted parent directory after confirming
+   no mount exists at or under the absent path; persists any newly
+   generated `INSTALL_ID` to `install.env` before invoking `usermod` so
+   interrupted attempts stay idempotent on retry; and refreshes
+   `STATE_VOL`/`INSTALL_VOL` in `policy.env`). Remove only resources owned
+   by the recorded installation with
+   `sudo scripts/setup-kvm-runner.sh uninstall [--token-file PATH] [--purge-user]`
+   (which requires a working `systemctl` client, verifies that systemd
+   resolves the service name to the installation's recorded local unit
+   fragment rather than a same-name vendor unit in another search-path
+   directory, and confirms deactivation of any owned unit before restoring a
+   `publishing` backup — then reconciles any interrupted `updating` phase via
+   the shared durable journal-write-before-prune sequence, durably saving
+   recovered `preparing`/`committed`/`restored` phases (including the
+   decision to discard a `publishing` backup when the live runner directory
+   is absent on the recorded volume) before pruning verified stage/backup
+   containers — and **after** backup restoration and pruning confirms the
+   owned unit is both stopped and disabled across persistent and `--runtime`
+   scopes, checking `systemctl disable`, `systemctl --runtime disable` when
+   runtime enablement is present, `is-enabled`, and absence of
+   `.wants`/`.requires`/`.upholds` links before running guest domain cleanup,
+   deregistration, or resource removal: if stopping fails before a
+   `publishing` restore, the backup and `UPDATE_PHASE=publishing` journal
+   stay untouched; if disabling fails afterward, backup restoration/pruning
+   has already completed and `install.env` (with `OWNED_UNIT=1` and
+   `UPDATE_PHASE=restored` when recovering from `updating`), the unit file,
+   and all owned runner/state/hook/config directories remain on disk for
+   retry; emits a manual **Settings → Actions → Runners** diagnostic naming
+   the recorded runner and target before discarding local state whenever
+   executable `config.sh` is unavailable for deregistration, directs legacy
+   pre-phase and preceding `376eed2` phased `updating` records to
+   `migrate-record --confirm-volumes`, and shares the same user, volume,
+   and mount checks BEFORE any `runuser`, `chown`, service stop, or token
+   handoff — leaving `install.env` intact on mismatch — stages and runs the
+   current installer's own domain-only cleanup logic with a minimal
+   `STATE_DIR`/`IMAGES_DIR`/`STATE_VOL` policy over a private temporary runtime dir once `OWNED_UNIT=0`, fails closed in the fallback
+   path when `runuser` or the service account is unavailable and
+   `$STATE_DIR/images` cannot be verified clean without following symlinks
+   or crossing a mount, verifies each owned or staged path's recorded
+   `VOL_*` backing volume before accepting absence as deleted or modifying
+   it, refuses to stage or delete across any active mount or
+   same-filesystem bind mount via `/proc/self/mountinfo` and kernel
+   `fdinfo` `mnt_id`, moves each owned unit or directory via pure
+   `rename(2)` (no copy-and-delete fallback on `EXDEV`) into a private
+   root-only `0700` `.qeminga-removing.*` staging container recorded in
+   `STAGED_*` before clearing `OWNED_*=0` and reloading systemd — refusing
+   to purge the service account or remove `install.env` until every staged
+   container is confirmed deleted so failed deletions stay recoverable on
+   retry without touching replacement paths — preserves `$STATE_DIR/images`
+   and `$STATE_DIR/.config` if session domain cleanup cannot confirm
+   domains are gone, and when run without `--purge-user` retains a minimal
+   `RECORD_STATE=user-only` UID/GID/marker record in
+   `/etc/qeminga-runner/install.env` so a later default reinstall or
+   `uninstall --purge-user` recognizes the surviving managed account).
+
+### Running the KVM smoke script locally (unprivileged)
+
+On any `x86_64` or `aarch64` Linux host where your account is in the `kvm`
+group and `libvirt-daemon`, `libvirt-daemon-driver-qemu`, `libvirt-clients`,
+`qemu-system-{x86,arm}` (plus `qemu-efi-aarch64` on arm64), `qemu-utils`,
+`genisoimage`, `jq`, and `curl` are installed:
+
+```sh
+cargo build --release --locked --features seccomp
+sha=$(git rev-parse HEAD)
+scripts/ci/libvirt-kvm-smoke.sh manifest --out /tmp/candidate --binary target/release/qeminga \
+  --arch "$(uname -m)" --source-sha "$sha" --version 0.1.0 --run-id 1 --run-attempt 1 --runner local
+scripts/ci/libvirt-kvm-smoke.sh run --arch "$(uname -m)" --candidate /tmp/candidate \
+  --source-sha "$sha" --run-id 1 --run-attempt 1 --out /tmp/kvm-out \
+  --expect-sha256 "$(sha256sum target/release/qeminga | cut -d' ' -f1)"
+scripts/ci/libvirt-kvm-smoke.sh cleanup --arch "$(uname -m)" --run-id 1 --run-attempt 1
 ```
 
 ## Manual run on a KVM host

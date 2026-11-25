@@ -10,9 +10,10 @@
 #
 #   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] DOMAIN
 #
-# CI runs it under QEMU TCG (scripts/ci/libvirt-tcg-smoke.sh); a KVM run
-# stays manual, see docs/testing.md. tests/libvirt_script.rs runs it
-# against a scripted `virsh` so the shell logic itself is tested.
+# CI runs it under QEMU TCG on both architectures (scripts/ci/libvirt-tcg-smoke.sh)
+# and under real KVM (scripts/ci/libvirt-kvm-smoke.sh on GitHub-hosted x86_64 and
+# self-hosted x86_64/aarch64 runners); see docs/testing.md. tests/libvirt_script.rs
+# runs it against a scripted `virsh` so the shell logic itself is tested.
 set -euo pipefail
 
 connect=""
@@ -21,7 +22,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --connect) connect="--connect=$2"; shift 2 ;;
         --no-shutdown) shutdown=0; shift ;;
-        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) break ;;
     esac
 done
@@ -43,6 +44,7 @@ for cmd in domfsfreeze domfsthaw domifaddr domfsinfo domstate qemu-agent-command
 done
 
 # Every check runs in this shell (a `bash -c` child would not see `v`).
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
 refused_exec() {
     local out
     if out="$(agent '{"execute":"guest-exec","arguments":{"path":"/bin/true"}}' 2>&1)"; then
@@ -56,6 +58,7 @@ refused_exec() {
         *) echo "unexpected refusal text"; return 1 ;;
     esac
 }
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
 status_is() {
     local out
     out="$(agent '{"execute":"guest-fsfreeze-status"}')" || { echo "$out"; return 1; }

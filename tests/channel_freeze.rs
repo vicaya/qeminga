@@ -832,3 +832,17 @@ async fn repeated_thaws_behind_a_blocked_drain_are_bounded_and_answered_in_order
     assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
     assert!(!rig.ctx.marker.exists());
 }
+
+#[test]
+fn session_report_keeps_public_two_field_shape() {
+    // External callers may construct and exhaustively destructure
+    // `SessionReport` by its two public fields (`end`, `received`); transport
+    // bookkeeping must stay out of the public struct.
+    let report = qeminga::channel::SessionReport {
+        end: qeminga::channel::SessionEnd::Eof,
+        received: 42,
+    };
+    let qeminga::channel::SessionReport { end, received } = report;
+    assert!(matches!(end, qeminga::channel::SessionEnd::Eof));
+    assert_eq!(received, 42);
+}

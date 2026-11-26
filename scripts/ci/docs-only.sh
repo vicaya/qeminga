@@ -11,9 +11,9 @@
 set -euo pipefail
 
 # Markdown that tests read: tests/packaging.rs parses the design's
-# configuration block and the packaging README, so a change to either can
-# turn a test red and must run the suite.
-READ_BY_TESTS="docs/design.md packaging/README.md"
+# configuration block, the packaging README, and the root README, so a
+# change to any of them can turn a test red and must run the suite.
+READ_BY_TESTS="README.md docs/design.md packaging/README.md"
 
 n=0
 while IFS= read -r path; do

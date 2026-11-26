@@ -98,16 +98,18 @@ post-compromise authority (design §5.9):
   `CapEff`, `CapPrm`, and `CapBnd` retain **only** `CAP_SYS_ADMIN` and
   `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty (`CAP_SYS_BOOT`
   absent from all five sets). The seccomp filter omits `reboot`, `sync`,
-  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, and
-  `FITRIM`.
+  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, the
+  inventory `sendto` rule, and `FITRIM` (see *Sockets and IPC* below for
+  the narrowed runtime signal rules).
 - **General-VM / lifecycle profile (`config.toml`, TOML schema default):**
   Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`,
   `guest-network-get-interfaces`, and `guest-get-fsinfo`. `CapEff`,
   `CapPrm`, and `CapBnd` retain `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and
   `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty; seccomp keeps
-  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, the netlink
-  syscalls, and `socket` (`AF_NETLINK` family check only, protocol
-  unrestricted).
+  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, `socket`
+  restricted to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`,
+  the inventory `sendto` rule (`flags == 0`, `addrlen == 12`), and the
+  netlink syscalls.
 - **Custom CVM configs must disable features explicitly:** The CVM
   installation default comes from installing `config-data-protection.toml`.
   An empty or partial `config.toml` is valid even under
@@ -142,15 +144,22 @@ device numbers, or marker paths).
     (required by `hardening = "enforced"`; the filter may be absent or
     logging-only under the development-only opt-out
     `hardening = "unenforced-development-only"`),
-    IP socket creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are
-    denied in every profile. With `information = false`, `socket` is
-    absent from the filter; with `information = true`, `socket` currently
-    checks only the `AF_NETLINK` family and leaves the netlink protocol
-    unrestricted (#67 tracks narrowing it). In every profile,
-    `socketpair`, `sendto`, and `recvfrom` remain in `COMMON` for the
-    Tokio/mio runtime signal driver with no argument or peer restriction,
-    so local IPC can reach other guest services subject to kernel
-    permissions (#67 tracks narrowing `socketpair`).
+    IP socket creation (`AF_INET`/`AF_INET6`), `connect`/`accept`/`listen`,
+    and `execve`/`execveat` are denied in every profile. With
+    `information = false`, `socket`, `bind`, `sendmsg`, `recvmsg`,
+    `setsockopt`, `getsockname`, and peer-addressed `sendto` are absent
+    from the filter; with `information = true`, `socket` is restricted to
+    `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` alongside an
+    additional inventory `sendto` rule restricted to `flags == 0` and
+    `addrlen == 12` (`sizeof(struct sockaddr_nl)`). In every profile,
+    `socketpair` is restricted to
+    `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)`,
+    `recvfrom` is restricted to peerless calls (`src_addr == NULL`,
+    `addrlen == NULL`), and `sendto` keeps the peerless form
+    (`dest_addr == NULL`, `addrlen == 0`) for the Tokio/mio runtime
+    signal driver; seccomp-BPF cannot dereference pointers or inspect
+    already-open descriptors such as the signal socketpair or inherited
+    journald `stderr` (design §§5.5, 5.9).
 - **Inventory and trim stay explicit guest choices.** Turning off
   `information = false` alone does not disable `guest-fstrim`:
   `guest-fstrim` replies independently list eligible mount paths even

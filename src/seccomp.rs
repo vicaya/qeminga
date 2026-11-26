@@ -7,14 +7,18 @@
 //! in the x86-64 profile, each with the observed need that justifies it.
 //! `ioctl` is restricted by request number to `FIFREEZE` and `FITHAW` (plus
 //! `FITRIM` only when `[features] fstrim = true`), `prctl` to `PR_SET_NAME`,
-//! `socket` to the `AF_NETLINK` family only (protocol currently unrestricted)
-//! when `[features] information = true` (absent when `information = false`),
-//! and `sync`/`reboot` only when `[features] shutdown = true`. Every profile
-//! retains unrestricted `socketpair`, `sendto`, and `recvfrom` in [`COMMON`]
-//! for the runtime signal driver. The default action kills the process; the
-//! `seccomp-log` feature switches it to logging only when `debug_assertions`
-//! are enabled ([`log_mode`]) for compatibility runs (C-17), while Cargo's
-//! standard `release` profile (`debug_assertions = false`) always enforces.
+//! `socket` to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` with an
+//! inventory `sendto` rule (`flags == 0`, `addrlen == 12`) when `[features]
+//! information = true` (both absent when `information = false`), and
+//! `sync`/`reboot` only when `[features] shutdown = true`. Every profile
+//! narrows `socketpair` to `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
+//! SOCK_CLOEXEC, 0)`, `recvfrom` to peerless calls (`src_addr == NULL`,
+//! `addrlen == NULL`), and `sendto` to peerless calls (`dest_addr == NULL`,
+//! `addrlen == 0`) for the runtime signal driver. The default action kills the
+//! process; the `seccomp-log` feature switches it to logging only when
+//! `debug_assertions` are enabled ([`log_mode`]) for compatibility runs
+//! (C-17), while Cargo's standard `release` profile (`debug_assertions =
+//! false`) always enforces.
 //!
 //! The filter is installed by `main` after the capability drop and
 //! `PR_SET_NO_NEW_PRIVS` (§5.4 step 6), so `seccomp(2)`/`prctl(2)` need
@@ -53,13 +57,55 @@ impl Target {
     }
 }
 
-/// A condition on one syscall argument (`seccompiler` dword `eq`).
+/// Width of a syscall argument comparison in `seccompiler`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgWidth {
+    /// Low 32 bits (`"dword"`), matching Linux kernel `int`/`unsigned int`/
+    /// `socklen_t` syscall parameter truncation on 64-bit targets.
+    Dword,
+    /// Full 64 bits (`"qword"`), required for pointer comparisons such as
+    /// checking that a `sockaddr` or `socklen_t*` argument is `NULL`.
+    Qword,
+}
+
+impl ArgWidth {
+    const fn as_str(self) -> &'static str {
+        match self {
+            ArgWidth::Dword => "dword",
+            ArgWidth::Qword => "qword",
+        }
+    }
+}
+
+/// A condition on one syscall argument (`seccompiler` `eq`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArgEq {
     /// Argument index (0-based).
     pub index: u8,
-    /// Required value (low 32 bits compared).
+    /// Comparison width (`dword` for 32-bit integers, `qword` for pointers).
+    pub width: ArgWidth,
+    /// Required value.
     pub value: u64,
+}
+
+impl ArgEq {
+    /// Matches the low 32 bits of syscall argument `index` against `value`.
+    pub const fn dword(index: u8, value: u64) -> Self {
+        Self {
+            index,
+            width: ArgWidth::Dword,
+            value,
+        }
+    }
+
+    /// Matches all 64 bits of syscall argument `index` against `value`.
+    pub const fn qword(index: u8, value: u64) -> Self {
+        Self {
+            index,
+            width: ArgWidth::Qword,
+            value,
+        }
+    }
 }
 
 /// One allow rule: a syscall name, optionally restricted by arguments.
@@ -79,6 +125,38 @@ pub const IOCTL_REQUESTS: [u32; 3] = [FIFREEZE, FITHAW, FITRIM];
 /// (`prctl(PR_SET_NAME, ...)` via `pthread_setname_np`); everything else
 /// `prctl` can do (`PR_SET_SECCOMP`, `PR_CAPBSET_DROP`, ...) stays denied.
 pub const PR_SET_NAME: u64 = 15;
+
+/// `AF_UNIX` (`1` on `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`).
+pub const AF_UNIX: u64 = 1;
+
+/// `SOCK_STREAM` (`1` on both supported Linux targets).
+pub const SOCK_STREAM: u64 = 1;
+
+/// `SOCK_RAW` (`3` on both supported Linux targets).
+pub const SOCK_RAW: u64 = 3;
+
+/// `SOCK_NONBLOCK` (`0x800` on both supported Linux targets).
+pub const SOCK_NONBLOCK: u64 = 0x800;
+
+/// `SOCK_CLOEXEC` (`0x80000` on both supported Linux targets).
+pub const SOCK_CLOEXEC: u64 = 0x8_0000;
+
+/// `NETLINK_ROUTE` (`0` on Linux): route/link/address netlink protocol used
+/// by `getifaddrs(3)` when `[features] information = true`.
+pub const NETLINK_ROUTE: u64 = 0;
+
+/// Exact `type` argument (`SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC`) passed
+/// by Tokio/mio's `UnixStream::pair()` signal-delivery socketpair.
+pub const SIGNAL_SOCKETPAIR_TYPE: u64 = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC;
+
+/// Exact `type` argument (`SOCK_RAW | SOCK_CLOEXEC`) passed by glibc's
+/// `getifaddrs(3)` when creating its `NETLINK_ROUTE` socket.
+pub const NETLINK_SOCKET_TYPE: u64 = SOCK_RAW | SOCK_CLOEXEC;
+
+/// `sizeof(struct sockaddr_nl)` (`12` bytes on both supported Linux targets):
+/// exact destination address length passed by glibc's `getifaddrs(3)` to
+/// `sendto(2)` with `flags == 0`.
+pub const SOCKADDR_NL_LEN: u64 = 12;
 
 /// Syscalls needed on both targets, grouped by the §5.5 surfaces table.
 pub const COMMON: &[&str] = &[
@@ -137,14 +215,8 @@ pub const COMMON: &[&str] = &[
     "eventfd2",
     "ppoll",
     "pipe2",
-    "socketpair",
-    // The signal driver's socketpair is written with send(2) and read
-    // with recv(2), which are sendto/recvfrom on Linux: needed to stop the
-    // daemon whatever the profile (observed under the data-protection
-    // profile as SECCOMP audit lines for syscalls 44 and 45 on x86-64).
-    "sendto",
-    "recvfrom",
-    // Signals.
+    // Signals (the signal driver's socketpair, sendto and recvfrom are listed
+    // separately below with explicit argument checks).
     "rt_sigaction",
     "rt_sigprocmask",
     "rt_sigreturn",
@@ -160,17 +232,20 @@ pub const COMMON: &[&str] = &[
     "getgid",
     "getegid",
     "getrandom",
-    // ioctl is listed separately with argument conditions; the
-    // information and power-management surfaces are in INFORMATION and
-    // POWER, present only with their consumer (§5.9).
+    // ioctl, prctl, socketpair, sendto, recvfrom, and optional socket are
+    // listed separately with argument conditions; the information and
+    // power-management surfaces are in INFORMATION and POWER, present only
+    // with their consumer (§5.9).
 ];
 
 /// Syscalls only the information commands need (§5.5, §5.9): `uname` for
 /// `guest-get-osinfo`, `statfs`/`fstatfs` for `guest-get-fsinfo`, and the
-/// netlink exchange of getifaddrs(3) for `guest-network-get-interfaces`
-/// (`socket` is listed separately, restricted to AF_NETLINK; `sendto` and
-/// `recvfrom` are common, the signal driver needs them too). Absent from
-/// the profile when `[features] information = false`.
+/// netlink exchange of `getifaddrs(3)` for `guest-network-get-interfaces`
+/// (`socket` is listed separately, restricted to `AF_NETLINK` +
+/// `SOCK_RAW | SOCK_CLOEXEC` + `NETLINK_ROUTE`, and an additional `sendto`
+/// rule permits `flags == 0` with `addrlen == SOCKADDR_NL_LEN` alongside the
+/// peerless `send(2)` rule present in every profile). Absent from the
+/// profile when `[features] information = false`.
 pub const INFORMATION: &[&str] = &[
     "uname",
     "statfs",
@@ -203,19 +278,24 @@ pub const X86_64_ONLY: &[&str] = &[
 ];
 
 /// `socket(2)` domain allowed when `[features] information = true`:
-/// `AF_NETLINK` (intended for `getifaddrs(3)` over `NETLINK_ROUTE`; today
-/// only the family argument is checked and the protocol is unrestricted).
-/// `socket(2)` is absent altogether when `information = false`, and
-/// `AF_INET`/`AF_INET6`/`AF_UNIX` `socket(2)` calls are never permitted;
-/// unrestricted `socketpair(2)` plus `sendto`/`recvfrom` remain in
-/// [`COMMON`] for the runtime signal driver (§5.9).
+/// `AF_NETLINK` (constrained with [`NETLINK_SOCKET_TYPE`] and
+/// [`NETLINK_ROUTE`] for `getifaddrs(3)`). `socket(2)` is absent altogether
+/// when `information = false`, and `AF_INET`/`AF_INET6`/`AF_UNIX` `socket(2)`
+/// calls are never permitted; narrowed `socketpair`, `sendto`, and `recvfrom`
+/// rules remain in every profile for the runtime signal driver (§5.5, §5.9).
 pub const AF_NETLINK: u64 = 16;
 
-/// The allow rules for `target` under `authority` (§5.9): the common
+/// The allow rules for `target` under `authority` (§5.5, §5.9): the common
 /// surface, the x86-64 aliases, `ioctl` restricted to `FIFREEZE` and
-/// `FITHAW` (and `FITRIM` with trim), `prctl(PR_SET_NAME)`, and only with
-/// their consumer the information syscalls with `socket(AF_NETLINK)` and
-/// the power syscalls.
+/// `FITHAW` (and `FITRIM` with trim), `prctl(PR_SET_NAME)`, `socketpair`
+/// restricted to `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)`,
+/// `recvfrom` restricted to peerless `recv(2)` (`src_addr == NULL`,
+/// `addrlen == NULL`), `sendto` restricted to peerless `send(2)`
+/// (`dest_addr == NULL`, `addrlen == 0`) in every profile, and only with
+/// their consumer the information syscalls with
+/// `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`, a second
+/// `sendto` rule for `flags == 0` and `addrlen == SOCKADDR_NL_LEN`, and the
+/// power syscalls.
 pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
     let plain = |name: &&'static str| Rule {
         syscall: name,
@@ -237,26 +317,57 @@ pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
             .filter(|request| authority.trim || **request != FITRIM)
             .map(|request| Rule {
                 syscall: "ioctl",
-                conditions: vec![ArgEq {
-                    index: 1,
-                    value: u64::from(*request),
-                }],
+                conditions: vec![ArgEq::dword(1, u64::from(*request))],
             }),
     );
     out.push(Rule {
         syscall: "prctl",
-        conditions: vec![ArgEq {
-            index: 0,
-            value: PR_SET_NAME,
-        }],
+        conditions: vec![ArgEq::dword(0, PR_SET_NAME)],
+    });
+    // Tokio/mio signal driver (`UnixStream::pair`): unnamed AF_UNIX stream
+    // socket pair only (no SOCK_DGRAM, no non-Unix family, no nonzero
+    // protocol, flags exact). `arg3` (`int sv[2]`) is a user pointer and
+    // cannot be dereferenced by seccomp-BPF.
+    out.push(Rule {
+        syscall: "socketpair",
+        conditions: vec![
+            ArgEq::dword(0, AF_UNIX),
+            ArgEq::dword(1, SIGNAL_SOCKETPAIR_TYPE),
+            ArgEq::dword(2, 0),
+        ],
+    });
+    // Signal driver reads via `recv(fd, buf, len, 0)` -> `recvfrom(..., NULL, NULL)`;
+    // `getifaddrs(3)` uses `recvmsg(2)`, so peerless `recvfrom` suffices in
+    // every profile.
+    out.push(Rule {
+        syscall: "recvfrom",
+        conditions: vec![ArgEq::qword(4, 0), ArgEq::qword(5, 0)],
+    });
+    // Signal driver writes via `send(fd, buf, len, MSG_NOSIGNAL)` ->
+    // `sendto(..., NULL, 0)`: permitted in every profile.
+    out.push(Rule {
+        syscall: "sendto",
+        conditions: vec![ArgEq::qword(4, 0), ArgEq::dword(5, 0)],
     });
     if authority.information {
+        // glibc `getifaddrs(3)` sends its netlink dump request via
+        // `sendto(fd, &req, sizeof(req), 0, &nladdr, sizeof(struct sockaddr_nl))`.
+        out.push(Rule {
+            syscall: "sendto",
+            conditions: vec![ArgEq::dword(3, 0), ArgEq::dword(5, SOCKADDR_NL_LEN)],
+        });
+        // glibc `getifaddrs(3)` creates `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
+        // NETLINK_ROUTE)`. Without `CAP_NET_ADMIN` (dropped in §5.4), route
+        // netlink cannot modify links or routes; other netlink protocols
+        // (`NETLINK_AUDIT`, `NETLINK_KOBJECT_UEVENT`, `NETLINK_GENERIC`, ...)
+        // and non-netlink families remain denied.
         out.push(Rule {
             syscall: "socket",
-            conditions: vec![ArgEq {
-                index: 0,
-                value: AF_NETLINK,
-            }],
+            conditions: vec![
+                ArgEq::dword(0, AF_NETLINK),
+                ArgEq::dword(1, NETLINK_SOCKET_TYPE),
+                ArgEq::dword(2, NETLINK_ROUTE),
+            ],
         });
     }
     out
@@ -301,7 +412,7 @@ pub fn profile_json(target: Target, authority: &Authority) -> String {
                     .map(|c| {
                         serde_json::json!({
                             "index": c.index,
-                            "type": "dword",
+                            "type": c.width.as_str(),
                             "op": "eq",
                             "val": c.value,
                         })
@@ -417,16 +528,497 @@ mod tests {
                 .filter(|r| r.syscall == "prctl")
                 .collect();
             assert_eq!(prctl.len(), 1);
-            assert_eq!(
-                prctl[0].conditions,
-                [ArgEq {
-                    index: 0,
-                    value: PR_SET_NAME
-                }]
-            );
+            assert_eq!(prctl[0].conditions, [ArgEq::dword(0, PR_SET_NAME)]);
             let json = profile_json(target, &FULL);
             assert_eq!(json.matches("\"syscall\":\"ioctl\"").count(), 3);
             assert!(json.contains(&format!("\"val\":{}", FIFREEZE)));
+        }
+    }
+
+    /// Pure-Rust cBPF interpreter covering every instruction emitted by
+    /// `seccompiler` for `struct seccomp_data` on little-endian 64-bit
+    /// Linux (`x86_64` and `aarch64`).
+    fn eval_bpf(program: &[seccompiler::sock_filter], arch: u32, nr: u32, args: [u64; 6]) -> u32 {
+        const BPF_LD_W_ABS: u16 = 0x20;
+        const BPF_ALU_AND_K: u16 = 0x54;
+        const BPF_JMP_JA: u16 = 0x05;
+        const BPF_JMP_JEQ_K: u16 = 0x15;
+        const BPF_JMP_JGT_K: u16 = 0x25;
+        const BPF_JMP_JGE_K: u16 = 0x35;
+        const BPF_RET_K: u16 = 0x06;
+
+        let mut data = [0u8; 64];
+        data[0..4].copy_from_slice(&nr.to_le_bytes());
+        data[4..8].copy_from_slice(&arch.to_le_bytes());
+        for (i, arg) in args.iter().enumerate() {
+            let off = 16 + i * 8;
+            data[off..off + 8].copy_from_slice(&arg.to_le_bytes());
+        }
+
+        let mut pc = 0usize;
+        let mut acc = 0u32;
+        let mut steps = 0usize;
+        while pc < program.len() {
+            steps += 1;
+            assert!(steps <= program.len() + 1, "cBPF loop detected");
+            let insn = &program[pc];
+            pc += 1;
+            match insn.code {
+                BPF_LD_W_ABS => {
+                    let off = insn.k as usize;
+                    acc = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
+                }
+                BPF_ALU_AND_K => acc &= insn.k,
+                BPF_JMP_JA => pc += insn.k as usize,
+                BPF_JMP_JEQ_K => pc += usize::from(if acc == insn.k { insn.jt } else { insn.jf }),
+                BPF_JMP_JGT_K => pc += usize::from(if acc > insn.k { insn.jt } else { insn.jf }),
+                BPF_JMP_JGE_K => pc += usize::from(if acc >= insn.k { insn.jt } else { insn.jf }),
+                BPF_RET_K => return insn.k,
+                other => panic!("unexpected cBPF opcode 0x{other:x} at pc={}", pc - 1),
+            }
+        }
+        panic!("cBPF program fell off the end without BPF_RET");
+    }
+
+    #[test]
+    fn socket_and_socketpair_filters_enforce_exact_arguments_on_both_targets() {
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+        const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+
+        let expected_deny = if log_mode() {
+            SECCOMP_RET_LOG
+        } else {
+            SECCOMP_RET_KILL_PROCESS
+        };
+
+        // ABI values shared across x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu.
+        const AF_UNIX_VAL: u64 = 1;
+        const AF_INET_VAL: u64 = 2;
+        const AF_INET6_VAL: u64 = 10;
+        const AF_NETLINK_VAL: u64 = 16;
+        const AF_PACKET_VAL: u64 = 17;
+        const AF_VSOCK_VAL: u64 = 40;
+        const SOCK_STREAM_VAL: u64 = 1;
+        const SOCK_DGRAM_VAL: u64 = 2;
+        const SOCK_RAW_VAL: u64 = 3;
+        const SOCK_SEQPACKET_VAL: u64 = 5;
+        const SOCK_NONBLOCK_VAL: u64 = 0x800;
+        const SOCK_CLOEXEC_VAL: u64 = 0x8_0000;
+        const NETLINK_ROUTE_VAL: u64 = 0;
+        const NETLINK_SOCK_DIAG_VAL: u64 = 4;
+        const NETLINK_AUDIT_VAL: u64 = 9;
+        const NETLINK_KOBJECT_UEVENT_VAL: u64 = 15;
+        const NETLINK_GENERIC_VAL: u64 = 16;
+        const MSG_NOSIGNAL_VAL: u64 = 0x4000;
+
+        // Verify ABI constants match libc on this host target (both x86_64 and
+        // aarch64 run natively in CI).
+        assert_eq!(AF_UNIX_VAL, u64::try_from(nix::libc::AF_UNIX).unwrap());
+        assert_eq!(
+            AF_NETLINK_VAL,
+            u64::try_from(nix::libc::AF_NETLINK).unwrap()
+        );
+        assert_eq!(
+            SOCK_STREAM_VAL,
+            u64::try_from(nix::libc::SOCK_STREAM).unwrap()
+        );
+        assert_eq!(SOCK_RAW_VAL, u64::try_from(nix::libc::SOCK_RAW).unwrap());
+        assert_eq!(
+            SOCK_NONBLOCK_VAL,
+            u64::try_from(nix::libc::SOCK_NONBLOCK).unwrap()
+        );
+        assert_eq!(
+            SOCK_CLOEXEC_VAL,
+            u64::try_from(nix::libc::SOCK_CLOEXEC).unwrap()
+        );
+        assert_eq!(
+            NETLINK_ROUTE_VAL,
+            u64::try_from(nix::libc::NETLINK_ROUTE).unwrap()
+        );
+        assert_eq!(
+            SOCKADDR_NL_LEN,
+            u64::try_from(std::mem::size_of::<nix::libc::sockaddr_nl>()).unwrap()
+        );
+
+        let targets = [
+            (
+                Target::X86_64,
+                AUDIT_ARCH_X86_64,
+                AUDIT_ARCH_AARCH64,
+                41u32, // SYS_socket
+                53u32, // SYS_socketpair
+                44u32, // SYS_sendto
+                45u32, // SYS_recvfrom
+            ),
+            (
+                Target::Aarch64,
+                AUDIT_ARCH_AARCH64,
+                AUDIT_ARCH_X86_64,
+                198u32, // SYS_socket
+                199u32, // SYS_socketpair
+                206u32, // SYS_sendto
+                207u32, // SYS_recvfrom
+            ),
+        ];
+
+        let dp = Authority::data_protection();
+        let info_only = Authority {
+            information: true,
+            ..dp
+        };
+
+        for (target, arch, wrong_arch, sys_socket, sys_socketpair, sys_sendto, sys_recvfrom) in
+            targets
+        {
+            for (label, auth) in [("cvm", &dp), ("info-only", &info_only), ("full", &FULL)] {
+                let bpf = profile(target, auth).unwrap();
+
+                // Wrong architecture is always killed unconditionally.
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        wrong_arch,
+                        sys_socketpair,
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_STREAM_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    SECCOMP_RET_KILL_PROCESS,
+                    "{target:?} {label}: wrong arch must kill"
+                );
+
+                // socketpair positive: Tokio/mio UnixStream::pair().
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        arch,
+                        sys_socketpair,
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_STREAM_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x7fff_1234,
+                            0,
+                            0,
+                        ],
+                    ),
+                    SECCOMP_RET_ALLOW,
+                    "{target:?} {label}: signal socketpair must be allowed"
+                );
+
+                // socketpair negatives: wrong family, type, flags, or protocol.
+                let good_pair_type = SOCK_STREAM_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL;
+                for (case, args) in [
+                    ("AF_INET", [AF_INET_VAL, good_pair_type, 0, 0x1000, 0, 0]),
+                    ("AF_INET6", [AF_INET6_VAL, good_pair_type, 0, 0x1000, 0, 0]),
+                    (
+                        "AF_NETLINK",
+                        [AF_NETLINK_VAL, good_pair_type, 0, 0x1000, 0, 0],
+                    ),
+                    (
+                        "AF_PACKET",
+                        [AF_PACKET_VAL, good_pair_type, 0, 0x1000, 0, 0],
+                    ),
+                    ("AF_VSOCK", [AF_VSOCK_VAL, good_pair_type, 0, 0x1000, 0, 0]),
+                    (
+                        "SOCK_DGRAM",
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_DGRAM_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "SOCK_SEQPACKET",
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_SEQPACKET_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "SOCK_RAW",
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_RAW_VAL | SOCK_NONBLOCK_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "missing flags",
+                        [AF_UNIX_VAL, SOCK_STREAM_VAL, 0, 0x1000, 0, 0],
+                    ),
+                    (
+                        "missing CLOEXEC",
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_STREAM_VAL | SOCK_NONBLOCK_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "missing NONBLOCK",
+                        [
+                            AF_UNIX_VAL,
+                            SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL,
+                            0,
+                            0x1000,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "extra type bit",
+                        [AF_UNIX_VAL, good_pair_type | 0x100, 0, 0x1000, 0, 0],
+                    ),
+                    (
+                        "nonzero protocol",
+                        [AF_UNIX_VAL, good_pair_type, 1, 0x1000, 0, 0],
+                    ),
+                ] {
+                    assert_eq!(
+                        eval_bpf(&bpf, arch, sys_socketpair, args),
+                        expected_deny,
+                        "{target:?} {label}: socketpair({case}) must be denied"
+                    );
+                }
+
+                // socket(2): absent when !information; strictly
+                // (AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) when information = true.
+                let netlink_args = [
+                    AF_NETLINK_VAL,
+                    SOCK_RAW_VAL | SOCK_CLOEXEC_VAL,
+                    NETLINK_ROUTE_VAL,
+                    0,
+                    0,
+                    0,
+                ];
+                assert_eq!(
+                    eval_bpf(&bpf, arch, sys_socket, netlink_args),
+                    if auth.information {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    },
+                    "{target:?} {label}: socket(AF_NETLINK, SOCK_RAW|SOCK_CLOEXEC, NETLINK_ROUTE)"
+                );
+
+                for (case, args) in [
+                    (
+                        "AF_INET",
+                        [AF_INET_VAL, SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL, 0, 0, 0, 0],
+                    ),
+                    (
+                        "AF_INET6",
+                        [AF_INET6_VAL, SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL, 0, 0, 0, 0],
+                    ),
+                    (
+                        "AF_UNIX",
+                        [AF_UNIX_VAL, SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL, 0, 0, 0, 0],
+                    ),
+                    (
+                        "AF_PACKET",
+                        [AF_PACKET_VAL, SOCK_RAW_VAL | SOCK_CLOEXEC_VAL, 0, 0, 0, 0],
+                    ),
+                    (
+                        "AF_VSOCK",
+                        [AF_VSOCK_VAL, SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL, 0, 0, 0, 0],
+                    ),
+                    (
+                        "NETLINK_AUDIT",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_RAW_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_AUDIT_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_KOBJECT_UEVENT",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_RAW_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_KOBJECT_UEVENT_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_GENERIC",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_RAW_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_GENERIC_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_SOCK_DIAG",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_RAW_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_SOCK_DIAG_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_ROUTE missing CLOEXEC",
+                        [AF_NETLINK_VAL, SOCK_RAW_VAL, NETLINK_ROUTE_VAL, 0, 0, 0],
+                    ),
+                    (
+                        "NETLINK_ROUTE extra NONBLOCK",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_RAW_VAL | SOCK_CLOEXEC_VAL | SOCK_NONBLOCK_VAL,
+                            NETLINK_ROUTE_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_ROUTE SOCK_DGRAM",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_DGRAM_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_ROUTE_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                    (
+                        "NETLINK_ROUTE SOCK_STREAM",
+                        [
+                            AF_NETLINK_VAL,
+                            SOCK_STREAM_VAL | SOCK_CLOEXEC_VAL,
+                            NETLINK_ROUTE_VAL,
+                            0,
+                            0,
+                            0,
+                        ],
+                    ),
+                ] {
+                    assert_eq!(
+                        eval_bpf(&bpf, arch, sys_socket, args),
+                        expected_deny,
+                        "{target:?} {label}: socket({case}) must be denied"
+                    );
+                }
+
+                // sendto: peerless send() allowed in every profile; netlink
+                // sendto(flags == 0, addrlen == sizeof(sockaddr_nl)) allowed
+                // only when information = true; unrelated flags or destination
+                // lengths (e.g., sockaddr_in=16, sockaddr_un=110) and non-null
+                // pointers with addrlen=0 (including high-bits-only) denied in
+                // every profile.
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        arch,
+                        sys_sendto,
+                        [9, 0x1000, 1, MSG_NOSIGNAL_VAL, 0, 0]
+                    ),
+                    SECCOMP_RET_ALLOW,
+                    "{target:?} {label}: peerless sendto (signal driver) must be allowed"
+                );
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        arch,
+                        sys_sendto,
+                        [9, 0x1000, 20, 0, 0x7fff_1234, SOCKADDR_NL_LEN]
+                    ),
+                    if auth.information {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    },
+                    "{target:?} {label}: netlink sendto(flags=0, addrlen=sizeof(sockaddr_nl))"
+                );
+                for (case, args) in [
+                    (
+                        "high-bits-only addr with addrlen=0",
+                        [9, 0x1000, 1, 0, 0x7fff_0000_0000, 0],
+                    ),
+                    (
+                        "sockaddr_nl len with nonzero flags",
+                        [
+                            9,
+                            0x1000,
+                            20,
+                            MSG_NOSIGNAL_VAL,
+                            0x7fff_1234,
+                            SOCKADDR_NL_LEN,
+                        ],
+                    ),
+                    ("sockaddr_in len (16)", [9, 0x1000, 20, 0, 0x7fff_1234, 16]),
+                    (
+                        "sockaddr_un len (110)",
+                        [9, 0x1000, 20, 0, 0x7fff_1234, 110],
+                    ),
+                ] {
+                    assert_eq!(
+                        eval_bpf(&bpf, arch, sys_sendto, args),
+                        expected_deny,
+                        "{target:?} {label}: sendto({case}) must be denied"
+                    );
+                }
+
+                // recvfrom: peerless recv() allowed in every profile; any
+                // non-null src_addr or addrlen pointer (including high-bits-only)
+                // denied in every profile (getifaddrs uses recvmsg).
+                assert_eq!(
+                    eval_bpf(&bpf, arch, sys_recvfrom, [10, 0x1000, 128, 0, 0, 0]),
+                    SECCOMP_RET_ALLOW,
+                    "{target:?} {label}: peerless recvfrom (signal driver) must be allowed"
+                );
+                for (case, args) in [
+                    ("src_addr", [10, 0x1000, 128, 0, 0x1000, 0]),
+                    (
+                        "high-bits src_addr",
+                        [10, 0x1000, 128, 0, 0x7fff_0000_0000, 0],
+                    ),
+                    ("addrlen ptr", [10, 0x1000, 128, 0, 0, 0x1000]),
+                    (
+                        "high-bits addrlen ptr",
+                        [10, 0x1000, 128, 0, 0, 0x7fff_0000_0000],
+                    ),
+                ] {
+                    assert_eq!(
+                        eval_bpf(&bpf, arch, sys_recvfrom, args),
+                        expected_deny,
+                        "{target:?} {label}: recvfrom({case}) must be denied"
+                    );
+                }
+            }
         }
     }
 
@@ -438,14 +1030,10 @@ mod tests {
                 .filter(|r| r.syscall == "socket")
                 .collect();
             assert_eq!(socket.len(), 1, "{target:?}");
-            assert_eq!(
-                socket[0].conditions,
-                [ArgEq {
-                    index: 0,
-                    value: AF_NETLINK
-                }]
-            );
             assert!(!COMMON.contains(&"socket"));
+            assert!(!COMMON.contains(&"socketpair"));
+            assert!(!COMMON.contains(&"sendto"));
+            assert!(!COMMON.contains(&"recvfrom"));
             let json = profile_json(target, &FULL);
             assert_eq!(json.matches("\"syscall\":\"socket\"").count(), 1);
             assert!(json.contains("\"val\":16"));
@@ -642,16 +1230,25 @@ mod tests {
                     "{target:?}: {forbidden} must be absent"
                 );
             }
-            // No duplicates.
+            // Only ioctl (3 rules) and sendto (2 rules in FULL: peerless +
+            // netlink sockaddr_nl) repeat.
             let mut sorted = names.clone();
             sorted.sort_unstable();
             sorted.dedup();
             assert_eq!(
-                sorted.len() + 2,
+                sorted.len() + 3,
                 names.len(),
-                "only ioctl repeats (3 rules)"
+                "only ioctl (3 rules) and sendto (2 rules) repeat in FULL"
             );
             assert_eq!(names.iter().filter(|n| **n == "prctl").count(), 1);
+            assert_eq!(names.iter().filter(|n| **n == "ioctl").count(), 3);
+            assert_eq!(names.iter().filter(|n| **n == "sendto").count(), 2);
+            // In CVM (information = false), sendto has only the peerless rule.
+            let dp_names: Vec<&str> = rules(target, &Authority::data_protection())
+                .iter()
+                .map(|r| r.syscall)
+                .collect();
+            assert_eq!(dp_names.iter().filter(|n| **n == "sendto").count(), 1);
         }
     }
 
@@ -739,5 +1336,166 @@ mod tests {
         );
         assert!(stdout.contains("MATRIX done"), "{stdout}");
         assert_eq!(stdout.matches("MATRIX {").count(), 15);
+    }
+
+    /// Installs the narrowed CVM (`Authority::data_protection()`) and full
+    /// profiles in child processes and verifies against the real Linux kernel:
+    /// - CVM signal delivery (`SIGTERM` over Tokio/mio's `AF_UNIX` `SOCK_STREAM`
+    ///   socketpair) succeeds and exits cleanly;
+    /// - under an enforcing filter (`!log_mode()`), each disallowed single
+    ///   syscall (`socketpair(AF_UNIX, SOCK_DGRAM|...)`, CVM
+    ///   `socket(AF_NETLINK, ...)`, `socket(AF_INET, ...)`,
+    ///   `socket(AF_NETLINK, ..., NETLINK_KOBJECT_UEVENT)`, and addressed
+    ///   Unix `sendto` in both CVM and full profiles) is killed immediately
+    ///   with `SIGSYS`; returning from the call (even with an OS error) exits
+    ///   with status 99 so a later denied syscall can never mask a failure.
+    #[test]
+    #[ignore = "installs a seccomp filter on the test process (run in the privileged job)"]
+    fn privileged_cvm_signal_delivery_and_socket_denials() {
+        use nix::sys::socket::{
+            AddressFamily, SockFlag, SockProtocol, SockType, socket, socketpair,
+        };
+        use std::os::unix::net::UnixDatagram;
+        use std::os::unix::process::ExitStatusExt;
+
+        const ENV_CASE: &str = "QEMINGA_SECCOMP_IPC_CASE";
+        const ENV_PEER: &str = "QEMINGA_SECCOMP_IPC_PEER";
+        const RETURNED_WITHOUT_SIGSYS: i32 = 99;
+
+        if let Ok(case) = std::env::var(ENV_CASE) {
+            let dp = Authority::data_protection();
+            match case.as_str() {
+                "cvm-sigterm" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &dp).unwrap()).unwrap();
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut sig = tokio::signal::unix::signal(
+                            tokio::signal::unix::SignalKind::terminate(),
+                        )
+                        .unwrap();
+                        nix::sys::signal::raise(nix::sys::signal::Signal::SIGTERM).unwrap();
+                        assert!(sig.recv().await.is_some());
+                    });
+                    println!("CVM_SIGTERM_OK");
+                }
+                "cvm-dgram-socketpair" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = socketpair(
+                        AddressFamily::Unix,
+                        SockType::Datagram,
+                        None,
+                        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "cvm-netlink-socket" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = socket(
+                        AddressFamily::Netlink,
+                        SockType::Raw,
+                        SockFlag::SOCK_CLOEXEC,
+                        SockProtocol::NetlinkRoute,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "cvm-addressed-sendto" => {
+                    let sock_path = std::env::var_os(ENV_PEER).unwrap();
+                    let sender = UnixDatagram::unbound().unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = sender.send_to(b"x", sock_path);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "full-inet-socket" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &FULL).unwrap()).unwrap();
+                    let _ = socket(
+                        AddressFamily::Inet,
+                        SockType::Stream,
+                        SockFlag::SOCK_CLOEXEC,
+                        None,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "full-uevent-netlink-socket" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &FULL).unwrap()).unwrap();
+                    let _ = socket(
+                        AddressFamily::Netlink,
+                        SockType::Raw,
+                        SockFlag::SOCK_CLOEXEC,
+                        SockProtocol::NetlinkKObjectUEvent,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "full-unix-sendto" => {
+                    let sock_path = std::env::var_os(ENV_PEER).unwrap();
+                    let sender = UnixDatagram::unbound().unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &FULL).unwrap()).unwrap();
+                    let _ = sender.send_to(b"x", sock_path);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                other => panic!("unknown child case: {other}"),
+            }
+            return;
+        }
+
+        // Parent owns the temp socket directory so a SIGSYS-killed child
+        // never leaves behind a socket file.
+        let dir = tempfile::tempdir().unwrap();
+        let peer_path = dir.path().join("peer.sock");
+        let _peer = UnixDatagram::bind(&peer_path).unwrap();
+
+        let run_child = |case: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "seccomp::tests::privileged_cvm_signal_delivery_and_socket_denials",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ENV_CASE, case)
+                .env(ENV_PEER, &peer_path)
+                .output()
+                .unwrap()
+        };
+
+        let ok = run_child("cvm-sigterm");
+        let stdout = String::from_utf8_lossy(&ok.stdout);
+        assert!(
+            ok.status.success() && stdout.contains("CVM_SIGTERM_OK"),
+            "cvm-sigterm failed: {:?}\nstdout: {stdout}\nstderr: {}",
+            ok.status,
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        if !log_mode() {
+            for denied in [
+                "cvm-dgram-socketpair",
+                "cvm-netlink-socket",
+                "cvm-addressed-sendto",
+                "full-inet-socket",
+                "full-uevent-netlink-socket",
+                "full-unix-sendto",
+            ] {
+                let out = run_child(denied);
+                assert_eq!(
+                    out.status.signal(),
+                    Some(nix::libc::SIGSYS),
+                    "{denied} must be killed by SIGSYS on the tested syscall (exit {:?} means it returned without SIGSYS); stdout={}\nstderr={}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
     }
 }

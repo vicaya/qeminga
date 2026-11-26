@@ -45,8 +45,8 @@ profiles differ in host command surface and retained authority (see
 
 | Profile | Config file | Host commands accepted | Privileges retained after drop |
 |---|---|---|---|
-| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty (`CAP_SYS_BOOT` absent from all sets); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, and `FITRIM`; keeps unrestricted `socketpair`, `sendto`, and `recvfrom` for runtime signal delivery |
-| **General-VM / lifecycle** (TOML schema default) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls plus `socket` (`AF_NETLINK` family check only), and `FITRIM` |
+| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty (`CAP_SYS_BOOT` absent from all sets); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, the inventory `sendto` rule, and `FITRIM`; keeps `socketpair(AF_UNIX, SOCK_STREAM \| SOCK_NONBLOCK \| SOCK_CLOEXEC, 0)`, peerless `recvfrom` (`src_addr == NULL`, `addrlen == NULL`), and peerless `sendto` (`dest_addr == NULL`, `addrlen == 0`) for runtime signal delivery |
+| **General-VM / lifecycle** (TOML schema default) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, `socket(AF_NETLINK, SOCK_RAW \| SOCK_CLOEXEC, NETLINK_ROUTE)`, an inventory `sendto` rule (`flags == 0`, `addrlen == 12`), netlink syscalls, and `FITRIM` |
 
 Installing `packaging/config-data-protection.toml` is what establishes the
 CVM default; an empty or partial `config.toml` defaults omitted
@@ -65,11 +65,19 @@ unit currently sets `ProtectSystem=no`, `ProtectHome=no`, and
 `PrivateTmp=no`). Under an installed, enforcing seccomp filter (required by
 `hardening = "enforced"`; the filter may be absent or logging-only under
 the development-only opt-out `hardening = "unenforced-development-only"`),
-IP socket creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every profile;
-`socket` is absent when `information = false` and currently checks only the
-`AF_NETLINK` family (protocol unrestricted) when enabled, while
-`socketpair`, `sendto`, and `recvfrom` remain unrestricted in `COMMON` for
-runtime signal delivery (narrowing these rules is tracked in #67).
+IP socket creation (`AF_INET`/`AF_INET6`), `connect`/`accept`/`listen`, and
+`execve`/`execveat` are denied in every profile. `socket` is absent when
+`information = false` and restricted to
+`(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` when
+`information = true`. When `information = true`, an additional `sendto`
+rule permits `flags == 0` and `addrlen == 12` (`sizeof(struct sockaddr_nl)`)
+for `getifaddrs(3)` netlink requests (seccomp-BPF cannot inspect the file
+descriptor type or pointed-to address); when `information = false`, that
+rule is absent. In every profile, `socketpair`
+(`AF_UNIX`, `SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC`, `0`), peerless
+`recvfrom` (`src_addr == NULL`, `addrlen == NULL`), and peerless `sendto`
+(`dest_addr == NULL`, `addrlen == 0`) remain allowed for runtime signal
+delivery (see `docs/design.md` §§5.5, 5.9).
 
 Filesystem freezes are bounded by a watchdog (30 s idle, 300 s hard cap by
 default) and survive an agent crash through a recovery marker on tmpfs.

@@ -378,12 +378,14 @@ impl FreezePlan {
         }
     }
 
-    /// Restricts a discovery recovery plan to superblocks authorized by
-    /// `allowed` (#63, design §§4.2, 5.9): keeps every target whose current
-    /// resolved device matches an allowed mount point or whose recorded
-    /// mount points (primary or bind alias, including one hidden by a later
-    /// overmount) include an allowed path, so recovery still drains every
-    /// freeze the agent owns while never touching unprovisioned superblocks.
+    /// Restricts a discovery recovery plan (and host-visible disclosure count
+    /// set) strictly to superblocks currently visible at the configured
+    /// `allowed` mount points (#63, design §§4.2, 5.9): resolves each allowed
+    /// path through `MountTree::resolve` (selecting at most one visible
+    /// superblock per configured name, never a hidden historical occupant
+    /// beneath an overmount), while leaving [`Target::requested`] as `None` so
+    /// recovery can still open each currently visible superblock through any
+    /// of its mount points.
     pub fn restrict_for_recovery(&self, allowed: &[String]) -> FreezePlan {
         if allowed.is_empty() {
             return FreezePlan {
@@ -392,7 +394,6 @@ impl FreezePlan {
             };
         }
         let tree = MountTree::index(&self.mounts);
-        let allowed_bytes: HashSet<&[u8]> = allowed.iter().map(String::as_bytes).collect();
         let mut allowed_devs: HashSet<(u32, u32)> = HashSet::new();
         for name in allowed {
             if let Some(dev) = tree.resolve(name.as_bytes()) {
@@ -402,12 +403,7 @@ impl FreezePlan {
         let targets = self
             .targets
             .iter()
-            .filter(|target| {
-                allowed_devs.contains(&target.dev)
-                    || target
-                        .mountpoints()
-                        .any(|mp| allowed_bytes.contains(mp.as_os_str().as_encoded_bytes()))
-            })
+            .filter(|target| allowed_devs.contains(&target.dev))
             .map(|target| Target {
                 requested: None,
                 ..target.clone()
@@ -889,7 +885,7 @@ mod tests {
     }
 
     #[test]
-    fn restrict_for_recovery_keeps_allowed_and_overmounted_owned_targets_only() {
+    fn restrict_for_recovery_selects_only_currently_visible_allowlisted_devices() {
         // 8:1 at `/`, 8:2 mounted at `/data` (overmounted by 8:3) with alias
         // `/data-alias`, and unprovisioned 8:4 at `/secret`.
         let table = concat!(
@@ -907,15 +903,16 @@ mod tests {
         let freeze_devs: Vec<(u32, u32)> = freeze.targets().iter().map(|t| t.dev).collect();
         assert_eq!(freeze_devs, [(8, 3)]);
 
-        // Recovery thaw keeps BOTH 8:2 (which had `/data` before overmount and is
-        // still reachable via `/data-alias`) and 8:3 (now visible at `/data`),
-        // while excluding unprovisioned `/` (8:1) and `/secret` (8:4).
+        // Recovery disclosure and clean-Thawed drains authorize ONLY the
+        // currently visible superblock at `/data` (8:3), never a hidden
+        // historical occupant (8:2) beneath an overmount, nor unprovisioned
+        // `/` (8:1) or `/secret` (8:4).
         let recovery = plan.restrict_for_recovery(&allowed);
         let recovery_devs: Vec<(u32, u32)> = recovery.targets().iter().map(|t| t.dev).collect();
-        assert_eq!(recovery_devs, [(8, 2), (8, 3)]);
+        assert_eq!(recovery_devs, [(8, 3)]);
         assert!(
             recovery.targets().iter().all(|t| t.requested.is_none()),
-            "recovery targets must try aliases, not pin a single requested path"
+            "recovery targets must allow any mountpoint of the currently visible superblock"
         );
 
         // Empty allowlist excludes all targets from recovery discovery.

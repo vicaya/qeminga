@@ -187,10 +187,25 @@ impl Marker {
         }
     }
 
+    /// Probes whether something is at the marker's name in the pinned
+    /// directory (`AT_SYMLINK_NOFOLLOW`).
+    ///
+    /// Only `ENOENT` confirms the marker is absent (`Ok(false)`). Any other
+    /// kernel error (such as `EACCES`, `EIO`, or `ENAMETOOLONG`) returns
+    /// `Err` so startup and recovery fail closed rather than treating an
+    /// indeterminate probe as confirmed absence (#63).
+    pub fn probe(&self) -> Result<bool, MarkerError> {
+        match fstatat(self.dir.as_fd(), &self.name, AtFlags::AT_SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(Errno::ENOENT) => Ok(false),
+            Err(errno) => Err(self.io("stat", errno)),
+        }
+    }
+
     /// `true` when something is at the marker's name in the pinned
     /// directory (a symlink counts, and is not followed).
     pub fn exists(&self) -> bool {
-        fstatat(self.dir.as_fd(), &self.name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok()
+        matches!(self.probe(), Ok(true))
     }
 
     /// A marker in the temporary directory under a name unique to this
@@ -483,6 +498,29 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent", marker.path()).unwrap();
         assert!(marker.exists());
         assert_eq!(marker.path(), dir.path().join("frozen"));
+    }
+
+    #[test]
+    fn probe_distinguishes_present_absent_and_indeterminate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = marker_in(dir.path());
+        assert_eq!(marker.probe(), Ok(false));
+        marker.create().unwrap();
+        assert_eq!(marker.probe(), Ok(true));
+        marker.remove().unwrap();
+        assert_eq!(marker.probe(), Ok(false));
+
+        // A name exceeding NAME_MAX yields ENAMETOOLONG deterministically
+        // regardless of UID; probe() must return Err, never Ok(false).
+        let indet = Marker::open(dir.path().join("a".repeat(256))).unwrap();
+        assert!(matches!(
+            indet.probe(),
+            Err(MarkerError::Io {
+                op: "stat",
+                errno: Errno::ENAMETOOLONG,
+                ..
+            })
+        ));
     }
 
     #[test]

@@ -7,13 +7,14 @@
 //! in the x86-64 profile, each with the observed need that justifies it.
 //! `ioctl` is restricted by request number to `FIFREEZE` and `FITHAW` (plus
 //! `FITRIM` only when `[features] fstrim = true`), `prctl` to `PR_SET_NAME`,
-//! `socket` to `AF_NETLINK` only when `[features] information = true`
-//! (absent when `information = false`), and `sync`/`reboot` only when
-//! `[features] shutdown = true`. Every profile retains `socketpair`,
-//! `sendto`, and `recvfrom` for the runtime signal driver. The default
-//! action kills the process; the `seccomp-log` feature switches it to
-//! logging in **debug builds only** ([`log_mode`]) for compatibility runs
-//! (C-17), while release builds always enforce.
+//! `socket` to the `AF_NETLINK` family only (protocol currently unrestricted)
+//! when `[features] information = true` (absent when `information = false`),
+//! and `sync`/`reboot` only when `[features] shutdown = true`. Every profile
+//! retains unrestricted `socketpair`, `sendto`, and `recvfrom` in [`COMMON`]
+//! for the runtime signal driver. The default action kills the process; the
+//! `seccomp-log` feature switches it to logging only when `debug_assertions`
+//! are enabled ([`log_mode`]) for compatibility runs (C-17), while Cargo's
+//! standard `release` profile (`debug_assertions = false`) always enforces.
 //!
 //! The filter is installed by `main` after the capability drop and
 //! `PR_SET_NO_NEW_PRIVS` (§5.4 step 6), so `seccomp(2)`/`prctl(2)` need
@@ -202,11 +203,12 @@ pub const X86_64_ONLY: &[&str] = &[
 ];
 
 /// `socket(2)` domain allowed when `[features] information = true`:
-/// `AF_NETLINK` (for `getifaddrs(3)` over `NETLINK_ROUTE`). `socket(2)` is
-/// absent altogether when `information = false`, and `AF_INET`/`AF_INET6`/
-/// `AF_UNIX` `socket(2)` calls are never permitted; local `socketpair(2)`
-/// plus `sendto`/`recvfrom` remain in [`COMMON`] for the runtime signal
-/// driver (§5.9).
+/// `AF_NETLINK` (intended for `getifaddrs(3)` over `NETLINK_ROUTE`; today
+/// only the family argument is checked and the protocol is unrestricted).
+/// `socket(2)` is absent altogether when `information = false`, and
+/// `AF_INET`/`AF_INET6`/`AF_UNIX` `socket(2)` calls are never permitted;
+/// unrestricted `socketpair(2)` plus `sendto`/`recvfrom` remain in
+/// [`COMMON`] for the runtime signal driver (§5.9).
 pub const AF_NETLINK: u64 = 16;
 
 /// The allow rules for `target` under `authority` (§5.9): the common
@@ -261,10 +263,12 @@ pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
 }
 
 /// `true` when an unlisted syscall is logged instead of killing the
-/// process: the `seccomp-log` compatibility feature (C-17) **in a debug
-/// build only**. A release build always enforces even if `seccomp-log` is
-/// passed (and a release build with `--all-features` also fails at compile
-/// time because of the independent `test-fakes` guard in `src/lib.rs`).
+/// process: the `seccomp-log` compatibility feature (C-17) **only when
+/// `debug_assertions` are enabled**. Cargo's standard `release` profile
+/// (`debug_assertions = false`) always enforces even if `seccomp-log` is
+/// passed (and `--all-features` fails at compile time whenever
+/// `debug_assertions = false` because of the independent `test-fakes` guard
+/// in `src/lib.rs`).
 pub const fn log_mode() -> bool {
     cfg!(feature = "seccomp-log") && cfg!(debug_assertions)
 }

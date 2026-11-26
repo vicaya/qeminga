@@ -45,23 +45,31 @@ profiles differ in host command surface and retained authority (see
 
 | Profile | Config file | Host commands accepted | Privileges retained after drop |
 |---|---|---|---|
-| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (`CAP_SYS_BOOT` trimmed from the bounding set and dropped); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, and `FITRIM`; retains `socketpair`, `sendto`, and `recvfrom` for the runtime signal driver |
-| **General-VM / lifecycle** (opt-in) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls plus `socket(AF_NETLINK)`, and `FITRIM` |
+| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty (`CAP_SYS_BOOT` absent from all sets); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, and `FITRIM`; keeps unrestricted `socketpair`, `sendto`, and `recvfrom` for runtime signal delivery |
+| **General-VM / lifecycle** (TOML schema default) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls plus `socket` (`AF_NETLINK` family check only), and `FITRIM` |
 
-If a defect compromised the parser process after startup, the process would
-still hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (plus `CAP_SYS_BOOT` in
-the general-VM profile), `openat`/`read`/`getdents64`, and the writable host
-virtio channel — so seccomp is **not** a confidentiality boundary for guest
-file contents after parser compromise (see `docs/design.md` §5.9 and
-`docs/tasks.md` OQ-10). Ordinary file opens, writes, and unlinks
-(`openat`/`write`/`pwrite64`/`fsync`/`unlinkat`) remain in the filter and
-are bounded by guest Unix permissions (UID/GID 600, with `CAP_DAC_OVERRIDE`
-dropped) and systemd service confinement (the shipped unit currently sets
-`ProtectSystem=no`, `ProtectHome=no`, and `PrivateTmp=no`). IP socket
-creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every
-profile; `socket` is absent when `information = false` and restricted to
-`AF_NETLINK` when enabled, while `socketpair`, `sendto`, and `recvfrom`
-stay enabled for runtime signal delivery.
+Installing `packaging/config-data-protection.toml` is what establishes the
+CVM default; an empty or partial `config.toml` defaults omitted
+`information`, `fstrim`, and `shutdown` keys to `true` even under
+`hardening = "enforced"`, so custom CVM configs must set them to `false`
+explicitly. If a defect compromised the parser process after startup, the
+process would still hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (plus
+`CAP_SYS_BOOT` in the general-VM profile), `openat`/`read`/`getdents64`,
+and the writable host virtio channel — so seccomp is **not** a
+confidentiality boundary for guest file contents after parser compromise
+(see `docs/design.md` §5.9 and `docs/tasks.md` OQ-10). Ordinary file opens,
+writes, and unlinks (`openat`/`write`/`pwrite64`/`fsync`/`unlinkat`) remain
+in the filter and are bounded by guest Unix permissions (UID/GID 600, with
+`CAP_DAC_OVERRIDE` dropped) and systemd service confinement (the shipped
+unit currently sets `ProtectSystem=no`, `ProtectHome=no`, and
+`PrivateTmp=no`). Under an installed, enforcing seccomp filter (required by
+`hardening = "enforced"`; absent or logging-only under the development-only
+opt-out `hardening = "unenforced-development-only"`), IP socket creation
+(`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every profile;
+`socket` is absent when `information = false` and currently checks only the
+`AF_NETLINK` family (protocol unrestricted) when enabled, while
+`socketpair`, `sendto`, and `recvfrom` remain unrestricted in `COMMON` for
+runtime signal delivery (narrowing these rules is tracked in #67).
 
 Filesystem freezes are bounded by a watchdog (30 s idle, 300 s hard cap by
 default) and survive an agent crash through a recovery marker on tmpfs.

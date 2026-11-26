@@ -7,22 +7,24 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 | `systemd/qeminga.service` | `/usr/lib/systemd/system/` | The unit: conflicts with `qemu-guest-agent.service`, deliberately does not bind to the virtio port device (a crash while frozen is recovered whether or not the port is there; the daemon retries the open), hands `/run/qeminga` to the service account before every start (privileged `ExecStartPre` lines; not `RuntimeDirectory=`, see below), `TimeoutStopSec=330s` for the default 300 s freeze cap. |
 | `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
 | `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
-| `config-data-protection.toml` | `/etc/qeminga/config.toml` (**CVM installation default**) | The data-protection profile (§5.9): freeze, thaw, status and the controls only; `guest-shutdown`, the information commands and `guest-fstrim` disabled together, and with them `CAP_SYS_BOOT`, `reboot(2)`, `uname`, `statfs`, netlink and `FITRIM` given up. |
-| `config.toml` | `/etc/qeminga/config.toml` (lifecycle profile, opt-in) | General-VM / libvirt lifecycle defaults (§8.2): enables `guest-shutdown`, `guest-fstrim`, and the information commands (`guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`); every key is optional. |
+| `config-data-protection.toml` | `/etc/qeminga/config.toml` (**CVM installation default**) | The data-protection profile (§5.9): freeze, thaw, status and the controls only; explicitly sets `shutdown = false`, `information = false`, and `fstrim = false` so `CAP_SYS_BOOT`, `reboot(2)`, `uname`, `statfs`, netlink and `FITRIM` are given up. |
+| `config.toml` | `/etc/qeminga/config.toml` (general-VM / TOML schema default) | General-VM / libvirt lifecycle defaults (§8.2): enables `guest-shutdown`, `guest-fstrim`, and the information commands (`guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`); every key is optional and omitted `[features]` switches default to `true`. |
 | `tmpfiles.d/qeminga.conf` | `/usr/lib/tmpfiles.d/` | Creates `/run/qeminga` (0700, owned by `qeminga`) at boot for the recovery marker (C-20). Always install it and run `systemd-tmpfiles --create`. |
 | `tmpfiles.d/qeminga-suspend.conf` | `/usr/lib/tmpfiles.d/` **only with** `[features] suspend_ram = true` | Hands `/sys/power/state` to group `qeminga` (mode 0664) on every boot, without which the dropped daemon cannot write it (OQ-6). Not installed by default. |
 
 The binary itself goes to `/usr/bin/qeminga`. Build releases with
 `cargo build --release --locked --features seccomp`. Never build releases
-with `--all-features`: an independent compile-time guard (`compile_error!`
-in `src/lib.rs`) rejects `test-fakes` outside debug builds, causing a
-release build with `--all-features` to fail at compile time. `seccomp-log`'s
-logging mode applies to **debug builds only** (`seccomp::log_mode` checks
-`cfg!(feature = "seccomp-log") && cfg!(debug_assertions)`): a release build
-always compiles an enforcing (`kill_process`) filter even if `seccomp-log`
-is enabled, whereas a **debug** binary built with `seccomp-log` (including
-`cargo build --all-features`) runs the filter in logging mode and therefore
-fails the `hardening = "enforced"` check at startup.
+with `--all-features`: both `seccomp::log_mode` and the `test-fakes`
+compile-time guard (`compile_error!` in `src/lib.rs`) key off
+`cfg!(debug_assertions)` (disabled in Cargo's standard `release` profile;
+downstream Cargo profiles that override `debug-assertions` change both).
+Under the shipped `release` profile (`debug_assertions = false`),
+`test-fakes` fails to compile — so `cargo build --release --all-features`
+fails at compile time — and `seccomp-log` still compiles an enforcing
+(`kill_process`) filter. By contrast, a **debug** binary built with
+`seccomp-log` (including `cargo build --all-features`) runs the filter in
+logging mode (`debug_assertions = true`) and therefore fails the
+`hardening = "enforced"` check at startup.
 
 ## Migration from qemu-guest-agent
 
@@ -88,21 +90,33 @@ management and host-driven inventory install `config.toml` instead. The
 two packaged profiles differ in commands, retained privileges, and
 post-compromise authority (design §5.9):
 
-- **CVM / data-protection profile (`config-data-protection.toml`, CVM default):**
+- **CVM / data-protection profile (`config-data-protection.toml`, CVM installation default):**
   Accepts only `guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, and
-  `guest-info`; disables `guest-shutdown`, `guest-get-osinfo`,
+  `guest-info`; explicitly disables `guest-shutdown`, `guest-get-osinfo`,
   `guest-network-get-interfaces`, `guest-get-fsinfo`, `guest-fstrim`, and
-  `guest-suspend-ram`. After dropping to `qeminga` (UID/GID 600), the
-  process retains **only** `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`
-  (`CAP_SYS_BOOT` is trimmed from the bounding set and dropped). The
-  seccomp filter omits `reboot`, `sync`, `uname`, `statfs`, `fstatfs`,
-  the netlink syscalls, `socket`, and `FITRIM`.
-- **General-VM / lifecycle profile (`config.toml`, opt-in):**
+  `guest-suspend-ram`. After dropping to `qeminga` (UID/GID 600),
+  `CapEff`, `CapPrm`, and `CapBnd` retain **only** `CAP_SYS_ADMIN` and
+  `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty (`CAP_SYS_BOOT`
+  absent from all five sets). The seccomp filter omits `reboot`, `sync`,
+  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, and
+  `FITRIM`.
+- **General-VM / lifecycle profile (`config.toml`, TOML schema default):**
   Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`,
-  `guest-network-get-interfaces`, and `guest-get-fsinfo`. Retains
-  `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, and keeps
+  `guest-network-get-interfaces`, and `guest-get-fsinfo`. `CapEff`,
+  `CapPrm`, and `CapBnd` retain `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and
+  `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty; seccomp keeps
   `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, the netlink
-  syscalls, and `socket(AF_NETLINK)`.
+  syscalls, and `socket` (`AF_NETLINK` family check only, protocol
+  unrestricted).
+- **Custom CVM configs must disable features explicitly:** The CVM
+  installation default comes from installing `config-data-protection.toml`.
+  An empty or partial `config.toml` is valid even under
+  `hardening = "enforced"`, and omitted `information`, `fstrim`, and
+  `shutdown` keys default to `true` in the TOML schema (matching
+  `config.toml`). Stripping those keys from a custom CVM config therefore
+  exposes inventory and trim and retains `CAP_SYS_BOOT`/`reboot(2)`; set
+  `shutdown = false`, `information = false`, and `fstrim = false`
+  explicitly.
 
 In both profiles the daemon derives its authority from `config.toml`
 before accepting any host request; nothing the host sends re-enables a
@@ -124,12 +138,18 @@ device numbers, or marker paths).
     and service confinement; the shipped unit currently sets
     `ProtectSystem=no`, `ProtectHome=no`, and `PrivateTmp=no`, so it does
     not yet confine writes to `/run/qeminga` alone.
-  - *Sockets and IPC:* IP socket creation (`AF_INET`/`AF_INET6`) and
-    `execve`/`execveat` are denied in every profile. With
-    `information = false`, `socket` is absent from the filter; with
-    `information = true`, `socket` allows only `AF_NETLINK`. In every
-    profile, `socketpair`, `sendto`, and `recvfrom` remain allowed for
-    the Tokio/mio runtime signal driver.
+  - *Sockets and IPC:* Under an installed, enforcing seccomp filter
+    (required by `hardening = "enforced"`; absent or logging-only under
+    the development opt-out `hardening = "unenforced-development-only"`),
+    IP socket creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are
+    denied in every profile. With `information = false`, `socket` is
+    absent from the filter; with `information = true`, `socket` currently
+    checks only the `AF_NETLINK` family and leaves the netlink protocol
+    unrestricted (#67 tracks narrowing it). In every profile,
+    `socketpair`, `sendto`, and `recvfrom` remain in `COMMON` for the
+    Tokio/mio runtime signal driver with no argument or peer restriction,
+    so local IPC can reach other guest services subject to kernel
+    permissions (#67 tracks narrowing `socketpair`).
 - **Inventory and trim stay explicit guest choices.** Turning off
   `information = false` alone does not disable `guest-fstrim`:
   `guest-fstrim` replies independently list eligible mount paths even
@@ -190,12 +210,14 @@ rate limit ends the loop (five starts in ten seconds by default): the
 unit is then `failed`, and a `systemctl restart` inside that window is
 rejected until `systemctl reset-failed qeminga`. It never falls back to
 serving without the sandbox. Typical causes after an upgrade: a binary
-built without `--features seccomp`, a debug binary built with
-`--features seccomp-log` or `--all-features` (which puts the filter into
-logging mode in debug builds; release builds always enforce and fail to
-compile if `test-fakes` is enabled), a stray `QEMINGA_TEST_FAKE_KERNEL`
-in the unit's environment, or a kernel or container runtime that refuses
-the filter (the line names the installer's error).
+built without `--features seccomp`, a binary with `debug_assertions`
+enabled built with `--features seccomp-log` or `--all-features` (which
+puts the filter into logging mode when `debug_assertions = true`; Cargo's
+standard `release` profile sets `debug_assertions = false`, where the
+filter always enforces and `test-fakes` fails to compile), a stray
+`QEMINGA_TEST_FAKE_KERNEL` in the unit's environment, or a kernel or
+container runtime that refuses the filter (the line names the installer's
+error).
 `[features] seccomp = false` left in the configuration is refused one
 step earlier, as a configuration error naming `features.seccomp`: the
 same exit status 78, without the `refusing to serve` line.

@@ -63,7 +63,7 @@ Verify with `systemctl status qeminga` and, from the host,
 
 `guest-suspend-ram` is disabled by default. Enabling it takes the
 `suspend_ram` Cargo feature, `[features] suspend_ram = true` in
-`config.toml`, **and** two host-side grants for `/sys/power/state`:
+`config.toml`, **and** two grants installed inside the guest for `/sys/power/state`:
 
 1. Discretionary write access for the service account: the file is `0644 root:root` and none of the daemon's remaining capabilities bypasses that, so install `tmpfiles.d/qeminga-suspend.conf` and run `sudo systemd-tmpfiles --create qeminga-suspend.conf` (OQ-6).
 2. A mount-namespace write exception: `qeminga.service` mounts `/sys` read-only inside the service's mount namespace (`ProtectKernelTunables=yes` and `BindReadOnlyPaths=/sys`). Add a drop-in (for example `/etc/systemd/system/qeminga.service.d/suspend.conf`), then run `sudo systemctl daemon-reload && sudo systemctl restart qeminga.service`:

@@ -68,7 +68,7 @@ use crate::dispatch::{Context, HeldMount, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
     FreezeFailure, FreezeStop, FreezeTaskStage, IncompleteDrain, RecoveryReason, build_plan,
-    drain_held, open_target, rollback,
+    drain_held, merge_incomplete, open_target, rollback,
 };
 use crate::kernel::{KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
@@ -490,6 +490,7 @@ pub(crate) fn start(
         thaw_token: None,
         reply: Some(reply_tx),
         frozen: 0,
+        op_held: 0,
         recovered: 0,
         recovery: None,
         kept: Vec::new(),
@@ -551,6 +552,10 @@ struct Driver {
     thaw_token: Option<ThawToken>,
     reply: Option<oneshot::Sender<Result<u64, FreezeFailure>>>,
     frozen: u64,
+    /// Number of handles published by *this* freeze operation (`Frozen` or
+    /// `Busy`), distinct from any carried-over excluded cleanup handles left
+    /// on `Context` by an earlier clean-`Thawed` rescan (#63).
+    op_held: usize,
     recovered: u64,
     /// The recovery drain in flight, if any (at most one).
     recovery: Option<JoinHandle<RecoveryPass>>,
@@ -604,6 +609,7 @@ impl Driver {
             match outcome {
                 Ok(TargetOutcome::Frozen(mount)) => {
                     self.frozen += 1;
+                    self.op_held += 1;
                     self.ctx.hold_frozen_mounts(vec![HeldMount {
                         mount,
                         countable: true,
@@ -618,6 +624,7 @@ impl Driver {
                         mountpoint = %mountpoint,
                         "already frozen by another freezer; retained for thaw"
                     );
+                    self.op_held += 1;
                     self.ctx.hold_frozen_mounts(vec![HeldMount {
                         mount,
                         countable: true,
@@ -670,13 +677,12 @@ impl Driver {
             self.commit_abort(AbortCause::ThawRequested);
             return self.settle_aborted().await;
         }
-        // Zero work (#43 §2): nothing frozen, nothing held for a drain
-        // (no `EBUSY` target), nothing uncertain and no worker
-        // outstanding leaves nothing to recover, so the operation settles
-        // `Thawed` with the marker removed, never `Frozen` with an armed
-        // watchdog and a gate closed on nothing. `frozen == 0` alone is
-        // not the test: a held handle keeps the conservative state.
-        if self.frozen == 0 && self.ctx.frozen_mount_count() == 0 && self.unrecoverable.is_none() {
+        // Zero work (#43 §2, #63): nothing frozen or retained (`EBUSY`) by
+        // *this* operation, nothing uncertain and no worker outstanding
+        // leaves nothing for this operation to recover, so it settles `Thawed`
+        // with the marker removed while preserving any carried-over excluded
+        // cleanup handles on `Context` without disclosing them via `Frozen`.
+        if self.op_held == 0 && self.unrecoverable.is_none() {
             return self.settle_nothing_frozen().await;
         }
         tracing::info!(
@@ -890,7 +896,7 @@ impl Driver {
             Ok(pass) => {
                 self.recovered += pass.recovered;
                 if let Some(incomplete) = pass.incomplete {
-                    self.unrecoverable.get_or_insert(incomplete);
+                    merge_incomplete(&mut self.unrecoverable, incomplete);
                 }
                 self.kept.extend(pass.keep);
             }

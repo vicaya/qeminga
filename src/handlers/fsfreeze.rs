@@ -1050,6 +1050,20 @@ pub(crate) fn rollback(
     }
 }
 
+/// Merges a new incomplete drain into `slot`, keeping the first failure while
+/// allowing a policy-authorized failure to upgrade a collapsed generic
+/// [`RecoveryReason::RecoveryIncomplete`] from an excluded handle (#63).
+pub(crate) fn merge_incomplete(slot: &mut Option<IncompleteDrain>, next: IncompleteDrain) {
+    match slot {
+        None => *slot = Some(next),
+        Some(IncompleteDrain {
+            kind: RecoveryReason::RecoveryIncomplete,
+            ..
+        }) if next.kind != RecoveryReason::RecoveryIncomplete => *slot = Some(next),
+        Some(_) => {}
+    }
+}
+
 /// Drains handles a freeze published, in forward mount order (they were
 /// pushed deepest-first). Returns the number of policy-authorized targets on
 /// which at least one `FITHAW` succeeded, the handles whose drain did not
@@ -1081,23 +1095,18 @@ pub(crate) fn drain_held(
                 reason = %detail,
                 "rollback target may still be frozen"
             );
-            let next = IncompleteDrain {
-                mountpoint: lossy(entry.mount.mountpoint()),
-                kind: if entry.countable {
-                    kind
-                } else {
-                    RecoveryReason::RecoveryIncomplete
+            merge_incomplete(
+                &mut incomplete,
+                IncompleteDrain {
+                    mountpoint: lossy(entry.mount.mountpoint()),
+                    kind: if entry.countable {
+                        kind
+                    } else {
+                        RecoveryReason::RecoveryIncomplete
+                    },
+                    detail,
                 },
-                detail,
-            };
-            match &incomplete {
-                None => incomplete = Some(next),
-                Some(IncompleteDrain {
-                    kind: RecoveryReason::RecoveryIncomplete,
-                    ..
-                }) if entry.countable => incomplete = Some(next),
-                Some(_) => {}
-            }
+            );
             keep.push(entry);
         }
     }
@@ -6682,5 +6691,240 @@ mod tests {
         let inc = inc.unwrap();
         assert_eq!(inc.kind, RecoveryReason::PermissionDenied);
         assert_eq!(inc.mountpoint, "/data");
+    }
+
+    #[tokio::test]
+    async fn later_freeze_after_clean_rescan_preserves_excluded_cleanup_without_disclosing_it() {
+        struct MutableMounts(std::sync::Mutex<String>);
+        impl MountSource for MutableMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Ok(self.0.lock().unwrap().as_bytes().to_vec())
+            }
+        }
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // Helper: puts `rig` into `Thawed` with a carried-over `countable == false`
+        // retained handle on `/data` (8:2) via the real clean-Thawed rescan path.
+        let setup_carried_over = |thaw_err_on_data: Option<Errno>| async move {
+            let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+            let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(table.to_owned())));
+            let rig = rig_with_allowed_mounts(
+                FreezeState::Thawed,
+                mounts.clone(),
+                Some(vec!["/data", "/app"]),
+            );
+            let data = rig.kernel.open_mount(Path::new("/data"), (8, 2)).unwrap();
+            rig.kernel.fifreeze(&data).unwrap();
+            rig.kernel.script_thaw_error("/data", Errno::EIO);
+
+            // Clean Thawed rescan retains /data while staying Thawed.
+            let _ = thaw(&rig.ctx, &thaw_req).await.unwrap_err();
+            assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+            assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+            // /data disappears from mountinfo; second clean rescan marks it
+            // countable = false and stays Thawed with the handle still held.
+            *mounts.0.lock().unwrap() = concat!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+                "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
+            )
+            .to_owned();
+            rig.kernel.clear_thaw_errors();
+            rig.kernel.script_thaw_error("/data", Errno::EACCES);
+            let err = thaw(&rig.ctx, &thaw_req).await.unwrap_err().to_string();
+            assert!(
+                err.contains("recovery did not complete; filesystem may still be frozen"),
+                "{err}"
+            );
+            assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+            assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+            rig.kernel.clear_thaw_errors();
+            if let Some(errno) = thaw_err_on_data {
+                rig.kernel.script_thaw_error("/data", errno);
+            }
+            (rig, mounts)
+        };
+
+        // 1. Zero-work later freeze (allowed `/app` returns EOPNOTSUPP so Driver
+        //    commits with 0 frozen and 0 handles of its own): MUST settle `Thawed`
+        //    with reply `0`, NEVER `Frozen`, while keeping the old `/data` cleanup
+        //    obligation retained on the context for a later drain.
+        let (rig, _mounts) = setup_carried_over(None).await;
+        rig.kernel.script_freeze_error("/app", Errno::EOPNOTSUPP);
+        let zero_req = parse_request(
+            br#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/app"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(freeze_list(&rig.ctx, &zero_req).await.unwrap(), json!(0));
+        assert_eq!(
+            rig.ctx.state.current(),
+            FreezeState::Thawed,
+            "zero-work freeze must not disclose carried-over excluded handle via Frozen state"
+        );
+        assert!(!rig.ctx.marker.exists());
+        assert_eq!(
+            rig.ctx.frozen_mount_count(),
+            1,
+            "carried-over cleanup obligation must stay retained across zero-work freeze"
+        );
+        // Subsequent explicit thaw drains the carried-over handle cleanly with count 0.
+        assert_eq!(thaw(&rig.ctx, &thaw_req).await.unwrap(), json!(0));
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+
+        // 2a. Later freeze that aborts after carried-over `/data` clears: drains
+        //     BOTH `/data` (guest-local cleanup) and `/app`, reports recovered=1
+        //     (only `/app`, NOT carried-over excluded `/data`), and settles `Thawed`.
+        let (rig, _mounts) = setup_carried_over(None).await;
+        let gate = rig.kernel.script_freeze_gate("/app");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&rig.ctx);
+        let freeze_task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        rig.clock.advance(Duration::from_secs(600));
+        while rig
+            .ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        let op = rig.ctx.freeze_op().expect("aborted op registered");
+        gate.release();
+        assert!(freeze_task.await.unwrap().is_err());
+        while rig.ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+        assert_eq!(
+            op.progress().recovered,
+            1,
+            "abort recovery must count /app (1) and NOT carried-over excluded /data"
+        );
+        assert_eq!(op.progress().unrecoverable_reason, None);
+
+        // 2b. Later freeze that aborts while carried-over `/data` STILL fails
+        //     with EACCES (pass 1) and `/app` drains cleanly (pass 2): reports
+        //     recovered=1, generic RecoveryIncomplete (NOT PermissionDenied),
+        //     settles Frozen, and keeps `/data` retained.
+        let (rig, _mounts) = setup_carried_over(Some(Errno::EACCES)).await;
+        let gate = rig.kernel.script_freeze_gate("/app");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&rig.ctx);
+        let freeze_task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        rig.clock.advance(Duration::from_secs(600));
+        while rig
+            .ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        let op = rig.ctx.freeze_op().expect("aborted op registered");
+        gate.release();
+        assert!(freeze_task.await.unwrap().is_err());
+        while rig.ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+        assert_eq!(op.progress().recovered, 1);
+        assert_eq!(
+            op.progress().unrecoverable_reason,
+            Some(RecoveryReason::RecoveryIncomplete)
+        );
+
+        // 2c. Two-pass abort where pass 1 fails ONLY on carried-over excluded
+        //     `/data` (RecoveryIncomplete) and pass 2 fails on authorized `/app`
+        //     (EPERM): unrecoverable_reason upgrades to PermissionDenied.
+        let (rig, _mounts) = setup_carried_over(Some(Errno::EACCES)).await;
+        rig.kernel.script_thaw_error("/app", Errno::EPERM);
+        let gate = rig.kernel.script_freeze_gate("/app");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&rig.ctx);
+        let freeze_task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        rig.clock.advance(Duration::from_secs(600));
+        while rig
+            .ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        let op = rig.ctx.freeze_op().expect("aborted op registered");
+        // Wait for pass 1 (draining carried-over /data -> RecoveryIncomplete)
+        // before releasing /app so /app runs in pass 2.
+        while op.progress().unrecoverable_reason.is_none() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            op.progress().unrecoverable_reason,
+            Some(RecoveryReason::RecoveryIncomplete)
+        );
+        gate.release();
+        assert!(freeze_task.await.unwrap().is_err());
+        while rig.ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(rig.ctx.frozen_mount_count(), 2);
+        assert_eq!(
+            op.progress().unrecoverable_reason,
+            Some(RecoveryReason::PermissionDenied),
+            "authorized pass-2 failure must upgrade generic pass-1 RecoveryIncomplete"
+        );
+
+        // 3. Later freeze that rolls back on `/app` EIO while carried-over `/data`
+        //    is held: when `/data` fails EACCES -> reports generic RecoveryIncomplete
+        //    with 0 thawed and stays Frozen; when `/data` clears -> drains `/data`
+        //    guest-locally, reports 0 thawed, and returns to Thawed.
+        let (rig, _mounts) = setup_carried_over(Some(Errno::EACCES)).await;
+        rig.kernel.script_freeze_error("/app", Errno::EIO);
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let err = freeze(&rig.ctx, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("recovery did not complete; filesystem may still be frozen"),
+            "{err}"
+        );
+        assert!(!err.contains("permission denied"), "{err}");
+        assert!(err.contains("0 target(s) thawed"), "{err}");
+        assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        let (rig, _mounts) = setup_carried_over(None).await;
+        rig.kernel.script_freeze_error("/app", Errno::EIO);
+        let err = freeze(&rig.ctx, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("rolled back (0 target(s) thawed); state thawed"),
+            "{err}"
+        );
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
     }
 }

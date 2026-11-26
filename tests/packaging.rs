@@ -225,8 +225,11 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "packaging/README.md must not retain stale ReadOnlyPaths=/run -/dev/shm directives"
     );
     assert!(
-        lower_readme.contains("ancestor") && lower_readme.contains("directory descriptor"),
-        "packaging/README.md must document the trusted-parent requirement for custom state_path"
+        lower_readme.contains("ancestor")
+            && lower_readme.contains("entire lifetime")
+            && readme.contains("Marker::open")
+            && !lower_readme.contains("fchown"),
+        "packaging/README.md must require lifetime trusted ancestry across ExecStartPre, ReadWritePaths, and Marker::open without a mutable-ancestry workaround"
     );
     assert!(
         suspend_tmpfiles.contains("ReadWritePaths=/sys/power/state")
@@ -248,8 +251,11 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
     }
     let lower_design = design.to_ascii_lowercase();
     assert!(
-        lower_design.contains("ancestor") && lower_design.contains("directory descriptor"),
-        "docs/design.md §8.4 must document the trusted-parent requirement for custom state_path"
+        lower_design.contains("ancestor")
+            && lower_design.contains("entire lifetime")
+            && design.contains("Marker::open")
+            && !lower_design.contains("before ownership/mode changes"),
+        "docs/design.md §8.4 must require lifetime trusted ancestry for custom state_path without a mutable-ancestry workaround"
     );
 }
 

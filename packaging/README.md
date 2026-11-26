@@ -135,17 +135,18 @@ writable, and keeping `-` so an absent directory can be created by
 `ExecStartPre=+` on cold start without failing with `226/NAMESPACE`
 while preserving any pre-existing marker across restarts).
 
-**Trusted-parent requirement:** Because the privileged `ExecStartPre=+`
-commands resolve this pathname again on every service start and restart
-before changing ownership and mode, a `0700` leaf directory alone does
-not prevent renaming the entry or swapping an ancestor directory. Every
-ancestor component of a custom marker directory **must** be owned by
-`root` and non-writable by `qeminga` or any other untrusted user (for
-example, directly under root-owned `0755` `/run`, as in
-`/run/custom-qeminga` below — never under `/tmp`, `/var/tmp`, or a
-service-writable directory); otherwise, provision it through a trusted
-open directory descriptor (`O_DIRECTORY | O_NOFOLLOW` from a root-owned
-ancestor) and verify the opened directory before `fchown`/`fchmod`:
+**Trusted-parent requirement:** In the supported v1 recipe, `ExecStartPre=+`
+resolves this pathname before changing ownership and mode, systemd resolves
+`ReadWritePaths` independently when constructing the service mount namespace,
+and `Marker::open` opens the configured parent directory by pathname again at
+daemon startup — none of those steps passes a verified directory descriptor to
+the next. With a replaceable ancestor, a later step could therefore resolve a
+different directory (including one missing an existing recovery marker). Every
+ancestor component of a custom marker directory **must** remain owned by
+`root` and non-writable by `qeminga` or any other untrusted user for the
+entire lifetime of the path (for example, directly under root-owned `0755`
+`/run`, as in `/run/custom-qeminga` below — never under `/tmp`, `/var/tmp`, or
+a service-writable directory):
 
 ```ini
 [Service]

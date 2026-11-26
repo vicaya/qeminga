@@ -35,7 +35,7 @@ if [ -n "$freeze_mount" ]; then
         echo "invalid --freeze-mount path (must be absolute): $freeze_mount" >&2
         exit 64
     fi
-    command -v jq >/dev/null 2>&1 || { echo "jq is required for --freeze-mount" >&2; exit 69; }
+    command -v python3 >/dev/null 2>&1 || { echo "python3 is required for --freeze-mount" >&2; exit 69; }
 fi
 
 # Predictable command output whatever the caller's locale (domstate is
@@ -97,21 +97,32 @@ domfsthaw_nonzero() {
         return 1
     }
 }
-# Shared parser for top-level QGA integer `return` counts: requires a single
-# JSON object whose top-level `return` is an exact non-negative integer equal
-# to $2 (rejecting fractional numbers, strings, nested objects, and malformed
-# or concatenated JSON).
+# Shared parser for top-level QGA integer `return` counts: uses Python's
+# `json.loads` (`type(val) is int`, avoiding jq 1.6 double coercion of `1.0`)
+# to require a single JSON object whose top-level `return` is an exact integer
+# equal to $2 (rejecting floats, booleans, strings, nested objects, and
+# malformed or concatenated JSON).
 # shellcheck disable=SC2317,SC2329 # invoked through `freeze_list_exact` and `thaw_exact`
 qga_return_is_exact_int() {
     local json="$1" want="$2"
-    printf '%s\n' "$json" | jq -se --argjson want "$want" \
-        'length == 1 and (.[0] | type == "object" and has("return") and (.return | type == "number" and . == floor and . == $want and (tostring | test("^[0-9]+$"))))' \
-        >/dev/null 2>&1
+    printf '%s\n' "$json" | python3 -c '
+import json, sys
+try:
+    obj = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+want = int(sys.argv[1])
+if type(obj) is dict and "return" in obj:
+    val = obj["return"]
+    if type(val) is int and val == want:
+        sys.exit(0)
+sys.exit(1)
+' "$want"
 }
 # shellcheck disable=SC2317,SC2329 # invoked through `step` below
 freeze_list_exact() {
     local mount="$1" want="$2" req out
-    req="$(jq -nc --arg mount "$mount" '{execute: "guest-fsfreeze-freeze-list", arguments: {mountpoints: [$mount]}}')" || return 1
+    req="$(python3 -c 'import json, sys; print(json.dumps({"execute": "guest-fsfreeze-freeze-list", "arguments": {"mountpoints": [sys.argv[1]]}}, separators=(",", ":")))' "$mount")" || return 1
     out="$(agent "$req" 2>&1)" || {
         echo "$out"
         return 1

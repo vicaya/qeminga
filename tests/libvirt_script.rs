@@ -231,8 +231,10 @@ fn script_rejects_fractional_nested_and_malformed_freeze_list_counts() {
     for bad in [
         r#"{"return":1.5}"#,
         r#"{"return":1.0}"#,
+        r#"{"return":true}"#,
         r#"{"return":"1"}"#,
         r#"{"return":{"return":1}}"#,
+        r#"{"return":1}{"return":1}"#,
         r#"{"return":1"#,
     ] {
         let (ok, text) = run_script_raw(false, 2, Some(mount), 1, 1, Some(bad), None);

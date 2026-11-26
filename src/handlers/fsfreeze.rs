@@ -362,6 +362,7 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     let kernel = Arc::clone(&ctx.kernel);
     let mounts = Arc::clone(&ctx.mounts);
     let marker = ctx.marker.clone();
+    let audit = ctx.audit.clone();
     let allowed = ctx.config.agent.freeze_allowed_mountpoints.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let held = ctx.take_frozen_mounts();
@@ -379,8 +380,13 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // Only ENOENT (`Ok(false)`) confirms the marker is absent so a
             // `Thawed` drain can narrow to the guest allowlist and finish
             // without touching the marker (#63). If a marker is present or
-            // its probe is indeterminate, escalate to full marker recovery.
+            // its probe is indeterminate, escalate to full marker recovery and
+            // switch the audit router to the freeze-safe ring before any
+            // recovery I/O (`on_thawed` flushes back to normal on settlement).
             let clean_thawed = from_thawed && matches!(marker.probe(), Ok(false));
+            if from_thawed && !clean_thawed {
+                audit.enter_ring();
+            }
             // Discovery and drain are separate: the handles this process
             // holds are drained whether or not the mount table can be
             // read (`thaw_blocking`), and a tracked thaw reads none.
@@ -901,19 +907,12 @@ pub(crate) fn build_recovery_plan(
             plan: full,
             countable_devs: None,
         }),
-        Some(mountpoints) if from_thawed => Ok(RecoveryPlan {
-            plan: full.restrict_for_recovery(mountpoints),
-            countable_devs: None,
-        }),
         Some(mountpoints) => {
-            let countable_devs = full
-                .restrict_for_recovery(mountpoints)
-                .targets()
-                .iter()
-                .map(|t| t.dev)
-                .collect();
+            let visible_allowed = full.restrict_for_recovery(mountpoints);
+            let countable_devs = visible_allowed.targets().iter().map(|t| t.dev).collect();
+            let plan = if from_thawed { visible_allowed } else { full };
             Ok(RecoveryPlan {
-                plan: full,
+                plan,
                 countable_devs: Some(countable_devs),
             })
         }
@@ -5969,6 +5968,7 @@ mod tests {
         //    `/data`'s thaw gate is paused.
         let rig_narrow = rig_with_allowed(FreezeState::Thawed, mounts, Some(vec!["/data"]));
         let gate = rig_narrow.kernel.script_thaw_gate("/data");
+        let _guard = gate.release_on_drop();
         let ctx_clone = Arc::clone(&rig_narrow.ctx);
         let req_clone = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
         let task = tokio::spawn(async move { thaw(&ctx_clone, &req_clone).await });
@@ -6231,5 +6231,148 @@ mod tests {
         assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
         assert_eq!(rig.ctx.frozen_mount_count(), 0);
         assert!(!rig.ctx.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn clean_thawed_rescan_excludes_disappeared_retained_handle_from_count_and_error_detail()
+    {
+        struct MutableMounts(std::sync::Mutex<String>);
+        impl MountSource for MutableMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Ok(self.0.lock().unwrap().as_bytes().to_vec())
+            }
+        }
+        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
+            concat!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+                "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            )
+            .to_owned(),
+        )));
+        let rig = rig_with_allowed_mounts(FreezeState::Thawed, mounts.clone(), Some(vec!["/data"]));
+        let data = rig.kernel.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        rig.kernel.fifreeze(&data).unwrap();
+        rig.kernel.script_thaw_error("/data", Errno::EIO);
+
+        // Attempt 1 (clean Thawed, no marker): /data fails transiently so its
+        // handle is retained and state returns to Thawed.
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let err1 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(err1.contains("FITHAW failed"), "{err1}");
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        // /data disappears from mountinfo before the second clean Thawed rescan.
+        *mounts.0.lock().unwrap() = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned();
+
+        // Attempt 2a (failure on disappeared retained handle): must collapse to
+        // fixed RecoveryIncomplete rather than disclosing FITHAW permission denied.
+        rig.kernel.clear_thaw_errors();
+        rig.kernel.script_thaw_error("/data", Errno::EACCES);
+        let err2 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert_eq!(
+            err2,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state thawed"
+        );
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        // Attempt 2b (success on disappeared retained handle): still drains and
+        // releases the descriptor, and reports 0 on the wire.
+        rig.kernel.clear_thaw_errors();
+        assert_eq!(thaw(&rig.ctx, &req).await.unwrap(), json!(0));
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_thawed_escalation_enters_audit_ring_retains_on_failure_and_flushes_on_settlement()
+    {
+        use crate::audit::Mode;
+
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /extra rw - ext4 /dev/sdc1 rw\n",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let mut config = Config::default();
+        config.agent.freeze_allowed_mountpoints = Some(vec!["/data".to_owned()]);
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(config),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel.clone())
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_hooks(Arc::new(LifecycleHooks)),
+        );
+        assert_eq!(ctx.audit.mode(), Mode::Normal);
+
+        // 1. Clean Thawed drain (marker confirmed absent) keeps audit router in Normal mode.
+        let clean_gate = kernel.script_thaw_gate("/data");
+        let _clean_guard = clean_gate.release_on_drop();
+        let ctx_c = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+            thaw(&ctx_c, &req).await
+        });
+        while clean_gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ctx.audit.mode(),
+            Mode::Normal,
+            "clean Thawed drain without marker should stay in normal audit mode"
+        );
+        clean_gate.release();
+        assert_eq!(task.await.unwrap().unwrap(), json!(0));
+        assert_eq!(ctx.audit.mode(), Mode::Normal);
+
+        // 2. Live Thawed service discovers a present marker -> escalates to full
+        //    recovery, enters Ring mode BEFORE recovery ioctls, and RETAINS Ring
+        //    mode when the drain fails and transitions to Frozen.
+        ctx.marker.create().unwrap();
+        let m3 = kernel.open_mount(Path::new("/extra"), (8, 3)).unwrap();
+        kernel.fifreeze(&m3).unwrap();
+        kernel.script_thaw_error("/extra", Errno::EIO);
+        let esc_gate = kernel.script_thaw_gate("/extra");
+        let _esc_guard = esc_gate.release_on_drop();
+        let ctx_e = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+            thaw(&ctx_e, &req).await
+        });
+        while esc_gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            ctx.audit.mode(),
+            Mode::Ring,
+            "live Thawed escalation must enter freeze-safe audit ring before recovery work"
+        );
+        esc_gate.release();
+        assert!(task.await.unwrap().is_err());
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(
+            ctx.audit.mode(),
+            Mode::Ring,
+            "failed escalated drain into Frozen must retain ring mode"
+        );
+
+        // 3. Subsequent successful recovery settles Thawed and flushes back to Normal.
+        kernel.clear_thaw_errors();
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&ctx, &req).await.unwrap(), json!(0));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!ctx.marker.exists());
+        assert_eq!(
+            ctx.audit.mode(),
+            Mode::Normal,
+            "successful settlement must flush audit router back to normal mode"
+        );
     }
 }

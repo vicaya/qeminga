@@ -7,6 +7,7 @@ fsfreeze_idle_timeout_secs = 30    # auto-thaw if no guest-fsfreeze-status heart
 fsfreeze_max_timeout_secs  = 300   # hard cap; thaw even if heartbeats are arriving
 hardening               = "enforced"  # production: refuse to serve without the sandbox (§8.1)
 # fsfreeze_operation_timeout_secs = 60  # freeze-walk deadline; omitted: min(60, fsfreeze_max_timeout_secs)
+# freeze_allowed_mountpoints = ["/var/lib/data"]  # optional guest-enforced freeze allowlist (§4.2, §4.5, #63)
 
 [rate_limits]
 ping_sync_per_min          = 120

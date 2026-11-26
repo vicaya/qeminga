@@ -115,6 +115,8 @@ struct FakeStartup {
     config: String,
     /// Whether the marker exists in `dir` when step 2 looks.
     marker: bool,
+    /// Optional marker file name override (for testing indeterminate probes).
+    marker_name: Option<String>,
     /// The real directory the fake's marker lives in (tmpfs), whatever
     /// path the configuration names.
     dir: tempfile::TempDir,
@@ -153,6 +155,7 @@ impl FakeStartup {
             steps: RefCell::new(Vec::new()),
             config: DEV_AGENT.to_owned(),
             marker: false,
+            marker_name: None,
             dir: shm_dir(),
             mountinfo: fixture("tmpfs_and_nfs.txt"),
             open: Ok(()),
@@ -225,7 +228,8 @@ impl Startup for FakeStartup {
     }
     fn open_marker(&self, path: &Path) -> Result<Marker, RunError> {
         self.log(format!("marker {}", path.display()));
-        let marker = Marker::open(self.dir.path().join("frozen"))?;
+        let name = self.marker_name.as_deref().unwrap_or("frozen");
+        let marker = Marker::open(self.dir.path().join(name))?;
         if self.marker && !marker.exists() {
             marker.create().unwrap();
         }
@@ -1405,5 +1409,30 @@ fn binary_serves_a_pty_and_exits_on_sigterm() {
         stderr.contains("\"event\":\"seccomp_log_mode\""),
         cfg!(feature = "seccomp") && daemon::seccomp_mode() == "log",
         "{stderr}"
+    );
+}
+
+#[test]
+fn indeterminate_marker_probe_at_startup_enters_recovery_mode() {
+    // #63: Only ENOENT confirms the marker is absent. An indeterminate
+    // fstatat error (here ENAMETOOLONG on a 256-byte marker filename, which
+    // triggers deterministically regardless of UID) must fail closed into
+    // recovery mode (ring logging + Frozen state) rather than assuming Thawed.
+    let mut startup = FakeStartup::new();
+    startup.marker_name = Some("a".repeat(256));
+    startup.run().unwrap();
+    let steps = startup.steps();
+    assert!(
+        steps.iter().any(|s| s == "logging info ring=true"),
+        "indeterminate marker probe must start in recovery mode (ring=true): {steps:?}"
+    );
+    assert!(
+        steps.iter().any(|s| s.starts_with("runtime recovery=true")),
+        "indeterminate marker probe must serve in recovery mode: {steps:?}"
+    );
+    let logs = startup.sink.text();
+    assert!(
+        logs.contains("marker_probe_indeterminate"),
+        "indeterminate startup probe should be logged: {logs}"
     );
 }

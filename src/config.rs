@@ -69,6 +69,16 @@ pub struct AgentConfig {
     /// (see [`AgentConfig::fsfreeze_operation_timeout_secs`]), so a
     /// configuration written before the key existed keeps starting.
     pub fsfreeze_operation_timeout_secs: Option<u64>,
+    /// Optional guest-enforced allowlist of canonical absolute mount points
+    /// authorized for `guest-fsfreeze-*` (#63, design §§4.2, 4.5, 5.9).
+    ///
+    /// When `None` (the default), the guest authorizes host-supplied mount
+    /// selections and whole-guest freezes across all eligible local
+    /// filesystems. When `Some(list)`, only exact entries in `list` are
+    /// admitted, enforced before mount-table lookup so unauthorized names
+    /// yield the guest-independent count `0`. An empty `Some(vec![])`
+    /// authorizes freezing nothing.
+    pub freeze_allowed_mountpoints: Option<Vec<String>>,
 }
 
 /// The hardening profile (`[agent] hardening`, §8.1). The opt-out is
@@ -124,6 +134,7 @@ impl Default for AgentConfig {
             fsfreeze_max_timeout_secs: 300,
             hardening: Hardening::Enforced,
             fsfreeze_operation_timeout_secs: None,
+            freeze_allowed_mountpoints: None,
         }
     }
 }
@@ -310,6 +321,36 @@ fn path_suffix(path: &Option<PathBuf>) -> String {
     }
 }
 
+/// Checks that an entry in `agent.freeze_allowed_mountpoints` is a canonical
+/// absolute mount point (starts with `/`, no NUL, no repeated `//`, no
+/// trailing `/` except `"/"`, and no `.` or `..` segments).
+fn validate_allowed_mountpoint(entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        return Some("must not be empty");
+    }
+    if !entry.starts_with('/') {
+        return Some("must be an absolute path starting with '/'");
+    }
+    if entry.contains('\0') {
+        return Some("must not contain NUL bytes");
+    }
+    if entry.contains("//") {
+        return Some("must not contain repeated '/'");
+    }
+    if entry.len() > 1 && entry.ends_with('/') {
+        return Some("must not end with '/'");
+    }
+    if entry != "/"
+        && entry
+            .split('/')
+            .skip(1)
+            .any(|seg| seg == "." || seg == "..")
+    {
+        return Some("must not contain '.' or '..' components");
+    }
+    None
+}
+
 impl ConfigError {
     fn with_path(self, path: &Path) -> Self {
         match self {
@@ -437,6 +478,23 @@ impl Config {
                 ),
             ));
         }
+        if let Some(allowed) = &agent.freeze_allowed_mountpoints {
+            let mut seen = std::collections::HashSet::with_capacity(allowed.len());
+            for entry in allowed {
+                if let Some(reason) = validate_allowed_mountpoint(entry) {
+                    return Err(invalid(
+                        "agent.freeze_allowed_mountpoints",
+                        format!("{entry:?}: {reason}"),
+                    ));
+                }
+                if !seen.insert(entry.as_str()) {
+                    return Err(invalid(
+                        "agent.freeze_allowed_mountpoints",
+                        format!("duplicate mount point {entry:?}"),
+                    ));
+                }
+            }
+        }
         let quotas = [
             (
                 "rate_limits.ping_sync_per_min",
@@ -516,6 +574,12 @@ impl Config {
     /// The information commands are available (runtime switch only, §5.9).
     pub fn information_enabled(&self) -> bool {
         self.features.information
+    }
+
+    /// Optional guest-enforced mount-point allowlist for `guest-fsfreeze-*`
+    /// (#63, design §§4.2, 4.5, 5.9).
+    pub fn freeze_allowed_mountpoints(&self) -> Option<&[String]> {
+        self.agent.freeze_allowed_mountpoints.as_deref()
     }
 
     /// The authority this configuration grants (§5.9): what the
@@ -983,5 +1047,60 @@ mod tests {
         assert_eq!(LogLevel::Trace.as_tracing(), tracing::Level::TRACE);
         assert_eq!(LogLevel::Error.as_tracing(), tracing::Level::ERROR);
         assert_eq!(LogLevel::Info.as_tracing(), tracing::Level::INFO);
+    }
+
+    #[test]
+    fn freeze_allowed_mountpoints_defaults_to_none_and_accepts_canonical_lists() {
+        assert_eq!(Config::default().freeze_allowed_mountpoints(), None);
+
+        let cfg = Config::parse(
+            "[agent]\nfreeze_allowed_mountpoints = [\"/\", \"/var/lib/data\", \"/srv/app\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.freeze_allowed_mountpoints(),
+            Some(
+                [
+                    "/".to_owned(),
+                    "/var/lib/data".to_owned(),
+                    "/srv/app".to_owned()
+                ]
+                .as_slice()
+            )
+        );
+
+        let empty = Config::parse("[agent]\nfreeze_allowed_mountpoints = []\n").unwrap();
+        assert_eq!(empty.freeze_allowed_mountpoints(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn freeze_allowed_mountpoints_rejects_noncanonical_and_duplicate_entries() {
+        let bad_cases = [
+            ("empty entry", "[\"\"]"),
+            ("relative path", "[\"var/lib/data\"]"),
+            ("trailing slash", "[\"/data/\"]"),
+            ("double slash", "[\"//data\"]"),
+            ("dot segment", "[\"/data/./sub\"]"),
+            ("dotdot segment", "[\"/data/../etc\"]"),
+            ("trailing dot", "[\"/data/.\"]"),
+            ("trailing dotdot", "[\"/data/..\"]"),
+            ("nul byte", "[\"/data\\u0000x\"]"),
+            ("duplicate entry", "[\"/data\", \"/data\"]"),
+        ];
+        for (label, list) in bad_cases {
+            let toml = format!("[agent]\nfreeze_allowed_mountpoints = {list}\n");
+            let err =
+                Config::parse(&toml).expect_err(&format!("expected Invalid error for {label}"));
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        key: "agent.freeze_allowed_mountpoints",
+                        ..
+                    }
+                ),
+                "{label}: unexpected error {err:?}"
+            );
+        }
     }
 }

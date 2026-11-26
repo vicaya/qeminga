@@ -233,6 +233,41 @@ pub fn is_eligible(entry: &MountEntry) -> bool {
     FREEZABLE_FS_TYPES.contains(&entry.fs_type.as_str()) && entry.source.starts_with("/dev/")
 }
 
+/// Enforces an optional guest-owned mount-point allowlist (`allowed`) on a
+/// freeze request selection (`requested`) **before** any mount-table lookup
+/// (#63, design §§4.2, 4.5, 5.9).
+///
+/// - When `allowed` is `None`, `requested` passes through unchanged (the host
+///   may freeze any eligible local mount point).
+/// - When `allowed` is `Some(allow)` and `requested` is `None` (whole-guest
+///   `guest-fsfreeze-freeze` or `guest-fsfreeze-freeze-list` with omitted
+///   `mountpoints`), the selection becomes `Some(allow)`.
+/// - When both are `Some`, only names present verbatim in `allow` survive
+///   (unauthorized names, including unauthorized aliases, are discarded before
+///   lookup so they yield the guest-independent count `0`).
+pub fn filter_freeze_selection(
+    requested: Option<&[String]>,
+    allowed: Option<&[String]>,
+) -> Option<Vec<String>> {
+    match (requested, allowed) {
+        (None, None) => None,
+        (Some(req), None) => Some(req.to_vec()),
+        (None, Some(allow)) => Some(allow.to_vec()),
+        (Some(req), Some(allow)) => {
+            if req.is_empty() || allow.is_empty() {
+                return Some(Vec::new());
+            }
+            let allow_set: HashSet<&str> = allow.iter().map(String::as_str).collect();
+            Some(
+                req.iter()
+                    .filter(|name| allow_set.contains(name.as_str()))
+                    .cloned()
+                    .collect(),
+            )
+        }
+    }
+}
+
 impl FreezePlan {
     /// Builds the plan from a mount table in mount order.
     pub fn build(mounts: &[MountEntry]) -> FreezePlan {
@@ -335,6 +370,43 @@ impl FreezePlan {
                     requested: Some(PathBuf::from(name)),
                     ..target.clone()
                 })
+            })
+            .collect();
+        FreezePlan {
+            targets,
+            mounts: self.mounts.clone(),
+        }
+    }
+
+    /// Restricts a discovery recovery plan (and host-visible disclosure count
+    /// set) strictly to superblocks currently visible at the configured
+    /// `allowed` mount points (#63, design §§4.2, 5.9): resolves each allowed
+    /// path through `MountTree::resolve` (selecting at most one visible
+    /// superblock per configured name, never a hidden historical occupant
+    /// beneath an overmount), while leaving [`Target::requested`] as `None` so
+    /// recovery can still open each currently visible superblock through any
+    /// of its mount points.
+    pub fn restrict_for_recovery(&self, allowed: &[String]) -> FreezePlan {
+        if allowed.is_empty() {
+            return FreezePlan {
+                targets: Vec::new(),
+                mounts: self.mounts.clone(),
+            };
+        }
+        let tree = MountTree::index(&self.mounts);
+        let mut allowed_devs: HashSet<(u32, u32)> = HashSet::new();
+        for name in allowed {
+            if let Some(dev) = tree.resolve(name.as_bytes()) {
+                allowed_devs.insert(dev);
+            }
+        }
+        let targets = self
+            .targets
+            .iter()
+            .filter(|target| allowed_devs.contains(&target.dev))
+            .map(|target| Target {
+                requested: None,
+                ..target.clone()
             })
             .collect();
         FreezePlan {
@@ -771,5 +843,79 @@ mod tests {
         let visible = visible_mounts(&entries).unwrap();
         let ids: Vec<u32> = visible.iter().map(|e| e.mount_id).collect();
         assert_eq!(ids, [1, 6]);
+    }
+
+    #[test]
+    fn filter_freeze_selection_enforces_guest_allowlist_before_lookup() {
+        let s = |v: &[&str]| -> Vec<String> { v.iter().map(|x| (*x).to_owned()).collect() };
+        // Unrestricted guest policy passes host selection through verbatim.
+        assert_eq!(filter_freeze_selection(None, None), None);
+        assert_eq!(
+            filter_freeze_selection(Some(&s(&["/data", "/secret"])), None),
+            Some(s(&["/data", "/secret"]))
+        );
+        // Restricted policy narrows whole-guest / omitted-list to the allowlist.
+        let allow = s(&["/data", "/var/lib/pg"]);
+        assert_eq!(
+            filter_freeze_selection(None, Some(&allow)),
+            Some(allow.clone())
+        );
+        // Explicit selections drop unauthorized names and unauthorized aliases before lookup.
+        assert_eq!(
+            filter_freeze_selection(Some(&s(&["/secret", "/data-alias"])), Some(&allow)),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            filter_freeze_selection(
+                Some(&s(&["/secret", "/data", "/data-alias", "/var/lib/pg"])),
+                Some(&allow),
+            ),
+            Some(s(&["/data", "/var/lib/pg"]))
+        );
+        // Explicit empty request or empty allowlist yields empty selection.
+        assert_eq!(
+            filter_freeze_selection(Some(&[]), Some(&allow)),
+            Some(Vec::new())
+        );
+        assert_eq!(filter_freeze_selection(None, Some(&[])), Some(Vec::new()));
+        assert_eq!(
+            filter_freeze_selection(Some(&s(&["/data"])), Some(&[])),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn restrict_for_recovery_selects_only_currently_visible_allowlisted_devices() {
+        // 8:1 at `/`, 8:2 mounted at `/data` (overmounted by 8:3) with alias
+        // `/data-alias`, and unprovisioned 8:4 at `/secret`.
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:2 / /data-alias rw - ext4 /dev/sdb1 rw\n",
+            "4 2 8:3 / /data rw - ext4 /dev/sdc1 rw\n",
+            "5 1 8:4 / /secret rw - ext4 /dev/sdd1 rw\n",
+        );
+        let plan = FreezePlan::build(&parse_mountinfo(table));
+        let allowed = vec!["/data".to_owned()];
+
+        // Normal freeze selection resolves `/data` to only the visible top superblock 8:3.
+        let freeze = plan.restrict_to(&allowed);
+        let freeze_devs: Vec<(u32, u32)> = freeze.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(freeze_devs, [(8, 3)]);
+
+        // Recovery disclosure and clean-Thawed drains authorize ONLY the
+        // currently visible superblock at `/data` (8:3), never a hidden
+        // historical occupant (8:2) beneath an overmount, nor unprovisioned
+        // `/` (8:1) or `/secret` (8:4).
+        let recovery = plan.restrict_for_recovery(&allowed);
+        let recovery_devs: Vec<(u32, u32)> = recovery.targets().iter().map(|t| t.dev).collect();
+        assert_eq!(recovery_devs, [(8, 3)]);
+        assert!(
+            recovery.targets().iter().all(|t| t.requested.is_none()),
+            "recovery targets must allow any mountpoint of the currently visible superblock"
+        );
+
+        // Empty allowlist excludes all targets from recovery discovery.
+        assert!(plan.restrict_for_recovery(&[]).is_empty());
     }
 }

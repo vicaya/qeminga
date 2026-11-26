@@ -76,6 +76,8 @@ struct Guest {
     /// The data-protection profile (§5.9): information, shutdown and trim
     /// off, so `guest-get-fsinfo` is not there to discover with.
     data_protection: bool,
+    /// Optional guest-enforced mount-point allowlist (#63).
+    freeze_allowed_mountpoints: Option<Vec<String>>,
 }
 
 impl Guest {
@@ -85,19 +87,32 @@ impl Guest {
     }
 
     fn with_mounts(mounts: &'static str) -> Arc<Guest> {
-        Self::build(fixture(mounts), false)
+        Self::build(fixture(mounts), false, None)
     }
 
     fn with_mount_table(mounts: String) -> Arc<Guest> {
-        Self::build(mounts, false)
+        Self::build(mounts, false, None)
     }
 
     /// A guest under `packaging/config-data-protection.toml`'s switches.
     fn data_protection() -> Arc<Guest> {
-        Self::build(fixture("simple.txt"), true)
+        Self::build(fixture("simple.txt"), true, None)
     }
 
-    fn build(mounts: String, data_protection: bool) -> Arc<Guest> {
+    /// A data-protection guest with a synthetic mount table and optional
+    /// guest-enforced `freeze_allowed_mountpoints` policy (#63).
+    fn data_protection_with_policy(
+        mounts: String,
+        freeze_allowed_mountpoints: Option<Vec<String>>,
+    ) -> Arc<Guest> {
+        Self::build(mounts, true, freeze_allowed_mountpoints)
+    }
+
+    fn build(
+        mounts: String,
+        data_protection: bool,
+        freeze_allowed_mountpoints: Option<Vec<String>>,
+    ) -> Arc<Guest> {
         let kernel = Arc::new(FakeKernel::new());
         kernel.track_freeze_depth();
         let guest = Arc::new(Guest {
@@ -108,6 +123,7 @@ impl Guest {
             lost: Notify::new(),
             mounts,
             data_protection,
+            freeze_allowed_mountpoints,
         });
         guest.start_agent();
         guest
@@ -121,6 +137,7 @@ impl Guest {
         let mut config = Config::default();
         config.agent.fsfreeze_idle_timeout_secs = IDLE_SECS;
         config.agent.fsfreeze_max_timeout_secs = MAX_SECS;
+        config.agent.freeze_allowed_mountpoints = self.freeze_allowed_mountpoints.clone();
         if self.data_protection {
             config.features.information = false;
             config.features.shutdown = false;
@@ -1109,4 +1126,153 @@ async fn inventory_selection_through_freeze_avoids_non_utf8_fffd_collision_and_f
     assert_eq!(thawed["return"], json!(4));
     assert_eq!(guest.state(), FreezeState::Thawed);
     assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn default_data_protection_profile_permits_host_named_and_whole_guest_freeze_counts() {
+    // #63: With `freeze_allowed_mountpoints` unset (the default of
+    // `config-data-protection.toml`), the guest explicitly authorizes the host
+    // to learn distinct-superblock counts for host-named mount paths and
+    // whole-guest freezes even with inventory and trim disabled.
+    let mounts = concat!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+        "2 1 8:2 / /srv/provisioned rw - ext4 /dev/sdb1 rw\n",
+        "3 1 8:3 / /srv/unprovisioned rw - ext4 /dev/sdc1 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::data_protection_with_policy(mounts, None);
+
+    // Host probing an unprovisioned eligible mount sees count 1 when unset.
+    let reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/srv/unprovisioned"]}}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["return"], json!(1));
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+
+    // Whole-guest freeze returns the aggregate distinct-superblock count (3).
+    let reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-freeze"}"#)
+        .await
+        .unwrap();
+    assert_eq!(reply["return"], json!(3));
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(3)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cvm_freeze_allowed_mountpoints_conceals_unprovisioned_layout_and_recovers_owned_freezes() {
+    // #63: A CVM deployment promising to conceal unprovisioned mount
+    // eligibility sets `freeze_allowed_mountpoints` in guest configuration.
+    // The provisioned controller verifies coverage without inventory, while
+    // unauthorized selections, unauthorized aliases, mixed selections,
+    // whole-guest, omitted-list, and recovery thaw counts never disclose
+    // unprovisioned mounts yet still recover every freeze the agent owns.
+    let mounts = concat!(
+        "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+        "2 1 8:2 / /srv/provisioned rw - ext4 /dev/sdb1 rw\n",
+        "3 1 8:2 / /srv/provisioned-alias rw - ext4 /dev/sdb1 rw\n",
+        "4 1 8:3 / /srv/private rw - ext4 /dev/sdc1 rw\n",
+    )
+    .to_owned();
+    let guest =
+        Guest::data_protection_with_policy(mounts, Some(vec!["/srv/provisioned".to_owned()]));
+
+    // Provisioned controller cycle still succeeds without inventory.
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &["/srv/provisioned"])
+        .await
+        .unwrap();
+    cycle
+        .cut("vol-prov", Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-prov".to_owned()]
+        }
+    );
+
+    // Unauthorized mount point and unauthorized alias both answer guest-independent 0.
+    for probe in ["/srv/private", "/srv/provisioned-alias", "/"] {
+        let req = json!({
+            "execute": "guest-fsfreeze-freeze-list",
+            "arguments": { "mountpoints": [probe] }
+        })
+        .to_string();
+        assert_eq!(guest.request(&req).await.unwrap()["return"], json!(0));
+        assert_eq!(guest.state(), FreezeState::Thawed);
+    }
+
+    // Mixed selection freezes only the authorized target (controller asking for
+    // 2 targets fails closed with 1 of 2 covered, identical to unmounted).
+    let verdict = Cycle::freeze(Arc::clone(&guest), &["/srv/provisioned", "/srv/private"])
+        .await
+        .unwrap_err();
+    rejected(&verdict, "freeze covered 1 of 2");
+    assert_eq!(guest.state(), FreezeState::Thawed);
+
+    // Whole-guest and omitted-list requests freeze only the allowlisted target (1).
+    for req in [
+        r#"{"execute":"guest-fsfreeze-freeze"}"#,
+        r#"{"execute":"guest-fsfreeze-freeze-list"}"#,
+    ] {
+        assert_eq!(guest.request(req).await.unwrap()["return"], json!(1));
+        assert_eq!(
+            guest
+                .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+                .await
+                .unwrap()["return"],
+            json!(1)
+        );
+    }
+
+    // Crash while frozen -> restart in recovery mode -> recovery thaw drains
+    // the owned freeze and returns 1.
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/srv/provisioned"]}}"#)
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+    guest.restart_agent();
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+
+    // Once Thawed (no marker), a host-requested recovery drain never touches
+    // unprovisioned superblocks and returns 0.
+    let before = guest.kernel.calls().len();
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(0)
+    );
+    assert!(
+        !guest.kernel.calls()[before..]
+            .iter()
+            .any(|c| matches!(c, Call::Open(_, d) if *d == (8, 1) || *d == (8, 3))),
+        "thaw from Thawed must never open unprovisioned superblocks"
+    );
 }

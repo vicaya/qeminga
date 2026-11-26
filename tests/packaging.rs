@@ -745,6 +745,33 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
 }
 
 #[test]
+fn cvm_docs_record_freeze_count_confidentiality_and_guest_allowlist() {
+    // #63: design.md and packaging/README.md distinguish host controller
+    // provisioning from guest-enforced `freeze_allowed_mountpoints` policy.
+    let readme = read("packaging/README.md");
+    let design = read("docs/design.md");
+    let dp_cfg = read("packaging/config-data-protection.toml");
+    assert!(
+        readme.contains("freeze_allowed_mountpoints")
+            && readme
+                .to_ascii_lowercase()
+                .contains("controller provisioning")
+            && readme.contains("guest-independent count `0`"),
+        "packaging/README.md must document freeze_allowed_mountpoints and the count confidentiality boundary"
+    );
+    assert!(
+        design.contains("Confidentiality of freeze counts")
+            && design.contains("freeze_allowed_mountpoints")
+            && design.contains("guest-independent"),
+        "docs/design.md must document the CVM freeze-count confidentiality decision"
+    );
+    assert!(
+        dp_cfg.contains("freeze_allowed_mountpoints"),
+        "packaging/config-data-protection.toml must document the optional freeze_allowed_mountpoints key"
+    );
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

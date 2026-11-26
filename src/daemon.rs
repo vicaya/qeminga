@@ -337,8 +337,21 @@ pub fn run_with(opts: &Options, startup: &dyn Startup) -> Result<(), RunError> {
     // exactly as it was, for the next start to act on.
     check_hardening(&config, &startup.build_profile())?;
     let marker = startup.open_marker(&config.agent.state_path)?;
-    let recovery = marker.exists();
+    // Only ENOENT confirms the marker is absent; an indeterminate probe fails
+    // closed into recovery mode so a narrowed allowlist drain cannot run or
+    // clear an unconfirmed recovery obligation (#63).
+    let (recovery, probe_err) = match marker.probe() {
+        Ok(present) => (present, None),
+        Err(err) => (true, Some(err)),
+    };
     let router = startup.init_logging(config.agent.log_level, recovery)?;
+    if let Some(err) = probe_err {
+        tracing::error!(
+            event = "marker_probe_indeterminate",
+            error = %err,
+            "cannot confirm recovery marker absence at startup; starting in recovery mode"
+        );
+    }
     let logging = router.clone();
     let result = serve_after_logging(opts, startup, config, marker, recovery, router);
     if let Err(err) = &result {

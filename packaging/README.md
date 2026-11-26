@@ -297,6 +297,37 @@ device numbers, or marker paths).
   group aliases within one reply and use provisioned mount paths across
   requests. Enabling `information` also enables `guest-get-osinfo` and
   `guest-network-get-interfaces`.
+- **Freeze-count confidentiality and guest target policy (#63).**
+  Controller provisioning (telling the host backup controller which mount
+  points to request) is separate from policy enforced by the guest agent.
+  With `[agent] freeze_allowed_mountpoints` unset (the default in
+  `config-data-protection.toml`), the guest authorizes the host to learn
+  distinct-superblock coverage counts for host-named mount paths and
+  aggregate whole-guest counts even with `information = false` and
+  `fstrim = false` (zero counts remain ambiguous and ordinary file
+  contents are never disclosed; design §4.5). A CVM deployment promising
+  to conceal unprovisioned mount-point eligibility from an untrusted host
+  must set `[agent] freeze_allowed_mountpoints = [...]` in
+  `/etc/qeminga/config.toml` (canonical absolute mount paths, alongside
+  `information = false` and `fstrim = false`): unauthorized names and
+  aliases are discarded before mount-table lookup and settle directly to
+  the guest-independent count `0` without reading `/proc/self/mountinfo`
+  or touching the recovery marker, whole-guest and omitted-list requests
+  are narrowed to the allowlist, recovery thaws from `Thawed` (only when
+  marker absence is confirmed via `ENOENT`) restrict discovery strictly to
+  currently visible allowlisted devices and never remove a marker, and
+  crash recovery from a present or indeterminate `/run/qeminga/frozen`
+  marker drains every eligible v1 superblock before removing the marker
+  (so narrowing `freeze_allowed_mountpoints` across a crash cannot strand
+  an earlier freeze) while reporting only currently visible allowlisted
+  counts on the wire and collapsing failures attributable solely to
+  excluded or unverified targets to one fixed host-safe reason — when
+  `/proc/self/mountinfo` cannot be read on a restricted recovery retry,
+  retained descriptors are still drained for guest recovery while their
+  wire credit and specific target error classes remain suppressed until
+  current visibility can be verified (per-target ownership in OQ-11 / #69
+  removes broad marker discovery once a second in-guest freezer is
+  supported).
 - **Mount-binding assumption (v1).** Whether required mount paths come
   from provisioning (`config-data-protection.toml`) or from
   `guest-get-fsinfo`, the guest must keep each required path bound to

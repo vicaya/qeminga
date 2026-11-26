@@ -72,7 +72,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::dispatch::{Context, ThawScope};
-use crate::freeze_plan::{FreezePlan, Target};
+use crate::freeze_plan::{FreezePlan, Target, filter_freeze_selection};
 use crate::handlers::NoArgs;
 use crate::kernel::{KernelError, KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
@@ -324,12 +324,14 @@ fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
 /// thaw request aborts it and the reply is the error, while the recovery
 /// of the targets frozen so far continues on the coordinator.
 async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result<Value, Error> {
+    let effective =
+        filter_freeze_selection(restrict.as_deref(), ctx.config.freeze_allowed_mountpoints());
     let token = ctx
         .state
         .begin_freeze()
         .map_err(|err| Error::Internal(format!("cannot freeze: {err}")))?;
     ctx.hooks.on_freezing(ctx);
-    let reply = crate::freeze_op::start(Arc::clone(ctx), token, restrict);
+    let reply = crate::freeze_op::start(Arc::clone(ctx), token, effective);
     match reply.await {
         Ok(Ok(frozen)) => Ok(json!(frozen)),
         Ok(Err(failure)) => Err(Error::Internal(failure.host_description())),
@@ -346,20 +348,25 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     let kernel = Arc::clone(&ctx.kernel);
     let mounts = Arc::clone(&ctx.mounts);
     let marker = ctx.marker.clone();
+    let allowed = ctx.config.agent.freeze_allowed_mountpoints.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let held = ctx.take_frozen_mounts();
     // The scope (§4.2 "Thaw scope"): a tracked operation's thaw drains
     // the descriptors it published and nothing else; a recovery drain
     // (from `Thawed`, after a restart, or after an operation with an
-    // uncertain target) discovers every planned superblock.
+    // uncertain target) discovers every planned superblock (scoped to the
+    // guest's freeze allowlist when configured, #63).
     let discover = token.is_recovery_drain() || ctx.thaw_scope() == ThawScope::Discovery;
+    let from_thawed = token.is_recovery_drain();
     let (outcome, held) = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             let mut held = held;
             // Discovery and drain are separate: the handles this process
             // holds are drained whether or not the mount table can be
             // read (`thaw_blocking`), and a tracked thaw reads none.
-            let plan = discover.then(|| build_plan::<ThawFailure>(mounts.as_ref(), None));
+            let plan = discover.then(|| {
+                build_recovery_plan(mounts.as_ref(), allowed.as_deref(), from_thawed)
+            });
             let outcome = thaw_blocking(kernel.as_ref(), &marker, plan, &mut held);
             (outcome, held)
         })
@@ -823,6 +830,58 @@ pub(crate) fn build_plan<E: From<String>>(
     })
 }
 
+/// A discovery recovery plan plus an optional wire-count filter (#63).
+///
+/// - When thawing from `Thawed` (`from_thawed == true`, no marker and no prior
+///   crash obligation) with `freeze_allowed_mountpoints` configured, `plan` is
+///   strictly narrowed via [`FreezePlan::restrict_for_recovery`] so
+///   unprovisioned superblocks are neither opened nor thawed.
+/// - During marker / uncertain-worker recovery (`from_thawed == false`), the
+///   v1 marker carries no target identities or policy version, so guest config
+///   may have narrowed `freeze_allowed_mountpoints` between the freeze and the
+///   restart. Under v1's sole-freezer assumption (§4.2), `plan` drains every
+///   eligible superblock before removing the marker so no earlier freeze can
+///   be stranded, while `countable_devs` restricts the count reported on the
+///   wire (in both success and failure replies) to superblocks authorized by
+///   the current guest policy.
+pub(crate) struct RecoveryPlan {
+    plan: FreezePlan,
+    countable_devs: Option<std::collections::HashSet<(u32, u32)>>,
+}
+
+pub(crate) fn build_recovery_plan(
+    mounts: &dyn MountSource,
+    allowed: Option<&[String]>,
+    from_thawed: bool,
+) -> Result<RecoveryPlan, ThawFailure> {
+    let entries = mounts
+        .mounts()
+        .map_err(|err| ThawFailure::from(err.to_string()))?;
+    let full = FreezePlan::build(&entries);
+    match allowed {
+        None => Ok(RecoveryPlan {
+            plan: full,
+            countable_devs: None,
+        }),
+        Some(mountpoints) if from_thawed => Ok(RecoveryPlan {
+            plan: full.restrict_for_recovery(mountpoints),
+            countable_devs: None,
+        }),
+        Some(mountpoints) => {
+            let countable_devs = full
+                .restrict_for_recovery(mountpoints)
+                .targets()
+                .iter()
+                .map(|t| t.dev)
+                .collect();
+            Ok(RecoveryPlan {
+                plan: full,
+                countable_devs: Some(countable_devs),
+            })
+        }
+    }
+}
+
 impl From<String> for FreezeFailure {
     fn from(message: String) -> Self {
         FreezeFailure::Plan(message)
@@ -1022,7 +1081,7 @@ pub(crate) fn drain_held(
 fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
-    plan: Option<Result<FreezePlan, ThawFailure>>,
+    plan: Option<Result<RecoveryPlan, ThawFailure>>,
     held: &mut Vec<Mount>,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
@@ -1037,8 +1096,14 @@ fn thaw_blocking(
             );
             None
         }
-        Some(Ok(plan)) => {
+        Some(Ok(RecoveryPlan {
+            plan,
+            countable_devs,
+        })) => {
             for target in plan.thaw_order() {
+                let countable = countable_devs
+                    .as_ref()
+                    .is_none_or(|devs| devs.contains(&target.dev));
                 let mount = match retained.iter().position(|m| m.dev() == target.dev) {
                     Some(index) => retained.remove(index),
                     None => match open_target(kernel, target) {
@@ -1069,7 +1134,7 @@ fn thaw_blocking(
                         }
                     },
                 };
-                state.drain(kernel, mount);
+                state.drain(kernel, mount, countable);
             }
             None
         }
@@ -1093,7 +1158,7 @@ fn thaw_blocking(
                 "frozen by this process but no longer in the plan; drained"
             );
         }
-        state.drain(kernel, mount);
+        state.drain(kernel, mount, true);
     }
     let ThawState {
         thawed,
@@ -1116,7 +1181,8 @@ fn thaw_blocking(
 /// The running result of a thaw drain over several targets.
 #[derive(Default)]
 struct ThawState {
-    /// Targets on which at least one `FITHAW` succeeded.
+    /// Policy-authorized targets on which at least one `FITHAW` succeeded
+    /// (reported on the wire).
     thawed: u64,
     /// The first failure to report, if any.
     unrecoverable: Option<ThawFailure>,
@@ -1126,9 +1192,9 @@ struct ThawState {
 
 impl ThawState {
     /// Drains one target, keeping its handle when the drain is incomplete.
-    fn drain(&mut self, kernel: &dyn KernelOps, mount: Mount) {
+    fn drain(&mut self, kernel: &dyn KernelOps, mount: Mount, countable: bool) {
         let drained = drain(kernel, &mount);
-        if drained.successes > 0 {
+        if drained.successes > 0 && countable {
             self.thawed += 1;
         }
         if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
@@ -5436,5 +5502,193 @@ mod tests {
             assert_clean("ThawFailure(Frozen)", &frozen_desc);
             assert_clean("ThawFailure(Thawed)", &thawed_desc);
         }
+    }
+
+    fn rig_with_allowed(state: FreezeState, mountinfo: &str, allowed: Option<Vec<&str>>) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let hooks = Arc::new(Recorder::default());
+        let clock = ManualClock::new();
+        let mut config = Config::default();
+        config.agent.freeze_allowed_mountpoints =
+            allowed.map(|list| list.into_iter().map(str::to_owned).collect());
+        let ctx = Context::new(
+            Arc::new(config),
+            Arc::new(FreezeStateMachine::starting_in(state)),
+            Router::new(Box::new(std::io::sink())),
+            Marker::open(dir.path().join("frozen")).unwrap(),
+        )
+        .with_kernel(kernel.clone())
+        .with_mounts(Arc::new(StaticMounts(mountinfo.to_owned())))
+        .with_hooks(hooks.clone())
+        .with_freeze_clock(Arc::new(clock.clone()));
+        Rig {
+            ctx: Arc::new(ctx),
+            kernel,
+            hooks,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_allowlist_blocks_unauthorized_selections_aliases_and_whole_guest() {
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:2 / /data-alias rw - ext4 /dev/sdb1 rw\n",
+            "4 1 8:3 / /secret rw - ext4 /dev/sdc1 rw\n",
+        );
+        let rig = rig_with_allowed(FreezeState::Thawed, mounts, Some(vec!["/data"]));
+
+        // 1. Unauthorized mount selection yields guest-independent 0 without opening it.
+        let req = parse_request(
+            br#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/secret"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(freeze_list(&rig.ctx, &req).await.unwrap(), json!(0));
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert!(rig.kernel.calls().is_empty(), "{:?}", rig.kernel.calls());
+
+        // 2. Unauthorized alias of an allowed superblock also yields 0 without lookup.
+        let req = parse_request(
+            br#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data-alias"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(freeze_list(&rig.ctx, &req).await.unwrap(), json!(0));
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert!(rig.kernel.calls().is_empty(), "{:?}", rig.kernel.calls());
+
+        // 3. Mixed authorized + unauthorized selection freezes only `/data` and returns 1.
+        let req = parse_request(
+            br#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/secret","/data","/data-alias"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(freeze_list(&rig.ctx, &req).await.unwrap(), json!(1));
+        assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+        let opened: Vec<(PathBuf, (u32, u32))> = rig
+            .kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Open(p, d) => Some((p, d)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened, vec![(PathBuf::from("/data"), (8, 2))]);
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&rig.ctx, &req).await.unwrap(), json!(1));
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+
+        // 4. Whole-guest freeze is narrowed to the guest allowlist.
+        let rig_whole = rig_with_allowed(FreezeState::Thawed, mounts, Some(vec!["/data"]));
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        assert_eq!(freeze(&rig_whole.ctx, &req).await.unwrap(), json!(1));
+        assert!(
+            !rig_whole
+                .kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Open(_, d) if *d != (8, 2)))
+        );
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&rig_whole.ctx, &req).await.unwrap(), json!(1));
+
+        // 5. Omitted-list `guest-fsfreeze-freeze-list` is narrowed identically.
+        let rig_omitted = rig_with_allowed(FreezeState::Thawed, mounts, Some(vec!["/data"]));
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze-list"}"#).unwrap();
+        assert_eq!(freeze_list(&rig_omitted.ctx, &req).await.unwrap(), json!(1));
+        assert!(
+            !rig_omitted
+                .kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Open(_, d) if *d != (8, 2)))
+        );
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&rig_omitted.ctx, &req).await.unwrap(), json!(1));
+
+        // 6. Explicit empty allowlist freezes nothing even on whole-guest requests.
+        let rig_empty = rig_with_allowed(FreezeState::Thawed, mounts, Some(vec![]));
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        assert_eq!(freeze(&rig_empty.ctx, &req).await.unwrap(), json!(0));
+        assert_eq!(rig_empty.ctx.state.current(), FreezeState::Thawed);
+        assert!(rig_empty.kernel.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn guest_allowlist_marker_recovery_drains_narrowed_obligations_and_filters_wire_count() {
+        // After a crash while `/data` (8:2, also aliased at `/data-alias`) and
+        // `/extra` (8:3, authorized under an earlier broader config) were
+        // frozen, 8:4 is mounted over `/data` and the restarted guest narrows
+        // `freeze_allowed_mountpoints` to `["/data"]`. Under v1's sole-freezer
+        // assumption, marker recovery drains BOTH 8:2 (via `/data-alias`) and
+        // 8:3 before removing `/run/qeminga/frozen` so no earlier freeze is
+        // stranded, while reporting only the current-policy count `1` on the
+        // wire.
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:2 / /data-alias rw - ext4 /dev/sdb1 rw\n",
+            "4 2 8:4 / /data rw - ext4 /dev/sdd1 rw\n",
+            "5 1 8:3 / /extra rw - ext4 /dev/sdc1 rw\n",
+        );
+        let rig = rig_with_allowed(FreezeState::Frozen, mounts, Some(vec!["/data"]));
+        rig.ctx.marker.create().unwrap();
+        let m2 = rig
+            .kernel
+            .open_mount(Path::new("/data-alias"), (8, 2))
+            .unwrap();
+        rig.kernel.fifreeze(&m2).unwrap();
+        let m3 = rig.kernel.open_mount(Path::new("/extra"), (8, 3)).unwrap();
+        rig.kernel.fifreeze(&m3).unwrap();
+
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&rig.ctx, &req).await.unwrap(), json!(1));
+        assert_eq!(rig.ctx.state.current(), FreezeState::Thawed);
+        assert!(!rig.ctx.marker.exists());
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+
+        // Once Thawed (no marker, no crash obligation), a host-requested
+        // recovery drain strictly scopes discovery to `freeze_allowed_mountpoints`
+        // and never opens or thaws an unprovisioned superblock.
+        let m3_again = rig.kernel.open_mount(Path::new("/extra"), (8, 3)).unwrap();
+        rig.kernel.fifreeze(&m3_again).unwrap();
+        let before = rig.kernel.calls().len();
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&rig.ctx, &req).await.unwrap(), json!(0));
+        let after_calls = &rig.kernel.calls()[before..];
+        assert!(
+            !after_calls
+                .iter()
+                .any(|c| matches!(c, Call::Open(_, d) if *d == (8, 1) || *d == (8, 3))),
+            "thaw from Thawed must not open unprovisioned superblocks: {after_calls:?}"
+        );
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 1);
+    }
+
+    #[tokio::test]
+    async fn guest_allowlist_marker_recovery_retains_marker_if_narrowed_target_cannot_thaw() {
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /extra rw - ext4 /dev/sdc1 rw\n",
+        );
+        let rig = rig_with_allowed(FreezeState::Frozen, mounts, Some(vec!["/data"]));
+        rig.ctx.marker.create().unwrap();
+        let m2 = rig.kernel.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        rig.kernel.fifreeze(&m2).unwrap();
+        let m3 = rig.kernel.open_mount(Path::new("/extra"), (8, 3)).unwrap();
+        rig.kernel.fifreeze(&m3).unwrap();
+        rig.kernel.script_thaw_error("/extra", Errno::EIO);
+
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let err = thaw(&rig.ctx, &req).await.unwrap_err();
+        let desc = err.to_string();
+        assert!(desc.contains("1 target(s) thawed"), "{desc}");
+        assert!(!desc.contains("/extra"), "{desc}");
+        assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
+        assert!(rig.ctx.marker.exists());
     }
 }

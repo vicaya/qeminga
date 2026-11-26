@@ -21,6 +21,11 @@ state_path              = "/run/qeminga/frozen"
 fsfreeze_idle_timeout_secs = 30
 fsfreeze_max_timeout_secs  = 300
 hardening               = "enforced"
+# Optional guest-enforced freeze allowlist (§4.2, §4.5, #63): when omitted, the
+# host may freeze any eligible mount point and learn distinct-superblock counts
+# for host-named selections and whole-guest freezes. Set this list when the
+# deployment must conceal unprovisioned mount-point eligibility from the host.
+# freeze_allowed_mountpoints = ["/var/lib/data"]
 
 [features]
 suspend_ram = false

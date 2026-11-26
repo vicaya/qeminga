@@ -237,9 +237,17 @@ device numbers, or marker paths).
     `pwrite64`, `fsync`, and `unlinkat` (for the channel, stderr, marker,
     and optional `/sys/power/state`). Ordinary writes are limited by
     guest Unix permissions (UID/GID 600, with `CAP_DAC_OVERRIDE` dropped)
-    and service confinement; the shipped unit currently sets
-    `ProtectSystem=no`, `ProtectHome=no`, and `PrivateTmp=no`, so it does
-    not yet confine writes to `/run/qeminga` alone.
+    and the shipped unit's read-only mount namespace (see *Filesystem
+    write confinement* above: `ProtectSystem=strict`,
+    `ProtectHome=read-only`, `PrivateTmp=no`,
+    `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`,
+    `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`,
+    `SystemCallFilter=~@mount`, and `UMask=0077`), which confines
+    ordinary file writes on mounts present at service start to
+    `/run/qeminga` (plus `/sys/power/state` only with an explicit suspend
+    drop-in) while leaving the residual writable objects inventoried
+    above (character devices under `/dev`, `/proc/self/*`, and
+    filesystems mounted after service start).
   - *Sockets and IPC:* Under an installed, enforcing seccomp filter
     (required by `hardening = "enforced"`; the filter may be absent or
     logging-only under the development-only opt-out

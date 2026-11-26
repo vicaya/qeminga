@@ -462,25 +462,93 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
         .expect("design §5.10");
     let s59 = &design[s59_start..s59_end];
 
-    // 1. Compare unit filesystem-confinement settings against both docs so
-    //    changing the unit without updating the docs (or vice versa) fails.
-    for key in ["ProtectSystem", "ProtectHome", "PrivateTmp"] {
+    let readme = read("README.md");
+    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
+
+    // 1. Compare unit filesystem-confinement settings against docs/design.md
+    //    §5.9, packaging/README.md (specifically the compromised-parser
+    //    "Ordinary file writes" summary, not only the earlier write-confinement
+    //    section), and README.md so changing the unit without updating every
+    //    doc (or leaving stale unconfined wording) fails.
+    let ordinary_writes_start = packaging
+        .find("*Ordinary file writes:*")
+        .expect("Ordinary file writes paragraph in packaging/README.md");
+    let ordinary_writes_end = packaging[ordinary_writes_start..]
+        .find("*Sockets and IPC:*")
+        .map(|off| ordinary_writes_start + off)
+        .expect("Sockets and IPC paragraph in packaging/README.md");
+    let ordinary_writes_norm = normalize_ws(&packaging[ordinary_writes_start..ordinary_writes_end]);
+    let s59_norm = normalize_ws(s59);
+    let packaging_norm = normalize_ws(&packaging);
+    let readme_norm = normalize_ws(&readme);
+
+    let single_value_keys = [
+        "ProtectSystem",
+        "ProtectHome",
+        "PrivateTmp",
+        "ReadWritePaths",
+        "ProtectKernelTunables",
+        "ReadOnlyPaths",
+        "SystemCallFilter",
+        "UMask",
+    ];
+    let mut unit_directives: Vec<String> = Vec::new();
+    for key in single_value_keys {
         let vals = values(&unit, "Service", key);
         assert_eq!(
             vals.len(),
             1,
             "qeminga.service must specify exactly one {key}= value: {vals:?}"
         );
-        let directive = format!("{key}={}", vals[0]);
+        unit_directives.push(format!("{key}={}", vals[0]));
+    }
+    let bro_vals = values(&unit, "Service", "BindReadOnlyPaths");
+    assert_eq!(
+        bro_vals.len(),
+        2,
+        "qeminga.service BindReadOnlyPaths must list /sys and /dev: {bro_vals:?}"
+    );
+    unit_directives.push(format!("BindReadOnlyPaths={}", bro_vals.join(" ")));
+
+    for directive in &unit_directives {
+        for (name, text) in [
+            ("docs/design.md §5.9", &s59_norm),
+            (
+                "packaging/README.md (*Ordinary file writes:*)",
+                &ordinary_writes_norm,
+            ),
+            ("README.md", &readme_norm),
+        ] {
+            assert!(
+                text.contains(directive.as_str()),
+                "{name} must match shipped unit directive `{directive}`"
+            );
+        }
+    }
+    for (name, text) in [
+        ("docs/design.md §5.9", &s59_norm),
+        (
+            "packaging/README.md (*Ordinary file writes:*)",
+            &ordinary_writes_norm,
+        ),
+        ("README.md", &readme_norm),
+    ] {
         assert!(
-            s59.contains(&directive),
-            "docs/design.md §5.9 must match shipped unit directive `{directive}`"
-        );
-        assert!(
-            packaging.contains(&directive),
-            "packaging/README.md must match shipped unit directive `{directive}`"
+            !text.contains("ProtectSystem=no")
+                && !text.contains("ProtectHome=no")
+                && !text.contains("does not yet enforce a read-only filesystem namespace")
+                && !text.contains("does not yet confine writes")
+                && !text.contains("currently sets")
+                && !text.contains("world-writable directories such as /tmp"),
+            "{name} must not retain stale unconfined-unit wording"
         );
     }
+    assert!(
+        !packaging_norm.contains("ProtectSystem=no")
+            && !packaging_norm.contains("does not yet confine writes")
+            && !packaging_norm.contains("currently sets"),
+        "packaging/README.md must not retain stale ProtectSystem=no or unconfined-unit wording"
+    );
 
     // 2. Parse the §5.9 profile comparison table column-by-column and compare
     //    each profile cell against the corresponding config's derived authority.
@@ -587,17 +655,15 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
 
     // 4. Residual authority: no overbroad write/socket claim, explicit enforcing
     //    seccomp prerequisite, and accurate narrowed socket/IPC rules.
-    let readme = read("README.md");
     assert!(
         !s59.contains("no configuration enables execution, arbitrary file writes, network egress")
             && !s59.contains("No allowed protocol command writes guest files"),
         "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
     );
-    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
     for (name, text) in [
-        ("docs/design.md §5.9", normalize_ws(s59)),
-        ("packaging/README.md", normalize_ws(&packaging)),
-        ("README.md", normalize_ws(&readme)),
+        ("docs/design.md §5.9", &s59_norm),
+        ("packaging/README.md", &packaging_norm),
+        ("README.md", &readme_norm),
     ] {
         assert!(
             !text.contains("protocol unrestricted")

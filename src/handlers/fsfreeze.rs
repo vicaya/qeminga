@@ -6481,12 +6481,23 @@ mod tests {
                 Some(ThawFailure::Incomplete {
                     mountpoint,
                     kind: RecoveryReason::RecoveryIncomplete,
+                    reason,
                     ..
-                }) if mountpoint == "/secret1"
+                }) if mountpoint == "/secret1" && reason == "first excluded"
             ),
             "second excluded failure must not overwrite the first: {:?}",
             state.unrecoverable
         );
+        let host_desc = state
+            .unrecoverable
+            .as_ref()
+            .unwrap()
+            .host_description(FreezeState::Frozen);
+        assert_eq!(
+            host_desc,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert!(!host_desc.contains("/secret1") && !host_desc.contains("first excluded"));
 
         // An authorized target failure upgrades the excluded placeholder.
         state.record_failure(

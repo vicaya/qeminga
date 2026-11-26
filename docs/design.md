@@ -304,26 +304,34 @@ A successful freeze reply is not a snapshot barrier of indefinite length, and `"
 
 ### 5.1 Static Allowlist via Match Arms
 
-The dispatcher uses a `match` expression on the method string. There is **no dynamic dispatch table**, no plugin loader, and no way to register new handlers at runtime. Adding a command requires a source-code change, a code review, and a new release.
+The dispatcher maps each incoming method string through a single static `match` (`Command::from_method`) into an exhaustive `Command` enum, and every subsequent per-command policy check — guest feature enablement (shared with `guest-info`), rate-limit class, session lane (`Command::lane`), reply suppression, sync sentinel, and handler invocation — is an exhaustive `match` on `Command` with no wildcard default, while the frozen-safe gate (`Command::is_frozen_safe`) is derived exhaustively from the four `Kind` lane values (`Kind::Control | Kind::Thaw` vs. `Kind::Freeze | Kind::Ordinary`) so lane assignment and freeze-gate admission always agree. There is **no dynamic dispatch table**, no plugin loader, and no way to register new handlers at runtime. Adding a command requires a source-code change, an explicit policy choice at every exhaustive `match`, a code review, and a new release.
 
 ```rust
-// Sketch — see src/dispatch.rs for full implementation
-match req.method.as_str() {
-    "guest-ping"              => handlers::ping(req),
-    "guest-info"              => handlers::info(req),
-    "guest-sync"              => handlers::sync(req),
-    "guest-sync-delimited"    => handlers::sync_delimited(req),
-    "guest-get-osinfo"        => handlers::get_osinfo(req),
-    "guest-network-get-interfaces" => handlers::get_interfaces(req),
-    "guest-get-fsinfo"        => handlers::get_fsinfo(req),
-    "guest-fsfreeze-status"   => handlers::fsfreeze_status(req),
-    "guest-fsfreeze-freeze"   => handlers::fsfreeze_freeze(req),
-    "guest-fsfreeze-freeze-list" => handlers::fsfreeze_freeze_list(req),
-    "guest-fsfreeze-thaw"     => handlers::fsfreeze_thaw(req),
-    "guest-fstrim" if config.fstrim_enabled() => handlers::fstrim(req),
-    "guest-shutdown"          => handlers::shutdown(req),
-    "guest-suspend-ram" if config.suspend_ram_enabled() => handlers::suspend_ram(req),
-    _                         => Err(Error::CommandNotFound(req.method)),
+// Sketch — see src/handlers/mod.rs and src/dispatch.rs for full implementation
+let cmd = Command::from_method(req.method.as_str())
+    .ok_or_else(|| Error::CommandNotFound(req.method.clone()))?;
+if !cmd.is_enabled(&config.authority()) {
+    return Err(Error::Disabled(req.method.clone()));
+}
+limiter.check(cmd.rate_class())?;
+if state.is_frozen_for_gate() && !cmd.is_frozen_safe() {
+    return Err(Error::Frozen);
+}
+match cmd {
+    Command::Ping                 => handlers::ping::handle(ctx, req),
+    Command::Info                 => handlers::info::handle(ctx, req),
+    Command::Sync                 => handlers::sync::sync(ctx, req),
+    Command::SyncDelimited        => handlers::sync::sync_delimited(ctx, req),
+    Command::GetOsInfo            => handlers::osinfo::handle(ctx, req),
+    Command::NetworkGetInterfaces => handlers::interfaces::handle(ctx, req),
+    Command::GetFsInfo            => handlers::fsinfo::handle(ctx, req),
+    Command::FsfreezeStatus       => handlers::fsfreeze::status(ctx, req),
+    Command::FsfreezeFreeze       => handlers::fsfreeze::freeze(ctx, req),
+    Command::FsfreezeFreezeList   => handlers::fsfreeze::freeze_list(ctx, req),
+    Command::FsfreezeThaw         => handlers::fsfreeze::thaw(ctx, req),
+    Command::Fstrim               => handlers::fstrim::handle(ctx, req),
+    Command::Shutdown             => handlers::shutdown::handle(ctx, req),
+    Command::SuspendRam           => handlers::suspend::handle(ctx, req),
 }
 ```
 

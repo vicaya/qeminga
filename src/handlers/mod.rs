@@ -17,6 +17,213 @@ pub mod shutdown;
 pub mod suspend;
 pub mod sync;
 
+/// Declares every allowlisted guest-agent command once (design §3, §5.1),
+/// generating the exhaustive [`Command`] enum, [`Command::ALL`], the single
+/// static wire-name `match` in [`Command::from_method`], and
+/// [`Command::name`]. Adding a command here automatically puts it into the
+/// `guest-info` inventory and forces an explicit choice at every exhaustive
+/// policy and dispatch `match`.
+macro_rules! define_commands {
+    ($( #[doc = $doc:literal] $variant:ident => $wire:literal ),+ $(,)?) => {
+        /// Every allowlisted guest-agent command (design §3, §5.1).
+        ///
+        /// Wire method names enter through one static string `match`
+        /// ([`Command::from_method`]), generated from the same ordered
+        /// declaration as [`Command::ALL`] and [`Command::name`]. Every
+        /// policy decision — guest feature enablement, concurrency lane and
+        /// freeze gate, rate-limit class, reply suppression, sync sentinel,
+        /// and handler dispatch — is an exhaustive `match` on this enum with
+        /// no wildcard default, so adding a command requires an explicit
+        /// policy choice at compile time and cannot leave it unreachable from
+        /// `guest-info`.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Command {
+            $(
+                #[doc = $doc]
+                $variant,
+            )+
+        }
+
+        impl Command {
+            /// Every allowlisted command in design §3 order, each exactly once.
+            pub const ALL: &[Command] = &[$(Command::$variant),+];
+
+            /// Static allowlist `match` mapping a wire method name to its
+            /// [`Command`] variant (design §5.1). There is no lookup table,
+            /// registry, or plugin mechanism.
+            pub fn from_method(method: &str) -> Option<Self> {
+                Some(match method {
+                    $( $wire => Command::$variant, )+
+                    _ => return None,
+                })
+            }
+
+            /// Canonical QGA wire name (design §3).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $( Command::$variant => $wire, )+
+                }
+            }
+        }
+    };
+}
+
+define_commands! {
+    /// `guest-ping`
+    Ping => "guest-ping",
+    /// `guest-info`
+    Info => "guest-info",
+    /// `guest-sync`
+    Sync => "guest-sync",
+    /// `guest-sync-delimited`
+    SyncDelimited => "guest-sync-delimited",
+    /// `guest-get-osinfo`
+    GetOsInfo => "guest-get-osinfo",
+    /// `guest-network-get-interfaces`
+    NetworkGetInterfaces => "guest-network-get-interfaces",
+    /// `guest-get-fsinfo`
+    GetFsInfo => "guest-get-fsinfo",
+    /// `guest-fsfreeze-status`
+    FsfreezeStatus => "guest-fsfreeze-status",
+    /// `guest-fsfreeze-freeze`
+    FsfreezeFreeze => "guest-fsfreeze-freeze",
+    /// `guest-fsfreeze-freeze-list`
+    FsfreezeFreezeList => "guest-fsfreeze-freeze-list",
+    /// `guest-fsfreeze-thaw`
+    FsfreezeThaw => "guest-fsfreeze-thaw",
+    /// `guest-fstrim`
+    Fstrim => "guest-fstrim",
+    /// `guest-shutdown`
+    Shutdown => "guest-shutdown",
+    /// `guest-suspend-ram`
+    SuspendRam => "guest-suspend-ram",
+}
+
+impl Command {
+    /// Whether a successful call produces a wire reply (§3.1, OQ-2).
+    pub const fn success_response(self) -> bool {
+        match self {
+            Command::Ping
+            | Command::Info
+            | Command::Sync
+            | Command::SyncDelimited
+            | Command::GetOsInfo
+            | Command::NetworkGetInterfaces
+            | Command::GetFsInfo
+            | Command::FsfreezeStatus
+            | Command::FsfreezeFreeze
+            | Command::FsfreezeFreezeList
+            | Command::FsfreezeThaw
+            | Command::Fstrim => true,
+            Command::Shutdown | Command::SuspendRam => false,
+        }
+    }
+
+    /// Whether every reply (success or error) carries the `0xFF` sync
+    /// sentinel prefix (C-10).
+    pub const fn sends_sentinel(self) -> bool {
+        match self {
+            Command::SyncDelimited => true,
+            Command::Ping
+            | Command::Info
+            | Command::Sync
+            | Command::GetOsInfo
+            | Command::NetworkGetInterfaces
+            | Command::GetFsInfo
+            | Command::FsfreezeStatus
+            | Command::FsfreezeFreeze
+            | Command::FsfreezeFreezeList
+            | Command::FsfreezeThaw
+            | Command::Fstrim
+            | Command::Shutdown
+            | Command::SuspendRam => false,
+        }
+    }
+
+    /// `CommandSpec` advertised by `guest-info`.
+    pub const fn spec(self) -> CommandSpec {
+        CommandSpec {
+            name: self.name(),
+            success_response: self.success_response(),
+        }
+    }
+
+    /// Whether guest-derived `authority` enables this command (§5.9, §8.1).
+    ///
+    /// Shared by request dispatch and `guest-info` capability reporting.
+    /// Exhaustive with no wildcard default: every command must explicitly
+    /// declare either the core snapshot/control baseline or the guest
+    /// switch that governs it. Temporary `Frozen` state is orthogonal and
+    /// enforced separately by the live freeze gate (§3.1, §5.3).
+    pub const fn is_enabled(self, authority: &crate::config::Authority) -> bool {
+        match self {
+            Command::Ping
+            | Command::Info
+            | Command::Sync
+            | Command::SyncDelimited
+            | Command::FsfreezeStatus
+            | Command::FsfreezeFreeze
+            | Command::FsfreezeFreezeList
+            | Command::FsfreezeThaw => true,
+            Command::GetOsInfo | Command::NetworkGetInterfaces | Command::GetFsInfo => {
+                authority.information
+            }
+            Command::Fstrim => authority.trim,
+            Command::Shutdown => authority.reboot,
+            Command::SuspendRam => authority.suspend,
+        }
+    }
+
+    /// The session lane for this command (§5.7).
+    pub const fn lane(self) -> crate::channel::Kind {
+        use crate::channel::Kind;
+        match self {
+            Command::FsfreezeThaw => Kind::Thaw,
+            Command::FsfreezeFreeze | Command::FsfreezeFreezeList => Kind::Freeze,
+            Command::Ping
+            | Command::Info
+            | Command::Sync
+            | Command::SyncDelimited
+            | Command::FsfreezeStatus => Kind::Control,
+            Command::GetOsInfo
+            | Command::NetworkGetInterfaces
+            | Command::GetFsInfo
+            | Command::Fstrim
+            | Command::Shutdown
+            | Command::SuspendRam => Kind::Ordinary,
+        }
+    }
+
+    /// `true` for the six commands accepted while filesystems are frozen
+    /// (§5.3): status, thaw, ping, sync, sync-delimited, info — derived
+    /// exhaustively from [`Command::lane`] so concurrency lane and freeze
+    /// gate always agree.
+    pub const fn is_frozen_safe(self) -> bool {
+        use crate::channel::Kind;
+        match self.lane() {
+            Kind::Control | Kind::Thaw => true,
+            Kind::Freeze | Kind::Ordinary => false,
+        }
+    }
+
+    /// The rate-limit class of this command (§5.3, C-9).
+    pub const fn rate_class(self) -> crate::dispatch::ratelimit::CommandClass {
+        use crate::dispatch::ratelimit::CommandClass;
+        match self {
+            Command::Ping | Command::Sync | Command::SyncDelimited | Command::Info => {
+                CommandClass::PingSync
+            }
+            Command::GetOsInfo | Command::GetFsInfo | Command::NetworkGetInterfaces => {
+                CommandClass::Get
+            }
+            Command::FsfreezeFreeze | Command::FsfreezeFreezeList => CommandClass::FsfreezeFreeze,
+            Command::FsfreezeStatus | Command::FsfreezeThaw => CommandClass::Unlimited,
+            Command::Fstrim => CommandClass::Fstrim,
+            Command::Shutdown | Command::SuspendRam => CommandClass::Shutdown,
+        }
+    }
+}
+
 /// A command in the allowlist as advertised by `guest-info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -28,65 +235,20 @@ pub struct CommandSpec {
     pub success_response: bool,
 }
 
+const fn build_supported_commands() -> [CommandSpec; Command::ALL.len()] {
+    let mut specs = [Command::ALL[0].spec(); Command::ALL.len()];
+    let mut i = 1;
+    while i < Command::ALL.len() {
+        specs[i] = Command::ALL[i].spec();
+        i += 1;
+    }
+    specs
+}
+
+const SUPPORTED_COMMAND_ARRAY: [CommandSpec; Command::ALL.len()] = build_supported_commands();
+
 /// Every allowlisted command (design §3), each exactly once.
-pub const SUPPORTED_COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        name: "guest-ping",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-info",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-sync",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-sync-delimited",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-get-osinfo",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-network-get-interfaces",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-get-fsinfo",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-fsfreeze-status",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-fsfreeze-freeze",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-fsfreeze-freeze-list",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-fsfreeze-thaw",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-fstrim",
-        success_response: true,
-    },
-    CommandSpec {
-        name: "guest-shutdown",
-        success_response: false,
-    },
-    CommandSpec {
-        name: "guest-suspend-ram",
-        success_response: false,
-    },
-];
+pub const SUPPORTED_COMMANDS: &[CommandSpec] = &SUPPORTED_COMMAND_ARRAY;
 
 /// Looks up a command's spec by name.
 pub fn spec(name: &str) -> Option<&'static CommandSpec> {
@@ -176,5 +338,62 @@ mod tests {
                 && text.contains("not truncated"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn command_enum_round_trips_and_matches_supported_commands() {
+        assert_eq!(Command::ALL.len(), 14);
+        assert_eq!(SUPPORTED_COMMANDS.len(), Command::ALL.len());
+        for (&cmd, spec_entry) in Command::ALL.iter().zip(SUPPORTED_COMMANDS.iter()) {
+            assert_eq!(Command::from_method(cmd.name()), Some(cmd));
+            assert_eq!(spec_entry, &cmd.spec());
+            assert_eq!(spec(cmd.name()), Some(spec_entry));
+            assert_eq!(
+                cmd.sends_sentinel(),
+                matches!(cmd, Command::SyncDelimited),
+                "{cmd:?}"
+            );
+        }
+        assert_eq!(Command::from_method("guest-exec"), None);
+        assert_eq!(spec("guest-exec"), None);
+    }
+
+    #[test]
+    fn command_is_enabled_follows_guest_authority_exhaustively() {
+        use crate::config::Authority;
+        let dp = Authority::data_protection();
+        for cmd in Command::ALL {
+            let core = matches!(
+                cmd,
+                Command::Ping
+                    | Command::Info
+                    | Command::Sync
+                    | Command::SyncDelimited
+                    | Command::FsfreezeStatus
+                    | Command::FsfreezeFreeze
+                    | Command::FsfreezeFreezeList
+                    | Command::FsfreezeThaw
+            );
+            assert_eq!(cmd.is_enabled(&dp), core, "data-protection {cmd:?}");
+            assert!(cmd.is_enabled(&Authority::full()), "full {cmd:?}");
+        }
+        assert!(Command::GetOsInfo.is_enabled(&Authority {
+            information: true,
+            ..dp
+        }));
+        assert!(Command::NetworkGetInterfaces.is_enabled(&Authority {
+            information: true,
+            ..dp
+        }));
+        assert!(Command::GetFsInfo.is_enabled(&Authority {
+            information: true,
+            ..dp
+        }));
+        assert!(Command::Fstrim.is_enabled(&Authority { trim: true, ..dp }));
+        assert!(Command::Shutdown.is_enabled(&Authority { reboot: true, ..dp }));
+        assert!(Command::SuspendRam.is_enabled(&Authority {
+            suspend: true,
+            ..dp
+        }));
     }
 }

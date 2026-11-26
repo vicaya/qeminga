@@ -37,17 +37,40 @@ qeminga --version
 ```
 
 The daemon starts as root to open the virtio-serial port, drops to the
-`qeminga` account keeping exactly `CAP_SYS_ADMIN`, `CAP_SYS_BOOT` and
-`CAP_DAC_READ_SEARCH`, installs a per-architecture seccomp filter (with
-the `seccomp` feature), and serves newline-delimited QGA JSON. Filesystem
-freezes are bounded by a watchdog (30 s idle, 300 s hard cap by default)
-and survive an agent crash through a recovery marker on tmpfs. Every
-command is audited as one JSON line on stderr; during a freeze the audit
-records are held in a 64 KiB ring so the agent can never block on a frozen
-journal. A marker left by a crashed instance arms that watchdog at startup
-whether or not the host's port can be opened yet. `guest-shutdown` is a
-hard shutdown, `sync(2)` followed by `reboot(2)`: no service is stopped
-and nothing is unmounted (`docs/tasks.md` OQ-1).
+`qeminga` account (UID/GID 600), derives its retained privileges from
+`config.toml`, installs a per-architecture seccomp-BPF filter (with the
+`seccomp` feature), and serves newline-delimited QGA JSON. The two packaged
+profiles differ in host command surface and retained authority (see
+[`docs/design.md`](docs/design.md) §5.9):
+
+| Profile | Config file | Host commands accepted | Privileges retained after drop |
+|---|---|---|---|
+| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (`CAP_SYS_BOOT` trimmed from the bounding set and dropped); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, and `FITRIM`; retains `socketpair`, `sendto`, and `recvfrom` for the runtime signal driver |
+| **General-VM / lifecycle** (opt-in) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls plus `socket(AF_NETLINK)`, and `FITRIM` |
+
+If a defect compromised the parser process after startup, the process would
+still hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (plus `CAP_SYS_BOOT` in
+the general-VM profile), `openat`/`read`/`getdents64`, and the writable host
+virtio channel — so seccomp is **not** a confidentiality boundary for guest
+file contents after parser compromise (see `docs/design.md` §5.9 and
+`docs/tasks.md` OQ-10). Ordinary file opens, writes, and unlinks
+(`openat`/`write`/`pwrite64`/`fsync`/`unlinkat`) remain in the filter and
+are bounded by guest Unix permissions (UID/GID 600, with `CAP_DAC_OVERRIDE`
+dropped) and systemd service confinement (the shipped unit currently sets
+`ProtectSystem=no`, `ProtectHome=no`, and `PrivateTmp=no`). IP socket
+creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every
+profile; `socket` is absent when `information = false` and restricted to
+`AF_NETLINK` when enabled, while `socketpair`, `sendto`, and `recvfrom`
+stay enabled for runtime signal delivery.
+
+Filesystem freezes are bounded by a watchdog (30 s idle, 300 s hard cap by
+default) and survive an agent crash through a recovery marker on tmpfs.
+Every command is audited as one JSON line on stderr; during a freeze the
+audit records are held in a 64 KiB ring so the agent can never block on a
+frozen journal. A marker left by a crashed instance arms that watchdog at
+startup whether or not the host's port can be opened yet. `guest-shutdown`
+is a hard shutdown, `sync(2)` followed by `reboot(2)`: no service is
+stopped and nothing is unmounted (`docs/tasks.md` OQ-1).
 
 Installation files (systemd unit, udev rule, sysusers, tmpfiles,
 configurations), the migration steps from `qemu-guest-agent`, and the
@@ -83,9 +106,9 @@ Cargo features (compile-time half of the two-level switches in the design):
 | Feature | Effect |
 |---|---|
 | `seccomp` | Build the seccomp-BPF filter (`seccompiler`). Release builds use it. |
-| `seccomp-log` | Same profile, logging instead of killing (compatibility runs only). |
+| `seccomp-log` | Same profile, logging instead of killing **in debug builds only** (`seccomp::log_mode`); release builds always enforce (`kill_process`), while debug builds with `seccomp-log` fail the enforced-hardening startup check. |
 | `suspend_ram` | Build the opt-in `guest-suspend-ram` handler. |
-| `test-fakes` | Let the binary fake the kernel shim for the E2E suite (development hardening only). A compile error in release builds. |
+| `test-fakes` | Let the binary fake the kernel shim for the E2E suite (development hardening only). An independent compile-time guard (`compile_error!` in `src/lib.rs`) rejects release builds carrying `test-fakes`, including `cargo build --release --all-features`. |
 
 Tests that need root or `CAP_SYS_ADMIN` are `#[ignore]`d and named
 `privileged_*`; see `AGENTS.md`.

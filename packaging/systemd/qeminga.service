@@ -34,9 +34,11 @@ RestartSec=1s
 TimeoutStopSec=330s
 StandardOutput=null
 StandardError=journal
-# Only what the startup sequence needs before its own drop (§5.4): open
+# Only what the startup sequence needs before its own drop (§5.4, §5.9): open
 # the 0600 qeminga-owned channel as root (DAC_OVERRIDE), change identity
-# (SETUID/SETGID), trim the bounding set (SETPCAP), and the final three.
+# (SETUID/SETGID), trim the bounding set (SETPCAP), and the final capabilities
+# (CAP_SYS_ADMIN and CAP_DAC_READ_SEARCH always; CAP_SYS_BOOT kept only when
+# [features] shutdown = true and dropped by the daemon under the CVM profile).
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_BOOT CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP
 AmbientCapabilities=
 # Hardening that does not interfere with FIFREEZE on the real mount table.
@@ -51,6 +53,9 @@ RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
+# Ordinary file writes are currently bounded by guest Unix permissions
+# (UID/GID 600, no CAP_DAC_OVERRIDE after drop) rather than a read-only
+# mount namespace; see design §5.9.
 PrivateTmp=no
 ProtectHome=no
 ProtectSystem=no

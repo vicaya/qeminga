@@ -1,14 +1,19 @@
-//! Target-specific seccomp-BPF profiles (design §5.5, §8.1; AC15; C-11,
-//! C-17). Compiled only with the `seccomp` Cargo feature.
+//! Target-specific seccomp-BPF profiles (design §5.5, §5.9, §8.1; AC15;
+//! C-11, C-17). Compiled only with the `seccomp` Cargo feature.
 //!
 //! One logical allowlist is resolved per target by `seccompiler`, so
 //! portable operations use `openat`, `newfstatat`/`statx`, `ppoll` and
-//! `epoll_pwait`; the x86-64 legacy aliases (`open`, `stat`, `lstat`,
-//! `poll`, `epoll_wait`) are listed only in the x86-64 profile, each with
-//! the observed need that justifies it. `ioctl` is restricted by request
-//! number to `FIFREEZE`, `FITHAW` and `FITRIM`. The default action kills
-//! the process; the `seccomp-log` feature switches it to logging for the
-//! compatibility run that derives and verifies the list (C-17).
+//! `epoll_pwait`; the x86-64 legacy aliases (`epoll_wait`) are listed only
+//! in the x86-64 profile, each with the observed need that justifies it.
+//! `ioctl` is restricted by request number to `FIFREEZE` and `FITHAW` (plus
+//! `FITRIM` only when `[features] fstrim = true`), `prctl` to `PR_SET_NAME`,
+//! `socket` to `AF_NETLINK` only when `[features] information = true`
+//! (absent when `information = false`), and `sync`/`reboot` only when
+//! `[features] shutdown = true`. Every profile retains `socketpair`,
+//! `sendto`, and `recvfrom` for the runtime signal driver. The default
+//! action kills the process; the `seccomp-log` feature switches it to
+//! logging in **debug builds only** ([`log_mode`]) for compatibility runs
+//! (C-17), while release builds always enforce.
 //!
 //! The filter is installed by `main` after the capability drop and
 //! `PR_SET_NO_NEW_PRIVS` (§5.4 step 6), so `seccomp(2)`/`prctl(2)` need
@@ -196,9 +201,12 @@ pub const X86_64_ONLY: &[&str] = &[
     "epoll_wait",
 ];
 
-/// `socket(2)` domain allowed: AF_NETLINK, the only family the daemon
-/// opens (getifaddrs(3) over NETLINK_ROUTE). AF_INET and AF_UNIX are
-/// refused, so a compromised handler has no socket egress path.
+/// `socket(2)` domain allowed when `[features] information = true`:
+/// `AF_NETLINK` (for `getifaddrs(3)` over `NETLINK_ROUTE`). `socket(2)` is
+/// absent altogether when `information = false`, and `AF_INET`/`AF_INET6`/
+/// `AF_UNIX` `socket(2)` calls are never permitted; local `socketpair(2)`
+/// plus `sendto`/`recvfrom` remain in [`COMMON`] for the runtime signal
+/// driver (§5.9).
 pub const AF_NETLINK: u64 = 16;
 
 /// The allow rules for `target` under `authority` (§5.9): the common
@@ -254,9 +262,9 @@ pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
 
 /// `true` when an unlisted syscall is logged instead of killing the
 /// process: the `seccomp-log` compatibility feature (C-17) **in a debug
-/// build only**. A release build always enforces, so `--all-features`
-/// (which enables `seccomp-log`) can never produce a release binary with
-/// a logging filter.
+/// build only**. A release build always enforces even if `seccomp-log` is
+/// passed (and a release build with `--all-features` also fails at compile
+/// time because of the independent `test-fakes` guard in `src/lib.rs`).
 pub const fn log_mode() -> bool {
     cfg!(feature = "seccomp-log") && cfg!(debug_assertions)
 }

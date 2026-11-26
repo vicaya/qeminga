@@ -31,15 +31,16 @@ default = []
 seccomp = ["dep:seccompiler"]
 # Compatibility builds (design §5.5, C-17): same profile, but an unlisted
 # syscall is logged instead of killing the process. Effective in debug
-# builds only (`seccomp::log_mode`), so a release built with
-# `--all-features` still enforces.
+# builds only (`seccomp::log_mode`), so a release build with `seccomp-log`
+# still enforces; a release build with `--all-features` fails at compile
+# time because of the independent `test-fakes` guard in `src/lib.rs`.
 seccomp-log = ["seccomp"]
 suspend_ram = []
 # End-to-end test support (T4.7): lets the real binary swap `LinuxKernel`
 # for the scripted fake when QEMINGA_TEST_FAKE_KERNEL is set, so the
-# unprivileged E2E suite can observe `guest-shutdown` silence. Never enable
-# it in a release build (build releases with `--features seccomp`, not
-# `--all-features`).
+# unprivileged E2E suite can observe `guest-shutdown` silence. Rejected at
+# compile time in release builds (`src/lib.rs`); build releases with
+# `--features seccomp`, never `--all-features`.
 test-fakes = []
 
 [dependencies]

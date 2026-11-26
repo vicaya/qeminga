@@ -298,6 +298,79 @@ fn cvm_installation_defaults_to_data_protection_profile_and_documents_single_fre
 }
 
 #[test]
+fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
+    // #65: operator guidance in docs/design.md §5.9 and packaging/README.md
+    // must match the executable definitions (src/kernel/caps.rs,
+    // src/seccomp.rs, src/lib.rs, packaging/systemd/qeminga.service).
+    let design = read("docs/design.md");
+    let packaging = read("packaging/README.md");
+
+    // Extract §5.9 up to §5.10 so assertions target the authority section.
+    let s59_start = design
+        .find("### 5.9 Authority Follows the Configuration")
+        .expect("design §5.9");
+    let s59_end = design[s59_start..]
+        .find("### 5.10 ")
+        .map(|off| s59_start + off)
+        .expect("design §5.10");
+    let s59 = &design[s59_start..s59_end];
+
+    // Residual authority must not make an overbroad claim that the sandbox
+    // prevents arbitrary file writes or all socket egress.
+    assert!(
+        !s59.contains("no configuration enables execution, arbitrary file writes, network egress"),
+        "§5.9 must not claim seccomp/unit prevents arbitrary file writes or conflate IP sockets with all socket IPC"
+    );
+    // Must describe ordinary writes via Unix permissions & service confinement.
+    assert!(
+        s59.contains("Unix permissions") && s59.contains("ProtectSystem=no"),
+        "§5.9 must explain how guest Unix permissions and current unit confinement govern ordinary file writes"
+    );
+    // Must distinguish IP socket creation, local socketpair IPC, and optional netlink.
+    assert!(
+        s59.contains("AF_INET")
+            && s59.contains("socketpair")
+            && s59.contains("sendto")
+            && s59.contains("recvfrom")
+            && s59.contains("AF_NETLINK"),
+        "§5.9 must describe IP socket creation, signal socketpair IPC, and optional AF_NETLINK separately"
+    );
+    // Must explain why CAP_DAC_READ_SEARCH + host channel matters after parser compromise.
+    assert!(
+        s59.contains("CAP_DAC_READ_SEARCH") && s59.contains("host channel"),
+        "§5.9 must explain broad file-read authority in a process holding the writable host channel"
+    );
+    // Must compare the packaged CVM and general-VM profiles explicitly.
+    assert!(
+        s59.contains("config-data-protection.toml")
+            && s59.contains("config.toml")
+            && s59.contains("CAP_SYS_BOOT"),
+        "§5.9 must distinguish the packaged CVM and general-VM profiles"
+    );
+
+    // Packaging guide: build instructions must not attribute a release startup
+    // failure to `seccomp-log` (its logging mode is debug-only).
+    assert!(
+        !packaging
+            .contains("and `seccomp-log` would fail the enforced hardening\ncheck at startup"),
+        "packaging/README.md must not attribute a release startup failure to seccomp-log"
+    );
+    let p_lower = packaging.to_ascii_lowercase();
+    assert!(
+        p_lower.contains("debug builds only") && packaging.contains("test-fakes"),
+        "packaging/README.md must state that seccomp-log logs in debug builds only and distinguish the compile-time test-fakes release guard"
+    );
+    assert!(
+        packaging.contains("CAP_SYS_ADMIN")
+            && packaging.contains("CAP_DAC_READ_SEARCH")
+            && packaging.contains("CAP_SYS_BOOT")
+            && packaging.contains("socketpair")
+            && packaging.contains("ProtectSystem=no"),
+        "packaging/README.md must align CVM vs general-VM capabilities, socket/socketpair rules, and unit file-write confinement"
+    );
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

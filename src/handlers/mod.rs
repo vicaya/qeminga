@@ -17,108 +17,89 @@ pub mod shutdown;
 pub mod suspend;
 pub mod sync;
 
-/// Every allowlisted guest-agent command (design §3, §5.1).
-///
-/// Wire method names enter through one static string `match`
-/// ([`Command::from_method`]). Every policy decision — guest feature
-/// enablement, frozen-safe status, session lane, rate-limit class,
-/// reply suppression, sentinel framing, and handler dispatch — is an
-/// exhaustive `match` on this enum with no wildcard default, so adding a
-/// command requires an explicit policy choice at compile time.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Command {
+/// Declares every allowlisted guest-agent command once (design §3, §5.1),
+/// generating the exhaustive [`Command`] enum, [`Command::ALL`], the single
+/// static wire-name `match` in [`Command::from_method`], and
+/// [`Command::name`]. Adding a command here automatically puts it into the
+/// `guest-info` inventory and forces an explicit choice at every exhaustive
+/// policy and dispatch `match`.
+macro_rules! define_commands {
+    ($( #[doc = $doc:literal] $variant:ident => $wire:literal ),+ $(,)?) => {
+        /// Every allowlisted guest-agent command (design §3, §5.1).
+        ///
+        /// Wire method names enter through one static string `match`
+        /// ([`Command::from_method`]), generated from the same ordered
+        /// declaration as [`Command::ALL`] and [`Command::name`]. Every
+        /// policy decision — guest feature enablement, concurrency lane and
+        /// freeze gate, rate-limit class, reply suppression, sync sentinel,
+        /// and handler dispatch — is an exhaustive `match` on this enum with
+        /// no wildcard default, so adding a command requires an explicit
+        /// policy choice at compile time and cannot leave it unreachable from
+        /// `guest-info`.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum Command {
+            $(
+                #[doc = $doc]
+                $variant,
+            )+
+        }
+
+        impl Command {
+            /// Every allowlisted command in design §3 order, each exactly once.
+            pub const ALL: &[Command] = &[$(Command::$variant),+];
+
+            /// Static allowlist `match` mapping a wire method name to its
+            /// [`Command`] variant (design §5.1). There is no lookup table,
+            /// registry, or plugin mechanism.
+            pub fn from_method(method: &str) -> Option<Self> {
+                Some(match method {
+                    $( $wire => Command::$variant, )+
+                    _ => return None,
+                })
+            }
+
+            /// Canonical QGA wire name (design §3).
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $( Command::$variant => $wire, )+
+                }
+            }
+        }
+    };
+}
+
+define_commands! {
     /// `guest-ping`
-    Ping,
+    Ping => "guest-ping",
     /// `guest-info`
-    Info,
+    Info => "guest-info",
     /// `guest-sync`
-    Sync,
+    Sync => "guest-sync",
     /// `guest-sync-delimited`
-    SyncDelimited,
+    SyncDelimited => "guest-sync-delimited",
     /// `guest-get-osinfo`
-    GetOsInfo,
+    GetOsInfo => "guest-get-osinfo",
     /// `guest-network-get-interfaces`
-    NetworkGetInterfaces,
+    NetworkGetInterfaces => "guest-network-get-interfaces",
     /// `guest-get-fsinfo`
-    GetFsInfo,
+    GetFsInfo => "guest-get-fsinfo",
     /// `guest-fsfreeze-status`
-    FsfreezeStatus,
+    FsfreezeStatus => "guest-fsfreeze-status",
     /// `guest-fsfreeze-freeze`
-    FsfreezeFreeze,
+    FsfreezeFreeze => "guest-fsfreeze-freeze",
     /// `guest-fsfreeze-freeze-list`
-    FsfreezeFreezeList,
+    FsfreezeFreezeList => "guest-fsfreeze-freeze-list",
     /// `guest-fsfreeze-thaw`
-    FsfreezeThaw,
+    FsfreezeThaw => "guest-fsfreeze-thaw",
     /// `guest-fstrim`
-    Fstrim,
+    Fstrim => "guest-fstrim",
     /// `guest-shutdown`
-    Shutdown,
+    Shutdown => "guest-shutdown",
     /// `guest-suspend-ram`
-    SuspendRam,
+    SuspendRam => "guest-suspend-ram",
 }
 
 impl Command {
-    /// Every allowlisted command in design §3 order, each exactly once.
-    pub const ALL: [Command; 14] = [
-        Command::Ping,
-        Command::Info,
-        Command::Sync,
-        Command::SyncDelimited,
-        Command::GetOsInfo,
-        Command::NetworkGetInterfaces,
-        Command::GetFsInfo,
-        Command::FsfreezeStatus,
-        Command::FsfreezeFreeze,
-        Command::FsfreezeFreezeList,
-        Command::FsfreezeThaw,
-        Command::Fstrim,
-        Command::Shutdown,
-        Command::SuspendRam,
-    ];
-
-    /// Static allowlist `match` mapping a wire method name to its
-    /// [`Command`] variant (design §5.1). There is no lookup table,
-    /// registry, or plugin mechanism.
-    pub fn from_method(method: &str) -> Option<Self> {
-        Some(match method {
-            "guest-ping" => Command::Ping,
-            "guest-info" => Command::Info,
-            "guest-sync" => Command::Sync,
-            "guest-sync-delimited" => Command::SyncDelimited,
-            "guest-get-osinfo" => Command::GetOsInfo,
-            "guest-network-get-interfaces" => Command::NetworkGetInterfaces,
-            "guest-get-fsinfo" => Command::GetFsInfo,
-            "guest-fsfreeze-status" => Command::FsfreezeStatus,
-            "guest-fsfreeze-freeze" => Command::FsfreezeFreeze,
-            "guest-fsfreeze-freeze-list" => Command::FsfreezeFreezeList,
-            "guest-fsfreeze-thaw" => Command::FsfreezeThaw,
-            "guest-fstrim" => Command::Fstrim,
-            "guest-shutdown" => Command::Shutdown,
-            "guest-suspend-ram" => Command::SuspendRam,
-            _ => return None,
-        })
-    }
-
-    /// Canonical QGA wire name (design §3).
-    pub const fn name(self) -> &'static str {
-        match self {
-            Command::Ping => "guest-ping",
-            Command::Info => "guest-info",
-            Command::Sync => "guest-sync",
-            Command::SyncDelimited => "guest-sync-delimited",
-            Command::GetOsInfo => "guest-get-osinfo",
-            Command::NetworkGetInterfaces => "guest-network-get-interfaces",
-            Command::GetFsInfo => "guest-get-fsinfo",
-            Command::FsfreezeStatus => "guest-fsfreeze-status",
-            Command::FsfreezeFreeze => "guest-fsfreeze-freeze",
-            Command::FsfreezeFreezeList => "guest-fsfreeze-freeze-list",
-            Command::FsfreezeThaw => "guest-fsfreeze-thaw",
-            Command::Fstrim => "guest-fstrim",
-            Command::Shutdown => "guest-shutdown",
-            Command::SuspendRam => "guest-suspend-ram",
-        }
-    }
-
     /// Whether a successful call produces a wire reply (§3.1, OQ-2).
     pub const fn success_response(self) -> bool {
         match self {
@@ -193,27 +174,6 @@ impl Command {
         }
     }
 
-    /// `true` for the six commands accepted while filesystems are frozen
-    /// (§5.3): status, thaw, ping, sync, sync-delimited, info.
-    pub const fn is_frozen_safe(self) -> bool {
-        match self {
-            Command::FsfreezeStatus
-            | Command::FsfreezeThaw
-            | Command::Ping
-            | Command::Sync
-            | Command::SyncDelimited
-            | Command::Info => true,
-            Command::GetOsInfo
-            | Command::NetworkGetInterfaces
-            | Command::GetFsInfo
-            | Command::FsfreezeFreeze
-            | Command::FsfreezeFreezeList
-            | Command::Fstrim
-            | Command::Shutdown
-            | Command::SuspendRam => false,
-        }
-    }
-
     /// The session lane for this command (§5.7).
     pub const fn lane(self) -> crate::channel::Kind {
         use crate::channel::Kind;
@@ -231,6 +191,18 @@ impl Command {
             | Command::Fstrim
             | Command::Shutdown
             | Command::SuspendRam => Kind::Ordinary,
+        }
+    }
+
+    /// `true` for the six commands accepted while filesystems are frozen
+    /// (§5.3): status, thaw, ping, sync, sync-delimited, info — derived
+    /// exhaustively from [`Command::lane`] so concurrency lane and freeze
+    /// gate always agree.
+    pub const fn is_frozen_safe(self) -> bool {
+        use crate::channel::Kind;
+        match self.lane() {
+            Kind::Control | Kind::Thaw => true,
+            Kind::Freeze | Kind::Ordinary => false,
         }
     }
 

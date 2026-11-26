@@ -22,7 +22,10 @@ use qeminga::dispatch::{Context, Dispatcher, reason};
 use qeminga::framing::{DecodeEvent, FrameDecoder};
 use qeminga::freeze_op::ManualClock;
 use qeminga::handlers::Command;
+use qeminga::handlers::fsinfo::{Statfs, StatfsSource};
 use qeminga::handlers::info::agent_info;
+use qeminga::handlers::interfaces::{InterfaceSource, RawAddr};
+use qeminga::handlers::osinfo::{OsInfoSource, Uname};
 use qeminga::handlers::suspend::SuspendOps;
 use qeminga::kernel::fake::FakeKernel;
 use qeminga::marker::Marker;
@@ -214,6 +217,52 @@ impl SuspendOps for FakeSuspend {
     }
 }
 
+struct FakeOsInfo;
+
+impl OsInfoSource for FakeOsInfo {
+    fn uname(&self) -> Result<Uname, Error> {
+        Ok(Uname {
+            release: "6.8.0-test".to_owned(),
+            version: "#1 SMP".to_owned(),
+            machine: "x86_64".to_owned(),
+        })
+    }
+    fn os_release(&self) -> Option<String> {
+        Some("ID=linux\nNAME=\"Test Linux\"\nPRETTY_NAME=\"Test Linux\"\n".to_owned())
+    }
+}
+
+struct FakeInterfaces;
+
+impl InterfaceSource for FakeInterfaces {
+    fn addresses(&self) -> Result<Vec<RawAddr>, Error> {
+        Ok(vec![RawAddr {
+            ifname: "eth0".to_owned(),
+            loopback: false,
+            mac: Some([0x52, 0x54, 0x00, 0x12, 0x34, 0x56]),
+            addr: None,
+            netmask: None,
+        }])
+    }
+}
+
+struct FakeStatfs;
+
+impl StatfsSource for FakeStatfs {
+    fn statfs(
+        &self,
+        _mount_point: &Path,
+        _expected_dev: (u32, u32),
+        _expected_mount_id: u32,
+    ) -> Result<Statfs, Error> {
+        Ok(Statfs {
+            blocks: 1024,
+            bfree: 512,
+            bsize: 4096,
+        })
+    }
+}
+
 fn read_repo(rel: &str) -> String {
     std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap()
 }
@@ -235,6 +284,9 @@ fn build_context(
         )
         .with_kernel(Arc::new(FakeKernel::new()))
         .with_mounts(Arc::new(StaticMounts(mounts)))
+        .with_osinfo(Arc::new(FakeOsInfo))
+        .with_interfaces(Arc::new(FakeInterfaces))
+        .with_statfs(Arc::new(FakeStatfs))
         .with_suspend(Arc::new(FakeSuspend)),
     );
     (ctx, sink, dir)
@@ -493,32 +545,36 @@ async fn unified_policy_matches_independent_matrix_across_profiles_and_freeze_st
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queued_requests_apply_live_gates_at_admission_with_zero_prohibited_handler_calls() {
-    // Queue multiple prohibited commands AND a configured non-frozen-safe
-    // command (`guest-fstrim`) behind an in-flight freeze under a mixed
-    // profile where `fstrim = true` and `information = false`, `shutdown = false`,
-    // `suspend_ram = false`.
+    // Hold an initial `guest-fstrim` (id 1) in `FITRIM` while the state is
+    // still `Thawed`, under a mixed profile (`fstrim = true`,
+    // `information = false`, `shutdown = false`, `suspend_ram = false`).
     //
-    // While the freeze is blocked inside `FIFREEZE`:
-    // - The queued serial commands wait in the session queue without running.
-    // - Once the freeze completes and publishes `Frozen`, the lane admits each
-    //   queued serial command one by one and evaluates gates LIVE:
-    //   - disabled `guest-get-osinfo`, `guest-shutdown`, `guest-suspend-ram`
-    //     get `CommandNotFound` ("has been disabled") — disabled beats frozen,
-    //     zero handler calls.
-    //   - unknown `guest-exec` gets `CommandNotFound` ("not been found") — zero
-    //     handler calls.
-    //   - enabled `guest-fstrim` (queued while Thawed!) sees the LIVE `Frozen`
-    //     state on admission and gets `GenericError` ("filesystems are frozen;
-    //     retry after thaw") with `freeze_state_before = "frozen"` and zero
-    //     handler calls.
+    // While id 1 holds the serial lane in `Thawed`, send:
+    // - id 2: `guest-fsfreeze-freeze` (queued behind id 1)
+    // - id 3: a second `guest-fstrim` (arrives and queues while `Thawed` —
+    //   would pass if the freeze gate were cached at frame receipt!)
+    // - ids 4–6: disabled `guest-get-osinfo`, `guest-shutdown`,
+    //   `guest-suspend-ram`
+    // - id 7: unknown `guest-exec`
+    // - id 8: `guest-ping` (control lane: executes beside the blocked trim,
+    //   deterministically proving the reader consumed and queued ids 2–7
+    //   while still `Thawed`, with no arbitrary sleep)
+    //
+    // Once id 1 is released, id 2 freezes the guest (`Thawed -> Frozen`), and
+    // each subsequent queued command is evaluated LIVE at lane admission:
+    // - id 3 (`guest-fstrim`) is rejected by the live `Frozen` gate with zero
+    //   second handler call and `freeze_state_before = "frozen"`;
+    // - ids 4–6 get `CommandNotFound` ("has been disabled") — disabled beats
+    //   frozen — with zero handler calls;
+    // - id 7 gets `CommandNotFound` ("not been found") with zero handler calls.
     let config = Config::parse(
         "[features]\ninformation = false\nshutdown = false\nfstrim = true\nsuspend_ram = false\n",
     )
     .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let kernel = Arc::new(FakeKernel::new());
-    let gate = kernel.script_freeze_gate("/home");
-    let _release = gate.release_on_drop();
+    let trim_gate = kernel.script_trim_gate("/home");
+    let _release = trim_gate.release_on_drop();
 
     let sink = SharedSink::default();
     let router = Router::new(Box::new(sink.clone()));
@@ -534,6 +590,10 @@ async fn queued_requests_apply_live_gates_at_admission_with_zero_prohibited_hand
         .with_mounts(Arc::new(StaticMounts(read_repo(
             "tests/fixtures/mountinfo/simple.txt",
         ))))
+        .with_osinfo(Arc::new(FakeOsInfo))
+        .with_interfaces(Arc::new(FakeInterfaces))
+        .with_statfs(Arc::new(FakeStatfs))
+        .with_suspend(Arc::new(FakeSuspend))
         .with_freeze_clock(Arc::new(clock))
         .with_freeze_operation_timeout(Duration::from_secs(30)),
     );
@@ -551,42 +611,61 @@ async fn queued_requests_apply_live_gates_at_admission_with_zero_prohibited_hand
         .with_subscriber(sub),
     );
 
-    // Send the freeze first, wait until its worker is blocked inside FIFREEZE.
-    peer.write_all(b"{\"execute\":\"guest-fsfreeze-freeze\",\"id\":1}\n")
+    // Start id 1 (`guest-fstrim`) and wait until it is blocked inside FITRIM
+    // while the state is still `Thawed`.
+    peer.write_all(b"{\"execute\":\"guest-fstrim\",\"id\":1}\n")
         .await
         .unwrap();
     let start = std::time::Instant::now();
-    while gate.waiting() == 0 {
+    while trim_gate.waiting() == 0 {
         assert!(
             start.elapsed() < Duration::from_secs(10),
-            "timed out waiting for freeze gate"
+            "timed out waiting for trim gate"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(ctx.handler_calls(), 1, "only the freeze handler is running");
+    assert_eq!(ctx.state.current(), FreezeState::Thawed);
+    assert_eq!(ctx.handler_calls(), 1, "only the first trim is running");
 
-    // Queue 5 serial requests behind the blocked freeze (total 6 <= MAX_QUEUED=8).
+    // Queue freeze + second trim + prohibited commands + trailing control
+    // ping while `Thawed` (total 8 frames == MAX_QUEUED).
     let queued = concat!(
-        "{\"execute\":\"guest-get-osinfo\",\"id\":2}\n",
-        "{\"execute\":\"guest-shutdown\",\"id\":3}\n",
-        "{\"execute\":\"guest-suspend-ram\",\"id\":4}\n",
-        "{\"execute\":\"guest-exec\",\"id\":5}\n",
-        "{\"execute\":\"guest-fstrim\",\"id\":6}\n",
+        "{\"execute\":\"guest-fsfreeze-freeze\",\"id\":2}\n",
+        "{\"execute\":\"guest-fstrim\",\"id\":3}\n",
+        "{\"execute\":\"guest-get-osinfo\",\"id\":4}\n",
+        "{\"execute\":\"guest-shutdown\",\"id\":5}\n",
+        "{\"execute\":\"guest-suspend-ram\",\"id\":6}\n",
+        "{\"execute\":\"guest-exec\",\"id\":7}\n",
+        "{\"execute\":\"guest-ping\",\"id\":8}\n",
     );
     peer.write_all(queued.as_bytes()).await.unwrap();
     peer.flush().await.unwrap();
-    // Give the session loop a chance to read and queue every frame.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Wait for the trailing control `guest-ping` (id 8) to run beside the
+    // blocked trim: because frames are read strictly in stream order, id 8
+    // running proves ids 2–7 were all read and queued while `Thawed`.
+    let start = std::time::Instant::now();
+    while ctx.handler_calls() < 2 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for control-lane ping beside blocked trim"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        ctx.state.current(),
+        FreezeState::Thawed,
+        "state must still be Thawed when ids 2–7 are queued"
+    );
     assert_eq!(
         ctx.handler_calls(),
-        1,
-        "queued serial commands must not execute before admission"
+        2,
+        "only the blocked trim and control ping may have run before release"
     );
 
-    // Release the freeze so it finishes and transitions to Frozen, then wait
-    // for all 6 replies (freeze + 5 queued serial commands) before thawing so
-    // the thaw lane cannot overtake `guest-fstrim`.
-    gate.release();
+    // Release the first trim; wait for all 8 replies before sending thaw so
+    // the thaw lane cannot overtake the queued serial requests.
+    trim_gate.release();
 
     async fn read_reply(peer: &mut tokio::io::DuplexStream) -> Value {
         let mut line = Vec::new();
@@ -606,32 +685,46 @@ async fn queued_requests_apply_live_gates_at_admission_with_zero_prohibited_hand
     }
 
     let mut replies = Vec::new();
-    for _ in 0..6 {
+    for _ in 0..8 {
         replies.push(read_reply(&mut peer).await);
     }
 
-    peer.write_all(b"{\"execute\":\"guest-fsfreeze-thaw\",\"id\":7}\n")
+    peer.write_all(b"{\"execute\":\"guest-fsfreeze-thaw\",\"id\":9}\n")
         .await
         .unwrap();
     replies.push(read_reply(&mut peer).await);
     peer.shutdown().await.unwrap();
     let _report = session.await.unwrap();
 
-    assert_eq!(replies.len(), 7, "{replies:?}");
+    assert_eq!(replies.len(), 9, "{replies:?}");
 
+    // id 1: initial trim succeeded.
     assert_eq!(replies[0]["id"], 1);
-    assert_eq!(replies[0]["return"], 2);
+    assert!(replies[0]["return"]["paths"].is_array(), "{}", replies[0]);
 
-    // Queued disabled commands: CommandNotFound ("has been disabled") beats Frozen gate.
+    // id 2: freeze succeeded and moved state to Frozen.
+    assert_eq!(replies[1]["id"], 2);
+    assert_eq!(replies[1]["return"], 2);
+
+    // id 3: second `guest-fstrim` arrived and queued while Thawed, then hit
+    // the LIVE freeze gate at lane admission in Frozen -> GenericError!
+    assert_eq!(replies[2]["id"], 3);
+    assert_eq!(replies[2]["error"]["class"], "GenericError");
+    assert_eq!(
+        replies[2]["error"]["desc"],
+        "filesystems are frozen; retry after thaw"
+    );
+
+    // ids 4–6: queued disabled commands -> CommandNotFound beats Frozen gate.
     for (idx, (id, name)) in [
-        (2, "guest-get-osinfo"),
-        (3, "guest-shutdown"),
-        (4, "guest-suspend-ram"),
+        (4, "guest-get-osinfo"),
+        (5, "guest-shutdown"),
+        (6, "guest-suspend-ram"),
     ]
     .into_iter()
     .enumerate()
     {
-        let r = &replies[idx + 1];
+        let r = &replies[idx + 3];
         assert_eq!(r["id"], id, "{r}");
         assert_eq!(r["error"]["class"], "CommandNotFound", "{r}");
         assert_eq!(
@@ -640,50 +733,49 @@ async fn queued_requests_apply_live_gates_at_admission_with_zero_prohibited_hand
         );
     }
 
-    // Queued unknown command: CommandNotFound ("not been found").
-    assert_eq!(replies[4]["id"], 5);
-    assert_eq!(replies[4]["error"]["class"], "CommandNotFound");
+    // id 7: queued unknown command -> CommandNotFound ("not been found").
+    assert_eq!(replies[6]["id"], 7);
+    assert_eq!(replies[6]["error"]["class"], "CommandNotFound");
     assert_eq!(
-        replies[4]["error"]["desc"],
+        replies[6]["error"]["desc"],
         "The command guest-exec has not been found"
     );
 
-    // Queued enabled `guest-fstrim`: evaluated LIVE at admission after freeze
-    // published Frozen -> GenericError freeze gate!
-    assert_eq!(replies[5]["id"], 6);
-    assert_eq!(replies[5]["error"]["class"], "GenericError");
-    assert_eq!(
-        replies[5]["error"]["desc"],
-        "filesystems are frozen; retry after thaw"
-    );
+    // id 8: control ping reply delivered in request order.
+    assert_eq!(replies[7]["id"], 8);
+    assert_eq!(replies[7]["return"], serde_json::json!({}));
 
-    // Final thaw succeeds.
-    assert_eq!(replies[6]["id"], 7);
-    assert_eq!(replies[6]["return"], 2);
+    // id 9: final thaw succeeds.
+    assert_eq!(replies[8]["id"], 9);
+    assert_eq!(replies[8]["return"], 2);
 
-    // Exactly 2 handler calls total: the initial freeze (id 1) and the final thaw (id 7).
-    // Zero handler calls for all 5 prohibited/gated queued commands!
-    assert_eq!(ctx.handler_calls(), 2);
+    // Exactly 4 handler calls total: initial trim (id 1), control ping (id 8),
+    // freeze (id 2), and final thaw (id 9). Zero handler calls for the second
+    // trim (id 3) or any prohibited command (ids 4–7)!
+    assert_eq!(ctx.handler_calls(), 4);
 
     assert!(ctx.audit.settle(Duration::from_secs(5)));
     let records = sink.records();
-    assert_eq!(records.len(), 7, "{records:?}");
+    assert_eq!(records.len(), 9, "{records:?}");
     let by_id = |id: i64| -> &Value {
         records
             .iter()
             .find(|r| r["id"].as_i64() == Some(id))
             .unwrap()
     };
-    assert_eq!(by_id(2)["reason"], reason::DISABLED);
-    assert_eq!(by_id(2)["freeze_state_before"], "frozen");
-    assert_eq!(by_id(3)["reason"], reason::DISABLED);
+    assert_eq!(by_id(8)["disposition"], "allowed");
+    assert_eq!(by_id(8)["freeze_state_before"], "thawed");
+    assert_eq!(by_id(3)["disposition"], "denied");
+    assert_eq!(by_id(3)["reason"], reason::FROZEN);
     assert_eq!(by_id(3)["freeze_state_before"], "frozen");
     assert_eq!(by_id(4)["reason"], reason::DISABLED);
     assert_eq!(by_id(4)["freeze_state_before"], "frozen");
-    assert_eq!(by_id(5)["reason"], reason::COMMAND_NOT_FOUND);
+    assert_eq!(by_id(5)["reason"], reason::DISABLED);
     assert_eq!(by_id(5)["freeze_state_before"], "frozen");
-    assert_eq!(by_id(6)["reason"], reason::FROZEN);
+    assert_eq!(by_id(6)["reason"], reason::DISABLED);
     assert_eq!(by_id(6)["freeze_state_before"], "frozen");
+    assert_eq!(by_id(7)["reason"], reason::COMMAND_NOT_FOUND);
+    assert_eq!(by_id(7)["freeze_state_before"], "frozen");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -706,7 +798,11 @@ async fn queued_prohibited_commands_under_cvm_profile_never_invoke_handlers() {
         .with_kernel(kernel)
         .with_mounts(Arc::new(StaticMounts(read_repo(
             "tests/fixtures/mountinfo/simple.txt",
-        )))),
+        ))))
+        .with_osinfo(Arc::new(FakeOsInfo))
+        .with_interfaces(Arc::new(FakeInterfaces))
+        .with_statfs(Arc::new(FakeStatfs))
+        .with_suspend(Arc::new(FakeSuspend)),
     );
 
     let (mut peer, ours) = tokio::io::duplex(16 * 1024);

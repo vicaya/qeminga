@@ -136,11 +136,17 @@ pub struct Context {
     pub suspend: Arc<dyn handlers::suspend::SuspendOps>,
     /// The armed watchdog, if any (§4.4).
     watchdog: std::sync::Mutex<Option<crate::watchdog::WatchdogHandle>>,
-    /// Handles of the filesystems this process froze (or retained from an
-    /// incomplete recovery drain), held until their drain completes: a thaw
-    /// drains the filesystem each was opened on, whatever its pathnames
-    /// lead to by then (§4.2).
+    /// Handles of the filesystems frozen by the current operation (or retained
+    /// from an incomplete frozen-state recovery drain), held until their drain
+    /// completes: a thaw drains the filesystem each was opened on, whatever
+    /// its pathnames lead to by then (§4.2).
     frozen_mounts: std::sync::Mutex<Vec<HeldMount>>,
+    /// Cleanup obligations retained from a failed clean-`Thawed` recovery
+    /// drain, kept separate from `frozen_mounts` so a later freeze's zero-work
+    /// settlement, rollback, abort, and tracked thaw depend only on the new
+    /// operation's own descriptors while discovery drains still recover these
+    /// handles (#63).
+    deferred_recovery_mounts: std::sync::Mutex<Vec<HeldMount>>,
     /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
     thaw_scope: std::sync::Mutex<ThawScope>,
     /// The freeze operation in progress, from `Freezing` until it settles
@@ -201,6 +207,7 @@ impl Context {
                 handlers::fsinfo::MAX_FSINFO_WALKS,
             )),
             frozen_mounts: std::sync::Mutex::new(Vec::new()),
+            deferred_recovery_mounts: std::sync::Mutex::new(Vec::new()),
             thaw_scope: std::sync::Mutex::new(ThawScope::Discovery),
             freeze_op: std::sync::Mutex::new(None),
             freeze_operation_timeout,
@@ -368,9 +375,28 @@ impl Context {
         self.frozen_mounts_slot().extend(mounts);
     }
 
-    /// Number of handles currently held.
+    /// Number of handles currently held for the active freeze/frozen state.
     pub fn frozen_mount_count(&self) -> usize {
         self.frozen_mounts_slot().len()
+    }
+
+    /// Takes cleanup obligations retained from earlier clean-`Thawed` recovery
+    /// drains for a discovery/recovery thaw (#63).
+    pub fn take_deferred_recovery_mounts(&self) -> Vec<HeldMount> {
+        std::mem::take(&mut *self.deferred_recovery_mounts_slot())
+    }
+
+    /// Retains undrained handles from a failed clean-`Thawed` recovery drain
+    /// separately from [`Context::hold_frozen_mounts`] so later freeze cycles'
+    /// tracked thaw, rollback, abort, and zero-work settlement see only their
+    /// own descriptors (#63).
+    pub fn hold_deferred_recovery_mounts(&self, mounts: Vec<HeldMount>) {
+        self.deferred_recovery_mounts_slot().extend(mounts);
+    }
+
+    /// Number of deferred cleanup handles currently held for discovery recovery.
+    pub fn deferred_recovery_mount_count(&self) -> usize {
+        self.deferred_recovery_mounts_slot().len()
     }
 
     /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
@@ -400,6 +426,12 @@ impl Context {
 
     fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<HeldMount>> {
         self.frozen_mounts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn deferred_recovery_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<HeldMount>> {
+        self.deferred_recovery_mounts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }

@@ -1051,9 +1051,11 @@ pub(crate) fn rollback(
 }
 
 /// Drains handles a freeze published, in forward mount order (they were
-/// pushed deepest-first). Returns the number of targets on which at least
-/// one `FITHAW` succeeded, the handles whose drain did not complete (kept
-/// for a later attempt), and the first such target with its reason.
+/// pushed deepest-first). Returns the number of policy-authorized targets on
+/// which at least one `FITHAW` succeeded, the handles whose drain did not
+/// complete (kept for a later attempt), and the first such target with its
+/// reason (collapsing excluded handles to [`RecoveryReason::RecoveryIncomplete`]
+/// while letting an authorized failure take precedence, #63).
 pub(crate) fn drain_held(
     kernel: &dyn KernelOps,
     held: Vec<HeldMount>,
@@ -1063,7 +1065,7 @@ pub(crate) fn drain_held(
     let mut keep = Vec::new();
     for entry in held.into_iter().rev() {
         let drained = drain(kernel, &entry.mount);
-        if drained.successes > 0 {
+        if drained.successes > 0 && entry.countable {
             recovered += 1;
         }
         tracing::warn!(
@@ -1079,11 +1081,23 @@ pub(crate) fn drain_held(
                 reason = %detail,
                 "rollback target may still be frozen"
             );
-            incomplete.get_or_insert(IncompleteDrain {
+            let next = IncompleteDrain {
                 mountpoint: lossy(entry.mount.mountpoint()),
-                kind,
+                kind: if entry.countable {
+                    kind
+                } else {
+                    RecoveryReason::RecoveryIncomplete
+                },
                 detail,
-            });
+            };
+            match &incomplete {
+                None => incomplete = Some(next),
+                Some(IncompleteDrain {
+                    kind: RecoveryReason::RecoveryIncomplete,
+                    ..
+                }) if entry.countable => incomplete = Some(next),
+                Some(_) => {}
+            }
             keep.push(entry);
         }
     }
@@ -6544,5 +6558,129 @@ mod tests {
             "later authorized failure must not overwrite first authorized failure: {:?}",
             state.unrecoverable
         );
+    }
+
+    #[tokio::test]
+    async fn rollback_preserves_excluded_held_handle_disclosure_policy_and_drains_it() {
+        // Codex P1 (#63): an excluded (`countable = false`) retained handle
+        // carried from an earlier Thawed rescan into a later freeze's rollback
+        // must still be drained without contributing to rollback counts or
+        // exposing its target-specific failure class.
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+        );
+        let rig = rig_with_allowed_mounts(
+            FreezeState::Thawed,
+            Arc::new(StaticMounts(mounts.to_owned())),
+            Some(vec!["/data"]),
+        );
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+
+        // 1. Excluded handle drains cleanly during rollback of a failed freeze:
+        //    it must be thawed & released, while wire rolled_back count is 0.
+        let secret = rig.kernel.open_mount(Path::new("/secret"), (8, 9)).unwrap();
+        rig.kernel.fifreeze(&secret).unwrap();
+        rig.ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: secret,
+            countable: false,
+        }]);
+        rig.kernel.script_freeze_error("/data", Errno::EIO);
+        let err1 = freeze(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(
+            err1.contains("rolled back (0 target(s) thawed)"),
+            "excluded handle must not inflate rollback count: {err1}"
+        );
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+
+        // 2. Excluded handle fails with EPERM during rollback: wire error must
+        //    collapse to RecoveryIncomplete, NOT expose FITHAW permission denied.
+        let secret2 = rig.kernel.open_mount(Path::new("/secret"), (8, 9)).unwrap();
+        rig.kernel.fifreeze(&secret2).unwrap();
+        rig.kernel.script_thaw_error("/secret", Errno::EPERM);
+        rig.ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: secret2,
+            countable: false,
+        }]);
+        let err2 = freeze(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(
+            err2.contains("recovery did not complete; filesystem may still be frozen"),
+            "excluded rollback failure must use fixed RecoveryIncomplete reason: {err2}"
+        );
+        assert!(
+            !err2.contains("FITHAW permission denied"),
+            "excluded rollback failure leaked specific errno class: {err2}"
+        );
+        assert!(err2.contains("0 target(s) thawed"), "{err2}");
+
+        // 3. Direct drain_held ordering cases (killing every countable-guard mutant):
+        //    a) Two excluded failures keep the first excluded diagnostic (in drain/rev order).
+        let k = FakeKernel::new();
+        k.track_freeze_depth();
+        let s1 = k.open_mount(Path::new("/secret1"), (8, 10)).unwrap();
+        let s2 = k.open_mount(Path::new("/secret2"), (8, 11)).unwrap();
+        let a1 = k.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        k.fifreeze(&s1).unwrap();
+        k.fifreeze(&s2).unwrap();
+        k.fifreeze(&a1).unwrap();
+        k.script_thaw_error("/secret1", Errno::EPERM);
+        k.script_thaw_error("/secret2", Errno::EIO);
+        k.script_thaw_error("/data", Errno::EPERM);
+        // drain_held iterates held.into_iter().rev(), so push second first.
+        let (rec, keep, inc) = drain_held(
+            &k,
+            vec![
+                HeldMount {
+                    mount: s2,
+                    countable: false,
+                },
+                HeldMount {
+                    mount: s1,
+                    countable: false,
+                },
+            ],
+        );
+        assert_eq!(rec, 0);
+        assert_eq!(keep.len(), 2);
+        let inc = inc.unwrap();
+        assert_eq!(inc.kind, RecoveryReason::RecoveryIncomplete);
+        assert_eq!(inc.mountpoint, "/secret1");
+
+        //    b) Excluded failure followed by authorized failure upgrades to authorized class.
+        let (_rec, _keep, inc) = drain_held(
+            &k,
+            vec![
+                HeldMount {
+                    mount: a1,
+                    countable: true,
+                },
+                HeldMount {
+                    mount: k.open_mount(Path::new("/secret1"), (8, 10)).unwrap(),
+                    countable: false,
+                },
+            ],
+        );
+        let inc = inc.unwrap();
+        assert_eq!(inc.kind, RecoveryReason::PermissionDenied);
+        assert_eq!(inc.mountpoint, "/data");
+
+        //    c) Authorized failure followed by excluded failure keeps authorized class.
+        let (_rec, _keep, inc) = drain_held(
+            &k,
+            vec![
+                HeldMount {
+                    mount: k.open_mount(Path::new("/secret1"), (8, 10)).unwrap(),
+                    countable: false,
+                },
+                HeldMount {
+                    mount: k.open_mount(Path::new("/data"), (8, 2)).unwrap(),
+                    countable: true,
+                },
+            ],
+        );
+        let inc = inc.unwrap();
+        assert_eq!(inc.kind, RecoveryReason::PermissionDenied);
+        assert_eq!(inc.mountpoint, "/data");
     }
 }

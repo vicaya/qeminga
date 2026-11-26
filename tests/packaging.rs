@@ -366,15 +366,33 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
 
     // 2. Parse the §5.9 profile comparison table column-by-column and compare
     //    each profile cell against the corresponding config's derived authority.
-    let table_rows: Vec<Vec<&str>> = s59
+    let split_md_cells = |line: &str| -> Vec<String> {
+        let mut cells = Vec::new();
+        let mut cur = String::new();
+        let mut escaped = false;
+        for ch in line.trim_matches('|').chars() {
+            if escaped {
+                cur.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '|' {
+                cells.push(cur.trim().to_owned());
+                cur.clear();
+            } else {
+                cur.push(ch);
+            }
+        }
+        if escaped {
+            cur.push('\\');
+        }
+        cells.push(cur.trim().to_owned());
+        cells
+    };
+    let table_rows: Vec<Vec<String>> = s59
         .lines()
         .filter(|l| l.starts_with('|'))
-        .map(|l| {
-            l.trim_matches('|')
-                .split('|')
-                .map(str::trim)
-                .collect::<Vec<_>>()
-        })
+        .map(split_md_cells)
         .collect();
     let header = table_rows.first().expect("§5.9 profile comparison header");
     assert_eq!(header.len(), 3, "expected 3-column table: {header:?}");
@@ -383,7 +401,7 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
         "§5.9 table columns must be CVM (col 1) and general-VM (col 2): {header:?}"
     );
 
-    let row_by_prefix = |prefix: &str| -> &[&str] {
+    let row_by_prefix = |prefix: &str| -> &[String] {
         table_rows
             .iter()
             .find(|r| r.len() == 3 && r[0].starts_with(prefix))
@@ -391,7 +409,7 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
     };
 
     let cap_row = row_by_prefix("Post-drop UID/GID and capabilities");
-    let (cvm_caps_cell, gen_caps_cell) = (cap_row[1], cap_row[2]);
+    let (cvm_caps_cell, gen_caps_cell) = (cap_row[1].as_str(), cap_row[2].as_str());
     for set in ["CapEff", "CapPrm", "CapBnd", "CapInh", "CapAmb"] {
         assert!(
             cvm_caps_cell.contains(set) && gen_caps_cell.contains(set),
@@ -426,15 +444,17 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
     assert!(
         seccomp_row[1].contains("Omits")
             && seccomp_row[1].contains("`socket`")
-            && seccomp_row[1].contains("socketpair")
-            && seccomp_row[1].contains("sendto")
-            && seccomp_row[1].contains("recvfrom"),
-        "CVM seccomp cell must distinguish omitted socket from retained socketpair/sendto/recvfrom: {}",
+            && seccomp_row[1].contains("SOCK_STREAM")
+            && seccomp_row[1].contains("peerless `recvfrom`")
+            && seccomp_row[1].contains("peerless `sendto`"),
+        "CVM seccomp cell must distinguish omitted socket from narrowed socketpair and peerless sendto/recvfrom: {}",
         seccomp_row[1]
     );
     assert!(
-        seccomp_row[2].contains("AF_NETLINK") && seccomp_row[2].contains("protocol unrestricted"),
-        "general-VM seccomp cell must describe AF_NETLINK family-only check: {}",
+        seccomp_row[2].contains("AF_NETLINK")
+            && seccomp_row[2].contains("NETLINK_ROUTE")
+            && seccomp_row[2].contains("addrlen == 12"),
+        "general-VM seccomp cell must describe NETLINK_ROUTE and inventory sendto rules: {}",
         seccomp_row[2]
     );
 
@@ -448,12 +468,25 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
     );
 
     // 4. Residual authority: no overbroad write/socket claim, explicit enforcing
-    //    seccomp prerequisite, and explicit unchecked IPC argument limits.
+    //    seccomp prerequisite, and accurate narrowed socket/IPC rules.
+    let readme = read("README.md");
     assert!(
         !s59.contains("no configuration enables execution, arbitrary file writes, network egress")
             && !s59.contains("No allowed protocol command writes guest files"),
         "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
     );
+    for (name, text) in [
+        ("docs/design.md §5.9", s59),
+        ("packaging/README.md", packaging.as_str()),
+        ("README.md", readme.as_str()),
+    ] {
+        assert!(
+            !text.contains("protocol unrestricted")
+                && !text.contains("no argument or peer restriction")
+                && !text.contains("leaves the netlink protocol"),
+            "{name} must not retain stale unrestricted-netlink or unrestricted-IPC wording"
+        );
+    }
     assert!(
         s59.contains("Unix permissions")
             && s59.contains("no general-purpose file-write command")
@@ -462,9 +495,10 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
             && s59.contains("unenforced-development-only")
             && s59.contains("may be absent or logging-only")
             && s59.contains("installed, enforcing seccomp filter")
-            && s59.contains("no argument or peer restriction")
-            && s59.contains("only the `AF_NETLINK` family"),
-        "§5.9 must document permissions, broad reads, enforcing-filter scope, and unchecked IPC arguments"
+            && s59.contains("NETLINK_ROUTE")
+            && s59.contains("peerless `sendto`")
+            && s59.contains("addrlen == 12"),
+        "§5.9 must document permissions, broad reads, enforcing-filter scope, and narrowed socket/IPC rules"
     );
 
     // 5. Reconcile AC3 and AC25 with the five Linux capability sets and shutdown switch.
@@ -489,8 +523,8 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
         "AC25 must name the five sets accurately instead of saying 'in every set': {ac25}"
     );
 
-    // 6. Packaging guide and §5.5: build instructions must name debug_assertions
-    //    and not attribute a release startup failure to `seccomp-log`.
+    // 6. Packaging guide, README, and §5.5: build instructions must name debug_assertions,
+    //    not attribute a release startup failure to `seccomp-log`, and match #67 socket rules.
     assert!(
         !packaging
             .contains("and `seccomp-log` would fail the enforced hardening\ncheck at startup"),
@@ -501,9 +535,13 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
             && packaging.contains("debug_assertions")
             && packaging.contains("test-fakes")
             && packaging.contains("unenforced-development-only")
-            && packaging.contains("no argument or peer restriction")
-            && packaging.contains("leaves the netlink protocol"),
-        "docs/design.md §5.5 and packaging/README.md must align on debug_assertions, enforcing-filter scope, and IPC argument limits"
+            && packaging.contains("NETLINK_ROUTE")
+            && packaging.contains("addrlen == 12")
+            && packaging.contains("peerless")
+            && readme.contains("NETLINK_ROUTE")
+            && readme.contains("addrlen == 12")
+            && readme.contains("peerless"),
+        "docs/design.md, packaging/README.md, and README.md must align on debug_assertions, enforcing-filter scope, and #67 narrowed socket/IPC rules"
     );
 }
 

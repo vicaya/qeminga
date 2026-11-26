@@ -9078,6 +9078,14 @@ case "$cmd" in
             *guest-fsfreeze-status*)
                 if [ -f "${FAKE_FROZEN_FILE:?}" ]; then echo '{"return":"frozen"}'; else echo '{"return":"thawed"}'; fi
                 ;;
+            *guest-fsfreeze-freeze-list*)
+                : > "${FAKE_FROZEN_FILE:?}"
+                echo '{"return":1}'
+                ;;
+            *guest-fsfreeze-thaw*)
+                rm -f "${FAKE_FROZEN_FILE:?}"
+                echo '{"return":1}'
+                ;;
             *) echo '{"return":{}}' ;;
         esac
         exit 0

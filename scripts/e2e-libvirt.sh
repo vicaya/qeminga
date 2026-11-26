@@ -8,7 +8,7 @@
 # Exits non-zero unless every step succeeds. Writes a log to stdout that
 # can be attached to the pull request.
 #
-#   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] DOMAIN
+#   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] [--freeze-mount PATH] DOMAIN
 #
 # CI runs it under QEMU TCG on both architectures (scripts/ci/libvirt-tcg-smoke.sh)
 # and under real KVM (scripts/ci/libvirt-kvm-smoke.sh on GitHub-hosted x86_64 and
@@ -18,16 +18,25 @@ set -euo pipefail
 
 connect=""
 shutdown=1
+freeze_mount=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --connect) connect="--connect=$2"; shift 2 ;;
         --no-shutdown) shutdown=0; shift ;;
+        --freeze-mount) freeze_mount="$2"; shift 2 ;;
         -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) break ;;
     esac
 done
-[ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] DOMAIN" >&2; exit 64; }
+[ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] [--freeze-mount PATH] DOMAIN" >&2; exit 64; }
 domain="$1"
+if [ -n "$freeze_mount" ]; then
+    if [[ "$freeze_mount" != /* ]]; then
+        echo "invalid --freeze-mount path (must be absolute): $freeze_mount" >&2
+        exit 64
+    fi
+    command -v python3 >/dev/null 2>&1 || { echo "python3 is required for --freeze-mount" >&2; exit 69; }
+fi
 
 # Predictable command output whatever the caller's locale (domstate is
 # parsed below).
@@ -67,6 +76,75 @@ status_is() {
         *"\"$1\""*) return 0 ;;
         *) echo "expected status $1"; return 1 ;;
     esac
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+domfsfreeze_nonzero() {
+    local out
+    out="$(v domfsfreeze "$domain" 2>&1)" || { echo "$out"; return 1; }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq 'Froze [1-9][0-9]* filesystem' || {
+        echo "expected nonzero frozen filesystem count"
+        return 1
+    }
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+domfsthaw_nonzero() {
+    local out
+    out="$(v domfsthaw "$domain" 2>&1)" || { echo "$out"; return 1; }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq 'Thawed [1-9][0-9]* filesystem' || {
+        echo "expected nonzero thawed filesystem count"
+        return 1
+    }
+}
+# Shared parser for top-level QGA integer `return` counts: uses Python's
+# `json.loads` (`type(val) is int`, avoiding jq 1.6 double coercion of `1.0`)
+# to require a single JSON object whose top-level `return` is an exact integer
+# equal to $2 (rejecting floats, booleans, strings, nested objects, and
+# malformed or concatenated JSON).
+# shellcheck disable=SC2317,SC2329 # invoked through `freeze_list_exact` and `thaw_exact`
+qga_return_is_exact_int() {
+    local json="$1" want="$2"
+    printf '%s\n' "$json" | python3 -c '
+import json, sys
+try:
+    obj = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(1)
+want = int(sys.argv[1])
+if type(obj) is dict and "return" in obj:
+    val = obj["return"]
+    if type(val) is int and val == want:
+        sys.exit(0)
+sys.exit(1)
+' "$want"
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+freeze_list_exact() {
+    local mount="$1" want="$2" req out
+    req="$(python3 -c 'import json, sys; print(json.dumps({"execute": "guest-fsfreeze-freeze-list", "arguments": {"mountpoints": [sys.argv[1]]}}, separators=(",", ":")))' "$mount")" || return 1
+    out="$(agent "$req" 2>&1)" || {
+        echo "$out"
+        return 1
+    }
+    echo "$out"
+    qga_return_is_exact_int "$out" "$want" || {
+        echo "expected exact integer return $want for $mount"
+        return 1
+    }
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+thaw_exact() {
+    local want="$1" out
+    out="$(agent '{"execute":"guest-fsfreeze-thaw"}' 2>&1)" || {
+        echo "$out"
+        return 1
+    }
+    echo "$out"
+    qga_return_is_exact_int "$out" "$want" || {
+        echo "expected exact integer return $want"
+        return 1
+    }
 }
 # The domain's state is exactly $1 ("running", "shut off", ...): the
 # query itself must succeed, and its first line is compared whole, so a
@@ -109,10 +187,16 @@ esac
 
 step "guest-exec is refused (AC1)" refused_exec
 
-step "domfsfreeze" v domfsfreeze "$domain"
+step "domfsfreeze" domfsfreeze_nonzero
 step "guest-fsfreeze-status is frozen" status_is frozen
-step "domfsthaw" v domfsthaw "$domain"
+step "domfsthaw" domfsthaw_nonzero
 step "guest-fsfreeze-status is thawed" status_is thawed
+if [ -n "$freeze_mount" ]; then
+    step "guest-fsfreeze-freeze-list ($freeze_mount)" freeze_list_exact "$freeze_mount" 1
+    step "guest-fsfreeze-status is frozen ($freeze_mount)" status_is frozen
+    step "guest-fsfreeze-thaw ($freeze_mount)" thaw_exact 1
+    step "guest-fsfreeze-status is thawed ($freeze_mount)" status_is thawed
+fi
 step "domifaddr --source agent" v domifaddr "$domain" --source agent
 step "guest-get-osinfo" agent '{"execute":"guest-get-osinfo"}'
 step "domfsinfo" v domfsinfo "$domain"

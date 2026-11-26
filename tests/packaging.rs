@@ -142,6 +142,126 @@ fn unit_provisions_the_state_directory_for_the_service_account() {
 }
 
 #[test]
+fn unit_constrains_filesystem_writes_to_marker_directory() {
+    // #66: the packaged unit remounts the filesystem hierarchy read-only
+    // (ProtectSystem=strict + ProtectHome=read-only, MNT_READONLY — compatible
+    // with FIFREEZE on O_RDONLY|O_DIRECTORY handles including separate /home
+    // mounts), punches only -/run/qeminga for ordinary file writes (with `-`
+    // so ExecStartPre=+ can create an absent directory on cold start), locks
+    // /sys and /dev (plus every filesystem already mounted beneath /dev, such
+    // as /dev/shm and /dev/mqueue) recursively read-only via
+    // BindReadOnlyPaths=/sys /dev while keeping character-device O_RDWR open
+    // and reopen working, locks /run, prevents remounting via ~@mount, sets
+    // UMask=0077, and deliberately keeps PrivateTmp=no and PrivateDevices
+    // unset so real /tmp and /dev/virtio-ports stay reachable.
+    let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
+    assert_eq!(values(&unit, "Service", "ProtectSystem"), ["strict"]);
+    assert_eq!(
+        values(&unit, "Service", "ReadWritePaths"),
+        ["-/run/qeminga"]
+    );
+    assert_eq!(values(&unit, "Service", "ProtectKernelTunables"), ["yes"]);
+    let bro = values(&unit, "Service", "BindReadOnlyPaths");
+    assert!(bro.contains(&"/sys"), "{bro:?}");
+    assert!(bro.contains(&"/dev"), "{bro:?}");
+    let ro = values(&unit, "Service", "ReadOnlyPaths");
+    assert!(ro.contains(&"/run"), "{ro:?}");
+    let sc = values(&unit, "Service", "SystemCallFilter");
+    assert!(sc.contains(&"~@mount"), "{sc:?}");
+    assert_eq!(values(&unit, "Service", "UMask"), ["0077"]);
+    assert_eq!(values(&unit, "Service", "PrivateTmp"), ["no"]);
+    assert_eq!(values(&unit, "Service", "ProtectHome"), ["read-only"]);
+    assert!(
+        values(&unit, "Service", "PrivateDevices").is_empty(),
+        "PrivateDevices=yes would hide /dev/virtio-ports/org.qemu.guest_agent.0"
+    );
+}
+
+#[test]
+fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
+    // #66: inventory writable objects during startup and after drop,
+    // residual writable locations, custom state_path drop-in with its
+    // trusted-parent requirement, optional suspend_ram
+    // ReadWritePaths=/sys/power/state drop-in, and the supported systemd
+    // baseline.
+    let readme = read("packaging/README.md");
+    let suspend_tmpfiles = read("packaging/tmpfiles.d/qeminga-suspend.conf");
+    let design = read("docs/design.md");
+    for needle in [
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "ReadWritePaths=-/run/qeminga",
+        "ProtectKernelTunables=yes",
+        "BindReadOnlyPaths=/sys /dev",
+        "ReadOnlyPaths=/run",
+        "~@mount",
+        "UMask=0077",
+        "ReadWritePaths=/sys/power/state",
+        "ReadWritePaths=-/run/custom-qeminga",
+        "ExecStartPre=",
+        "state_path",
+        "systemd 245",
+        "PrivateTmp=no",
+        "PrivateDevices",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "packaging/README.md missing {needle:?}"
+        );
+    }
+    let lower_readme = readme.to_ascii_lowercase();
+    assert!(
+        lower_readme.contains("during privileged startup")
+            && lower_readme.contains("after privilege drop")
+            && lower_readme.contains("residual writable"),
+        "packaging/README.md must inventory startup, post-drop, and residual writable locations"
+    );
+    assert!(
+        lower_readme.contains("system-manager mount namespace")
+            && lower_readme.contains("after the service starts")
+            && !lower_readme.contains("mounted on the host"),
+        "packaging/README.md must document guest system-manager mount propagation of post-start mounts without calling the guest 'the host'"
+    );
+    assert!(
+        !readme.contains("ReadOnlyPaths=/run -/dev/shm"),
+        "packaging/README.md must not retain stale ReadOnlyPaths=/run -/dev/shm directives"
+    );
+    assert!(
+        lower_readme.contains("ancestor")
+            && lower_readme.contains("entire lifetime")
+            && readme.contains("Marker::open")
+            && !lower_readme.contains("fchown"),
+        "packaging/README.md must require lifetime trusted ancestry across ExecStartPre, ReadWritePaths, and Marker::open without a mutable-ancestry workaround"
+    );
+    assert!(
+        suspend_tmpfiles.contains("ReadWritePaths=/sys/power/state")
+            && suspend_tmpfiles.contains("BindReadOnlyPaths=/sys"),
+        "packaging/tmpfiles.d/qeminga-suspend.conf must note BindReadOnlyPaths=/sys and ReadWritePaths=/sys/power/state"
+    );
+    for needle in [
+        "ProtectSystem=strict",
+        "ProtectHome=read-only",
+        "ReadWritePaths=-/run/qeminga",
+        "ProtectKernelTunables=yes",
+        "BindReadOnlyPaths=/sys /dev",
+        "ReadOnlyPaths=/run",
+        "SystemCallFilter=~@mount",
+        "ReadWritePaths=/sys/power/state",
+        "systemd 245",
+    ] {
+        assert!(design.contains(needle), "docs/design.md missing {needle:?}");
+    }
+    let lower_design = design.to_ascii_lowercase();
+    assert!(
+        lower_design.contains("ancestor")
+            && lower_design.contains("entire lifetime")
+            && design.contains("Marker::open")
+            && !lower_design.contains("before ownership/mode changes"),
+        "docs/design.md §8.4 must require lifetime trusted ancestry for custom state_path without a mutable-ancestry workaround"
+    );
+}
+
+#[test]
 fn tmpfiles_rule_provisions_the_state_directory_at_boot() {
     // C-20: /run is cleared at boot; the directory the dropped daemon
     // creates its marker in must exist and belong to the service account.
@@ -344,25 +464,91 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
         .expect("design §5.10");
     let s59 = &design[s59_start..s59_end];
 
-    // 1. Compare unit filesystem-confinement settings against both docs so
-    //    changing the unit without updating the docs (or vice versa) fails.
-    for key in ["ProtectSystem", "ProtectHome", "PrivateTmp"] {
+    let readme = read("README.md");
+    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
+
+    // 1. Compare unit filesystem-confinement settings against docs/design.md
+    //    §5.9, packaging/README.md (specifically the compromised-parser
+    //    "Ordinary file writes" summary, not only the earlier write-confinement
+    //    section), and README.md so changing the unit without updating every
+    //    doc (or leaving stale unconfined wording) fails.
+    let ordinary_writes_start = packaging
+        .find("*Ordinary file writes:*")
+        .expect("Ordinary file writes paragraph in packaging/README.md");
+    let ordinary_writes_end = packaging[ordinary_writes_start..]
+        .find("*Sockets and IPC:*")
+        .map(|off| ordinary_writes_start + off)
+        .expect("Sockets and IPC paragraph in packaging/README.md");
+    let ordinary_writes_norm = normalize_ws(&packaging[ordinary_writes_start..ordinary_writes_end]);
+    let s59_norm = normalize_ws(s59);
+    let packaging_norm = normalize_ws(&packaging);
+    let readme_norm = normalize_ws(&readme);
+
+    let single_value_keys = [
+        "ProtectSystem",
+        "ProtectHome",
+        "PrivateTmp",
+        "ReadWritePaths",
+        "ProtectKernelTunables",
+        "ReadOnlyPaths",
+        "SystemCallFilter",
+        "UMask",
+    ];
+    let mut unit_directives: Vec<String> = Vec::new();
+    for key in single_value_keys {
         let vals = values(&unit, "Service", key);
         assert_eq!(
             vals.len(),
             1,
             "qeminga.service must specify exactly one {key}= value: {vals:?}"
         );
-        let directive = format!("{key}={}", vals[0]);
+        unit_directives.push(format!("{key}={}", vals[0]));
+    }
+    let bro_vals = values(&unit, "Service", "BindReadOnlyPaths");
+    assert_eq!(
+        bro_vals.len(),
+        2,
+        "qeminga.service BindReadOnlyPaths must list /sys and /dev: {bro_vals:?}"
+    );
+    unit_directives.push(format!("BindReadOnlyPaths={}", bro_vals.join(" ")));
+
+    for directive in &unit_directives {
+        for (name, text) in [
+            ("docs/design.md §5.9", &s59_norm),
+            (
+                "packaging/README.md (*Ordinary file writes:*)",
+                &ordinary_writes_norm,
+            ),
+            ("README.md", &readme_norm),
+        ] {
+            assert!(
+                text.contains(directive.as_str()),
+                "{name} must match shipped unit directive `{directive}`"
+            );
+        }
+    }
+    for (name, text) in [
+        ("docs/design.md §5.9", &s59_norm),
+        (
+            "packaging/README.md (*Ordinary file writes:*)",
+            &ordinary_writes_norm,
+        ),
+        ("README.md", &readme_norm),
+    ] {
         assert!(
-            s59.contains(&directive),
-            "docs/design.md §5.9 must match shipped unit directive `{directive}`"
-        );
-        assert!(
-            packaging.contains(&directive),
-            "packaging/README.md must match shipped unit directive `{directive}`"
+            !text.contains("ProtectSystem=no")
+                && !text.contains("ProtectHome=no")
+                && !text.contains("does not yet enforce a read-only filesystem namespace")
+                && !text.contains("does not yet confine writes")
+                && !text.contains("world-writable directories such as /tmp"),
+            "{name} must not retain stale unconfined-unit wording"
         );
     }
+    assert!(
+        !packaging_norm.contains("ProtectSystem=no")
+            && !packaging_norm.contains("does not yet confine writes"),
+        "packaging/README.md must not retain stale ProtectSystem=no or unconfined-unit wording"
+    );
 
     // 2. Parse the §5.9 profile comparison table column-by-column and compare
     //    each profile cell against the corresponding config's derived authority.
@@ -469,17 +655,15 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
 
     // 4. Residual authority: no overbroad write/socket claim, explicit enforcing
     //    seccomp prerequisite, and accurate narrowed socket/IPC rules.
-    let readme = read("README.md");
     assert!(
         !s59.contains("no configuration enables execution, arbitrary file writes, network egress")
             && !s59.contains("No allowed protocol command writes guest files"),
         "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
     );
-    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
     for (name, text) in [
-        ("docs/design.md §5.9", normalize_ws(s59)),
-        ("packaging/README.md", normalize_ws(&packaging)),
-        ("README.md", normalize_ws(&readme)),
+        ("docs/design.md §5.9", &s59_norm),
+        ("packaging/README.md", &packaging_norm),
+        ("README.md", &readme_norm),
     ] {
         assert!(
             !text.contains("protocol unrestricted")
@@ -795,6 +979,15 @@ impl PtyChannel {
         }
     }
 
+    fn open_for_qeminga() -> Self {
+        let pty = Self::open();
+        let (ok, text) = sh("chown", &["600:600", &pty.slave_path]);
+        assert!(ok, "chown {}: {text}", pty.slave_path);
+        let (ok, text) = sh("chmod", &["0600", &pty.slave_path]);
+        assert!(ok, "chmod {}: {text}", pty.slave_path);
+        pty
+    }
+
     /// Sends one request line and returns the reply line, or panics after
     /// ten seconds.
     fn request(&mut self, json: &str) -> String {
@@ -833,12 +1026,295 @@ impl PtyChannel {
     }
 }
 
+/// Removes a test file or symlink on drop.
+struct PathGuard(std::path::PathBuf);
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Removes a unique test-owned directory tree on drop.
+struct DirGuard(std::path::PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Atomically points symlink `link` at `target`.
+fn repoint_symlink(link: &Path, target: &str) {
+    let tmp = link.with_extension("next");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp).unwrap();
+    std::fs::rename(&tmp, link).unwrap();
+}
+
+/// Returns `(mnt_id, vfs_opts, mount_point)` for the mount actually serving
+/// `target` inside `pid`'s mount namespace by opening `target` inside that
+/// namespace, reading `mnt_id:` from `/proc/self/fdinfo/3`, and looking up the
+/// exact row in `/proc/self/mountinfo`.
+fn effective_mount_in_ns(pid: &str, target: &str) -> (u64, String, String) {
+    let ns_arg = format!("--mount=/proc/{pid}/ns/mnt");
+    let output = std::process::Command::new("nsenter")
+        .env("LC_ALL", "C")
+        .args([
+            &ns_arg,
+            "--",
+            "/bin/sh",
+            "-c",
+            concat!(
+                "exec 3<\"$1\" || exit 1; ",
+                "id=\"$(awk '$1 == \"mnt_id:\" { print $2; exit }' /proc/self/fdinfo/3)\"; ",
+                "[ -n \"$id\" ] || exit 1; ",
+                "awk -v id=\"$id\" '$1 == id { print $1, $6, $5; found = 1; exit } END { exit(found ? 0 : 1) }' /proc/self/mountinfo",
+            ),
+            "_",
+            target,
+        ])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    assert!(
+        output.status.success(),
+        "effective_mount_in_ns({pid}, {target}) failed: stdout={stdout:?} stderr={stderr:?}"
+    );
+    let mut parts = stdout.splitn(3, ' ');
+    let mnt_id: u64 = parts
+        .next()
+        .unwrap_or_else(|| panic!("missing mnt_id in {stdout:?}"))
+        .parse()
+        .unwrap();
+    let vfs_opts = parts
+        .next()
+        .unwrap_or_else(|| panic!("missing vfs_opts in {stdout:?}"))
+        .to_owned();
+    let mount_point = parts
+        .next()
+        .unwrap_or_else(|| panic!("missing mount_point in {stdout:?}"))
+        .to_owned();
+    (mnt_id, vfs_opts, mount_point)
+}
+
+fn vfs_opts_has(opts: &str, flag: &str) -> bool {
+    opts.split(',').any(|opt| opt == flag)
+}
+
+/// Runs `script` with argument `arg` as UID/GID 600 inside `pid`'s mount
+/// namespace.
+fn run_as_qeminga_in_ns(pid: &str, script: &str, arg: &str) -> (bool, String) {
+    let ns_arg = format!("--mount=/proc/{pid}/ns/mnt");
+    let output = std::process::Command::new("nsenter")
+        .env("LC_ALL", "C")
+        .args([
+            &ns_arg,
+            "--",
+            "setpriv",
+            "--reuid",
+            "600",
+            "--regid",
+            "600",
+            "--clear-groups",
+            "--",
+            "/bin/sh",
+            "-c",
+            script,
+            "_",
+            arg,
+        ])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+/// Creates a unique test-owned directory under `parent`, sets UID/GID 600 and
+/// mode `0700` on its open directory descriptor, creates `"probe"` and
+/// `"unlink-outside"` exclusively with `O_CREAT|O_EXCL|O_NOFOLLOW` and
+/// descriptor-based `fchown`/`fchmod`, confirms UID 600 can genuinely write and
+/// unlink outside confinement, then asserts both fail with `EROFS` inside
+/// `pid`'s mount namespace and leaves only this run's directory to drop.
+fn assert_ro_dir_confinement(pid: &str, parent: &Path) {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::{Mode, fchmod};
+    use nix::unistd::{Gid, Uid, fchown, write};
+
+    let dir = tempfile::Builder::new()
+        .prefix("qeminga-confinement-")
+        .tempdir_in(parent)
+        .unwrap_or_else(|e| panic!("tempdir in {}: {e}", parent.display()));
+    let uid = Some(Uid::from_raw(600));
+    let gid = Some(Gid::from_raw(600));
+    let dfd = open(
+        dir.path(),
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    fchown(&dfd, uid, gid).unwrap();
+    fchmod(&dfd, Mode::from_bits_truncate(0o700)).unwrap();
+
+    for name in ["probe", "unlink-outside"] {
+        let fd = openat(
+            &dfd,
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )
+        .unwrap();
+        fchown(&fd, uid, gid).unwrap();
+        fchmod(&fd, Mode::from_bits_truncate(0o600)).unwrap();
+        let written = write(&fd, b"intact\n").unwrap();
+        assert_eq!(written, b"intact\n".len());
+    }
+
+    let probe = dir.path().join("probe");
+    let unlink_outside = dir.path().join("unlink-outside");
+
+    // Outside confinement, UID 600 must genuinely be able to write and unlink.
+    let (ok, text) = sh(
+        "setpriv",
+        &[
+            "--reuid",
+            "600",
+            "--regid",
+            "600",
+            "--clear-groups",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'intact\\n' > \"$1\"",
+            "_",
+            probe.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ok,
+        "uid 600 must be able to write {} outside unit: {text}",
+        probe.display()
+    );
+    let (ok, text) = sh(
+        "setpriv",
+        &[
+            "--reuid",
+            "600",
+            "--regid",
+            "600",
+            "--clear-groups",
+            "--",
+            "/bin/rm",
+            "--",
+            unlink_outside.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ok,
+        "uid 600 must be able to unlink {} outside unit: {text}",
+        unlink_outside.display()
+    );
+    assert!(!unlink_outside.exists());
+
+    // Inside the service mount namespace, both write and unlink must fail EROFS.
+    let (ok, text) = run_as_qeminga_in_ns(
+        pid,
+        "printf 'tampered\\n' > \"$1\"",
+        probe.to_str().unwrap(),
+    );
+    assert!(
+        !ok && text.contains("Read-only file system"),
+        "write under {} must fail with EROFS: ok={ok} text={text}",
+        parent.display()
+    );
+    let (ok, text) = run_as_qeminga_in_ns(pid, "/bin/rm -- \"$1\"", probe.to_str().unwrap());
+    assert!(
+        !ok && text.contains("Read-only file system"),
+        "unlink under {} must fail with EROFS: ok={ok} text={text}",
+        parent.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&probe).unwrap(),
+        "intact\n",
+        "probe file under {} must remain untouched",
+        parent.display()
+    );
+}
+
+/// Verifies #66 write confinement inside `qeminga.service`'s mount namespace:
+/// unique UID-600-owned directories under `/var/tmp`, `/home`, `/run`, `/dev`,
+/// and `/dev/shm` allow write+unlink outside confinement but fail both with
+/// `EROFS` inside it; the effective mounts serving `/`, `/sys`,
+/// `/sys/power/state` (when present), `/run`, `/home`, `/dev`, and `/dev/shm`
+/// are `ro`; and `/run/qeminga` stays writable to UID 600.
+fn assert_unit_write_confinement(pid: &str) {
+    assert_ro_dir_confinement(pid, Path::new("/var/tmp"));
+    assert_ro_dir_confinement(pid, Path::new("/home"));
+    assert_ro_dir_confinement(pid, Path::new("/run"));
+    assert_ro_dir_confinement(pid, Path::new("/dev"));
+    assert_ro_dir_confinement(pid, Path::new("/dev/shm"));
+
+    let mut ro_targets = vec!["/", "/sys", "/run", "/home", "/dev", "/dev/shm"];
+    if Path::new("/sys/power/state").exists() {
+        ro_targets.push("/sys/power/state");
+    }
+    for target in ro_targets {
+        let (mnt_id, vfs_opts, mp) = effective_mount_in_ns(pid, target);
+        assert!(
+            vfs_opts_has(&vfs_opts, "ro"),
+            "effective mount for {target} must be ro (mnt_id={mnt_id} opts={vfs_opts:?} mp={mp:?})"
+        );
+    }
+
+    let (ok, text) = run_as_qeminga_in_ns(
+        pid,
+        "p=\"$(mktemp \"$1/confinement-probe.XXXXXX\")\" && printf 'ok\\n' > \"$p\" && /bin/rm -- \"$p\"",
+        "/run/qeminga",
+    );
+    assert!(
+        ok,
+        "/run/qeminga must remain writable to uid 600 in service mount namespace: {text}"
+    );
+}
+
+/// Creates `name` inside `dir` owned by UID/GID 600 mode `0600` exclusively
+/// through open directory and file descriptors.
+fn create_qeminga_file(dir: &Path, name: &str) {
+    use nix::fcntl::{OFlag, open, openat};
+    use nix::sys::stat::{Mode, fchmod};
+    use nix::unistd::{Gid, Uid, fchown};
+
+    let dfd = open(
+        dir,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap();
+    let fd = openat(
+        &dfd,
+        name,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    fchown(&fd, Some(Uid::from_raw(600)), Some(Gid::from_raw(600))).unwrap();
+    fchmod(&fd, Mode::from_bits_truncate(0o600)).unwrap();
+}
+
 /// The installed unit, not just the binary, freezes and thaws: the
 /// daemon started by systemd, dropped to `qeminga`, must be able to
 /// create its marker in /run/qeminga and remove it again. (With
 /// RuntimeDirectory= it could not: systemd re-applied root ownership
-/// before ExecStart and every freeze failed on the marker.) The channel
-/// is a pty the test holds the master of.
+/// before ExecStart and every freeze failed on the marker.) Also removes
+/// `/run/qeminga` before starting so `ExecStartPre=+` creating it ahead
+/// of `ReadWritePaths=-/run/qeminga` is exercised (#66), and confirms an
+/// existing marker is preserved across restarts. The channel is a pty
+/// the test holds the master of.
 #[test]
 #[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
 fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
@@ -847,9 +1323,9 @@ fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
     let Some(installed) = install_unit(&pty.slave_path) else {
         return;
     };
-    let _ = std::fs::remove_file("/run/qeminga/frozen");
+    let _ = std::fs::remove_dir_all("/run/qeminga");
     let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
-    assert!(ok, "systemctl start: {text}");
+    assert!(ok, "systemctl start from absent /run/qeminga: {text}");
     let reply = pty.request(r#"{"execute":"guest-ping"}"#);
     assert_eq!(reply, r#"{"return":{}}"#);
     let reply = pty.request(r#"{"execute":"guest-fsfreeze-freeze"}"#);
@@ -860,6 +1336,11 @@ fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
     let marker = std::fs::metadata("/run/qeminga/frozen")
         .unwrap_or_else(|e| panic!("marker not created by the dropped daemon: {e}"));
     assert_eq!(marker.uid(), 600, "created by the service account");
+    assert_eq!(
+        marker.mode() & 0o777,
+        0o600,
+        "marker mode 0600 (UMask=0077)"
+    );
     let dir = std::fs::metadata("/run/qeminga").unwrap();
     assert_eq!(
         (dir.uid(), dir.mode() & 0o777),
@@ -878,6 +1359,160 @@ fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
     assert!(
         !Path::new("/run/qeminga/frozen").exists(),
         "marker removed by the dropped daemon"
+    );
+    // Restarting with a pre-existing marker must preserve it across ExecStartPre=+
+    // so the restarted daemon enters recovery mode and drains/removes it.
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    let (_, since_raw) = sh("date", &["-u", "+%Y-%m-%d %H:%M:%S UTC"]);
+    let since = since_raw.trim();
+    create_qeminga_file(Path::new("/run/qeminga"), "frozen");
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(ok, "systemctl start with existing marker: {text}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while Path::new("/run/qeminga/frozen").exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (_, log) = sh(
+        "journalctl",
+        &[
+            "-u",
+            "qeminga.service",
+            "--no-pager",
+            "-o",
+            "cat",
+            "--since",
+            since,
+        ],
+    );
+    assert!(
+        !Path::new("/run/qeminga/frozen").exists(),
+        "restarted unit must preserve and recover a pre-existing marker:\n{log}"
+    );
+    assert!(
+        log.contains("\"recovery\":true"),
+        "restarted unit must enter recovery mode from preserved marker:\n{log}"
+    );
+    assert_eq!(
+        pty.request(r#"{"execute":"guest-fsfreeze-status"}"#),
+        r#"{"return":"thawed"}"#
+    );
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    drop(installed);
+}
+
+/// Exercises the documented custom-marker drop-in recipe (#66) starting from
+/// an absent custom directory: `ExecStartPre=+` provisions it owned by UID 600
+/// mode `0700` without `226/NAMESPACE`, `/run` outside the custom directory
+/// stays `ro`, freeze/thaw creates and removes the custom marker, and a
+/// pre-existing marker is preserved across restarts for recovery.
+#[test]
+#[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
+fn privileged_installed_unit_custom_marker_path_from_absent_dir() {
+    use std::os::unix::fs::MetadataExt;
+    let mut pty = PtyChannel::open();
+    let custom_dir =
+        std::path::PathBuf::from(format!("/run/qeminga-custom-{}", std::process::id()));
+    let custom_marker = custom_dir.join("frozen");
+    let _custom_guard = DirGuard(custom_dir.clone());
+    let Some(installed) = install_unit(&pty.slave_path) else {
+        return;
+    };
+    let _ = std::fs::remove_dir_all(&custom_dir);
+    assert!(!custom_dir.exists());
+
+    std::fs::write(
+        InstalledUnit::CONFIG,
+        format!(
+            "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nfsfreeze_idle_timeout_secs = 1\nhardening = \"unenforced-development-only\"\n",
+            pty.slave_path,
+            custom_marker.display()
+        ),
+    )
+    .unwrap();
+    let custom_str = custom_dir.to_str().unwrap();
+    std::fs::write(
+        Path::new(InstalledUnit::DROPIN_DIR).join("60-custom-marker.conf"),
+        format!(
+            "[Service]\nExecStartPre=\nExecStartPre=+/usr/bin/mkdir -p {custom_str}\nExecStartPre=+/usr/bin/chown qeminga:qeminga {custom_str}\nExecStartPre=+/usr/bin/chmod 0700 {custom_str}\nReadWritePaths=\nReadWritePaths=-{custom_str}\n"
+        ),
+    )
+    .unwrap();
+    let (ok, text) = sh("systemctl", &["daemon-reload"]);
+    assert!(ok, "daemon-reload: {text}");
+
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(
+        ok,
+        "systemctl start from absent custom marker dir {custom_str}: {text}"
+    );
+    assert_eq!(
+        pty.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#
+    );
+    let (_, pid_raw) = sh(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", "qeminga.service"],
+    );
+    let pid = pid_raw.trim();
+    let (run_id, run_opts, _) = effective_mount_in_ns(pid, "/run");
+    assert!(
+        vfs_opts_has(&run_opts, "ro"),
+        "/run must stay ro under custom marker drop-in (mnt_id={run_id} opts={run_opts:?})"
+    );
+    let (cust_id, cust_opts, _) = effective_mount_in_ns(pid, custom_str);
+    assert!(
+        vfs_opts_has(&cust_opts, "rw") && cust_id != run_id,
+        "{custom_str} must be rw on a distinct mount (mnt_id={cust_id} run_id={run_id} opts={cust_opts:?})"
+    );
+
+    let reply = pty.request(r#"{"execute":"guest-fsfreeze-freeze"}"#);
+    assert!(reply.starts_with(r#"{"return":"#), "freeze: {reply}");
+    let dir = std::fs::metadata(&custom_dir).unwrap();
+    assert_eq!((dir.uid(), dir.mode() & 0o777), (600, 0o700));
+    let marker = std::fs::metadata(&custom_marker).unwrap();
+    assert_eq!((marker.uid(), marker.mode() & 0o777), (600, 0o600));
+    let reply = pty.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
+    assert!(reply.starts_with(r#"{"return":"#), "thaw: {reply}");
+    assert!(!custom_marker.exists());
+
+    // Restart with a pre-existing custom marker: ExecStartPre=+ must preserve it
+    // and the restarted daemon must enter recovery mode and drain/remove it.
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
+    let (_, since_raw) = sh("date", &["-u", "+%Y-%m-%d %H:%M:%S UTC"]);
+    let since = since_raw.trim();
+    create_qeminga_file(&custom_dir, "frozen");
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(ok, "systemctl start with existing custom marker: {text}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while custom_marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (_, log) = sh(
+        "journalctl",
+        &[
+            "-u",
+            "qeminga.service",
+            "--no-pager",
+            "-o",
+            "cat",
+            "--since",
+            since,
+        ],
+    );
+    assert!(
+        !custom_marker.exists(),
+        "restarted unit must preserve and recover pre-existing custom marker:\n{log}"
+    );
+    assert!(
+        log.contains("\"recovery\":true"),
+        "restarted unit must enter recovery mode from preserved custom marker:\n{log}"
+    );
+    assert_eq!(
+        pty.request(r#"{"execute":"guest-fsfreeze-status"}"#),
+        r#"{"return":"thawed"}"#
     );
     let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
     assert!(ok, "systemctl stop: {text}");
@@ -1031,23 +1666,37 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
 
 /// The installed artifact under the shipped defaults (enforced
 /// hardening, real kernel): the daemon's effective capabilities,
-/// no-new-privileges, seccomp mode, a prohibited operation and a real
-/// freeze/thaw on the loop ext4 all match the advertised profile, and a
-/// test-kernel request is refused with the marker left alone (#43 §4).
-/// Under the `seccomp-log` compatibility build the same start is refused
-/// outright, which is the negative half of the same property.
+/// no-new-privileges, seccomp mode, filesystem write confinement (#66),
+/// a prohibited operation, a real freeze/thaw with pinned deduplicated
+/// counts on the known loop layout (ext4, bind mount, and xfs when
+/// present), post-drop read-write channel reopen, and SIGKILL crash
+/// recovery all match the advertised profile, and a test-kernel request
+/// is refused with the marker left alone (#43 §4). Under the
+/// `seccomp-log` compatibility build the same start is refused outright,
+/// which is the negative half of the same property.
 #[test]
 #[ignore = "needs root, a running systemd and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_installed_unit_matches_the_advertised_profile() {
     use std::io::Write;
-    let mount = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
+    use std::os::unix::fs::MetadataExt;
+    let ext4 = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup");
+    let ext4_bind = std::env::var("QEMINGA_TEST_EXT4_BIND").ok();
+    let xfs = std::env::var("QEMINGA_TEST_XFS_MOUNT").ok();
+    let mut thaw_targets = vec![ext4.clone()];
+    if let Some(ref x) = xfs {
+        thaw_targets.push(x.clone());
+    }
     // A failed assertion between the freeze and the thaw would otherwise
-    // leave the loop ext4 frozen for the rest of the serial run: the
+    // leave a loop filesystem frozen for the rest of the serial run: the
     // unit's drop SIGKILLs the daemon, watchdog included.
-    let _thaw = e2e::ThawGuard::new(std::slice::from_ref(&mount));
-    let mut pty = PtyChannel::open();
-    let Some(installed) = install_unit_with(&pty.slave_path, true) else {
+    let _thaw = e2e::ThawGuard::new(&thaw_targets);
+
+    let channel_link = Path::new("/run/qeminga-test-channel");
+    let _channel_guard = PathGuard(channel_link.to_path_buf());
+    let mut pty1 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty1.slave_path);
+    let Some(installed) = install_unit_with(channel_link.to_str().unwrap(), true) else {
         return;
     };
     let _ = std::fs::remove_file("/run/qeminga/frozen");
@@ -1112,14 +1761,15 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
     assert!(ok, "systemctl start: {text}\n{}", journal());
     assert_eq!(
-        pty.request(r#"{"execute":"guest-ping"}"#),
+        pty1.request(r#"{"execute":"guest-ping"}"#),
         r#"{"return":{}}"#
     );
-    let (_, pid) = sh(
+    let (_, pid_raw) = sh(
         "systemctl",
         &["show", "-p", "MainPID", "--value", "qeminga.service"],
     );
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.trim())).unwrap();
+    let pid = pid_raw.trim().to_owned();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let field = |name: &str| -> String {
         status
             .lines()
@@ -1138,24 +1788,73 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     assert_eq!(field("NoNewPrivs:"), "1");
     assert_eq!(field("Seccomp:"), "2", "SECCOMP_MODE_FILTER");
     assert!(field("Uid:").starts_with("600\t600"), "{}", field("Uid:"));
-    // A prohibited operation is refused; a real freeze/thaw works.
-    let reply = pty.request(r#"{"execute":"guest-exec","arguments":{"path":"/bin/true"}}"#);
+
+    // #66: verify write confinement inside the running service's mount namespace.
+    assert_unit_write_confinement(&pid);
+
+    // A prohibited operation is refused; a real freeze/thaw on the known loop
+    // layout (ext4 + bind alias deduplicated, plus xfs when available) works
+    // under ProtectSystem=strict with exact nonzero counts.
+    let reply = pty1.request(r#"{"execute":"guest-exec","arguments":{"path":"/bin/true"}}"#);
     assert!(reply.contains("CommandNotFound"), "{reply}");
-    let reply = pty.request(&format!(
-        r#"{{"execute":"guest-fsfreeze-freeze-list","arguments":{{"mountpoints":["{mount}"]}}}}"#
-    ));
-    assert_eq!(reply, r#"{"return":1}"#, "freeze under the installed unit");
-    assert!(Path::new("/run/qeminga/frozen").exists());
-    let reply = pty.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
-    assert!(reply.starts_with(r#"{"return":"#), "{reply}");
+    let mut requested = vec![ext4.clone()];
+    if let Some(ref bind) = ext4_bind {
+        requested.push(bind.clone());
+    }
+    if let Some(ref x) = xfs {
+        requested.push(x.clone());
+    }
+    let expected_count: u64 = if xfs.is_some() { 2 } else { 1 };
+    let freeze_req = serde_json::json!({
+        "execute": "guest-fsfreeze-freeze-list",
+        "arguments": { "mountpoints": requested },
+    })
+    .to_string();
+    let expected_reply = format!(r#"{{"return":{expected_count}}}"#);
+
+    let reply = pty1.request(&freeze_req);
+    assert_eq!(
+        reply, expected_reply,
+        "pinned freeze count under ProtectSystem=strict for {requested:?}"
+    );
+    let marker = std::fs::metadata("/run/qeminga/frozen").unwrap();
+    assert_eq!(marker.uid(), 600);
+    assert_eq!(marker.mode() & 0o777, 0o600);
+    let reply = pty1.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
+    assert_eq!(
+        reply, expected_reply,
+        "pinned thaw count under ProtectSystem=strict"
+    );
     assert!(!Path::new("/run/qeminga/frozen").exists());
-    std::fs::File::create(format!("{mount}/installed-unit-probe"))
-        .and_then(|mut f| f.write_all(b"ok"))
-        .expect("the loop filesystem is thawed");
+    for target in &thaw_targets {
+        std::fs::File::create(format!("{target}/installed-unit-probe"))
+            .and_then(|mut f| f.write_all(b"ok"))
+            .unwrap_or_else(|e| panic!("loop filesystem {target} must be thawed: {e}"));
+    }
+
+    // #66: read-write channel reopen after privilege drop under ProtectSystem=strict.
+    let mut pty2 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty2.slave_path);
+    drop(pty1);
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#,
+        "dropped daemon must reopen channel O_RDWR under ProtectSystem=strict"
+    );
+    let (_, pid_after_reopen) = sh(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", "qeminga.service"],
+    );
+    assert_eq!(
+        pid_after_reopen.trim(),
+        pid,
+        "channel reopen must occur in the existing dropped daemon"
+    );
+
     // Every thread, not only the main one (§5.4): the ceiling is per
     // thread, and the freeze and thaw have put the audit writer and the
     // blocking pool to work.
-    let threads = e2e::thread_statuses(pid.trim().parse().unwrap());
+    let threads = e2e::thread_statuses(pid.parse().unwrap());
     let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"qeminga-audit"), "{names:?}");
     assert!(threads.len() >= 3, "{names:?}");
@@ -1174,6 +1873,55 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
             t.field("Uid:")
         );
     }
+
+    // #66: crash recovery under the confined unit (SIGKILL while frozen ->
+    // Restart=always -> marker recovery drains real ext4/xfs superblocks
+    // and removes the marker under ProtectSystem=strict).
+    let reply = pty2.request(&freeze_req);
+    assert_eq!(reply, expected_reply, "second freeze before SIGKILL");
+    assert!(Path::new("/run/qeminga/frozen").exists());
+    let (ok, text) = sh(
+        "systemctl",
+        &["kill", "--signal=SIGKILL", "qeminga.service"],
+    );
+    assert!(ok, "systemctl kill: {text}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+        let (_, new_pid) = sh(
+            "systemctl",
+            &["show", "-p", "MainPID", "--value", "qeminga.service"],
+        );
+        let new_pid = new_pid.trim();
+        if active.trim() == "active"
+            && !new_pid.is_empty()
+            && new_pid != "0"
+            && new_pid != pid
+            && !Path::new("/run/qeminga/frozen").exists()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted unit did not recover marker after SIGKILL (active={active:?}, new_pid={new_pid:?}, marker={}):\n{}",
+            Path::new("/run/qeminga/frozen").exists(),
+            journal()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-fsfreeze-status"}"#),
+        r#"{"return":"thawed"}"#,
+        "restarted unit must report thawed after crash recovery"
+    );
+    for target in &thaw_targets {
+        std::fs::File::create(format!("{target}/installed-unit-recovery-probe"))
+            .and_then(|mut f| f.write_all(b"recovered"))
+            .unwrap_or_else(|e| {
+                panic!("loop filesystem {target} must be thawed after recovery: {e}")
+            });
+    }
+
     let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
     assert!(ok, "systemctl stop: {text}");
     // The distributed profile cannot be talked into faking the kernel.

@@ -60,11 +60,16 @@ confidentiality boundary for guest file contents after parser compromise
 (see `docs/design.md` §5.9 and `docs/tasks.md` OQ-10). Ordinary file opens,
 writes, and unlinks (`openat`/`write`/`pwrite64`/`fsync`/`unlinkat`) remain
 in the filter and are bounded by guest Unix permissions (UID/GID 600, with
-`CAP_DAC_OVERRIDE` dropped) and systemd service confinement (the shipped
-unit currently sets `ProtectSystem=no`, `ProtectHome=no`, and
-`PrivateTmp=no`). Under an installed, enforcing seccomp filter (required by
-`hardening = "enforced"`; the filter may be absent or logging-only under
-the development-only opt-out `hardening = "unenforced-development-only"`),
+`CAP_DAC_OVERRIDE` dropped) and the shipped systemd unit confinement
+(`ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=no`,
+`ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`,
+`BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`,
+`SystemCallFilter=~@mount`, and `UMask=0077`), confining ordinary file writes
+on mounts present at service start to `/run/qeminga` (with residual writable
+objects inventoried in `packaging/README.md`). Under an installed, enforcing
+seccomp filter (required by `hardening = "enforced"`; the filter may be absent
+or logging-only under the development-only opt-out
+`hardening = "unenforced-development-only"`),
 IP socket creation (`AF_INET`/`AF_INET6`), `connect`/`accept`/`listen`, and
 `execve`/`execveat` are denied in every profile. `socket` is absent when
 `information = false` and restricted to

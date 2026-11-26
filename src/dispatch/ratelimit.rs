@@ -36,19 +36,7 @@ pub enum CommandClass {
 impl CommandClass {
     /// Classifies an allowlisted method; `None` for anything else.
     pub fn of(method: &str) -> Option<CommandClass> {
-        Some(match method {
-            "guest-ping" | "guest-sync" | "guest-sync-delimited" | "guest-info" => {
-                CommandClass::PingSync
-            }
-            "guest-get-osinfo" | "guest-get-fsinfo" | "guest-network-get-interfaces" => {
-                CommandClass::Get
-            }
-            "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => CommandClass::FsfreezeFreeze,
-            "guest-fsfreeze-status" | "guest-fsfreeze-thaw" => CommandClass::Unlimited,
-            "guest-fstrim" => CommandClass::Fstrim,
-            "guest-shutdown" | "guest-suspend-ram" => CommandClass::Shutdown,
-            _ => return None,
-        })
+        crate::handlers::Command::from_method(method).map(crate::handlers::Command::rate_class)
     }
 
     /// The name used in error descriptions and audit records; matches the

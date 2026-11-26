@@ -3,9 +3,10 @@
 //! Replies with the upstream `GuestAgentInfo` shape: `version` and
 //! `supported_commands` (underscore), each entry a `GuestAgentCommandInfo`
 //! with `name`, `enabled`, and `success-response` (hyphen). The list is
-//! built from [`SUPPORTED_COMMANDS`] plus the configuration flags; there
-//! is no second hand-maintained list. A frozen state does not change the
-//! advertised capabilities.
+//! built from [`Command::ALL`] and [`Command::is_enabled`] (the same
+//! guest-derived policy enforced by the dispatcher); there is no second
+//! hand-maintained list. A frozen state does not change the advertised
+//! capabilities.
 #![forbid(unsafe_code)]
 
 use serde::Serialize;
@@ -13,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::config::Config;
 use crate::dispatch::Context;
-use crate::handlers::{NoArgs, SUPPORTED_COMMANDS};
+use crate::handlers::{Command, NoArgs};
 use crate::proto::{Error, Request, arguments};
 
 /// One `GuestAgentCommandInfo` entry.
@@ -37,32 +38,20 @@ pub struct AgentInfo {
     pub supported_commands: Vec<CommandInfo>,
 }
 
-/// Builds the capability list for `config`.
+/// Builds the capability list for `config` using the same guest-derived
+/// command policy ([`Command::is_enabled`]) that the dispatcher enforces.
 pub fn agent_info(config: &Config) -> AgentInfo {
+    let authority = config.authority();
     AgentInfo {
         version: crate::VERSION,
-        supported_commands: SUPPORTED_COMMANDS
+        supported_commands: Command::ALL
             .iter()
-            .map(|spec| CommandInfo {
-                name: spec.name,
-                enabled: is_enabled(config, spec.name),
-                success_response: spec.success_response,
+            .map(|&cmd| CommandInfo {
+                name: cmd.name(),
+                enabled: cmd.is_enabled(&authority),
+                success_response: cmd.success_response(),
             })
             .collect(),
-    }
-}
-
-/// The runtime/compile-time switches, mirrored from the dispatcher's
-/// feature gate.
-fn is_enabled(config: &Config, name: &str) -> bool {
-    match name {
-        "guest-fstrim" => config.fstrim_enabled(),
-        "guest-suspend-ram" => config.suspend_ram_enabled(),
-        "guest-shutdown" => config.shutdown_enabled(),
-        "guest-get-osinfo" | "guest-network-get-interfaces" | "guest-get-fsinfo" => {
-            config.information_enabled()
-        }
-        _ => true,
     }
 }
 
@@ -76,6 +65,7 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
 mod tests {
     use super::*;
     use crate::audit::Router;
+    use crate::handlers::SUPPORTED_COMMANDS;
     use crate::proto::parse_request;
     use crate::state::{FreezeState, FreezeStateMachine};
     use std::sync::Arc;

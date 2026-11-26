@@ -4,15 +4,15 @@
 //! Order of evaluation for every frame (C-7):
 //!
 //! 1. parse ([`crate::proto::parse_request`], bounds first);
-//! 2. allowlist ([`is_allowlisted`], a `match` on the method string);
-//! 3. runtime feature gate (`guest-fstrim`, `guest-suspend-ram`,
-//!    `guest-shutdown` and the information commands may be disabled by
-//!    configuration → `CommandNotFound`, C-2, §5.9);
+//! 2. allowlist ([`Command::from_method`], a single static `match` on the
+//!    method string into an exhaustive [`Command`] enum);
+//! 3. guest command policy ([`Command::is_enabled`], shared with
+//!    `guest-info`; disabled commands → `CommandNotFound`, C-2, §5.9);
 //! 4. rate limiter ([`ratelimit`]);
-//! 5. freeze gate ([`is_frozen_safe`]; anything else is rejected while the
-//!    state is not `Thawed`, AC9);
-//! 6. the handler, chosen by a static `match` (§5.1). There is no lookup
-//!    table, registry, or plugin mechanism.
+//! 5. freeze gate ([`Command::is_frozen_safe`]; anything else is rejected
+//!    while the state is not `Thawed`, AC9);
+//! 6. the handler, chosen by an exhaustive static `match` on [`Command`]
+//!    (§5.1). There is no lookup table, registry, or plugin mechanism.
 //!
 //! Every received frame produces exactly one audit record (§9), emitted
 //! before the handler runs so that a `guest-shutdown` record precedes the
@@ -30,60 +30,31 @@ use crate::audit::{AuditRecord, Disposition, Router, project_method};
 use crate::channel::Kind;
 use crate::config::Config;
 use crate::framing::{DecodeEvent, encode};
-use crate::handlers;
+use crate::handlers::{self, Command};
 use crate::proto::{Error, Request, Response, parse_request};
 use crate::state::FreezeStateMachine;
-use ratelimit::{CommandClass, RateLimiter};
+use ratelimit::RateLimiter;
+
+pub use crate::handlers::Command as AllowlistedCommand;
 
 /// `true` for the commands in the design §3 allowlist.
 ///
-/// A `match`, not a table lookup (§5.1); the consistency test keeps it in
-/// step with [`handlers::SUPPORTED_COMMANDS`].
+/// Backed by the single static `match` in [`Command::from_method`] (§5.1).
 pub fn is_allowlisted(method: &str) -> bool {
-    matches!(
-        method,
-        "guest-ping"
-            | "guest-info"
-            | "guest-sync"
-            | "guest-sync-delimited"
-            | "guest-get-osinfo"
-            | "guest-network-get-interfaces"
-            | "guest-get-fsinfo"
-            | "guest-fsfreeze-status"
-            | "guest-fsfreeze-freeze"
-            | "guest-fsfreeze-freeze-list"
-            | "guest-fsfreeze-thaw"
-            | "guest-fstrim"
-            | "guest-shutdown"
-            | "guest-suspend-ram"
-    )
+    Command::from_method(method).is_some()
 }
 
 /// `true` for the six commands accepted while filesystems are frozen
 /// (§5.3): status, thaw, ping, sync, sync-delimited, info.
 pub fn is_frozen_safe(method: &str) -> bool {
-    matches!(
-        method,
-        "guest-fsfreeze-status"
-            | "guest-fsfreeze-thaw"
-            | "guest-ping"
-            | "guest-sync"
-            | "guest-sync-delimited"
-            | "guest-info"
-    )
+    Command::from_method(method).is_some_and(Command::is_frozen_safe)
 }
 
 /// The session lane of an allowlisted method (§5.7): the frozen-safe
 /// controls run beside the command in progress, a thaw beside a freeze,
-/// everything else one at a time. Derived from [`is_frozen_safe`] so the
-/// two never disagree.
+/// everything else one at a time. Unknown methods run in the serial lane.
 pub fn lane(method: &str) -> Kind {
-    match method {
-        "guest-fsfreeze-thaw" => Kind::Thaw,
-        "guest-fsfreeze-freeze" | "guest-fsfreeze-freeze-list" => Kind::Freeze,
-        _ if is_frozen_safe(method) => Kind::Control,
-        _ => Kind::Ordinary,
-    }
+    Command::from_method(method).map_or(Kind::Ordinary, Command::lane)
 }
 
 /// Audit `reason` values for denied frames.
@@ -495,8 +466,9 @@ impl Dispatcher {
             }
         };
 
-        let result = match self.gates(&req) {
-            Ok(()) => {
+        let cmd = Command::from_method(&req.method);
+        let result = match self.gates(cmd, &req.method) {
+            Ok(allowed) => {
                 AuditRecord {
                     method: project_method(&req.method),
                     id: req.id,
@@ -505,7 +477,7 @@ impl Dispatcher {
                     freeze_state_before,
                 }
                 .emit();
-                self.run_handler(&req).await
+                self.run_handler(allowed, &req).await
             }
             Err((denial, err)) => {
                 AuditRecord {
@@ -520,13 +492,13 @@ impl Dispatcher {
             }
         };
 
-        let suppress_success = handlers::spec(&req.method).is_some_and(|s| !s.success_response);
+        let suppress_success = cmd.is_some_and(|c| !c.success_response());
         if result.is_ok() && suppress_success {
             return None;
         }
         // Every reply to `guest-sync-delimited` (success or error) carries
         // the sentinel so a client that is resynchronising can find it (C-10).
-        let sentinel = req.method == "guest-sync-delimited";
+        let sentinel = cmd.is_some_and(Command::sends_sentinel);
         Some(encode(
             &Response::from_result(req.id, result).to_json(),
             sentinel,
@@ -549,76 +521,53 @@ impl Dispatcher {
         }
     }
 
-    /// Steps 2–5 of the dispatch order (C-7). On denial returns the audit
-    /// reason together with the wire error.
-    fn gates(&self, req: &Request) -> Result<(), (&'static str, Error)> {
-        let method = req.method.as_str();
-        if !is_allowlisted(method) {
+    /// Steps 2–5 of the dispatch order (C-7), evaluated live when the
+    /// lane admits the command. On denial returns the audit reason together
+    /// with the wire error.
+    fn gates(&self, cmd: Option<Command>, method: &str) -> Result<Command, (&'static str, Error)> {
+        let Some(cmd) = cmd else {
             return Err((
                 reason::COMMAND_NOT_FOUND,
                 Error::CommandNotFound(method.to_owned()),
             ));
+        };
+        if !cmd.is_enabled(&self.ctx.config.authority()) {
+            return Err((reason::DISABLED, Error::Disabled(method.to_owned())));
         }
-        self.runtime_feature_gate(method)
-            .map_err(|err| (reason::DISABLED, err))?;
-        // Every allowlisted method has a class; treat the impossible `None`
-        // as the strictest class rather than skipping the limiter.
-        let class = CommandClass::of(method).unwrap_or(CommandClass::Shutdown);
         self.limiter
-            .check(class)
+            .check(cmd.rate_class())
             .map_err(|err| (reason::RATE_LIMITED, Error::from(err)))?;
-        if self.ctx.state.is_frozen_for_gate() && !is_frozen_safe(method) {
+        if self.ctx.state.is_frozen_for_gate() && !cmd.is_frozen_safe() {
             return Err((reason::FROZEN, Error::Frozen));
         }
-        Ok(())
+        Ok(cmd)
     }
 
-    /// Runtime half of the two-level feature switches (§8.1, C-2).
-    fn runtime_feature_gate(&self, method: &str) -> Result<(), Error> {
-        let config = &self.ctx.config;
-        match method {
-            "guest-fstrim" if !config.fstrim_enabled() => Err(Error::Disabled(method.to_owned())),
-            "guest-suspend-ram" if !config.suspend_ram_enabled() => {
-                Err(Error::Disabled(method.to_owned()))
-            }
-            "guest-shutdown" if !config.shutdown_enabled() => {
-                Err(Error::Disabled(method.to_owned()))
-            }
-            "guest-get-osinfo" | "guest-network-get-interfaces" | "guest-get-fsinfo"
-                if !config.information_enabled() =>
-            {
-                Err(Error::Disabled(method.to_owned()))
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Step 6: the static allowlist `match` (§5.1). Nothing is looked up
-    /// in a table.
-    async fn run_handler(&self, req: &Request) -> Result<Value, Error> {
+    /// Step 6: exhaustive static `match` on [`Command`] (§5.1). Nothing is
+    /// looked up in a table.
+    async fn run_handler(&self, cmd: Command, req: &Request) -> Result<Value, Error> {
         self.ctx.handler_calls.fetch_add(1, Ordering::SeqCst);
         let ctx = &*self.ctx;
-        match req.method.as_str() {
-            "guest-ping" => handlers::ping::handle(ctx, req).await,
-            "guest-info" => handlers::info::handle(ctx, req).await,
-            "guest-sync" => handlers::sync::sync(ctx, req).await,
-            "guest-sync-delimited" => handlers::sync::sync_delimited(ctx, req).await,
-            "guest-get-osinfo" => handlers::osinfo::handle(ctx, req).await,
-            "guest-network-get-interfaces" => handlers::interfaces::handle(ctx, req).await,
-            "guest-get-fsinfo" => handlers::fsinfo::handle(ctx, req).await,
-            "guest-fsfreeze-status" => handlers::fsfreeze::status(&self.ctx, req).await,
-            "guest-fsfreeze-freeze" => handlers::fsfreeze::freeze(&self.ctx, req).await,
-            "guest-fsfreeze-freeze-list" => handlers::fsfreeze::freeze_list(&self.ctx, req).await,
-            "guest-fsfreeze-thaw" => handlers::fsfreeze::thaw(&self.ctx, req).await,
-            "guest-fstrim" => handlers::fstrim::handle(ctx, req).await,
-            "guest-shutdown" => handlers::shutdown::handle(ctx, req).await,
+        match cmd {
+            Command::Ping => handlers::ping::handle(ctx, req).await,
+            Command::Info => handlers::info::handle(ctx, req).await,
+            Command::Sync => handlers::sync::sync(ctx, req).await,
+            Command::SyncDelimited => handlers::sync::sync_delimited(ctx, req).await,
+            Command::GetOsInfo => handlers::osinfo::handle(ctx, req).await,
+            Command::NetworkGetInterfaces => handlers::interfaces::handle(ctx, req).await,
+            Command::GetFsInfo => handlers::fsinfo::handle(ctx, req).await,
+            Command::FsfreezeStatus => handlers::fsfreeze::status(&self.ctx, req).await,
+            Command::FsfreezeFreeze => handlers::fsfreeze::freeze(&self.ctx, req).await,
+            Command::FsfreezeFreezeList => handlers::fsfreeze::freeze_list(&self.ctx, req).await,
+            Command::FsfreezeThaw => handlers::fsfreeze::thaw(&self.ctx, req).await,
+            Command::Fstrim => handlers::fstrim::handle(ctx, req).await,
+            Command::Shutdown => handlers::shutdown::handle(ctx, req).await,
             #[cfg(feature = "suspend_ram")]
-            "guest-suspend-ram" => handlers::suspend::handle(ctx, req).await,
-            // Unreachable: the runtime feature gate already answered
+            Command::SuspendRam => handlers::suspend::handle(ctx, req).await,
+            // Unreachable: `Command::is_enabled` already answered
             // `Disabled` for builds without the feature (§8.1).
             #[cfg(not(feature = "suspend_ram"))]
-            "guest-suspend-ram" => Err(Error::Disabled(req.method.clone())),
-            other => Err(Error::CommandNotFound(other.to_owned())),
+            Command::SuspendRam => Err(Error::Disabled(cmd.name().to_owned())),
         }
     }
 }
@@ -627,6 +576,7 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use crate::audit;
+    use crate::dispatch::ratelimit::CommandClass;
     use crate::framing::MAX_FRAME_LEN;
 
     #[test]

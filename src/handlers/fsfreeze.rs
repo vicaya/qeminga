@@ -65,6 +65,7 @@
 //! `spawn_blocking`.
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,6 +79,7 @@ use crate::handlers::NoArgs;
 use crate::kernel::{KernelError, KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
 use crate::mountinfo::MountSource;
+use crate::ownership::{OwnershipError, OwnershipSnapshot, OwnershipStore, TargetOwnership};
 use crate::proto::{Error, Request, arguments};
 use crate::state::{FreezeState, ThawToken};
 use crate::watchdog::{ThawFn, Watchdog, WatchdogConfig};
@@ -363,6 +365,7 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     let kernel = Arc::clone(&ctx.kernel);
     let mounts = Arc::clone(&ctx.mounts);
     let marker = ctx.marker.clone();
+    let ownership = ctx.ownership.clone();
     let audit = ctx.audit.clone();
     let allowed = ctx.config.agent.freeze_allowed_mountpoints.clone();
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
@@ -371,64 +374,141 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     // (from `Thawed`, after a restart, or after an operation with an
     // uncertain target) discovers every planned superblock (scoped to the
     // guest's freeze allowlist when configured and marker absence is confirmed
-    // via ENOENT, #63) and also drains any deferred cleanup obligations left
-    // behind by an earlier clean-`Thawed` recovery drain.
+    // via ENOENT in sole-freezer mode, #63, or strictly to superblocks owned
+    // by qeminga when cooperative ownership is configured, #69) and also drains
+    // any deferred cleanup obligations left behind by an earlier clean-`Thawed`
+    // recovery drain.
     let discover = token.is_recovery_drain() || ctx.thaw_scope() == ThawScope::Discovery;
     let from_thawed = token.is_recovery_drain();
+    let has_ownership = ownership.is_some();
     let mut held = ctx.take_frozen_mounts();
     if discover {
         held.extend(ctx.take_deferred_recovery_mounts());
     }
     let clean_thawed_confirmed = Arc::new(AtomicBool::new(false));
     let clean_thawed_worker = Arc::clone(&clean_thawed_confirmed);
-    let (outcome, held, clean_thawed) = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&dispatch, || {
-            let mut held = held;
-            // Only ENOENT (`Ok(false)`) confirms the marker is absent so a
-            // `Thawed` drain can narrow to the guest allowlist and finish
-            // without touching the marker (#63). If a marker is present or
-            // its probe is indeterminate, escalate to full marker recovery and
-            // switch the audit router to the freeze-safe ring before any
-            // recovery I/O (`on_thawed` flushes back to normal on settlement).
-            let clean_thawed = from_thawed && matches!(marker.probe(), Ok(false));
-            if clean_thawed {
-                clean_thawed_worker.store(true, Ordering::Release);
-            } else if from_thawed {
-                audit.enter_ring();
-            }
-            // Discovery and drain are separate: the handles this process
-            // holds are drained whether or not the mount table can be
-            // read (`thaw_blocking`), and a tracked thaw reads none.
-            let plan = discover
-                .then(|| build_recovery_plan(mounts.as_ref(), allowed.as_deref(), clean_thawed));
-            let outcome = thaw_blocking(
-                kernel.as_ref(),
-                &marker,
-                plan,
-                &mut held,
-                !clean_thawed,
-                allowed.is_some(),
-            );
-            (outcome, held, clean_thawed)
+    let (outcome, held, clean_thawed, need_discovery, marker_retained) =
+        tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                let mut held = held;
+                let mut need_discovery = false;
+                let mut marker_retained = true;
+                let mut clean_thawed = false;
+                let outcome = match ownership.as_deref() {
+                    Some(store) if discover => {
+                        let snapshot = store.inspect_all();
+                        // Only ENOENT (`Ok(false)`) confirms marker absence (#63);
+                        // an indeterminate `fstatat` error escalates into recovery
+                        // instead of taking the idle `Ok(0)` fast path (#63 + #69).
+                        let marker_probe = marker.probe();
+                        let marker_confirmed_absent = matches!(marker_probe, Ok(false));
+                        if let Err(err) = &marker_probe {
+                            tracing::error!(
+                                event = "marker_probe_indeterminate",
+                                error = %err,
+                                "cannot confirm recovery marker absence during cooperative thaw; escalating to recovery"
+                            );
+                        }
+                        if from_thawed
+                            && marker_confirmed_absent
+                            && held.is_empty()
+                            && matches!(
+                                &snapshot,
+                                Ok(s) if s.owned_by_self.is_empty() && s.ambiguous.is_empty()
+                            )
+                        {
+                            Ok(0)
+                        } else {
+                            if from_thawed {
+                                audit.enter_ring();
+                            }
+                            if !matches!(marker_probe, Ok(true)) {
+                                match marker.create() {
+                                    Ok(()) | Err(MarkerError::AlreadyPresent { .. }) => {}
+                                    Err(err) => {
+                                        tracing::error!(
+                                            event = "fsfreeze_recovery_marker_create_failed",
+                                            error = %err,
+                                            "cannot create recovery marker when escalating cooperative thaw to recovery; continuing drain"
+                                        );
+                                        marker_retained = false;
+                                    }
+                                }
+                            }
+                            thaw_blocking_cooperative(
+                                kernel.as_ref(),
+                                mounts.as_ref(),
+                                &marker,
+                                store,
+                                snapshot,
+                                allowed.as_deref(),
+                                &mut held,
+                                &mut need_discovery,
+                            )
+                        }
+                    }
+                    maybe_store => {
+                        // Only ENOENT (`Ok(false)`) confirms the marker is absent so a
+                        // `Thawed` drain can narrow to the guest allowlist and finish
+                        // without touching the marker (#63). If a marker is present or
+                        // its probe is indeterminate, escalate to full marker recovery and
+                        // switch the audit router to the freeze-safe ring before any
+                        // recovery I/O (`on_thawed` flushes back to normal on settlement).
+                        clean_thawed =
+                            maybe_store.is_none() && from_thawed && matches!(marker.probe(), Ok(false));
+                        if clean_thawed {
+                            clean_thawed_worker.store(true, Ordering::Release);
+                        } else if from_thawed {
+                            audit.enter_ring();
+                        }
+                        // Discovery and drain are separate: the handles this process
+                        // holds are drained whether or not the mount table can be
+                        // read (`thaw_blocking`), and a tracked thaw reads none.
+                        let plan = discover.then(|| {
+                            build_recovery_plan(mounts.as_ref(), allowed.as_deref(), clean_thawed)
+                        });
+                        thaw_blocking(
+                            kernel.as_ref(),
+                            maybe_store,
+                            &marker,
+                            plan,
+                            &mut held,
+                            !clean_thawed,
+                            allowed.is_some(),
+                            &mut need_discovery,
+                        )
+                    }
+                };
+                (outcome, held, clean_thawed, need_discovery, marker_retained)
+            })
         })
-    })
-    .await
-    .unwrap_or_else(|err| {
-        // The task is lost with the descriptors it took: they are no
-        // longer evidence of complete ownership, so the next thaw must
-        // discover its targets (§4.2 "Thaw scope"), as after a lost
-        // recovery drain in the coordinator. Preserve the marker-probe
-        // decision (defaulting conservatively to `false` if ENOENT was
-        // never confirmed) so an escalated recovery fails closed to
-        // `Frozen` and re-arms the watchdog.
-        tracing::error!(event = "fsfreeze_thaw_lost", error = %err, "thaw drain lost; targets uncertain");
+        .await
+        .unwrap_or_else(|err| {
+            // The task is lost with the descriptors it took: they are no
+            // longer evidence of complete ownership, so the next thaw must
+            // discover its targets (§4.2 "Thaw scope"), as after a lost
+            // recovery drain in the coordinator. Preserve the marker-probe
+            // decision (defaulting conservatively to `false` if ENOENT was
+            // never confirmed) so an escalated recovery fails closed to
+            // `Frozen` and re-arms the watchdog.
+            tracing::error!(event = "fsfreeze_thaw_lost", error = %err, "thaw drain lost; targets uncertain");
+            ctx.set_thaw_scope(ThawScope::Discovery);
+            let marker_retained = if has_ownership {
+                matches!(ctx.marker.probe(), Ok(true))
+            } else {
+                true
+            };
+            (
+                Err(ThawFailure::Task(err.to_string())),
+                Vec::new(),
+                !has_ownership && clean_thawed_confirmed.load(Ordering::Acquire),
+                true,
+                marker_retained,
+            )
+        });
+    if need_discovery {
         ctx.set_thaw_scope(ThawScope::Discovery);
-        (
-            Err(ThawFailure::Task(err.to_string())),
-            Vec::new(),
-            clean_thawed_confirmed.load(Ordering::Acquire),
-        )
-    });
+    }
 
     match outcome {
         Ok(thawed) => {
@@ -441,7 +521,7 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             tracing::info!(event = "fsfreeze_thawed", thawed, "filesystems thawed");
             Ok(thawed)
         }
-        Err(failure) if clean_thawed => {
+        Err(failure) if !has_ownership && clean_thawed => {
             // Nothing was frozen by this agent (the drain started from
             // `Thawed` and `marker.probe()` confirmed no marker existed),
             // so there is no frozen state to retain: keep undrained handles
@@ -467,10 +547,15 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // (§4.4); without it a failed thaw would be unbounded.
             ctx.state.thaw_failed(token);
             ctx.hooks.on_frozen(ctx);
-            tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; marker retained");
-            Err(Error::Internal(
-                failure.host_description(FreezeState::Frozen),
-            ))
+            if marker_retained {
+                tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; marker retained");
+            } else {
+                tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; recovery marker unavailable");
+            }
+            Err(Error::Internal(failure.host_description_with_marker(
+                FreezeState::Frozen,
+                marker_retained,
+            )))
         }
     }
 }
@@ -504,6 +589,12 @@ pub enum RecoveryReason {
     DrainLost,
     /// The recovery marker could not be removed after the drain.
     MarkerRetained,
+    /// Cooperative per-superblock freeze ownership is ambiguous (corrupt,
+    /// spoofed, non-regular, stray, or replaced entry; OQ-11, #69).
+    OwnershipAmbiguous,
+    /// Cooperative per-superblock freeze ownership could not be updated or
+    /// inspected due to an I/O error (OQ-11, #69).
+    OwnershipError,
 }
 
 impl RecoveryReason {
@@ -527,6 +618,22 @@ impl RecoveryReason {
             RecoveryReason::WorkerLost => "freeze worker lost; target outcome unknown",
             RecoveryReason::DrainLost => "recovery drain lost; targets uncertain",
             RecoveryReason::MarkerRetained => "cannot remove recovery marker",
+            RecoveryReason::OwnershipAmbiguous => {
+                "freeze ownership is ambiguous; cannot confirm complete recovery"
+            }
+            RecoveryReason::OwnershipError => "cannot update freeze ownership state",
+        }
+    }
+}
+
+/// Maps an [`OwnershipError`] to its fixed host-safe [`RecoveryReason`].
+pub(crate) fn recovery_reason_for_ownership_error(err: &OwnershipError) -> RecoveryReason {
+    match err {
+        OwnershipError::OpenDir { .. } | OwnershipError::Io { .. } => {
+            RecoveryReason::OwnershipError
+        }
+        OwnershipError::TooManyEntries { .. } | OwnershipError::NotOwnedBySelf { .. } => {
+            RecoveryReason::OwnershipAmbiguous
         }
     }
 }
@@ -543,7 +650,8 @@ pub enum FreezeTaskStage {
 }
 
 /// What stopped a freeze at a target: the kernel's answer to `FIFREEZE`,
-/// or no pathname of the target leading to its superblock.
+/// no pathname of the target leading to its superblock, or a cooperative
+/// ownership failure (OQ-11, #69).
 #[derive(Debug)]
 pub enum FreezeStop {
     /// `FIFREEZE` failed with this error.
@@ -555,6 +663,20 @@ pub enum FreezeStop {
         attempts: String,
         /// `true` when every attempt failed with `EPERM`/`EACCES`.
         permission_denied: bool,
+    },
+    /// An ambiguous ownership entry prevented claiming this superblock; no
+    /// ioctl was issued.
+    OwnershipAmbiguous(String),
+    /// Claiming this superblock failed with an ownership store error; no
+    /// ioctl was issued.
+    OwnershipError(OwnershipError),
+    /// Releasing a freshly acquired ownership claim failed after a non-freeze
+    /// outcome; the claim may remain on disk so the frozen state is retained.
+    OwnershipReleaseFailed {
+        /// Host-safe classification.
+        kind: RecoveryReason,
+        /// Guest-local diagnostic detail.
+        detail: String,
     },
 }
 
@@ -579,6 +701,29 @@ impl FreezeStop {
                 permission_denied: false,
                 ..
             } => "target unreachable; no FIFREEZE issued",
+            FreezeStop::OwnershipAmbiguous(_) => {
+                "freeze ownership is ambiguous; cannot claim target"
+            }
+            FreezeStop::OwnershipError(err) => err.host_reason(),
+            FreezeStop::OwnershipReleaseFailed { kind, .. } => kind.host_reason(),
+        }
+    }
+
+    /// Returns the host-safe [`RecoveryReason`] and guest-local diagnostic when
+    /// a freeze stopped on unresolved cooperative ownership ambiguity or an
+    /// ownership store failure, requiring recovery state (`Frozen` +
+    /// `ThawScope::Discovery`, recovery marker retained, watchdog armed) rather
+    /// than settling `Thawed` (§4.2, OQ-11, #69).
+    pub(crate) fn ownership_recovery(&self) -> Option<(RecoveryReason, String)> {
+        match self {
+            FreezeStop::OwnershipAmbiguous(detail) => {
+                Some((RecoveryReason::OwnershipAmbiguous, detail.clone()))
+            }
+            FreezeStop::OwnershipError(err) => {
+                Some((recovery_reason_for_ownership_error(err), err.to_string()))
+            }
+            FreezeStop::OwnershipReleaseFailed { kind, detail } => Some((*kind, detail.clone())),
+            FreezeStop::Ioctl(_) | FreezeStop::Unreachable { .. } => None,
         }
     }
 }
@@ -592,6 +737,16 @@ impl std::fmt::Display for FreezeStop {
                     f,
                     "no mount point leads to it ({attempts}); no FIFREEZE issued"
                 )
+            }
+            FreezeStop::OwnershipAmbiguous(reason) => {
+                write!(
+                    f,
+                    "freeze ownership is ambiguous ({reason}); no FIFREEZE issued"
+                )
+            }
+            FreezeStop::OwnershipError(err) => write!(f, "{err}; no FIFREEZE issued"),
+            FreezeStop::OwnershipReleaseFailed { detail, .. } => {
+                write!(f, "cannot release freeze ownership claim ({detail})")
             }
         }
     }
@@ -858,9 +1013,22 @@ impl ThawFailure {
     /// alternate paths, device numbers and marker paths in guest-local
     /// diagnostics.
     pub fn host_description(&self, final_state: FreezeState) -> String {
-        let state_suffix = match final_state {
-            FreezeState::Thawed => "state thawed",
-            _ => "state frozen, marker retained",
+        self.host_description_with_marker(final_state, true)
+    }
+
+    /// Like [`ThawFailure::host_description`], distinguishing whether the
+    /// recovery marker is actually retained on disk when `final_state` is
+    /// `Frozen` (for example when escalating a marker-absent cooperative thaw
+    /// into recovery cannot create `/run/qeminga/frozen`).
+    pub fn host_description_with_marker(
+        &self,
+        final_state: FreezeState,
+        marker_retained: bool,
+    ) -> String {
+        let state_suffix = match (final_state, marker_retained) {
+            (FreezeState::Thawed, _) => "state thawed",
+            (_, true) => "state frozen, marker retained",
+            (_, false) => "state frozen, marker unavailable",
         };
         match self {
             ThawFailure::Plan { thawed, .. } => {
@@ -1019,20 +1187,40 @@ pub(crate) struct IncompleteDrain {
     pub(crate) detail: String,
 }
 
+/// Result of draining a set of held handles through [`drain_held`].
+pub(crate) struct DrainHeldResult {
+    /// Policy-authorized targets on which at least one `FITHAW` succeeded.
+    pub(crate) recovered: u64,
+    /// Handles whose drain did not complete (kept for a later attempt).
+    pub(crate) keep: Vec<HeldMount>,
+    /// First incomplete drain or claim-release failure, if any.
+    pub(crate) incomplete: Option<IncompleteDrain>,
+    /// `true` when releasing a cooperative ownership claim failed after a
+    /// complete drain, so subsequent recovery must discover from the ownership
+    /// store rather than blindly re-issuing `FITHAW` on a retained handle.
+    pub(crate) uncertain: bool,
+}
+
 /// Drains every processed target through the handle its freeze opened, in
 /// forward mount order, then removes the marker; `held` keeps the handles
 /// whose drain did not complete. Every processed target gets its drain,
 /// as in [`thaw_blocking`]: one that cannot be thawed is remembered and
 /// reported afterwards, and must not leave the later ones frozen until a
-/// recovery. Returns the failure to report.
+/// recovery. Returns `(failure, uncertain)`.
 pub(crate) fn rollback(
     kernel: &dyn KernelOps,
+    ownership: Option<&dyn OwnershipStore>,
     marker: &Marker,
     held: &mut Vec<HeldMount>,
     failed: &Path,
     cause: FreezeStop,
-) -> FreezeFailure {
-    let (rolled_back, keep, incomplete) = drain_held(kernel, std::mem::take(held));
+) -> (FreezeFailure, bool) {
+    let DrainHeldResult {
+        recovered: rolled_back,
+        keep,
+        incomplete,
+        uncertain,
+    } = drain_held(kernel, ownership, std::mem::take(held));
     *held = keep;
     let failed = lossy(failed);
     if let Some(IncompleteDrain {
@@ -1041,16 +1229,32 @@ pub(crate) fn rollback(
         detail,
     }) = incomplete
     {
-        return FreezeFailure::RollbackIncomplete {
-            failed,
-            cause,
-            mountpoint,
-            recovery_reason: kind,
-            reason: detail,
-            rolled_back,
-        };
+        return (
+            FreezeFailure::RollbackIncomplete {
+                failed,
+                cause,
+                mountpoint,
+                recovery_reason: kind,
+                reason: detail,
+                rolled_back,
+            },
+            uncertain,
+        );
     }
-    match marker.remove() {
+    if let Some((kind, detail)) = cause.ownership_recovery() {
+        return (
+            FreezeFailure::RollbackIncomplete {
+                failed: failed.clone(),
+                mountpoint: failed,
+                recovery_reason: kind,
+                reason: detail,
+                cause,
+                rolled_back,
+            },
+            true,
+        );
+    }
+    let failure = match marker.remove() {
         Ok(()) | Err(MarkerError::Absent { .. }) => FreezeFailure::Hard {
             mountpoint: failed,
             cause,
@@ -1062,6 +1266,92 @@ pub(crate) fn rollback(
             marker,
             rolled_back,
         },
+    };
+    (failure, uncertain)
+}
+
+/// Result of verifying current cooperative freeze ownership immediately before
+/// issuing `FITHAW` on a retained or discovered mount descriptor (OQ-11, #69).
+enum PreThawOwnership {
+    /// Ownership is verified as `qeminga` (or cooperative mode is disabled);
+    /// safe to issue `FITHAW`.
+    Proceed,
+    /// Ownership could not be confirmed as `qeminga`; `FITHAW` must not run.
+    Refused {
+        kind: RecoveryReason,
+        detail: String,
+        /// `true` when current ownership is uncertain (`Ambiguous` or `Err`),
+        /// so the handle must stay retained for retry; `false` when ownership
+        /// is confirmed no longer held by `qeminga` (`OwnedByOther` or `Unclaimed`).
+        keep_handle: bool,
+    },
+}
+
+/// Shared read-only ownership check run once immediately before starting each
+/// target's `FITHAW` drain across tracked thaw, rollback, abort recovery, and
+/// discovery drains (OQ-11, #69). Under the cooperative protocol a valid claim
+/// remains exclusively held by its owner until the drain reaches a terminal
+/// ioctl (`EINVAL`/`EOPNOTSUPP`) and releases it.
+fn verify_ownership_before_thaw(
+    ownership: Option<&dyn OwnershipStore>,
+    mount: &Mount,
+) -> PreThawOwnership {
+    let Some(store) = ownership else {
+        return PreThawOwnership::Proceed;
+    };
+    match store.inspect(mount.dev()) {
+        Ok(TargetOwnership::OwnedBySelf) => PreThawOwnership::Proceed,
+        Ok(TargetOwnership::OwnedByOther { owner }) => {
+            tracing::error!(
+                event = "fsfreeze_retained_ownership_lost",
+                mountpoint = %mount.mountpoint().display(),
+                owner = %owner,
+                "retained handle is now owned by another guest freezer; refusing FITHAW"
+            );
+            PreThawOwnership::Refused {
+                kind: RecoveryReason::OwnershipAmbiguous,
+                detail: format!("retained handle is owned by {owner}, not qeminga"),
+                keep_handle: false,
+            }
+        }
+        Ok(TargetOwnership::Unclaimed) => {
+            tracing::error!(
+                event = "fsfreeze_retained_ownership_lost",
+                mountpoint = %mount.mountpoint().display(),
+                "retained handle has no qeminga ownership claim; refusing FITHAW"
+            );
+            PreThawOwnership::Refused {
+                kind: RecoveryReason::OwnershipAmbiguous,
+                detail: "retained handle is no longer owned by qeminga".to_owned(),
+                keep_handle: false,
+            }
+        }
+        Ok(TargetOwnership::Ambiguous { reason }) => {
+            tracing::error!(
+                event = "fsfreeze_retained_ownership_uncertain",
+                mountpoint = %mount.mountpoint().display(),
+                reason = %reason,
+                "cannot verify freeze ownership before FITHAW; retaining handle for retry"
+            );
+            PreThawOwnership::Refused {
+                kind: RecoveryReason::OwnershipAmbiguous,
+                detail: format!("cannot verify ownership before FITHAW: {reason}"),
+                keep_handle: true,
+            }
+        }
+        Err(err) => {
+            tracing::error!(
+                event = "fsfreeze_retained_ownership_uncertain",
+                mountpoint = %mount.mountpoint().display(),
+                error = %err,
+                "cannot read freeze ownership before FITHAW; retaining handle for retry"
+            );
+            PreThawOwnership::Refused {
+                kind: recovery_reason_for_ownership_error(&err),
+                detail: err.to_string(),
+                keep_handle: true,
+            }
+        }
     }
 }
 
@@ -1080,19 +1370,49 @@ pub(crate) fn merge_incomplete(slot: &mut Option<IncompleteDrain>, next: Incompl
 }
 
 /// Drains handles a freeze published, in forward mount order (they were
-/// pushed deepest-first). Returns the number of policy-authorized targets on
-/// which at least one `FITHAW` succeeded, the handles whose drain did not
-/// complete (kept for a later attempt), and the first such target with its
-/// reason (collapsing excluded handles to [`RecoveryReason::RecoveryIncomplete`]
-/// while letting an authorized failure take precedence, #63).
+/// pushed deepest-first), verifying cooperative ownership immediately before
+/// `FITHAW` and releasing each `qeminga` ownership claim only after its drain
+/// completes cleanly. Returns the number of policy-authorized targets on which
+/// at least one `FITHAW` succeeded, the handles whose drain did not complete
+/// (kept for a later attempt), the first such target with its reason
+/// (collapsing excluded handles to [`RecoveryReason::RecoveryIncomplete`] while
+/// letting an authorized failure take precedence, #63), and whether ownership
+/// became uncertain (#69).
 pub(crate) fn drain_held(
     kernel: &dyn KernelOps,
+    ownership: Option<&dyn OwnershipStore>,
     held: Vec<HeldMount>,
-) -> (u64, Vec<HeldMount>, Option<IncompleteDrain>) {
+) -> DrainHeldResult {
     let mut recovered = 0;
     let mut incomplete: Option<IncompleteDrain> = None;
     let mut keep = Vec::new();
+    let mut uncertain = false;
     for entry in held.into_iter().rev() {
+        if let PreThawOwnership::Refused {
+            kind,
+            detail,
+            keep_handle,
+        } = verify_ownership_before_thaw(ownership, &entry.mount)
+        {
+            let wire_kind = if entry.countable {
+                kind
+            } else {
+                RecoveryReason::RecoveryIncomplete
+            };
+            merge_incomplete(
+                &mut incomplete,
+                IncompleteDrain {
+                    mountpoint: lossy(entry.mount.mountpoint()),
+                    kind: wire_kind,
+                    detail,
+                },
+            );
+            uncertain = true;
+            if keep_handle {
+                keep.push(entry);
+            }
+            continue;
+        }
         let drained = drain(kernel, &entry.mount);
         if drained.successes > 0 && entry.countable {
             recovered += 1;
@@ -1123,13 +1443,41 @@ pub(crate) fn drain_held(
                 },
             );
             keep.push(entry);
+        } else if let Some(store) = ownership
+            && let Err(err) = store.release(entry.mount.dev())
+        {
+            tracing::error!(
+                event = "fsfreeze_ownership_release_failed",
+                mountpoint = %entry.mount.mountpoint().display(),
+                error = %err,
+                "cannot release freeze ownership claim after rollback drain"
+            );
+            merge_incomplete(
+                &mut incomplete,
+                IncompleteDrain {
+                    mountpoint: lossy(entry.mount.mountpoint()),
+                    kind: if entry.countable {
+                        recovery_reason_for_ownership_error(&err)
+                    } else {
+                        RecoveryReason::RecoveryIncomplete
+                    },
+                    detail: err.to_string(),
+                },
+            );
+            uncertain = true;
         }
     }
-    (recovered, keep, incomplete)
+    DrainHeldResult {
+        recovered,
+        keep,
+        incomplete,
+        uncertain,
+    }
 }
 
 /// Drains every target in forward order, then removes the marker. Returns
-/// the number of targets on which at least one `FITHAW` succeeded.
+/// the number of policy-authorized targets on which at least one `FITHAW`
+/// succeeded.
 ///
 /// With a `plan` (a discovery drain, §4.2 "Thaw scope") a target is
 /// drained through the handle its freeze opened when `held` has one for
@@ -1157,13 +1505,16 @@ pub(crate) fn drain_held(
 /// the later targets: everything that can be thawed is thawed first
 /// (§4.2), then the first such failure is reported and the marker is
 /// retained.
+#[allow(clippy::too_many_arguments)]
 fn thaw_blocking(
     kernel: &dyn KernelOps,
+    ownership: Option<&dyn OwnershipStore>,
     marker: &Marker,
     plan: Option<Result<RecoveryPlan, ThawFailure>>,
     held: &mut Vec<HeldMount>,
     remove_marker: bool,
     restricted: bool,
+    need_discovery: &mut bool,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
     let mut retained = std::mem::take(held);
@@ -1201,36 +1552,12 @@ fn thaw_blocking(
                     None => match open_target(kernel, target) {
                         Ok(mount) => mount,
                         Err(err) => {
-                            let kind = if countable {
-                                if err.permission_denied {
-                                    RecoveryReason::TargetOpenPermissionDenied
-                                } else {
-                                    RecoveryReason::TargetUnreachable
-                                }
-                            } else {
-                                RecoveryReason::RecoveryIncomplete
-                            };
-                            let failure = ThawFailure::Incomplete {
-                                mountpoint: lossy(&target.mountpoint),
-                                kind,
-                                reason: format!(
-                                    "no mount point leads to {}:{} ({}); no FITHAW issued",
-                                    target.dev.0, target.dev.1, err.detail
-                                ),
-                                thawed: 0,
-                            };
-                            tracing::error!(
-                                event = "fsfreeze_thaw_target_failed",
-                                mountpoint = %target.mountpoint.display(),
-                                error = %failure,
-                                "target cannot be reached; draining the remaining targets"
-                            );
-                            state.record_failure(failure, countable);
+                            record_unreachable(&mut state, target, err, countable);
                             continue;
                         }
                     },
                 };
-                state.drain(kernel, mount, countable);
+                state.drain(kernel, ownership, mount, countable);
             }
             None
         }
@@ -1259,12 +1586,287 @@ fn thaw_blocking(
         } else {
             entry.countable
         };
-        state.drain(kernel, entry.mount, countable);
+        state.drain(kernel, ownership, entry.mount, countable);
     }
+    *need_discovery = state.ownership_uncertain;
+    finish_thaw_state(state, discovery, marker, held, remove_marker)
+}
+
+/// Discovery / recovery drain under cooperative per-superblock ownership
+/// (OQ-11, #69), composed with optional `freeze_allowed_mountpoints` wire
+/// count/error disclosure suppression (#63).
+///
+/// Drains ONLY superblocks verified as owned by `qeminga`, leaves foreign-owned
+/// and unclaimed superblocks untouched, drains and releases `qeminga`-owned
+/// superblocks even if they lie outside the current `freeze_allowed_mountpoints`
+/// list (without crediting wire counts or leaking target-specific failure
+/// classes), and retains the recovery marker whenever ownership is ambiguous,
+/// unreadable, or an owned superblock cannot be reached or released.
+#[allow(clippy::too_many_arguments)]
+fn thaw_blocking_cooperative(
+    kernel: &dyn KernelOps,
+    mounts: &dyn MountSource,
+    marker: &Marker,
+    store: &dyn OwnershipStore,
+    snapshot: Result<OwnershipSnapshot, OwnershipError>,
+    allowed: Option<&[String]>,
+    held: &mut Vec<HeldMount>,
+    need_discovery: &mut bool,
+) -> Result<u64, ThawFailure> {
+    let mut state = ThawState::default();
+    let mut retained = std::mem::take(held);
+    let restricted = allowed.is_some();
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::error!(
+                event = "fsfreeze_ownership_inspect_failed",
+                error = %err,
+                held = retained.len(),
+                "cannot scan freeze ownership directory; verifying mounted targets individually and draining held handles"
+            );
+            match build_recovery_plan(mounts, allowed, false) {
+                Ok(RecoveryPlan {
+                    plan,
+                    countable_devs,
+                }) => {
+                    for target in plan.thaw_order() {
+                        let countable = countable_devs
+                            .as_ref()
+                            .is_none_or(|devs| devs.contains(&target.dev));
+                        match store.inspect(target.dev) {
+                            Ok(TargetOwnership::OwnedBySelf) => {
+                                drain_planned_target(
+                                    kernel,
+                                    store,
+                                    &mut state,
+                                    &mut retained,
+                                    target,
+                                    countable,
+                                );
+                            }
+                            Ok(
+                                TargetOwnership::OwnedByOther { .. } | TargetOwnership::Unclaimed,
+                            ) => {}
+                            Ok(TargetOwnership::Ambiguous { reason }) => {
+                                tracing::error!(
+                                    event = "fsfreeze_ownership_ambiguous",
+                                    major = target.dev.0,
+                                    minor = target.dev.1,
+                                    reason = %reason,
+                                    "ambiguous freeze ownership entry during fallback target scan; skipping FITHAW"
+                                );
+                            }
+                            Err(inspect_err) => {
+                                tracing::error!(
+                                    event = "fsfreeze_ownership_inspect_target_failed",
+                                    major = target.dev.0,
+                                    minor = target.dev.1,
+                                    error = %inspect_err,
+                                    "cannot inspect freeze ownership for mounted target during fallback scan; skipping FITHAW"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(failure) => {
+                    tracing::error!(
+                        event = "fsfreeze_thaw_plan_failed",
+                        error = %failure,
+                        held = retained.len(),
+                        "cannot read the mount table during ownership scan fallback; draining the handles this process holds"
+                    );
+                }
+            }
+            for entry in retained.into_iter().rev() {
+                let countable = if restricted { false } else { entry.countable };
+                state.drain(kernel, Some(store), entry.mount, countable);
+            }
+            state.record_failure(
+                ThawFailure::Incomplete {
+                    mountpoint: "(ownership)".to_owned(),
+                    kind: recovery_reason_for_ownership_error(&err),
+                    reason: err.to_string(),
+                    thawed: 0,
+                },
+                true,
+            );
+            *need_discovery = true;
+            return finish_thaw_state(state, None, marker, held, true);
+        }
+    };
+
+    for reason in &snapshot.ambiguous {
+        tracing::error!(
+            event = "fsfreeze_ownership_ambiguous",
+            reason = %reason,
+            "ambiguous freeze ownership entry; draining reachable qeminga targets and retaining marker"
+        );
+    }
+
+    let mut pending_self: BTreeSet<(u32, u32)> = snapshot.owned_by_self.iter().copied().collect();
+    let (discovery, verified_countable) =
+        if !pending_self.is_empty() || (restricted && !retained.is_empty()) {
+            match build_recovery_plan(mounts, allowed, false) {
+                Ok(RecoveryPlan {
+                    plan,
+                    countable_devs,
+                }) => {
+                    for target in plan.thaw_order() {
+                        if !pending_self.remove(&target.dev) {
+                            continue;
+                        }
+                        let countable = countable_devs
+                            .as_ref()
+                            .is_none_or(|devs| devs.contains(&target.dev));
+                        drain_planned_target(
+                            kernel,
+                            store,
+                            &mut state,
+                            &mut retained,
+                            target,
+                            countable,
+                        );
+                    }
+                    (None, countable_devs)
+                }
+                Err(failure) => {
+                    tracing::error!(
+                        event = "fsfreeze_thaw_plan_failed",
+                        error = %failure,
+                        held = retained.len(),
+                        "cannot read the mount table; draining the handles this process holds"
+                    );
+                    (Some(failure), None)
+                }
+            }
+        } else {
+            (None, None)
+        };
+
+    for entry in retained.into_iter().rev() {
+        pending_self.remove(&entry.mount.dev());
+        let countable = if restricted {
+            verified_countable
+                .as_ref()
+                .is_some_and(|devs| devs.contains(&entry.mount.dev()))
+        } else {
+            entry.countable
+        };
+        state.drain(kernel, Some(store), entry.mount, countable);
+    }
+
+    if discovery.is_none() {
+        for dev in pending_self {
+            let dev_label = format!("{}:{}", dev.0, dev.1);
+            tracing::error!(
+                event = "fsfreeze_owned_target_missing",
+                major = dev.0,
+                minor = dev.1,
+                "qeminga-owned superblock is missing from mountinfo; retaining claim and marker"
+            );
+            let countable = !restricted;
+            let kind = if countable {
+                RecoveryReason::TargetUnreachable
+            } else {
+                RecoveryReason::RecoveryIncomplete
+            };
+            state.record_failure(
+                ThawFailure::Incomplete {
+                    mountpoint: dev_label.clone(),
+                    kind,
+                    reason: format!(
+                        "qeminga-owned superblock {dev_label} not present in mount table; no FITHAW issued"
+                    ),
+                    thawed: 0,
+                },
+                countable,
+            );
+        }
+    }
+
+    if !snapshot.ambiguous.is_empty() {
+        state.record_failure(
+            ThawFailure::Incomplete {
+                mountpoint: "(ownership)".to_owned(),
+                kind: RecoveryReason::OwnershipAmbiguous,
+                reason: snapshot.ambiguous.join("; "),
+                thawed: 0,
+            },
+            true,
+        );
+    }
+
+    *need_discovery = state.ownership_uncertain;
+    finish_thaw_state(state, discovery, marker, held, true)
+}
+
+fn drain_planned_target(
+    kernel: &dyn KernelOps,
+    store: &dyn OwnershipStore,
+    state: &mut ThawState,
+    retained: &mut Vec<HeldMount>,
+    target: &Target,
+    countable: bool,
+) {
+    let mount = match retained.iter().position(|h| h.mount.dev() == target.dev) {
+        Some(index) => retained.remove(index).mount,
+        None => match open_target(kernel, target) {
+            Ok(mount) => mount,
+            Err(err) => {
+                record_unreachable(state, target, err, countable);
+                return;
+            }
+        },
+    };
+    state.drain(kernel, Some(store), mount, countable);
+}
+
+fn record_unreachable(
+    state: &mut ThawState,
+    target: &Target,
+    err: OpenTargetError,
+    countable: bool,
+) {
+    let kind = if countable {
+        if err.permission_denied {
+            RecoveryReason::TargetOpenPermissionDenied
+        } else {
+            RecoveryReason::TargetUnreachable
+        }
+    } else {
+        RecoveryReason::RecoveryIncomplete
+    };
+    let failure = ThawFailure::Incomplete {
+        mountpoint: lossy(&target.mountpoint),
+        kind,
+        reason: format!(
+            "no mount point leads to {}:{} ({}); no FITHAW issued",
+            target.dev.0, target.dev.1, err.detail
+        ),
+        thawed: 0,
+    };
+    tracing::error!(
+        event = "fsfreeze_thaw_target_failed",
+        mountpoint = %target.mountpoint.display(),
+        error = %failure,
+        "target cannot be reached; draining the remaining targets"
+    );
+    state.record_failure(failure, countable);
+}
+
+fn finish_thaw_state(
+    state: ThawState,
+    discovery: Option<ThawFailure>,
+    marker: &Marker,
+    held: &mut Vec<HeldMount>,
+    remove_marker: bool,
+) -> Result<u64, ThawFailure> {
     let ThawState {
         thawed,
         unrecoverable,
         keep,
+        ..
     } = state;
     *held = keep;
     if let Some(failure) = unrecoverable {
@@ -1290,8 +1892,12 @@ struct ThawState {
     thawed: u64,
     /// The first failure to report, if any.
     unrecoverable: Option<ThawFailure>,
-    /// Handles whose drain did not complete.
+    /// Handles whose drain did not complete or whose ownership was uncertain.
     keep: Vec<HeldMount>,
+    /// `true` when cooperative ownership could not be verified before `FITHAW`
+    /// or releasing a claim failed after drain, requiring `ThawScope::Discovery`
+    /// on retry.
+    ownership_uncertain: bool,
 }
 
 impl ThawState {
@@ -1311,8 +1917,42 @@ impl ThawState {
         }
     }
 
-    /// Drains one target, keeping its handle when the drain is incomplete.
-    fn drain(&mut self, kernel: &dyn KernelOps, mount: Mount, countable: bool) {
+    /// Verifies cooperative ownership once immediately before starting a
+    /// target's `FITHAW` drain, keeps its handle when uncertain or incomplete,
+    /// and releases its cooperative ownership claim only after a complete drain.
+    fn drain(
+        &mut self,
+        kernel: &dyn KernelOps,
+        ownership: Option<&dyn OwnershipStore>,
+        mount: Mount,
+        countable: bool,
+    ) {
+        if let PreThawOwnership::Refused {
+            kind,
+            detail,
+            keep_handle,
+        } = verify_ownership_before_thaw(ownership, &mount)
+        {
+            let wire_kind = if countable {
+                kind
+            } else {
+                RecoveryReason::RecoveryIncomplete
+            };
+            self.record_failure(
+                ThawFailure::Incomplete {
+                    mountpoint: lossy(mount.mountpoint()),
+                    kind: wire_kind,
+                    reason: detail,
+                    thawed: 0,
+                },
+                countable,
+            );
+            self.ownership_uncertain = true;
+            if keep_handle {
+                self.keep.push(HeldMount { mount, countable });
+            }
+            return;
+        }
         let drained = drain(kernel, &mount);
         if drained.successes > 0 && countable {
             self.thawed += 1;
@@ -1337,6 +1977,28 @@ impl ThawState {
             );
             self.record_failure(failure, countable);
             self.keep.push(HeldMount { mount, countable });
+        } else if let Some(store) = ownership
+            && let Err(err) = store.release(mount.dev())
+        {
+            let wire_kind = if countable {
+                recovery_reason_for_ownership_error(&err)
+            } else {
+                RecoveryReason::RecoveryIncomplete
+            };
+            let failure = ThawFailure::Incomplete {
+                mountpoint: lossy(mount.mountpoint()),
+                kind: wire_kind,
+                reason: err.to_string(),
+                thawed: 0,
+            };
+            tracing::error!(
+                event = "fsfreeze_ownership_release_failed",
+                mountpoint = %mount.mountpoint().display(),
+                error = %failure,
+                "drain complete but cannot release freeze ownership claim"
+            );
+            self.record_failure(failure, countable);
+            self.ownership_uncertain = true;
         }
     }
 }
@@ -5352,6 +6014,27 @@ mod tests {
                 },
                 "target unreachable; no FIFREEZE issued",
             ),
+            (
+                FreezeStop::OwnershipAmbiguous(format!(
+                    "{GUEST_MOUNT}: {GUEST_DEV}: {GUEST_DETAIL}"
+                )),
+                "freeze ownership is ambiguous; cannot claim target",
+            ),
+            (
+                FreezeStop::OwnershipError(crate::ownership::OwnershipError::Io {
+                    dev: Some((253, 77)),
+                    op: "create",
+                    errno: Errno::EIO,
+                }),
+                "cannot update freeze ownership state",
+            ),
+            (
+                FreezeStop::OwnershipReleaseFailed {
+                    kind: RecoveryReason::OwnershipError,
+                    detail: format!("{GUEST_MOUNT}: {GUEST_DEV}: {GUEST_DETAIL}"),
+                },
+                "cannot update freeze ownership state",
+            ),
         ];
         for (stop, expected) in &stops {
             assert_eq!(stop.host_reason(), *expected);
@@ -5369,6 +6052,8 @@ mod tests {
             RecoveryReason::WorkerLost,
             RecoveryReason::DrainLost,
             RecoveryReason::MarkerRetained,
+            RecoveryReason::OwnershipAmbiguous,
+            RecoveryReason::OwnershipError,
         ] {
             let text = reason.host_reason();
             assert!(!text.is_empty());
@@ -5626,10 +6311,16 @@ mod tests {
         ];
         for (failure, frozen_expected, thawed_expected) in &thaw_cases {
             let frozen_desc = failure.host_description(FreezeState::Frozen);
+            let unavail_desc = failure.host_description_with_marker(FreezeState::Frozen, false);
             let thawed_desc = failure.host_description(FreezeState::Thawed);
             assert_eq!(frozen_desc, *frozen_expected);
+            assert_eq!(
+                unavail_desc,
+                frozen_expected.replace("marker retained", "marker unavailable")
+            );
             assert_eq!(thawed_desc, *thawed_expected);
             assert_clean("ThawFailure(Frozen)", &frozen_desc);
+            assert_clean("ThawFailure(Frozen, unavailable)", &unavail_desc);
             assert_clean("ThawFailure(Thawed)", &thawed_desc);
         }
     }
@@ -6638,8 +7329,14 @@ mod tests {
         k.script_thaw_error("/secret2", Errno::EIO);
         k.script_thaw_error("/data", Errno::EPERM);
         // drain_held iterates held.into_iter().rev(), so push second first.
-        let (rec, keep, inc) = drain_held(
+        let DrainHeldResult {
+            recovered: rec,
+            keep,
+            incomplete: inc,
+            ..
+        } = drain_held(
             &k,
+            None,
             vec![
                 HeldMount {
                     mount: s2,
@@ -6658,8 +7355,11 @@ mod tests {
         assert_eq!(inc.mountpoint, "/secret1");
 
         //    b) Excluded failure followed by authorized failure upgrades to authorized class.
-        let (_rec, _keep, inc) = drain_held(
+        let DrainHeldResult {
+            incomplete: inc, ..
+        } = drain_held(
             &k,
+            None,
             vec![
                 HeldMount {
                     mount: a1,
@@ -6676,8 +7376,11 @@ mod tests {
         assert_eq!(inc.mountpoint, "/data");
 
         //    c) Authorized failure followed by excluded failure keeps authorized class.
-        let (_rec, _keep, inc) = drain_held(
+        let DrainHeldResult {
+            incomplete: inc, ..
+        } = drain_held(
             &k,
+            None,
             vec![
                 HeldMount {
                     mount: k.open_mount(Path::new("/secret1"), (8, 10)).unwrap(),
@@ -7071,5 +7774,1934 @@ mod tests {
         );
         assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
         assert_eq!(rig.ctx.frozen_mount_count(), 0);
+    }
+
+    fn cooperative_rig(
+        state: FreezeState,
+        mountinfo: &str,
+        ownership: Arc<dyn crate::ownership::OwnershipStore>,
+        hooks: Arc<dyn FreezeHooks>,
+    ) -> (
+        Arc<Context>,
+        Arc<FakeKernel>,
+        ManualClock,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let clock = ManualClock::new();
+        let ctx = Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::starting_in(state)),
+            Router::new(Box::new(std::io::sink())),
+            Marker::open(dir.path().join("frozen")).unwrap(),
+        )
+        .with_kernel(kernel.clone())
+        .with_mounts(Arc::new(StaticMounts(mountinfo.to_owned())))
+        .with_hooks(hooks)
+        .with_freeze_clock(Arc::new(clock.clone()))
+        .with_ownership(ownership);
+        (Arc::new(ctx), kernel, clock, dir)
+    }
+
+    #[tokio::test]
+    async fn cooperative_freeze_skips_foreign_claimed_and_unannounced_busy_while_preserving_self_busy()
+     {
+        use crate::ownership::{InMemoryOwnershipStore, QEMINGA_OWNER};
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /c rw - ext4 /dev/sdc1 rw\n",
+            "4 1 8:4 / /d rw - ext4 /dev/sdd1 rw\n",
+        );
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+
+        // /b (8:2): claimed and frozen by an independent guest integrity owner.
+        assert!(store.claim_foreign((8, 2), "guest-integrity"));
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+
+        // /c (8:3): frozen in kernel without a claim file (unannounced foreign freeze).
+        let mc = kernel.open_mount(Path::new("/c"), (8, 3)).unwrap();
+        kernel.fifreeze(&mc).unwrap();
+        kernel.script_freeze_error("/c", Errno::EBUSY);
+
+        // /d (8:4): already claimed by qeminga AND frozen in kernel.
+        store.seed_self_claim((8, 4));
+        let md = kernel.open_mount(Path::new("/d"), (8, 4)).unwrap();
+        kernel.fifreeze(&md).unwrap();
+        kernel.script_freeze_error("/d", Errno::EBUSY);
+        kernel.clear_calls();
+
+        // Freeze: only /a (8:1) is newly frozen; /b is never opened/frozen;
+        // /c hits EBUSY on a fresh claim -> claim immediately released & not retained;
+        // /d hits EBUSY on AlreadyOwnedBySelf -> retained for qeminga thaw.
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let reply = freeze(&ctx, &freeze_req).await.unwrap();
+        assert_eq!(reply, json!(1));
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(store.owner_of((8, 1)).as_deref(), Some(QEMINGA_OWNER));
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(
+            store.owner_of((8, 3)),
+            None,
+            "fresh claim on unannounced EBUSY must be released immediately"
+        );
+        assert_eq!(store.owner_of((8, 4)).as_deref(), Some(QEMINGA_OWNER));
+        assert_eq!(
+            ctx.frozen_mount_count(),
+            2,
+            "only /a and AlreadyOwnedBySelf /d should be retained"
+        );
+        assert!(
+            !kernel.calls().iter().any(|c| matches!(
+                c,
+                Call::Open(p, _) | Call::Fifreeze(p) if p == Path::new("/b")
+            )),
+            "foreign-claimed /b must never be opened or frozen: {:?}",
+            kernel.calls()
+        );
+        kernel.clear_calls();
+
+        // Tracked thaw: drains ONLY /a and /d, releases their claims, and leaves
+        // both /b (claimed) and /c (unannounced) frozen without issuing FITHAW.
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let thawed = thaw(&ctx, &thaw_req).await.unwrap();
+        assert_eq!(thawed, json!(2));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!ctx.marker.exists());
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(store.owner_of((8, 3)), None);
+        assert_eq!(store.owner_of((8, 4)), None);
+        assert_eq!(
+            kernel.tracked_frozen_superblocks(),
+            2,
+            "/b and /c must stay frozen"
+        );
+        assert!(
+            !kernel.calls().iter().any(
+                |c| matches!(c, Call::Fithaw(p) if p == Path::new("/b") || p == Path::new("/c"))
+            ),
+            "foreign /b and /c must never receive FITHAW: {:?}",
+            kernel.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_freeze_releases_fresh_claims_on_eopnotsupp_rollback_and_deadline_abort() {
+        use crate::ownership::{InMemoryOwnershipStore, QEMINGA_OWNER};
+
+        // Reverse mount order freezes /c (8:3), /b (8:2), /a (8:1).
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /c rw - ext4 /dev/sdc1 rw\n",
+        );
+
+        // 1. EOPNOTSUPP on /c releases fresh claim; /b is foreign-owned (untouched);
+        //    /a freezes; thaw drains /a only.
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx1, kernel1, _clock1, _dir1) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store1.clone(),
+            Arc::new(NoHooks),
+        );
+        store1.claim_foreign((8, 2), "guest-integrity");
+        let mb = kernel1.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel1.fifreeze(&mb).unwrap();
+        kernel1.script_freeze_error("/c", Errno::EOPNOTSUPP);
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        assert_eq!(freeze(&ctx1, &freeze_req).await.unwrap(), json!(1));
+        assert_eq!(store1.owner_of((8, 3)), None);
+        assert_eq!(store1.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(store1.owner_of((8, 1)).as_deref(), Some(QEMINGA_OWNER));
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&ctx1, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(store1.owner_of((8, 1)), None);
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 1);
+
+        // 2. Hard EIO on /a rolls back /c (releasing (8,3)), releases fresh (8,1),
+        //    and leaves foreign /b frozen and claimed.
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx2, kernel2, _clock2, _dir2) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store2.clone(),
+            Arc::new(NoHooks),
+        );
+        store2.claim_foreign((8, 2), "guest-integrity");
+        let mb2 = kernel2.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel2.fifreeze(&mb2).unwrap();
+        kernel2.script_freeze_error("/a", Errno::EIO);
+        assert!(freeze(&ctx2, &freeze_req).await.is_err());
+        assert_eq!(ctx2.state.current(), FreezeState::Thawed);
+        assert!(!ctx2.marker.exists());
+        assert_eq!(store2.owner_of((8, 1)), None);
+        assert_eq!(store2.owner_of((8, 3)), None);
+        assert_eq!(store2.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 1);
+
+        // 3. Pre-existing AlreadyOwnedBySelf claim on /a is NOT removed on EIO.
+        let store3 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx3, kernel3, _clock3, _dir3) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store3.clone(),
+            Arc::new(NoHooks),
+        );
+        store3.seed_self_claim((8, 1));
+        kernel3.script_freeze_error("/a", Errno::EIO);
+        assert!(freeze(&ctx3, &freeze_req).await.is_err());
+        assert_eq!(
+            store3.owner_of((8, 1)).as_deref(),
+            Some(QEMINGA_OWNER),
+            "pre-existing self claim must be preserved on freeze error"
+        );
+
+        // 4. Deadline expiring while open_mount is in flight releases fresh claim
+        //    on NotAuthorized and issues zero FIFREEZE; an in-flight FIFREEZE
+        //    that completes late is drained and its claim is released on recovery.
+        #[derive(Debug)]
+        struct GatedOpenKernel {
+            inner: Arc<FakeKernel>,
+            gate: Gate,
+        }
+        impl KernelOps for GatedOpenKernel {
+            fn open_mount(&self, mountpoint: &Path, dev: (u32, u32)) -> Result<Mount, KernelError> {
+                self.gate.wait();
+                self.inner.open_mount(mountpoint, dev)
+            }
+            fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError> {
+                self.inner.fifreeze(mount)
+            }
+            fn fithaw(&self, mount: &Mount) -> Result<(), KernelError> {
+                self.inner.fithaw(mount)
+            }
+            fn fitrim(
+                &self,
+                mount: &Mount,
+                minimum: u64,
+            ) -> Result<crate::kernel::Trimmed, KernelError> {
+                self.inner.fitrim(mount, minimum)
+            }
+            fn sync(&self) {
+                self.inner.sync();
+            }
+            fn reboot(&self, cmd: crate::kernel::RebootCommand) -> Result<(), KernelError> {
+                self.inner.reboot(cmd)
+            }
+        }
+        let store4 = Arc::new(InMemoryOwnershipStore::new());
+        let inner4 = Arc::new(FakeKernel::new());
+        inner4.track_freeze_depth();
+        let open_gate = Gate::new();
+        let _guard = open_gate.release_on_drop();
+        let clock4 = ManualClock::new();
+        let dir4 = tempfile::tempdir().unwrap();
+        let ctx4 = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir4.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(Arc::new(GatedOpenKernel {
+                inner: inner4.clone(),
+                gate: open_gate.clone(),
+            }))
+            .with_mounts(Arc::new(StaticMounts(
+                "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n".to_owned(),
+            )))
+            .with_hooks(Arc::new(NoHooks))
+            .with_freeze_clock(Arc::new(clock4.clone()))
+            .with_ownership(store4.clone()),
+        );
+        let ctx4_bg = Arc::clone(&ctx4);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx4_bg, &req).await
+        });
+        while open_gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store4.owner_of((8, 1)).as_deref(), Some(QEMINGA_OWNER));
+        clock4.advance(Duration::from_secs(600));
+        while ctx4
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        open_gate.release();
+        assert!(task.await.unwrap().is_err());
+        while ctx4.state.current() != FreezeState::Thawed {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            store4.owner_of((8, 1)),
+            None,
+            "fresh claim must be released on NotAuthorized abort"
+        );
+        assert_eq!(inner4.tracked_frozen_superblocks(), 0);
+    }
+
+    #[tokio::test]
+    async fn cooperative_thaw_from_thawed_preserves_foreign_freezes_with_zero_fithaw() {
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+
+        store.claim_foreign((8, 1), "guest-integrity");
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        kernel.clear_calls();
+
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let reply = thaw(&ctx, &thaw_req).await.unwrap();
+        assert_eq!(reply, json!(0));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(
+            kernel.calls().is_empty(),
+            "idle thaw with zero self claims must issue zero kernel calls: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 2);
+        assert_eq!(store.owner_of((8, 1)).as_deref(), Some("guest-integrity"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooperative_watchdog_and_restart_marker_recovery_drain_only_self_owned_targets() {
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /c rw - ext4 /dev/sdc1 rw\n",
+        );
+
+        // 1. Automatic idle watchdog thaw: drains /a, keeps foreign /b frozen.
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx1, kernel1, _clock1, _dir1) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store1.clone(),
+            Arc::new(LifecycleHooks),
+        );
+        store1.claim_foreign((8, 2), "guest-integrity");
+        let mb = kernel1.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        let mc = kernel1.open_mount(Path::new("/c"), (8, 3)).unwrap();
+        kernel1.fifreeze(&mb).unwrap();
+        kernel1.fifreeze(&mc).unwrap();
+        kernel1.script_freeze_error("/c", Errno::EBUSY);
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        assert_eq!(freeze(&ctx1, &freeze_req).await.unwrap(), json!(1));
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        kernel1.clear_calls();
+
+        tokio::time::advance(Duration::from_secs(
+            ctx1.config.agent.fsfreeze_idle_timeout_secs + 1,
+        ))
+        .await;
+        wait_until_thawed(&ctx1).await;
+        assert_eq!(ctx1.state.current(), FreezeState::Thawed);
+        assert!(!ctx1.marker.exists());
+        assert_eq!(store1.owner_of((8, 1)), None);
+        assert_eq!(store1.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 2);
+        assert!(
+            !kernel1.calls().iter().any(
+                |c| matches!(c, Call::Fithaw(p) if p == Path::new("/b") || p == Path::new("/c"))
+            ),
+            "watchdog thaw must never touch foreign /b or /c: {:?}",
+            kernel1.calls()
+        );
+
+        // 2. Simulated restart with /run/qeminga/frozen present (Frozen + Discovery):
+        //    (8,1) owned by qeminga, (8,2) owned by guest-integrity, (8,3) unclaimed.
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx2, kernel2, _clock2, _dir2) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store2.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx2.marker.create().unwrap();
+        store2.seed_self_claim((8, 1));
+        store2.claim_foreign((8, 2), "guest-integrity");
+        let ma2 = kernel2.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb2 = kernel2.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        let mc2 = kernel2.open_mount(Path::new("/c"), (8, 3)).unwrap();
+        kernel2.fifreeze(&ma2).unwrap();
+        kernel2.fifreeze(&mb2).unwrap();
+        kernel2.fifreeze(&mc2).unwrap();
+        kernel2.clear_calls();
+
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        assert_eq!(thaw(&ctx2, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(ctx2.state.current(), FreezeState::Thawed);
+        assert!(!ctx2.marker.exists());
+        assert_eq!(store2.owner_of((8, 1)), None);
+        assert_eq!(store2.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 2);
+        assert!(
+            !kernel2.calls().iter().any(
+                |c| matches!(c, Call::Fithaw(p) if p == Path::new("/b") || p == Path::new("/c"))
+            ),
+            "restart recovery must never touch foreign /b or unclaimed /c: {:?}",
+            kernel2.calls()
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_ambiguous_and_failing_ownership_fails_closed_while_draining_reachable_self_targets()
+     {
+        use crate::audit::Mode;
+        use crate::ownership::{InMemoryOwnershipStore, QEMINGA_OWNER};
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Freeze encountering Ambiguous claim on /a rolls back /b (releasing (8,2)),
+        //    retains recovery state (Frozen + Discovery + marker + watchdog armed),
+        //    and returns fixed host-safe reason without leaking paths/devices/details.
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        let hooks1 = Arc::new(Recorder::default());
+        let (ctx1, kernel1, _clock1, _dir1) =
+            cooperative_rig(FreezeState::Thawed, mounts, store1.clone(), hooks1.clone());
+        store1.inject_ambiguous_entry((8, 1), "spoofed-uid-secret-detail");
+        let err1 = freeze(&ctx1, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err1.contains("freeze ownership is ambiguous; cannot claim target"),
+            "{err1}"
+        );
+        assert!(
+            err1.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err1}"
+        );
+        assert!(err1.contains("1 target(s) thawed"), "{err1}");
+        assert!(err1.contains("state frozen, marker retained"), "{err1}");
+        assert!(!err1.contains("spoofed-uid-secret-detail"), "{err1}");
+        assert!(!err1.contains("/a"), "{err1}");
+        assert!(!err1.contains("8:1"), "{err1}");
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx1.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx1.marker.exists());
+        assert_eq!(hooks1.events().last().copied(), Some("frozen"));
+        assert_eq!(store1.owner_of((8, 2)), None);
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 0);
+        // Once the ambiguous entry is removed, discovery thaw clears recovery cleanly.
+        assert!(store1.release((8, 1)).is_err());
+        let err1_retry = thaw(&ctx1, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err1_retry.contains("freeze ownership is ambiguous"),
+            "{err1_retry}"
+        );
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        assert!(ctx1.marker.exists());
+
+        // 2. Restart recovery with ambiguous entry STILL drains reachable qeminga /a,
+        //    never touches foreign /b, retains marker and Frozen state.
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx2, kernel2, _clock2, _dir2) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store2.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx2.marker.create().unwrap();
+        store2.seed_self_claim((8, 1));
+        store2.claim_foreign((8, 2), "guest-integrity");
+        store2.inject_stray_ambiguous("corrupt-entry-secret");
+        let ma2 = kernel2.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb2 = kernel2.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel2.fifreeze(&ma2).unwrap();
+        kernel2.fifreeze(&mb2).unwrap();
+        kernel2.clear_calls();
+
+        let err2 = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err2.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err2}"
+        );
+        assert!(err2.contains("1 target(s) thawed"), "{err2}");
+        assert!(!err2.contains("corrupt-entry-secret"), "{err2}");
+        assert!(!err2.contains("guest-integrity"), "{err2}");
+        assert_eq!(ctx2.state.current(), FreezeState::Frozen);
+        assert!(ctx2.marker.exists());
+        assert_eq!(store2.owner_of((8, 1)), None);
+        assert_eq!(store2.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 1);
+
+        // 3. Restart recovery with unreadable ownership store (inspect_all Err) fails
+        //    closed without touching foreign /b.
+        let store3 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx3, kernel3, _clock3, _dir3) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store3.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx3.marker.create().unwrap();
+        store3.claim_foreign((8, 2), "guest-integrity");
+        let mb3 = kernel3.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel3.fifreeze(&mb3).unwrap();
+        kernel3.clear_calls();
+        store3.script_inspect_error(Some(Errno::EIO));
+        let err3 = thaw(&ctx3, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err3.contains("cannot update freeze ownership state"),
+            "{err3}"
+        );
+        assert_eq!(ctx3.state.current(), FreezeState::Frozen);
+        assert!(ctx3.marker.exists());
+        assert!(kernel3.calls().is_empty());
+
+        // 4. Restart recovery with an OwnedBySelf claim missing from mountinfo
+        //    retains the missing claim and marker.
+        let store4 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx4, _kernel4, _clock4, _dir4) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store4.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx4.marker.create().unwrap();
+        store4.seed_self_claim((8, 99));
+        let err4 = thaw(&ctx4, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err4.contains("target unreachable; no FITHAW issued"),
+            "{err4}"
+        );
+        assert!(!err4.contains("8:99"), "{err4}");
+        assert_eq!(ctx4.state.current(), FreezeState::Frozen);
+        assert!(ctx4.marker.exists());
+        assert_eq!(store4.owner_of((8, 99)).as_deref(), Some(QEMINGA_OWNER));
+
+        // 5. Claim release failure on thaw fails closed and switches to Discovery so
+        //    retry succeeds via inspect_all once the transient error clears.
+        let store5 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx5, kernel5, _clock5, _dir5) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store5.clone(),
+            Arc::new(NoHooks),
+        );
+        assert_eq!(freeze(&ctx5, &freeze_req).await.unwrap(), json!(1));
+        store5.script_release_error(Some(Errno::EIO));
+        let err5 = thaw(&ctx5, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err5.contains("cannot update freeze ownership state"),
+            "{err5}"
+        );
+        assert_eq!(ctx5.state.current(), FreezeState::Frozen);
+        assert!(ctx5.marker.exists());
+        assert_eq!(ctx5.thaw_scope(), ThawScope::Discovery);
+        assert_eq!(kernel5.tracked_frozen_superblocks(), 0);
+        // Clear release error and retry: discovery sees (8,1) claim, releases it, settles Thawed.
+        store5.script_release_error(None);
+        assert_eq!(thaw(&ctx5, &thaw_req).await.unwrap(), json!(0));
+        assert_eq!(ctx5.state.current(), FreezeState::Thawed);
+        assert!(!ctx5.marker.exists());
+        assert_eq!(store5.owner_of((8, 1)), None);
+
+        // 6. Claim release failure on freshly acquired claim during freeze (unannounced EBUSY)
+        //    retains Frozen state and marker instead of settling Thawed with a stray claim.
+        let store6 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx6, kernel6, _clock6, _dir6) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store6.clone(),
+            Arc::new(NoHooks),
+        );
+        let ma6 = kernel6.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        kernel6.fifreeze(&ma6).unwrap();
+        kernel6.script_freeze_error("/a", Errno::EBUSY);
+        store6.script_release_error(Some(Errno::EIO));
+        let err6 = freeze(&ctx6, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err6.contains("cannot update freeze ownership state"),
+            "{err6}"
+        );
+        assert_eq!(ctx6.state.current(), FreezeState::Frozen);
+        assert!(ctx6.marker.exists());
+        assert_eq!(ctx6.thaw_scope(), ThawScope::Discovery);
+
+        // 7. Live Thawed thaw encountering an ambiguous entry escalates to Frozen,
+        //    enters audit Ring mode, and arms the watchdog.
+        let store7 = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx7, _kernel7, _clock7, _dir7) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store7.clone(),
+            Arc::new(LifecycleHooks),
+        );
+        store7.inject_stray_ambiguous("unexpected-entry");
+        let err7 = thaw(&ctx7, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err7.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err7}"
+        );
+        assert_eq!(ctx7.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx7.audit.mode(), Mode::Ring);
+        assert!(ctx7.watchdog_slot().is_some());
+        if let Some(wd) = ctx7.watchdog_slot().take() {
+            wd.cancel();
+        }
+    }
+
+    #[tokio::test]
+    async fn cooperative_edge_cases_cover_release_errors_unreachable_and_aborted_recovery() {
+        use crate::ownership::{InMemoryOwnershipStore, OwnershipError, OwnershipStore};
+
+        // 1. All four OwnershipError variants map to the expected RecoveryReason.
+        assert_eq!(
+            recovery_reason_for_ownership_error(&OwnershipError::OpenDir {
+                path: PathBuf::from("/run/x"),
+                errno: Errno::EACCES,
+            }),
+            RecoveryReason::OwnershipError
+        );
+        assert_eq!(
+            recovery_reason_for_ownership_error(&OwnershipError::Io {
+                dev: Some((8, 1)),
+                op: "unlink",
+                errno: Errno::EIO,
+            }),
+            RecoveryReason::OwnershipError
+        );
+        assert_eq!(
+            recovery_reason_for_ownership_error(&OwnershipError::TooManyEntries { limit: 4096 }),
+            RecoveryReason::OwnershipAmbiguous
+        );
+        assert_eq!(
+            recovery_reason_for_ownership_error(&OwnershipError::NotOwnedBySelf { dev: (8, 1) }),
+            RecoveryReason::OwnershipAmbiguous
+        );
+
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let mounts2 = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+
+        // 2. try_claim Io error retains Frozen + Discovery + marker + watchdog
+        //    and returns fixed host-safe FreezeStop::OwnershipError.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let hooks = Arc::new(Recorder::default());
+        let (ctx, _kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store.clone(),
+            hooks.clone(),
+        );
+        store.script_claim_error(Some(Errno::EIO));
+        let err = freeze(&ctx, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert!(err.contains("state frozen, marker retained"), "{err}");
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+        assert_eq!(hooks.events().last().copied(), Some("frozen"));
+        // Once the transient ownership I/O error clears, discovery thaw settles Thawed.
+        store.script_claim_error(None);
+        assert_eq!(thaw(&ctx, &thaw_req).await.unwrap(), json!(0));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!ctx.marker.exists());
+
+        // 3. open_target failure after fresh claim releases the claim cleanly.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        kernel.script_open_error("/a", Errno::ENOENT);
+        assert!(freeze(&ctx, &freeze_req).await.is_err());
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+
+        // 4. Rollback via drain_held failing store.release retains Frozen + Discovery.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        // Freeze order: /b (8:2) succeeds, then /a (8:1) fails with EIO ->
+        // rollback drains /b cleanly, then release((8,2)) fails with EIO.
+        // Note: /a fresh claim also fails release, so fail /b release only by
+        // gating /a's freeze error AFTER scripting release error on rollback?
+        // Instead: pre-seed /a as AlreadyOwnedBySelf so /a does NOT call release
+        // on EIO, and only drain_held on /b calls store.release((8,2))!
+        store.seed_self_claim((8, 1));
+        kernel.script_freeze_error("/a", Errno::EIO);
+        store.script_release_error(Some(Errno::EIO));
+        let err = freeze(&ctx, &freeze_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert_eq!(kernel.tracked_frozen_superblocks(), 0);
+
+        // 5a. Aborted freeze mid-FIFREEZE: late Frozen(mount) drained and claim released.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        let gate = kernel.script_freeze_gate("/a");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        clock.advance(Duration::from_secs(600));
+        while ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        gate.release();
+        assert!(task.await.unwrap().is_err());
+        while ctx.state.current() != FreezeState::Thawed {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(kernel.tracked_frozen_superblocks(), 0);
+
+        // 5b. Same aborted recovery when drain_held's release fails -> settles Frozen + Discovery.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        let gate = kernel.script_freeze_gate("/a");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        store.script_release_error(Some(Errno::EIO));
+        clock.advance(Duration::from_secs(600));
+        while ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        gate.release();
+        assert!(task.await.unwrap().is_err());
+        while ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+
+        // 6. Cooperative discovery: open_target EACCES on OwnedBySelf /a fails closed.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        kernel.script_open_error("/a", Errno::EACCES);
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("target open permission denied; no FITHAW issued"),
+            "{err}"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+
+        // 7. Cooperative discovery with inspect_all error STILL drains in-process held handles.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        store.claim_foreign((8, 2), "guest-integrity");
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: ma,
+            countable: true,
+        }]);
+        store.script_inspect_error(Some(Errno::EIO));
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(err.contains("1 target(s) thawed"), "{err}");
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+
+        // 8. Cooperative discovery with mountinfo error STILL drains held self-owned handles.
+        struct FailingMounts;
+        impl MountSource for FailingMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Err(Error::Internal("EMFILE".into()))
+            }
+        }
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel.clone())
+            .with_mounts(Arc::new(FailingMounts))
+            .with_ownership(store.clone()),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: ma,
+            countable: true,
+        }]);
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot build thaw plan (1 target(s) thawed)"),
+            "{err}"
+        );
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(kernel.tracked_frozen_superblocks(), 0);
+
+        // 9. Retained handle whose ownership was replaced by a foreign owner before
+        //    discovery retry refuses FITHAW and reports OwnershipAmbiguous.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: ma,
+            countable: true,
+        }]);
+        // Simulate external handoff of (8, 1) to foreign owner before retry.
+        store.release((8, 1)).unwrap();
+        store.claim_foreign((8, 1), "guest-integrity");
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err}"
+        );
+        assert!(
+            kernel.calls().is_empty(),
+            "must refuse FITHAW when retained handle is now foreign-owned: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert_eq!(store.owner_of((8, 1)).as_deref(), Some("guest-integrity"));
+    }
+
+    #[tokio::test]
+    async fn cooperative_pre_thaw_ownership_check_protects_foreign_and_retains_uncertain_handles() {
+        use crate::ownership::InMemoryOwnershipStore;
+        let mounts2 = "27 1 8:1 / /a rw - ext4 /dev/sda1 rw\n\
+                       28 27 8:2 / /b rw - ext4 /dev/sdb1 rw\n";
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Tracked thaw after foreign handoff: refuse FITHAW, keep foreign
+        //    freeze intact, retain marker + Frozen, switch to Discovery.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        assert_eq!(freeze(&ctx, &freeze_req).await.unwrap(), json!(2));
+        assert_eq!(ctx.thaw_scope(), ThawScope::Tracked);
+        // External handoff of (8, 1) to guest-integrity while (8, 2) remains qeminga.
+        store.release((8, 1)).unwrap();
+        store.claim_foreign((8, 1), "guest-integrity");
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/a"))),
+            "tracked thaw must NEVER issue FITHAW on foreign-owned /a: {:?}",
+            kernel.calls()
+        );
+        assert!(
+            kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "still-owned /b must still be drained: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert_eq!(store.owner_of((8, 1)).as_deref(), Some("guest-integrity"));
+        assert_eq!(store.owner_of((8, 2)), None);
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+
+        // 2. Unavailable directory scan (`inspect_all` EIO) after foreign handoff:
+        //    must verify per-target ownership before FITHAW, leaving foreign /a frozen
+        //    while still draining verified self-owned /b.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.claim_foreign((8, 1), "guest-integrity");
+        store.seed_self_claim((8, 2));
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        ctx.hold_frozen_mounts(vec![
+            HeldMount {
+                mount: mb,
+                countable: true,
+            },
+            HeldMount {
+                mount: ma,
+                countable: true,
+            },
+        ]);
+        store.script_inspect_error(Some(Errno::EIO));
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("1 target(s) thawed"),
+            "self-owned /b should drain cleanly: {err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/a"))),
+            "unavailable directory scan must NEVER issue FITHAW on foreign-owned /a: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert_eq!(store.owner_of((8, 1)).as_deref(), Some("guest-integrity"));
+        assert_eq!(store.owner_of((8, 2)), None);
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+
+        // 3. Rollback after foreign handoff: /b is frozen, then /a blocks at its
+        //    gate while /b's claim is handed off to guest-integrity before /a
+        //    fails with EIO -> rollback must NOT issue FITHAW on /b, leaving
+        //    foreign freeze intact and settling Frozen + Discovery.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        let gate = kernel.script_freeze_gate("/a");
+        let _guard = gate.release_on_drop();
+        kernel.script_freeze_error("/a", Errno::EIO);
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // /b is frozen and held; hand (8, 2) off to foreign owner before /a errors.
+        store.release((8, 2)).unwrap();
+        store.claim_foreign((8, 2), "guest-integrity");
+        gate.release();
+        let err = task.await.unwrap().unwrap_err().to_string();
+        assert!(
+            err.contains("freeze ownership is ambiguous"),
+            "rollback must report ownership ambiguity: {err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "rollback must NEVER issue FITHAW on handed-off /b: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+
+        // 4. Abort recovery after foreign handoff: /b is frozen, /a blocks at its
+        //    gate while /b's claim is handed off and timeout aborts -> abort drain
+        //    must NOT FITHAW /b and must settle Frozen + Discovery with foreign
+        //    freeze intact.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        let gate = kernel.script_freeze_gate("/a");
+        let _guard = gate.release_on_drop();
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        // Hand (8, 2) off to foreign owner before abort fires.
+        store.release((8, 2)).unwrap();
+        store.claim_foreign((8, 2), "guest-integrity");
+        clock.advance(Duration::from_secs(600));
+        while ctx
+            .freeze_op()
+            .is_some_and(|op| op.progress().phase == crate::freeze_op::Phase::Freezing)
+        {
+            tokio::task::yield_now().await;
+        }
+        gate.release();
+        assert!(task.await.unwrap().is_err());
+        while ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "abort recovery must NEVER issue FITHAW on handed-off /b: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+
+        // 5. Uncertain per-target ownership (inspect Err and Ambiguous) keeps the
+        //    retained handle for retry without issuing FITHAW, then drains cleanly
+        //    once ownership becomes verifiable again.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        assert_eq!(freeze(&ctx, &freeze_req).await.unwrap(), json!(2));
+        // 5a. Transient inspect I/O error during tracked thaw retains both handles.
+        store.script_inspect_target_error(Some(Errno::EIO));
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert!(kernel.calls().is_empty(), "must not FITHAW when uncertain");
+        assert_eq!(
+            ctx.frozen_mount_count(),
+            2,
+            "uncertain handles must be retained for retry"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+
+        // 5b. Entry (8, 1) becomes ambiguous while (8, 2) is readable -> drains (8, 2)
+        //     and keeps (8, 1) retained for retry without touching it.
+        store.script_inspect_target_error(None);
+        store.inject_ambiguous_entry((8, 1), "momentary corruption");
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(err.contains("1 target(s) thawed"), "{err}");
+        assert!(
+            err.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/a"))),
+            "must not FITHAW ambiguous /a"
+        );
+        assert_eq!(
+            ctx.frozen_mount_count(),
+            1,
+            "ambiguous /a handle must stay retained for retry"
+        );
+
+        // 5c. Once (8, 1) is restored to qeminga ownership, retry drains it cleanly
+        //     and returns to Thawed with zero claims and marker removed.
+        store.seed_self_claim((8, 1));
+        assert_eq!(thaw(&ctx, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert!(store.owned_by_self().is_empty());
+        assert!(!ctx.marker.exists());
+
+        // 6. Uncertain rollback (inspect Err during rollback) retains /b's handle
+        //    for retry without FITHAW, then recovers cleanly once error clears.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        let gate = kernel.script_freeze_gate("/a");
+        let _guard = gate.release_on_drop();
+        kernel.script_freeze_error("/a", Errno::EIO);
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+        while gate.waiting() == 0 {
+            tokio::task::yield_now().await;
+        }
+        store.script_inspect_target_error(Some(Errno::EIO));
+        gate.release();
+        let err = task.await.unwrap().unwrap_err().to_string();
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "uncertain rollback must not FITHAW /b"
+        );
+        assert_eq!(
+            ctx.frozen_mount_count(),
+            1,
+            "uncertain rollback must keep /b handle for retry"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        store.script_inspect_target_error(None);
+        assert_eq!(thaw(&ctx, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(ctx.frozen_mount_count(), 0);
+        assert!(store.owned_by_self().is_empty());
+
+        // 7. Retained handle whose claim vanished (Unclaimed) before tracked thaw:
+        //    refuses FITHAW, reports OwnershipAmbiguous, drops the unowned handle,
+        //    and retains marker + Frozen + Discovery.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts2,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        assert_eq!(freeze(&ctx, &freeze_req).await.unwrap(), json!(2));
+        store.release((8, 1)).unwrap();
+        kernel.clear_calls();
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+            "{err}"
+        );
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/a"))),
+            "must not FITHAW unclaimed /a: {:?}",
+            kernel.calls()
+        );
+        assert_eq!(
+            ctx.frozen_mount_count(),
+            0,
+            "confirmed-unclaimed handle is dropped after refusal"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn cooperative_thawed_drain_removes_stale_recovery_marker_with_empty_ownership_store() {
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, _kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        assert!(ctx.marker.exists());
+        assert_eq!(thaw(&ctx, &thaw_req).await.unwrap(), json!(0));
+        assert!(
+            !ctx.marker.exists(),
+            "stale recovery marker must be removed on Thawed cooperative thaw"
+        );
+    }
+
+    #[tokio::test]
+    async fn cooperative_discovery_matches_multiple_retained_handles_by_device_in_forward_order() {
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        store.seed_self_claim((8, 2));
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        // Hold in deepest-first order [mb (8:2), ma (8:1)] while blocking path opens.
+        ctx.hold_frozen_mounts(vec![
+            HeldMount {
+                mount: mb,
+                countable: true,
+            },
+            HeldMount {
+                mount: ma,
+                countable: true,
+            },
+        ]);
+        kernel.script_open_error("/a", Errno::EACCES);
+        kernel.script_open_error("/b", Errno::EACCES);
+        kernel.clear_calls();
+        assert_eq!(thaw(&ctx, &thaw_req).await.unwrap(), json!(2));
+        let thaw_order: Vec<std::path::PathBuf> = kernel
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Fithaw(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        let first_a = thaw_order
+            .iter()
+            .position(|p| p == Path::new("/a"))
+            .expect("/a thawed");
+        let first_b = thaw_order
+            .iter()
+            .position(|p| p == Path::new("/b"))
+            .expect("/b thawed");
+        assert!(
+            first_a < first_b,
+            "retained handles must match target.dev in forward mount order (/a before /b): {thaw_order:?}"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!ctx.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn cooperative_restart_recovery_drains_owned_mounted_targets_even_when_directory_scan_fails()
+     {
+        use crate::ownership::{
+            InMemoryOwnershipStore, LinuxOwnershipStore, MAX_OWNERSHIP_ENTRIES,
+        };
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /c rw - ext4 /dev/sdc1 rw\n",
+            "4 1 8:4 / /d rw - ext4 /dev/sdd1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Real LinuxOwnershipStore overflowing MAX_OWNERSHIP_ENTRIES (4096)
+        //    after a restart (no retained handles): inspect_all() returns
+        //    TooManyEntries, yet recovery must still discover mounted targets,
+        //    individually verify their claims via direct openat, drain and
+        //    release qeminga-owned /a (8:1), skip foreign /b (8:2), ambiguous
+        //    /c (8:3), and unclaimed /d (8:4), and retain the marker + Frozen
+        //    state with the inventory error reported.
+        let own_dir = tempfile::tempdir().unwrap();
+        let linux_store = Arc::new(LinuxOwnershipStore::open(own_dir.path()).unwrap());
+        assert_eq!(
+            linux_store.try_claim((8, 1)).unwrap(),
+            crate::ownership::ClaimOutcome::Acquired
+        );
+        std::fs::write(own_dir.path().join("8-2"), b"guest-backup\n").unwrap();
+        std::fs::write(own_dir.path().join("8-3"), b"").unwrap();
+        for i in 0..MAX_OWNERSHIP_ENTRIES {
+            std::fs::write(own_dir.path().join(format!("stray-{i:04}")), b"x").unwrap();
+        }
+        assert!(matches!(
+            linux_store.inspect_all(),
+            Err(crate::ownership::OwnershipError::TooManyEntries { .. })
+        ));
+
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            linux_store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        let mc = kernel.open_mount(Path::new("/c"), (8, 3)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        kernel.fifreeze(&mc).unwrap();
+        kernel.clear_calls();
+
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("1 target(s) thawed"),
+            "reachable qeminga-owned /a must thaw despite TooManyEntries scan failure: {err}"
+        );
+        assert!(
+            err.contains("freeze ownership is ambiguous"),
+            "TooManyEntries inventory failure must still be reported: {err}"
+        );
+        assert!(
+            kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/a"))),
+            "/a must receive FITHAW: {:?}",
+            kernel.calls()
+        );
+        for untouched in ["/b", "/c", "/d"] {
+            assert!(
+                !kernel
+                    .calls()
+                    .iter()
+                    .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new(untouched))),
+                "{untouched} must NOT receive FITHAW: {:?}",
+                kernel.calls()
+            );
+        }
+        assert!(
+            !own_dir.path().join("8-1").exists(),
+            "drained qeminga claim 8-1 must be released"
+        );
+        assert!(
+            own_dir.path().join("8-2").exists(),
+            "foreign claim 8-2 must stay untouched"
+        );
+        assert!(
+            own_dir.path().join("8-3").exists(),
+            "ambiguous claim 8-3 must stay untouched"
+        );
+        assert_eq!(
+            kernel.tracked_frozen_superblocks(),
+            2,
+            "only foreign /b and ambiguous /c remain frozen"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+
+        // 2. Directory scan I/O failure (EIO) after restart (empty held) with
+        //    per-target inspect still working: drains qeminga-owned /a and
+        //    leaves foreign /b and ambiguous /c untouched while reporting the
+        //    directory scan error.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        store.claim_foreign((8, 2), "guest-backup");
+        store.inject_ambiguous_entry((8, 3), "corrupt");
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        let mc = kernel.open_mount(Path::new("/c"), (8, 3)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        kernel.fifreeze(&mc).unwrap();
+        store.script_inspect_error(Some(Errno::EIO));
+        kernel.clear_calls();
+
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(err.contains("1 target(s) thawed"), "{err}");
+        assert!(
+            err.contains("cannot update freeze ownership state"),
+            "{err}"
+        );
+        assert_eq!(store.owner_of((8, 1)), None);
+        assert_eq!(store.owner_of((8, 2)).as_deref(), Some("guest-backup"));
+        assert_eq!(kernel.tracked_frozen_superblocks(), 2);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+
+        // 3. When BOTH directory scan AND per-target inspect fail, no mounted
+        //    target is opened or thawed and any retained handle stays held.
+        let store = Arc::new(InMemoryOwnershipStore::new());
+        let (ctx, kernel, _clock, _dir) = cooperative_rig(
+            FreezeState::Frozen,
+            mounts,
+            store.clone(),
+            Arc::new(NoHooks),
+        );
+        ctx.marker.create().unwrap();
+        store.seed_self_claim((8, 1));
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        ctx.hold_frozen_mounts(vec![HeldMount {
+            mount: ma,
+            countable: true,
+        }]);
+        store.script_inspect_error(Some(Errno::EIO));
+        store.script_inspect_target_error(Some(Errno::EIO));
+        kernel.clear_calls();
+
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(err.contains("0 target(s) thawed"), "{err}");
+        assert!(kernel.calls().is_empty(), "{:?}", kernel.calls());
+        assert_eq!(ctx.frozen_mount_count(), 1);
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(ctx.marker.exists());
+    }
+
+    #[tokio::test]
+    async fn cooperative_late_abort_ambiguous_claim_retains_recovery_state() {
+        use crate::ownership::{
+            ClaimOutcome, InMemoryOwnershipStore, OwnershipError, OwnershipStore,
+        };
+        use std::sync::{Condvar, Mutex};
+
+        #[derive(Debug)]
+        struct GatedClaimStore {
+            inner: InMemoryOwnershipStore,
+            gate_dev: (u32, u32),
+            entered: Mutex<bool>,
+            released: Mutex<bool>,
+            cv: Condvar,
+        }
+
+        impl GatedClaimStore {
+            fn new(gate_dev: (u32, u32)) -> Self {
+                Self {
+                    inner: InMemoryOwnershipStore::new(),
+                    gate_dev,
+                    entered: Mutex::new(false),
+                    released: Mutex::new(false),
+                    cv: Condvar::new(),
+                }
+            }
+
+            fn is_waiting(&self) -> bool {
+                *self.entered.lock().unwrap()
+            }
+
+            fn release(&self) {
+                *self.released.lock().unwrap() = true;
+                self.cv.notify_all();
+            }
+        }
+
+        impl OwnershipStore for GatedClaimStore {
+            fn try_claim(&self, dev: (u32, u32)) -> Result<ClaimOutcome, OwnershipError> {
+                if dev == self.gate_dev {
+                    *self.entered.lock().unwrap() = true;
+                    let mut guard = self.released.lock().unwrap();
+                    while !*guard {
+                        guard = self.cv.wait(guard).unwrap();
+                    }
+                }
+                self.inner.try_claim(dev)
+            }
+
+            fn inspect(
+                &self,
+                dev: (u32, u32),
+            ) -> Result<crate::ownership::TargetOwnership, OwnershipError> {
+                self.inner.inspect(dev)
+            }
+
+            fn release(&self, dev: (u32, u32)) -> Result<(), OwnershipError> {
+                self.inner.release(dev)
+            }
+
+            fn inspect_all(&self) -> Result<crate::ownership::OwnershipSnapshot, OwnershipError> {
+                self.inner.inspect_all()
+            }
+        }
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let store = Arc::new(GatedClaimStore::new((8, 1)));
+        store
+            .inner
+            .inject_ambiguous_entry((8, 1), "corrupt-after-startup");
+        let hooks = Arc::new(Recorder::default());
+        let (ctx, kernel, clock, _dir) =
+            cooperative_rig(FreezeState::Thawed, mounts, store.clone(), hooks.clone());
+        let ctx_bg = Arc::clone(&ctx);
+        let task = tokio::spawn(async move {
+            let req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+            freeze(&ctx_bg, &req).await
+        });
+
+        // /b freezes cleanly; /a blocks inside try_claim().
+        while !store.is_waiting() {
+            tokio::task::yield_now().await;
+        }
+        // Expire the operation deadline so the abort commits while /a is still
+        // inside try_claim(), then release /a to return OwnershipAmbiguous.
+        clock.advance(Duration::from_secs(600));
+        let err = task.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("freeze aborted"), "{err}");
+        store.release();
+
+        // Wait for the aborted freeze operation to settle.
+        while ctx.freeze_op().is_some() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx.thaw_scope(), ThawScope::Discovery);
+        assert!(ctx.marker.exists());
+        assert_eq!(hooks.events().last().copied(), Some("frozen"));
+        // Already-frozen /b was rolled back cleanly and its claim released.
+        assert_eq!(store.inner.owner_of((8, 2)), None);
+        assert_eq!(kernel.tracked_frozen_superblocks(), 0);
+    }
+
+    #[tokio::test]
+    async fn cooperative_markerless_thawed_scan_failure_establishes_or_reports_unavailable_marker_and_preserves_foreign()
+     {
+        use crate::ownership::{LinuxOwnershipStore, MAX_OWNERSHIP_ENTRIES};
+
+        let mounts = concat!(
+            "1 0 8:1 / /a rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /b rw - ext4 /dev/sdb1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Marker absent on disk while Thawed + directory scan fails
+        //    (TooManyEntries): cooperative thaw establishes /run/qeminga/frozen,
+        //    drains reachable qeminga-owned /a (8:1), preserves foreign /b (8:2),
+        //    and accurately reports "state frozen, marker retained" matching disk.
+        let own_dir = tempfile::tempdir().unwrap();
+        let linux_store = Arc::new(LinuxOwnershipStore::open(own_dir.path()).unwrap());
+        assert_eq!(
+            linux_store.try_claim((8, 1)).unwrap(),
+            crate::ownership::ClaimOutcome::Acquired
+        );
+        std::fs::write(own_dir.path().join("8-2"), b"guest-backup\n").unwrap();
+        for i in 0..MAX_OWNERSHIP_ENTRIES {
+            std::fs::write(own_dir.path().join(format!("stray-{i:04}")), b"x").unwrap();
+        }
+
+        let (ctx, kernel, _clock, marker_dir) = cooperative_rig(
+            FreezeState::Thawed,
+            mounts,
+            linux_store.clone(),
+            Arc::new(NoHooks),
+        );
+        assert!(
+            !ctx.marker.exists(),
+            "precondition: marker absent before thaw"
+        );
+        let ma = kernel.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb = kernel.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel.fifreeze(&ma).unwrap();
+        kernel.fifreeze(&mb).unwrap();
+        kernel.clear_calls();
+
+        let err = thaw(&ctx, &thaw_req).await.unwrap_err().to_string();
+        assert!(err.contains("1 target(s) thawed"), "{err}");
+        assert!(err.contains("freeze ownership is ambiguous"), "{err}");
+        assert!(
+            err.contains("state frozen, marker retained"),
+            "reply must match established on-disk marker: {err}"
+        );
+        assert!(
+            ctx.marker.exists(),
+            "recovery marker must actually exist on disk when reply says marker retained"
+        );
+        assert_eq!(ctx.state.current(), FreezeState::Frozen);
+        assert!(!own_dir.path().join("8-1").exists());
+        assert!(own_dir.path().join("8-2").exists());
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert!(
+            !kernel
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "foreign /b must not be touched: {:?}",
+            kernel.calls()
+        );
+
+        // Simulated restart with the same marker path and ownership directory:
+        // marker is present so the restarted instance starts Frozen; once stray
+        // entries are cleared, retry removes the marker and preserves foreign /b.
+        let restarted_marker = Marker::open(marker_dir.path().join("frozen")).unwrap();
+        assert!(
+            restarted_marker.exists(),
+            "restarted instance must observe the established recovery marker"
+        );
+        let restarted_store = Arc::new(LinuxOwnershipStore::open(own_dir.path()).unwrap());
+        let restarted_ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                restarted_marker,
+            )
+            .with_kernel(kernel.clone())
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_ownership(restarted_store.clone()),
+        );
+        for i in 0..MAX_OWNERSHIP_ENTRIES {
+            std::fs::remove_file(own_dir.path().join(format!("stray-{i:04}"))).unwrap();
+        }
+        kernel.clear_calls();
+        assert_eq!(thaw(&restarted_ctx, &thaw_req).await.unwrap(), json!(0));
+        assert_eq!(restarted_ctx.state.current(), FreezeState::Thawed);
+        assert!(!restarted_ctx.marker.exists());
+        assert!(own_dir.path().join("8-2").exists());
+        assert_eq!(kernel.tracked_frozen_superblocks(), 1);
+        assert!(kernel.calls().is_empty(), "{:?}", kernel.calls());
+
+        // 2. Marker absent AND creating the marker fails (pinned parent dir
+        //    unlinked before thaw): recovery STILL drains reachable qeminga /a,
+        //    preserves foreign /b, retains Frozen state, and reports
+        //    "state frozen, marker unavailable" (never falsely claiming
+        //    "marker retained"). On restart, startup's ownership-directory probe
+        //    still detects the scan failure without relying on the marker.
+        let own_dir2 = tempfile::tempdir().unwrap();
+        let linux_store2 = Arc::new(LinuxOwnershipStore::open(own_dir2.path()).unwrap());
+        assert_eq!(
+            linux_store2.try_claim((8, 1)).unwrap(),
+            crate::ownership::ClaimOutcome::Acquired
+        );
+        std::fs::write(own_dir2.path().join("8-2"), b"guest-backup\n").unwrap();
+        for i in 0..MAX_OWNERSHIP_ENTRIES {
+            std::fs::write(own_dir2.path().join(format!("stray-{i:04}")), b"x").unwrap();
+        }
+        let ephemeral_dir = tempfile::tempdir().unwrap();
+        let ephemeral_sub = ephemeral_dir.path().join("gone");
+        std::fs::create_dir(&ephemeral_sub).unwrap();
+        let failing_marker = Marker::open(ephemeral_sub.join("frozen")).unwrap();
+        std::fs::remove_dir(&ephemeral_sub).unwrap();
+
+        let kernel2 = Arc::new(FakeKernel::new());
+        kernel2.track_freeze_depth();
+        let ma2 = kernel2.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        let mb2 = kernel2.open_mount(Path::new("/b"), (8, 2)).unwrap();
+        kernel2.fifreeze(&ma2).unwrap();
+        kernel2.fifreeze(&mb2).unwrap();
+        kernel2.clear_calls();
+
+        let hooks2 = Arc::new(Recorder::default());
+        let ctx2 = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                failing_marker,
+            )
+            .with_kernel(kernel2.clone())
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_hooks(hooks2.clone())
+            .with_ownership(linux_store2.clone()),
+        );
+        let err2 = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert!(err2.contains("1 target(s) thawed"), "{err2}");
+        assert!(err2.contains("freeze ownership is ambiguous"), "{err2}");
+        assert!(
+            err2.contains("state frozen, marker unavailable"),
+            "must report marker unavailable when marker creation fails: {err2}"
+        );
+        assert!(
+            !err2.contains("marker retained"),
+            "must never claim marker retained when marker could not be created: {err2}"
+        );
+        assert!(!ctx2.marker.exists());
+        assert_eq!(ctx2.state.current(), FreezeState::Frozen);
+        assert_eq!(hooks2.events().last().copied(), Some("frozen"));
+        assert!(!own_dir2.path().join("8-1").exists());
+        assert!(own_dir2.path().join("8-2").exists());
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 1);
+        assert!(
+            !kernel2
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/b"))),
+            "foreign /b must not be touched: {:?}",
+            kernel2.calls()
+        );
+        // Without a marker, a restarted instance inspecting the same ownership
+        // directory still detects TooManyEntries and escalates into recovery.
+        assert!(matches!(
+            LinuxOwnershipStore::open(own_dir2.path())
+                .unwrap()
+                .inspect_all(),
+            Err(crate::ownership::OwnershipError::TooManyEntries { .. })
+        ));
+
+        // 3. When marker creation fails AND the ownership store is readable with
+        //    no remaining obligations or ambiguity after draining qeminga /a,
+        //    the complete drain returns 1, settles Thawed, and preserves foreign /b.
+        for i in 0..MAX_OWNERSHIP_ENTRIES {
+            std::fs::remove_file(own_dir2.path().join(format!("stray-{i:04}"))).unwrap();
+        }
+        assert_eq!(
+            linux_store2.try_claim((8, 1)).unwrap(),
+            crate::ownership::ClaimOutcome::Acquired
+        );
+        let ma3 = kernel2.open_mount(Path::new("/a"), (8, 1)).unwrap();
+        kernel2.fifreeze(&ma3).unwrap();
+        kernel2.clear_calls();
+        assert_eq!(thaw(&ctx2, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(ctx2.state.current(), FreezeState::Thawed);
+        assert!(!ctx2.marker.exists());
+        assert!(!own_dir2.path().join("8-1").exists());
+        assert!(own_dir2.path().join("8-2").exists());
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 1);
+    }
+
+    #[tokio::test]
+    async fn cooperative_idle_thaw_escalates_on_indeterminate_marker_probe_and_collapses_excluded_recovery_failures()
+     {
+        use crate::audit::Mode;
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let mounts = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /secret rw - ext4 /dev/sdc1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Indeterminate Marker::probe() (256-byte filename -> ENAMETOOLONG
+        //    deterministically regardless of UID) on an idle cooperative thaw
+        //    from `Thawed` MUST NOT fast-path `Ok(0)`: it must enter ring mode,
+        //    escalate to cooperative recovery, transition to `Frozen` with
+        //    watchdog armed, report `marker unavailable`, and never touch the
+        //    foreign-owned allowlisted `/data` freeze.
+        let dir1 = tempfile::tempdir().unwrap();
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        store1.claim_foreign((8, 2), "guest-integrity");
+        let kernel1 = Arc::new(FakeKernel::new());
+        kernel1.track_freeze_depth();
+        let md1 = kernel1.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        kernel1.fifreeze(&md1).unwrap();
+        kernel1.clear_calls();
+        let hooks1 = Arc::new(Recorder::default());
+        let mut cfg1 = Config::default();
+        cfg1.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx1 = Arc::new(
+            Context::new(
+                Arc::new(cfg1),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir1.path().join("m".repeat(256))).unwrap(),
+            )
+            .with_kernel(kernel1.clone())
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_hooks(hooks1.clone())
+            .with_ownership(store1.clone()),
+        );
+        let err1 = thaw(&ctx1, &thaw_req).await.unwrap_err().to_string();
+        assert!(
+            err1.contains("cannot remove recovery marker")
+                && err1.contains("state frozen, marker unavailable"),
+            "indeterminate marker probe on idle cooperative thaw must escalate and fail closed: {err1}"
+        );
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        assert_eq!(ctx1.audit.mode(), Mode::Ring);
+        assert_eq!(hooks1.states_at("frozen"), vec![FreezeState::Frozen]);
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 1);
+        assert!(
+            kernel1.calls().is_empty(),
+            "foreign /data must never be touched during indeterminate-marker escalation: {:?}",
+            kernel1.calls()
+        );
+
+        // 2. Fallback per-target scan (when `inspect_all()` fails with EIO)
+        //    composed with `freeze_allowed_mountpoints = ["/data"]`: drains
+        //    non-allowlisted qeminga-owned `/secret` (8:3) and releases its
+        //    claim while reporting `0 target(s) thawed` + store-level
+        //    `OwnershipError`, and never touches foreign allowlisted `/data`.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        store2.claim_foreign((8, 2), "guest-integrity");
+        store2.seed_self_claim((8, 3));
+        store2.script_inspect_error(Some(Errno::EIO));
+        let kernel2 = Arc::new(FakeKernel::new());
+        kernel2.track_freeze_depth();
+        let md2 = kernel2.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        let ms2 = kernel2.open_mount(Path::new("/secret"), (8, 3)).unwrap();
+        kernel2.fifreeze(&md2).unwrap();
+        kernel2.fifreeze(&ms2).unwrap();
+        kernel2.clear_calls();
+        let mut cfg2 = Config::default();
+        cfg2.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx2 = Arc::new(
+            Context::new(
+                Arc::new(cfg2),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir2.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel2.clone())
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_hooks(Arc::new(NoHooks))
+            .with_ownership(store2.clone()),
+        );
+        ctx2.marker.create().unwrap();
+        let err2 = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err2,
+            "thaw incomplete: cannot update freeze ownership state (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(store2.owner_of((8, 3)), None);
+        assert_eq!(store2.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert_eq!(kernel2.tracked_frozen_superblocks(), 1);
+        assert!(
+            !kernel2.calls().iter().any(
+                |c| matches!(c, Call::Open(p, _) | Call::Fithaw(p) if p == Path::new("/data"))
+            ),
+            "fallback cooperative scan must never touch foreign /data: {:?}",
+            kernel2.calls()
+        );
+
+        // 3. Missing qeminga-owned superblock (8:99 absent from mountinfo)
+        //    under `freeze_allowed_mountpoints = ["/data"]` collapses to
+        //    `RecoveryReason::RecoveryIncomplete` instead of disclosing
+        //    `target mountpoint is unreachable` for an unallowlisted device.
+        let dir3 = tempfile::tempdir().unwrap();
+        let store3 = Arc::new(InMemoryOwnershipStore::new());
+        store3.seed_self_claim((8, 99));
+        let kernel3 = Arc::new(FakeKernel::new());
+        kernel3.track_freeze_depth();
+        let mut cfg3 = Config::default();
+        cfg3.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx3 = Arc::new(
+            Context::new(
+                Arc::new(cfg3),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir3.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel3)
+            .with_mounts(Arc::new(StaticMounts(mounts.to_owned())))
+            .with_hooks(Arc::new(NoHooks))
+            .with_ownership(store3.clone()),
+        );
+        ctx3.marker.create().unwrap();
+        let err3 = thaw(&ctx3, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(
+            store3.owner_of((8, 99)).as_deref(),
+            Some(crate::ownership::QEMINGA_OWNER)
+        );
+        assert_eq!(ctx3.state.current(), FreezeState::Frozen);
+        assert!(ctx3.marker.exists());
     }
 }

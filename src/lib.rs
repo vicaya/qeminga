@@ -31,6 +31,7 @@ pub mod handlers;
 pub mod kernel;
 pub mod marker;
 pub mod mountinfo;
+pub mod ownership;
 pub mod proto;
 #[cfg(feature = "seccomp")]
 pub mod seccomp;

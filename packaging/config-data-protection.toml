@@ -10,9 +10,11 @@
 # FITRIM ioctl; the host cannot widen it. Install as
 # /etc/qeminga/config.toml.
 #
-# v1 assumes qeminga is the sole freezer in the guest (design §4.2,
-# packaging/README.md): guests relying on an independent in-guest
-# freezer should wait for guest-side freeze ownership coordination.
+# By default (freeze_ownership_dir omitted), qeminga assumes it is the sole
+# freezer in the guest (design §4.2, packaging/README.md). Guests that also
+# run an independent in-guest freezer must opt into cooperative per-superblock
+# ownership by configuring freeze_ownership_dir and its sticky-bit runtime
+# tmpfs directory (OQ-11, #69).
 [agent]
 config_version          = 1
 channel_path            = "/dev/virtio-ports/org.qemu.guest_agent.0"
@@ -26,6 +28,7 @@ hardening               = "enforced"
 # for host-named selections and whole-guest freezes. Set this list when the
 # deployment must conceal unprovisioned mount-point eligibility from the host.
 # freeze_allowed_mountpoints = ["/var/lib/data"]
+# freeze_ownership_dir  = "/run/qeminga-freeze-owners"
 
 [features]
 suspend_ram = false

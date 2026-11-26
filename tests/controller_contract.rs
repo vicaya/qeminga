@@ -33,6 +33,7 @@ use qeminga::kernel::KernelOps;
 use qeminga::kernel::fake::{Call, FakeKernel, ReleaseOnDrop};
 use qeminga::marker::Marker;
 use qeminga::mountinfo::StaticMounts;
+use qeminga::ownership::{LinuxOwnershipStore, OwnershipStore};
 use qeminga::state::{FreezeState, FreezeStateMachine};
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -76,8 +77,11 @@ struct Guest {
     /// The data-protection profile (§5.9): information, shutdown and trim
     /// off, so `guest-get-fsinfo` is not there to discover with.
     data_protection: bool,
-    /// Optional guest-enforced mount-point allowlist (#63).
-    freeze_allowed_mountpoints: Option<Vec<String>>,
+    /// Optional guest-enforced mount-point allowlist (#63), behind a mutex so
+    /// restart tests can simulate narrowing the guest policy across a crash.
+    freeze_allowed_mountpoints: Mutex<Option<Vec<String>>>,
+    /// Optional real-filesystem cooperative ownership directory (OQ-11, #69).
+    ownership_dir: Option<std::path::PathBuf>,
 }
 
 impl Guest {
@@ -87,16 +91,16 @@ impl Guest {
     }
 
     fn with_mounts(mounts: &'static str) -> Arc<Guest> {
-        Self::build(fixture(mounts), false, None)
+        Self::build(fixture(mounts), false, None, None)
     }
 
     fn with_mount_table(mounts: String) -> Arc<Guest> {
-        Self::build(mounts, false, None)
+        Self::build(mounts, false, None, None)
     }
 
     /// A guest under `packaging/config-data-protection.toml`'s switches.
     fn data_protection() -> Arc<Guest> {
-        Self::build(fixture("simple.txt"), true, None)
+        Self::build(fixture("simple.txt"), true, None, None)
     }
 
     /// A data-protection guest with a synthetic mount table and optional
@@ -105,13 +109,38 @@ impl Guest {
         mounts: String,
         freeze_allowed_mountpoints: Option<Vec<String>>,
     ) -> Arc<Guest> {
-        Self::build(mounts, true, freeze_allowed_mountpoints)
+        Self::build(mounts, true, freeze_allowed_mountpoints, None)
+    }
+
+    /// A CVM data-protection guest with a real cooperative ownership directory.
+    fn with_cooperative_ownership(mounts: String, ownership_dir: std::path::PathBuf) -> Arc<Guest> {
+        Self::build(mounts, true, None, Some(ownership_dir))
+    }
+
+    /// A CVM data-protection guest combining `freeze_allowed_mountpoints` (#63)
+    /// and a real cooperative ownership directory (#69).
+    fn with_policy_and_cooperative_ownership(
+        mounts: String,
+        freeze_allowed_mountpoints: Option<Vec<String>>,
+        ownership_dir: std::path::PathBuf,
+    ) -> Arc<Guest> {
+        Self::build(
+            mounts,
+            true,
+            freeze_allowed_mountpoints,
+            Some(ownership_dir),
+        )
+    }
+
+    fn set_freeze_allowed_mountpoints(&self, allowed: Option<Vec<String>>) {
+        *self.freeze_allowed_mountpoints.lock().unwrap() = allowed;
     }
 
     fn build(
         mounts: String,
         data_protection: bool,
         freeze_allowed_mountpoints: Option<Vec<String>>,
+        ownership_dir: Option<std::path::PathBuf>,
     ) -> Arc<Guest> {
         let kernel = Arc::new(FakeKernel::new());
         kernel.track_freeze_depth();
@@ -123,21 +152,33 @@ impl Guest {
             lost: Notify::new(),
             mounts,
             data_protection,
-            freeze_allowed_mountpoints,
+            freeze_allowed_mountpoints: Mutex::new(freeze_allowed_mountpoints),
+            ownership_dir,
         });
         guest.start_agent();
         guest
     }
 
     /// Starts an agent instance: in recovery mode when the marker of a
-    /// previous instance is present (§4.4), exactly as `main` does.
+    /// previous instance is present (§4.4) or when the cooperative ownership
+    /// directory holds outstanding/ambiguous entries (#69), as `main` does.
     fn start_agent(&self) {
         let marker = Marker::open(self.dir.path().join("frozen")).unwrap();
-        let recovery = marker.exists();
+        let ownership = self.ownership_dir.as_ref().map(|dir| {
+            Arc::new(LinuxOwnershipStore::open(dir).unwrap()) as Arc<dyn OwnershipStore>
+        });
+        let mut recovery = !matches!(marker.probe(), Ok(false));
+        if !recovery && let Some(store) = ownership.as_deref() {
+            recovery = match store.inspect_all() {
+                Ok(s) => !s.owned_by_self.is_empty() || !s.ambiguous.is_empty(),
+                Err(_) => true,
+            };
+        }
         let mut config = Config::default();
         config.agent.fsfreeze_idle_timeout_secs = IDLE_SECS;
         config.agent.fsfreeze_max_timeout_secs = MAX_SECS;
-        config.agent.freeze_allowed_mountpoints = self.freeze_allowed_mountpoints.clone();
+        config.agent.freeze_allowed_mountpoints =
+            self.freeze_allowed_mountpoints.lock().unwrap().clone();
         if self.data_protection {
             config.features.information = false;
             config.features.shutdown = false;
@@ -148,18 +189,20 @@ impl Guest {
         } else {
             FreezeStateMachine::new()
         };
-        let ctx = Arc::new(
-            Context::new(
-                Arc::new(config),
-                Arc::new(state),
-                Router::new(Box::new(std::io::sink())),
-                marker,
-            )
-            .with_kernel(self.kernel.clone() as Arc<dyn KernelOps>)
-            .with_mounts(Arc::new(StaticMounts(self.mounts.clone())))
-            .with_freeze_clock(Arc::new(self.clock.clone()))
-            .with_freeze_operation_timeout(Duration::from_secs(OPERATION_SECS)),
-        );
+        let mut ctx = Context::new(
+            Arc::new(config),
+            Arc::new(state),
+            Router::new(Box::new(std::io::sink())),
+            marker,
+        )
+        .with_kernel(self.kernel.clone() as Arc<dyn KernelOps>)
+        .with_mounts(Arc::new(StaticMounts(self.mounts.clone())))
+        .with_freeze_clock(Arc::new(self.clock.clone()))
+        .with_freeze_operation_timeout(Duration::from_secs(OPERATION_SECS));
+        if let Some(store) = ownership {
+            ctx = ctx.with_ownership(store);
+        }
+        let ctx = Arc::new(ctx);
         if recovery {
             fsfreeze::start_recovery(&ctx).unwrap();
         }
@@ -1274,5 +1317,468 @@ async fn cvm_freeze_allowed_mountpoints_conceals_unprovisioned_layout_and_recove
             .iter()
             .any(|c| matches!(c, Call::Open(_, d) if *d == (8, 1) || *d == (8, 3))),
         "thaw from Thawed must never open unprovisioned superblocks"
+    );
+}
+
+#[tokio::test]
+async fn two_cooperating_owners_preserve_guest_freeze_across_normal_thaw_idle_thaw_restart_and_ambiguity()
+ {
+    // OQ-11 (#69): two cooperating in-guest freezers — qeminga and an
+    // independent `guest-integrity` owner — share a real tmpfs ownership
+    // directory (`LinuxOwnershipStore` under /dev/shm). Every qeminga cycle,
+    // idle thaw, crash/restart recovery, and ambiguous-entry recovery must
+    // preserve `guest-integrity`'s freeze and recover qeminga's own work.
+    let own_dir = tempfile::Builder::new()
+        .prefix("qeminga-owners-e2e-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let table = concat!(
+        "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+        "28 27 8:2 / /integrity rw,relatime - ext4 /dev/sdb1 rw\n",
+        "29 27 8:3 / /data rw,relatime - ext4 /dev/sdc1 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::with_cooperative_ownership(table, own_dir.path().to_path_buf());
+    let foreign_store = LinuxOwnershipStore::open(own_dir.path()).unwrap();
+
+    // Independent guest component claims and freezes `/integrity` (8:2).
+    assert!(foreign_store.claim_as("guest-integrity", (8, 2)).unwrap());
+    let integrity_mount = guest
+        .kernel
+        .open_mount(Path::new("/integrity"), (8, 2))
+        .unwrap();
+    guest.kernel.fifreeze(&integrity_mount).unwrap();
+    guest
+        .kernel
+        .script_freeze_error("/integrity", nix::errno::Errno::EBUSY);
+    guest.kernel.clear_calls();
+
+    // 1. Controller requesting `/integrity` sees 0 (uncovered) and rejects;
+    //    qeminga never opens or freezes `/integrity` and leaves its claim intact.
+    let uncovered = Cycle::freeze(Arc::clone(&guest), &["/integrity"]).await;
+    assert!(
+        uncovered.is_err(),
+        "controller must reject uncovered foreign-owned mountpoint"
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert!(
+        !guest.kernel.calls().iter().any(|c| matches!(
+            c,
+            Call::Open(p, _) | Call::Fifreeze(p) | Call::Fithaw(p) if p == Path::new("/integrity")
+        )),
+        "qeminga must never touch foreign-owned /integrity: {:?}",
+        guest.kernel.calls()
+    );
+
+    // 2. Controller runs a full quiesced cycle on `/` and `/data`: qeminga
+    //    creates 8-1 and 8-3 on tmpfs, freezes both, thaws both, removes 8-1
+    //    and 8-3, and preserves `/integrity` frozen with 8-2 intact.
+    let mut cycle = Cycle::freeze(Arc::clone(&guest), &["/", "/data"])
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-1")).unwrap(),
+        "qeminga\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-3")).unwrap(),
+        "qeminga\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 3);
+    cycle
+        .cut("vol-root-data", Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(
+        cycle.thaw().await,
+        Verdict::Quiesced {
+            volumes: vec!["vol-root-data".to_owned()]
+        }
+    );
+    assert!(!own_dir.path().join("8-1").exists());
+    assert!(!own_dir.path().join("8-3").exists());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // 3. Host sends `guest-fsfreeze-thaw` while qeminga is `Thawed`: zero
+    //    FITHAW calls issued and `/integrity` stays frozen.
+    guest.kernel.clear_calls();
+    let idle_thaw = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(idle_thaw["return"], json!(0));
+    assert!(guest.kernel.calls().is_empty());
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // 4. Crash & restart with `/run/qeminga/frozen` and `8-3` on real tmpfs:
+    //    restarted agent recovers ONLY `/data`, removes 8-3 and marker, and
+    //    leaves `/integrity` frozen and claimed by `guest-integrity`.
+    let frozen = guest
+        .request(
+            r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen["return"], json!(1));
+    assert!(own_dir.path().join("8-3").exists());
+    assert!(guest.dir.path().join("frozen").exists());
+    guest.crash_agent();
+    guest.start_agent();
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    guest.kernel.clear_calls();
+    let recovered = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(recovered["return"], json!(1));
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!own_dir.path().join("8-3").exists());
+    assert!(!guest.dir.path().join("frozen").exists());
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert!(
+        !guest
+            .kernel
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/integrity"))),
+        "restart recovery must never touch /integrity: {:?}",
+        guest.kernel.calls()
+    );
+
+    // 5. Ambiguous ownership on real tmpfs (empty corrupt file `8-4` alongside
+    //    valid `qeminga` `8-3` and foreign `8-2`): recovery drains `/data` and
+    //    releases `8-3`, never touches `/integrity`, retains marker and Frozen,
+    //    and succeeds once the operator removes corrupt `8-4`.
+    let frozen = guest
+        .request(
+            r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen["return"], json!(1));
+    guest.crash_agent();
+    std::fs::write(own_dir.path().join("8-4"), b"").unwrap();
+    guest.start_agent();
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    let amb_reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    let desc = amb_reply["error"]["desc"].as_str().unwrap();
+    assert!(
+        desc.contains("freeze ownership is ambiguous; cannot confirm complete recovery"),
+        "{amb_reply}"
+    );
+    assert!(desc.contains("1 target(s) thawed"), "{amb_reply}");
+    assert!(
+        !desc.contains("8-4") && !desc.contains("guest-integrity"),
+        "{amb_reply}"
+    );
+    assert!(
+        !own_dir.path().join("8-3").exists(),
+        "reachable /data drained and released"
+    );
+    assert!(
+        guest.dir.path().join("frozen").exists(),
+        "marker retained until ambiguity resolved"
+    );
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // Operator clears the corrupt entry; retry finishes cleanly while `/integrity` stays frozen.
+    std::fs::remove_file(own_dir.path().join("8-4")).unwrap();
+    let cleared = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(cleared["return"], json!(0));
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // 6. Independent owner finishes its own integrity check, thaws `/integrity`,
+    //    and releases its claim on real tmpfs.
+    guest.kernel.fithaw(&integrity_mount).unwrap();
+    foreign_store.release_as("guest-integrity", (8, 2)).unwrap();
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 0);
+    assert_eq!(
+        std::fs::read_dir(own_dir.path()).unwrap().count(),
+        0,
+        "all cooperative ownership files released cleanly"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_cooperating_owners_automatic_watchdog_thaw_preserves_guest_freeze() {
+    let own_dir = tempfile::Builder::new()
+        .prefix("qeminga-owners-wd-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let table = concat!(
+        "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+        "28 27 8:2 / /integrity rw,relatime - ext4 /dev/sdb1 rw\n",
+        "29 27 8:3 / /data rw,relatime - ext4 /dev/sdc1 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::with_cooperative_ownership(table, own_dir.path().to_path_buf());
+    let foreign_store = LinuxOwnershipStore::open(own_dir.path()).unwrap();
+
+    // Foreign owner holds `/integrity` (8:2).
+    assert!(foreign_store.claim_as("guest-integrity", (8, 2)).unwrap());
+    let integrity_mount = guest
+        .kernel
+        .open_mount(Path::new("/integrity"), (8, 2))
+        .unwrap();
+    guest.kernel.fifreeze(&integrity_mount).unwrap();
+    guest
+        .kernel
+        .script_freeze_error("/integrity", nix::errno::Errno::EBUSY);
+
+    // qeminga freezes `/data` (8:3), then goes silent past idle timeout.
+    let frozen = guest
+        .request(
+            r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen["return"], json!(1));
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    guest.kernel.clear_calls();
+
+    tokio::time::advance(Duration::from_secs(IDLE_SECS + 1)).await;
+    for _ in 0..500 {
+        if guest.state() == FreezeState::Thawed {
+            break;
+        }
+        tokio::task::yield_now().await;
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+    assert!(!own_dir.path().join("8-3").exists());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert!(
+        !guest
+            .kernel
+            .calls()
+            .iter()
+            .any(|c| matches!(c, Call::Fithaw(p) if p == Path::new("/integrity"))),
+        "automatic watchdog thaw must never touch foreign /integrity: {:?}",
+        guest.kernel.calls()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn cvm_allowlist_and_cooperative_ownership_compose_across_foreign_freezes_narrowed_recovery_and_idle_thaws()
+ {
+    // #63 + #69 composition:
+    // (a) With both `freeze_allowed_mountpoints` and `freeze_ownership_dir`
+    //     enabled, an allowlisted filesystem owned by another guest service
+    //     stays frozen (never opened, frozen, or thawed by qeminga), while
+    //     counts reflect only qeminga-frozen allowlisted targets.
+    // (b) A qeminga-owned filesystem outside `freeze_allowed_mountpoints`
+    //     (for example after narrowing the allowlist across a crash/restart)
+    //     still recovers (drained and claim released) with wire count 0 and
+    //     excluded failures collapsed to `recovery incomplete` without
+    //     disclosing paths, device numbers, or target-specific failure classes.
+    let own_dir = tempfile::Builder::new()
+        .prefix("qeminga-owners-policy-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let table = concat!(
+        "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+        "28 27 8:2 / /integrity rw,relatime - ext4 /dev/sdb1 rw\n",
+        "29 27 8:3 / /data rw,relatime - ext4 /dev/sdc1 rw\n",
+        "30 27 8:4 / /secret rw,relatime - ext4 /dev/sdd1 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::with_policy_and_cooperative_ownership(
+        table,
+        Some(vec!["/integrity".to_owned(), "/data".to_owned()]),
+        own_dir.path().to_path_buf(),
+    );
+    let foreign_store = LinuxOwnershipStore::open(own_dir.path()).unwrap();
+
+    // Independent guest service claims and freezes allowlisted `/integrity` (8:2).
+    assert!(foreign_store.claim_as("guest-integrity", (8, 2)).unwrap());
+    let integrity_mount = guest
+        .kernel
+        .open_mount(Path::new("/integrity"), (8, 2))
+        .unwrap();
+    guest.kernel.fifreeze(&integrity_mount).unwrap();
+    guest
+        .kernel
+        .script_freeze_error("/integrity", nix::errno::Errno::EBUSY);
+    guest.kernel.clear_calls();
+
+    // (a1) Controller requests ["/integrity", "/data"]: only `/data` is frozen
+    //      (1 of 2), controller rejects and thaws `/data` (1), `/integrity`
+    //      is never opened/frozen/thawed and keeps its foreign claim.
+    let verdict = Cycle::freeze(Arc::clone(&guest), &["/integrity", "/data"])
+        .await
+        .unwrap_err();
+    rejected(&verdict, "freeze covered 1 of 2");
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!own_dir.path().join("8-3").exists());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert!(
+        !guest.kernel.calls().iter().any(|c| matches!(
+            c,
+            Call::Open(p, _) | Call::Fifreeze(p) | Call::Fithaw(p)
+                if p == Path::new("/integrity") || p == Path::new("/secret") || p == Path::new("/")
+        )),
+        "qeminga must never touch foreign /integrity or unallowlisted / or /secret: {:?}",
+        guest.kernel.calls()
+    );
+
+    // (a2) Whole-guest freeze respects both policies: skips foreign `/integrity`
+    //      and unallowlisted `/` & `/secret`, freezing only `/data` (count 1).
+    guest.kernel.clear_calls();
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-freeze"}"#)
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+    assert!(own_dir.path().join("8-3").exists());
+    assert!(!own_dir.path().join("8-1").exists());
+    assert!(!own_dir.path().join("8-4").exists());
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!own_dir.path().join("8-3").exists());
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // (a3) Unauthorized selection returns guest-independent 0 without touching
+    //      `/secret`, and idle thaw from Thawed (confirmed ENOENT marker)
+    //      returns 0 with zero kernel calls while keeping `/integrity` frozen.
+    guest.kernel.clear_calls();
+    assert_eq!(
+        guest
+            .request(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/secret"]}}"#
+            )
+            .await
+            .unwrap()["return"],
+        json!(0)
+    );
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(0)
+    );
+    assert!(
+        guest.kernel.calls().is_empty(),
+        "unauthorized freeze + clean idle cooperative thaw must issue zero kernel calls: {:?}",
+        guest.kernel.calls()
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+
+    // (b1) Narrowing allowlist across a crash: qeminga freezes `/secret` while
+    //      allowlisted, crashes, then restarts with allowlist narrowed to
+    //      `["/integrity", "/data"]`. Recovery thaw drains `/secret`, releases
+    //      its claim (8-4), removes the marker, reports wire count 0, and
+    //      still never touches foreign `/integrity`.
+    guest.set_freeze_allowed_mountpoints(Some(vec![
+        "/integrity".to_owned(),
+        "/data".to_owned(),
+        "/secret".to_owned(),
+    ]));
+    guest.restart_agent();
+    assert_eq!(
+        guest
+            .request(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/secret"]}}"#
+            )
+            .await
+            .unwrap()["return"],
+        json!(1)
+    );
+    assert!(own_dir.path().join("8-4").exists());
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 2);
+
+    guest.set_freeze_allowed_mountpoints(Some(vec!["/integrity".to_owned(), "/data".to_owned()]));
+    guest.restart_agent();
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    guest.kernel.clear_calls();
+
+    // First simulate a thaw failure (EPERM) on non-allowlisted `/secret`:
+    // wire must collapse the error to `recovery incomplete` (never leaking
+    // `permission denied`, `/secret`, or `8:4`), retain Frozen + marker + 8-4,
+    // and never touch `/integrity`.
+    guest
+        .kernel
+        .script_thaw_error("/secret", nix::errno::Errno::EPERM);
+    let err_reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    let desc = err_reply["error"]["desc"].as_str().unwrap();
+    assert_eq!(
+        desc,
+        "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+    );
+    assert!(!desc.contains("permission") && !desc.contains("/secret") && !desc.contains("8:4"));
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(own_dir.path().join("8-4").exists());
+    assert!(
+        !guest.kernel.calls().iter().any(
+            |c| matches!(c, Call::Open(p, _) | Call::Fithaw(p) if p == Path::new("/integrity"))
+        ),
+        "narrowed recovery retry must never touch foreign /integrity: {:?}",
+        guest.kernel.calls()
+    );
+
+    // Clear the EPERM: retry drains `/secret`, releases 8-4, removes marker,
+    // reports wire count 0 (concealing `/secret`), and leaves foreign `/integrity`
+    // frozen with 8-2 intact.
+    guest.kernel.clear_thaw_errors();
+    guest.kernel.clear_calls();
+    assert_eq!(
+        guest
+            .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+            .await
+            .unwrap()["return"],
+        json!(0)
+    );
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+    assert!(!own_dir.path().join("8-4").exists());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert!(
+        !guest.kernel.calls().iter().any(
+            |c| matches!(c, Call::Open(p, _) | Call::Fithaw(p) if p == Path::new("/integrity"))
+        ),
+        "narrowed cooperative recovery must never touch foreign /integrity: {:?}",
+        guest.kernel.calls()
     );
 }

@@ -133,6 +133,9 @@ pub struct Context {
     pub kernel: Arc<dyn crate::kernel::KernelOps>,
     /// The recovery marker at `config.agent.state_path` (§4.4).
     pub marker: crate::marker::Marker,
+    /// Optional cooperative per-superblock freeze ownership store (§4.2, OQ-11, #69).
+    /// `None` selects v1 sole-freezer mode.
+    pub ownership: Option<Arc<dyn crate::ownership::OwnershipStore>>,
     /// Freeze lifecycle callbacks (watchdog, audit ring).
     pub hooks: Arc<dyn handlers::fsfreeze::FreezeHooks>,
     /// The sysfs power interface (`guest-suspend-ram`).
@@ -199,6 +202,7 @@ impl Context {
             audit,
             kernel,
             marker,
+            ownership: None,
             hooks: Arc::new(handlers::fsfreeze::LifecycleHooks),
             suspend: Arc::new(handlers::suspend::SysPower),
             watchdog: std::sync::Mutex::new(None),
@@ -217,6 +221,13 @@ impl Context {
             freeze_clock: Arc::new(crate::freeze_op::TokioClock),
             handler_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Installs a cooperative per-superblock freeze ownership store (OQ-11, #69).
+    #[must_use]
+    pub fn with_ownership(mut self, ownership: Arc<dyn crate::ownership::OwnershipStore>) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     /// Replaces the freeze operation deadline (tests use short ones).

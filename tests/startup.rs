@@ -15,12 +15,15 @@ use nix::errno::Errno;
 use qeminga::audit::{Mode, Router};
 use qeminga::channel::{Channel, OpenError, OpenFn};
 use qeminga::config::{Authority, Config, ConfigError, LogLevel};
-use qeminga::daemon::{self, BuildProfile, EX_CONFIG, EX_UNAVAILABLE, Options, RunError, Startup};
+use qeminga::daemon::{
+    self, BuildProfile, EX_CONFIG, EX_UNAVAILABLE, OpenedOwnershipDir, Options, RunError, Startup,
+};
 use qeminga::dispatch::Context;
 use qeminga::kernel::caps::{Outcome, PrivilegeError};
 use qeminga::kernel::fake::FakeKernel;
 use qeminga::marker::Marker;
 use qeminga::mountinfo::{MountEntry, StaticMounts, parse_mountinfo};
+use qeminga::ownership::{InMemoryOwnershipStore, OwnershipStore};
 use qeminga::state::FreezeState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::instrument::WithSubscriber;
@@ -136,6 +139,14 @@ struct FakeStartup {
     /// An error the fake installer fails with (a kernel that refuses the
     /// filter), instead of installing or not.
     filter_error: Option<&'static str>,
+    /// Optional cooperative ownership store returned by `open_ownership_dir`.
+    ownership_store: Option<Arc<InMemoryOwnershipStore>>,
+    /// Fake device, UID, GID, mode, and tmpfs check reported for `freeze_ownership_dir`.
+    ownership_dev: (u32, u32),
+    ownership_uid: u32,
+    ownership_gid: u32,
+    ownership_mode: u32,
+    ownership_is_tmpfs: bool,
 }
 
 /// The `[agent]` lines every fake configuration starts with: the
@@ -169,6 +180,12 @@ impl FakeStartup {
             root: false,
             filter_installs: true,
             filter_error: None,
+            ownership_store: None,
+            ownership_dev: (0, 30),
+            ownership_uid: 0,
+            ownership_gid: 650,
+            ownership_mode: 0o3770,
+            ownership_is_tmpfs: true,
         }
     }
     /// A fake whose sink takes `delay` over its first write.
@@ -246,6 +263,21 @@ impl Startup for FakeStartup {
         self.log("mounts");
         Ok(parse_mountinfo(&self.mountinfo))
     }
+    fn open_ownership_dir(&self, path: &Path) -> Result<OpenedOwnershipDir, RunError> {
+        self.log(format!("ownership {}", path.display()));
+        let store = self
+            .ownership_store
+            .clone()
+            .unwrap_or_else(|| Arc::new(InMemoryOwnershipStore::new()));
+        Ok(OpenedOwnershipDir {
+            store,
+            dev: self.ownership_dev,
+            uid: self.ownership_uid,
+            gid: self.ownership_gid,
+            mode: self.ownership_mode,
+            is_tmpfs: self.ownership_is_tmpfs,
+        })
+    }
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError> {
         self.log(format!("channel {}", path.display()));
         match self.open {
@@ -270,8 +302,19 @@ impl Startup for FakeStartup {
             }
         }
     }
-    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError> {
-        self.log(format!("caps reboot={}", authority.reboot));
+    fn drop_privileges(
+        &self,
+        authority: &Authority,
+        extra_gid: Option<nix::unistd::Gid>,
+    ) -> Result<Outcome, PrivilegeError> {
+        match extra_gid {
+            Some(gid) => self.log(format!(
+                "caps reboot={} extra_gid={}",
+                authority.reboot,
+                gid.as_raw()
+            )),
+            None => self.log(format!("caps reboot={}", authority.reboot)),
+        }
         Ok(if self.root {
             Outcome::Dropped
         } else {
@@ -300,9 +343,15 @@ impl Startup for FakeStartup {
         recovery: bool,
         channel: Option<OwnedFd>,
         _marker: Marker,
+        ownership: Option<Arc<dyn OwnershipStore>>,
     ) -> Result<(), RunError> {
+        let ownership_suffix = if ownership.is_some() {
+            " ownership=on"
+        } else {
+            ""
+        };
         self.log(format!(
-            "runtime recovery={recovery} mode={:?} channel={}",
+            "runtime recovery={recovery} mode={:?} channel={}{ownership_suffix}",
             router.mode(),
             if channel.is_some() { "open" } else { "none" }
         ));
@@ -702,7 +751,7 @@ fn rig_with_idle(recovery: bool, sink: &SharedSink, idle_secs: u64) -> Rig {
         marker.path().display()
     ))
     .unwrap();
-    let ctx = daemon::production_context(Arc::new(config), router, recovery, marker);
+    let ctx = daemon::production_context(Arc::new(config), router, recovery, marker, None);
     let ctx = Arc::new(
         Arc::try_unwrap(ctx)
             .unwrap_or_else(|_| panic!("unshared"))
@@ -1435,4 +1484,252 @@ fn indeterminate_marker_probe_at_startup_enters_recovery_mode() {
         logs.contains("marker_probe_indeterminate"),
         "indeterminate startup probe should be logged: {logs}"
     );
+}
+
+#[test]
+fn freeze_ownership_dir_on_freezable_filesystem_is_refused_before_channel() {
+    let mut startup = FakeStartup::production();
+    startup.config = concat!(
+        "[agent]\n",
+        "state_path = \"/run/qeminga/frozen\"\n",
+        "freeze_ownership_dir = \"/var/lib/qeminga-owners\"\n",
+    )
+    .to_owned();
+    // Fixture tmpfs_and_nfs.txt has ext4 root on 8:1.
+    startup.ownership_dev = (8, 1);
+    let err = startup.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipPath { dev: (8, 1), .. }),
+        "{err:?}"
+    );
+    assert!(
+        !startup.steps().iter().any(|s| s.starts_with("channel ")),
+        "must fail before opening channel: {:?}",
+        startup.steps()
+    );
+}
+
+#[test]
+fn freeze_ownership_dir_on_non_tmpfs_host_share_is_refused_before_channel() {
+    let mut startup = FakeStartup::production();
+    startup.config = concat!(
+        "[agent]\n",
+        "state_path = \"/run/qeminga/frozen\"\n",
+        "freeze_ownership_dir = \"/mnt/nine/qeminga-owners\"\n",
+    )
+    .to_owned();
+    // Fixture tmpfs_and_nfs.txt has a host-provided 9p share on 0:50 which is
+    // outside `FreezePlan`, and reports valid root:650 03770 metadata — it must
+    // still be refused before opening the channel because it is not tmpfs.
+    startup.ownership_dev = (0, 50);
+    startup.ownership_uid = 0;
+    startup.ownership_gid = 650;
+    startup.ownership_mode = 0o3770;
+    startup.ownership_is_tmpfs = false;
+    let err = startup.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(matches!(err, RunError::OwnershipNotTmpfs { .. }), "{err:?}");
+    assert!(
+        !startup.steps().iter().any(|s| s.starts_with("channel ")),
+        "must fail before opening channel: {:?}",
+        startup.steps()
+    );
+}
+
+#[test]
+fn freeze_ownership_dir_enforced_hardening_requires_root_group_sticky_setgid_and_no_other() {
+    let cfg = concat!(
+        "[agent]\n",
+        "state_path = \"/run/qeminga/frozen\"\n",
+        "freeze_ownership_dir = \"/run/qeminga-freeze-owners\"\n",
+    );
+
+    // 1. Non-root owner rejected under enforced hardening.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 600;
+    s.ownership_gid = 650;
+    s.ownership_mode = 0o3770;
+    let err = s.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipDirPermissions { .. }),
+        "{err:?}"
+    );
+
+    // 2. Root group (gid 0) rejected under enforced hardening.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 0;
+    s.ownership_gid = 0;
+    s.ownership_mode = 0o3770;
+    let err = s.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipDirPermissions { .. }),
+        "{err:?}"
+    );
+
+    // 3. Missing sticky bit rejected under enforced hardening.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 0;
+    s.ownership_gid = 650;
+    s.ownership_mode = 0o2770;
+    let err = s.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipDirPermissions { .. }),
+        "{err:?}"
+    );
+
+    // 4. Missing setgid bit (01770) rejected under enforced hardening.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 0;
+    s.ownership_gid = 650;
+    s.ownership_mode = 0o1770;
+    let err = s.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipDirPermissions { .. }),
+        "{err:?}"
+    );
+
+    // 5. Missing group rwx (03750) rejected under enforced hardening.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 0;
+    s.ownership_gid = 650;
+    s.ownership_mode = 0o3750;
+    let err = s.run().unwrap_err();
+    assert_eq!(err.exit_code(), EX_CONFIG);
+    assert!(
+        matches!(err, RunError::OwnershipDirPermissions { .. }),
+        "{err:?}"
+    );
+
+    // 6. Any permission bit for other users (03775, 03777) rejected.
+    for bad_mode in [0o3775, 0o3777] {
+        let mut s = FakeStartup::production();
+        s.config = cfg.to_owned();
+        s.ownership_uid = 0;
+        s.ownership_gid = 650;
+        s.ownership_mode = bad_mode;
+        let err = s.run().unwrap_err();
+        assert_eq!(err.exit_code(), EX_CONFIG);
+        assert!(
+            matches!(err, RunError::OwnershipDirPermissions { .. }),
+            "mode {bad_mode:04o}: {err:?}"
+        );
+    }
+
+    // 7. Valid 03770 root:650 tmpfs dir accepted, passes extra_gid=650 to
+    //    privilege drop, and wires ownership store to serve.
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_uid = 0;
+    s.ownership_gid = 650;
+    s.ownership_mode = 0o3770;
+    s.ownership_is_tmpfs = true;
+    s.run().unwrap();
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "caps reboot=true extra_gid=650"),
+        "privilege drop must receive ownership dir gid: {:?}",
+        s.steps()
+    );
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "runtime recovery=false mode=Normal channel=open ownership=on"),
+        "{:?}",
+        s.steps()
+    );
+}
+
+#[test]
+fn cooperative_ownership_escalates_startup_recovery_post_drop_for_self_or_ambiguous_only() {
+    let cfg = concat!(
+        "[agent]\n",
+        "state_path = \"/run/qeminga/frozen\"\n",
+        "freeze_ownership_dir = \"/run/qeminga-freeze-owners\"\n",
+    );
+
+    // 1. Foreign claim ONLY (marker absent) -> starts cleanly Thawed in Normal mode.
+    let store_foreign = Arc::new(InMemoryOwnershipStore::new());
+    store_foreign.claim_foreign((8, 2), "guest-integrity");
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_store = Some(store_foreign);
+    s.run().unwrap();
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "runtime recovery=false mode=Normal channel=open ownership=on"),
+        "foreign-only claim must not escalate qeminga startup to recovery: {:?}",
+        s.steps()
+    );
+
+    // 2. Stale qeminga claim without marker -> escalates post-drop to Frozen + Ring.
+    let store_self = Arc::new(InMemoryOwnershipStore::new());
+    store_self.seed_self_claim((8, 1));
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_store = Some(store_self);
+    s.run().unwrap();
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "runtime recovery=true mode=Ring channel=open ownership=on"),
+        "stale qeminga claim must escalate startup to recovery + Ring: {:?}",
+        s.steps()
+    );
+
+    // 3. Ambiguous entry without marker -> escalates post-drop to Frozen + Ring.
+    let store_amb = Arc::new(InMemoryOwnershipStore::new());
+    store_amb.inject_stray_ambiguous("corrupt");
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_store = Some(store_amb);
+    s.run().unwrap();
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "runtime recovery=true mode=Ring channel=open ownership=on"),
+        "ambiguous ownership entry must escalate startup to recovery + Ring: {:?}",
+        s.steps()
+    );
+
+    // 4. Unreadable ownership store (inspect_all Err) -> escalates to Frozen + Ring.
+    let store_err = Arc::new(InMemoryOwnershipStore::new());
+    store_err.script_inspect_error(Some(Errno::EIO));
+    let mut s = FakeStartup::production();
+    s.config = cfg.to_owned();
+    s.ownership_store = Some(store_err);
+    s.run().unwrap();
+    assert!(
+        s.steps()
+            .iter()
+            .any(|step| step == "runtime recovery=true mode=Ring channel=open ownership=on"),
+        "unreadable ownership store must escalate startup to recovery + Ring: {:?}",
+        s.steps()
+    );
+}
+
+#[test]
+fn system_startup_open_ownership_dir_reads_real_tmpfs_metadata() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = shm_dir();
+    let meta = std::fs::metadata(dir.path()).unwrap();
+    let opened = daemon::SystemStartup
+        .open_ownership_dir(dir.path())
+        .unwrap();
+    assert_eq!(opened.dev, dev_of(dir.path()));
+    assert_eq!(opened.uid, meta.uid());
+    assert_eq!(opened.gid, meta.gid());
+    assert_eq!(opened.mode, meta.mode() & 0o7777);
+    assert!(opened.is_tmpfs, "/dev/shm tempdir should report tmpfs");
 }

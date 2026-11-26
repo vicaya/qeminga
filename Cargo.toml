@@ -57,7 +57,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 governor = "0.10"
 # Audit digest of over-long method names (design §5.2, C-4).
 sha2 = "0.10"
-nix = { version = "0.31", features = ["fs", "ioctl", "user", "reboot", "net", "feature", "process", "signal", "poll"] }
+nix = { version = "0.31", features = ["dir", "fs", "ioctl", "user", "reboot", "net", "feature", "process", "signal", "poll"] }
 caps = "0.5"
 # The JSON front-end resolves syscall names for every supported target on
 # any host, so both profiles are built and tested in one place.

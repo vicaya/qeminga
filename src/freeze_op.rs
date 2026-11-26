@@ -67,11 +67,13 @@ use tracing::instrument::WithSubscriber;
 use crate::dispatch::{Context, HeldMount, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
-    FreezeFailure, FreezeStop, FreezeTaskStage, IncompleteDrain, RecoveryReason, build_plan,
-    drain_held, merge_incomplete, open_target, rollback,
+    DrainHeldResult, FreezeFailure, FreezeStop, FreezeTaskStage, IncompleteDrain, RecoveryReason,
+    build_plan, drain_held, merge_incomplete, open_target, recovery_reason_for_ownership_error,
+    rollback,
 };
 use crate::kernel::{KernelOps, Mount};
 use crate::marker::{Marker, MarkerError};
+use crate::ownership::{ClaimOutcome, OwnershipStore};
 use crate::state::{FreezeState, FreezeToken, ThawToken};
 use crate::watchdog::BoxFuture;
 
@@ -483,6 +485,7 @@ pub(crate) fn start(
     let driver = Driver {
         kernel: Arc::clone(&ctx.kernel),
         marker: ctx.marker.clone(),
+        ownership: ctx.ownership.clone(),
         ctx,
         op,
         dispatch: dispatch.clone(),
@@ -510,15 +513,47 @@ pub(crate) fn start(
 enum TargetOutcome {
     /// `FIFREEZE` succeeded; the handle is to be drained later.
     Frozen(Mount),
-    /// `EBUSY`: frozen by another freezer; retained for the drain (§4.2).
+    /// `EBUSY`: retained for the drain (sole-freezer mode §4.2, or
+    /// `AlreadyOwnedBySelf` in cooperative mode #69).
     Busy(Mount),
+    /// Owned by another cooperating guest freezer (`OwnedByOther`, #69);
+    /// skipped without opening or issuing `FIFREEZE` and never retained.
+    ForeignOwned { owner: String },
+    /// `EBUSY` on a freshly acquired cooperative claim (unannounced foreign
+    /// freeze, #69); fresh claim released immediately and never retained.
+    ForeignBusy,
     /// `EOPNOTSUPP`: skipped.
     Skipped,
     /// The abort had committed, or the deadline had passed, before the
     /// ioctl: nothing was issued.
     NotAuthorized,
-    /// A hard error, or no mount point leads to the target.
+    /// A hard error, ownership ambiguity/error, claim-release failure, or no
+    /// mount point leads to the target.
     Failed(FreezeStop),
+}
+
+/// Releases a freshly acquired cooperative claim after a non-freeze outcome.
+/// Pre-existing `AlreadyOwnedBySelf` claims (`freshly_claimed == false`) are
+/// preserved untouched.
+fn release_fresh_claim(
+    store: Option<&dyn OwnershipStore>,
+    freshly_claimed: bool,
+    dev: (u32, u32),
+    on_released: TargetOutcome,
+) -> TargetOutcome {
+    if !freshly_claimed {
+        return on_released;
+    }
+    let Some(store) = store else {
+        return on_released;
+    };
+    match store.release(dev) {
+        Ok(()) => on_released,
+        Err(err) => TargetOutcome::Failed(FreezeStop::OwnershipReleaseFailed {
+            kind: recovery_reason_for_ownership_error(&err),
+            detail: err.to_string(),
+        }),
+    }
 }
 
 /// The result of a recovery drain over published handles.
@@ -526,6 +561,7 @@ struct RecoveryPass {
     recovered: u64,
     keep: Vec<HeldMount>,
     incomplete: Option<IncompleteDrain>,
+    uncertain: bool,
 }
 
 /// What ended a tracked wait.
@@ -547,6 +583,7 @@ struct Driver {
     op: Arc<FreezeOp>,
     kernel: Arc<dyn KernelOps>,
     marker: Marker,
+    ownership: Option<Arc<dyn OwnershipStore>>,
     dispatch: tracing::Dispatch,
     token: Option<FreezeToken>,
     thaw_token: Option<ThawToken>,
@@ -622,7 +659,7 @@ impl Driver {
                     tracing::warn!(
                         event = "fsfreeze_busy",
                         mountpoint = %mountpoint,
-                        "already frozen by another freezer; retained for thaw"
+                        "already frozen; retained for thaw"
                     );
                     self.op_held += 1;
                     self.ctx.hold_frozen_mounts(vec![HeldMount {
@@ -630,6 +667,21 @@ impl Driver {
                         countable: true,
                     }]);
                     self.refresh_pass_done();
+                }
+                Ok(TargetOutcome::ForeignOwned { owner }) => {
+                    tracing::info!(
+                        event = "fsfreeze_foreign_owned",
+                        mountpoint = %mountpoint,
+                        owner = %owner,
+                        "claimed by another cooperating guest freezer; skipped and not retained"
+                    );
+                }
+                Ok(TargetOutcome::ForeignBusy) => {
+                    tracing::warn!(
+                        event = "fsfreeze_foreign_busy",
+                        mountpoint = %mountpoint,
+                        "already frozen by an unannounced freezer; fresh claim released and not retained"
+                    );
                 }
                 Ok(TargetOutcome::Skipped) => {
                     tracing::info!(event = "fsfreeze_skipped", mountpoint = %mountpoint, "freeze not supported; skipped");
@@ -640,10 +692,45 @@ impl Driver {
                     self.decide();
                 }
                 Ok(TargetOutcome::Failed(stop)) => {
+                    let requires_recovery = if let Some((kind, detail)) = stop.ownership_recovery()
+                    {
+                        if matches!(stop, FreezeStop::OwnershipReleaseFailed { .. }) {
+                            tracing::error!(
+                                event = "fsfreeze_ownership_release_failed",
+                                mountpoint = %mountpoint,
+                                reason = %detail,
+                                "cannot release freshly acquired freeze ownership claim; retaining frozen state"
+                            );
+                        }
+                        self.uncertain = true;
+                        self.unrecoverable.get_or_insert(IncompleteDrain {
+                            mountpoint: mountpoint.clone(),
+                            kind,
+                            detail,
+                        });
+                        self.publish_recovery_progress();
+                        true
+                    } else {
+                        false
+                    };
                     if self.abort.is_none() {
                         return self.settle_hard_error(mountpoint, stop).await;
                     }
-                    tracing::warn!(event = "fsfreeze_late_failure", mountpoint = %mountpoint, cause = %stop, "target failed after the abort; nothing to recover for it");
+                    if requires_recovery {
+                        tracing::error!(
+                            event = "fsfreeze_late_ownership_failure",
+                            mountpoint = %mountpoint,
+                            cause = %stop,
+                            "target failed with unresolved ownership state after the abort; retaining recovery state"
+                        );
+                    } else {
+                        tracing::warn!(
+                            event = "fsfreeze_late_failure",
+                            mountpoint = %mountpoint,
+                            cause = %stop,
+                            "target failed after the abort; nothing to recover for it"
+                        );
+                    }
                 }
                 Err(err) => {
                     // The worker panicked or was cancelled with the runtime:
@@ -749,29 +836,78 @@ impl Driver {
         tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, f))
     }
 
-    /// The worker for one target: open it on its planned device, take the
-    /// last check, then `FIFREEZE`.
+    /// The worker for one target: claim cooperative ownership (if configured),
+    /// open it on its planned device, take the last check, then `FIFREEZE`.
     fn spawn_freeze(&self, target: Target) -> JoinHandle<TargetOutcome> {
         let kernel = Arc::clone(&self.kernel);
         let op = Arc::clone(&self.op);
+        let ownership = self.ownership.clone();
         self.spawn_blocking(move || {
+            let freshly_claimed = if let Some(store) = ownership.as_deref() {
+                match store.try_claim(target.dev) {
+                    Ok(ClaimOutcome::Acquired) => true,
+                    Ok(ClaimOutcome::AlreadyOwnedBySelf) => false,
+                    Ok(ClaimOutcome::OwnedByOther { owner }) => {
+                        return TargetOutcome::ForeignOwned { owner };
+                    }
+                    Ok(ClaimOutcome::Ambiguous { reason }) => {
+                        return TargetOutcome::Failed(FreezeStop::OwnershipAmbiguous(reason));
+                    }
+                    Err(err) => {
+                        return TargetOutcome::Failed(FreezeStop::OwnershipError(err));
+                    }
+                }
+            } else {
+                false
+            };
             let mount = match open_target(kernel.as_ref(), &target) {
                 Ok(mount) => mount,
                 Err(err) => {
-                    return TargetOutcome::Failed(FreezeStop::Unreachable {
-                        attempts: err.detail,
-                        permission_denied: err.permission_denied,
-                    });
+                    return release_fresh_claim(
+                        ownership.as_deref(),
+                        freshly_claimed,
+                        target.dev,
+                        TargetOutcome::Failed(FreezeStop::Unreachable {
+                            attempts: err.detail,
+                            permission_denied: err.permission_denied,
+                        }),
+                    );
                 }
             };
             if !op.authorises() {
-                return TargetOutcome::NotAuthorized;
+                return release_fresh_claim(
+                    ownership.as_deref(),
+                    freshly_claimed,
+                    target.dev,
+                    TargetOutcome::NotAuthorized,
+                );
             }
             match kernel.fifreeze(&mount) {
                 Ok(()) => TargetOutcome::Frozen(mount),
-                Err(err) if err.is_not_supported() => TargetOutcome::Skipped,
-                Err(err) if err.is_busy() => TargetOutcome::Busy(mount),
-                Err(err) => TargetOutcome::Failed(FreezeStop::Ioctl(err)),
+                Err(err) if err.is_not_supported() => release_fresh_claim(
+                    ownership.as_deref(),
+                    freshly_claimed,
+                    target.dev,
+                    TargetOutcome::Skipped,
+                ),
+                Err(err) if err.is_busy() => {
+                    if freshly_claimed {
+                        release_fresh_claim(
+                            ownership.as_deref(),
+                            true,
+                            target.dev,
+                            TargetOutcome::ForeignBusy,
+                        )
+                    } else {
+                        TargetOutcome::Busy(mount)
+                    }
+                }
+                Err(err) => release_fresh_claim(
+                    ownership.as_deref(),
+                    freshly_claimed,
+                    target.dev,
+                    TargetOutcome::Failed(FreezeStop::Ioctl(err)),
+                ),
             }
         })
     }
@@ -869,12 +1005,19 @@ impl Driver {
             return;
         }
         let kernel = Arc::clone(&self.kernel);
+        let ownership = self.ownership.clone();
         self.recovery = Some(self.spawn_blocking(move || {
-            let (recovered, keep, incomplete) = drain_held(kernel.as_ref(), held);
+            let DrainHeldResult {
+                recovered,
+                keep,
+                incomplete,
+                uncertain,
+            } = drain_held(kernel.as_ref(), ownership.as_deref(), held);
             RecoveryPass {
                 recovered,
                 keep,
                 incomplete,
+                uncertain,
             }
         }));
     }
@@ -895,6 +1038,9 @@ impl Driver {
         match res {
             Ok(pass) => {
                 self.recovered += pass.recovered;
+                if pass.uncertain {
+                    self.uncertain = true;
+                }
                 if let Some(incomplete) = pass.incomplete {
                     merge_incomplete(&mut self.unrecoverable, incomplete);
                 }
@@ -961,24 +1107,29 @@ impl Driver {
     async fn settle_hard_error(mut self, failed: String, stop: FreezeStop) {
         let kernel = Arc::clone(&self.kernel);
         let marker = self.marker.clone();
+        let ownership = self.ownership.clone();
         let mut held = self.ctx.take_frozen_mounts();
         let rolled = self
             .await_tracked(
                 self.spawn_blocking(move || {
-                    let failure = rollback(
+                    let (failure, uncertain) = rollback(
                         kernel.as_ref(),
+                        ownership.as_deref(),
                         &marker,
                         &mut held,
                         std::path::Path::new(&failed),
                         stop,
                     );
-                    (failure, held)
+                    (failure, held, uncertain)
                 }),
                 false,
             )
             .await;
         let failure = match rolled {
-            Ok((failure, keep)) => {
+            Ok((failure, keep, uncertain)) => {
+                if uncertain {
+                    self.uncertain = true;
+                }
                 self.ctx.hold_frozen_mounts(keep);
                 failure
             }

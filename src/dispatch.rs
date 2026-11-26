@@ -89,6 +89,22 @@ pub enum ThawScope {
     Discovery,
 }
 
+/// A held mount handle together with whether thawing it may increment
+/// the host-visible wire count under the guest's mount policy (§4.2, #63).
+///
+/// Handles published by a policy-authorized freeze are always countable.
+/// Handles retained from an incomplete marker-recovery drain preserve the
+/// countability of their discovery pass so later retries — including when
+/// `/proc/self/mountinfo` cannot be read or the mountpoint disappears —
+/// still drain them without disclosing an unauthorized mount count.
+#[derive(Debug)]
+pub struct HeldMount {
+    /// The verified mount handle to drain.
+    pub mount: crate::kernel::Mount,
+    /// `true` when thawing this superblock may be counted on the wire.
+    pub countable: bool,
+}
+
 /// Everything handlers need, shared behind an `Arc`. Tests build it with
 /// fakes; later tasks add the kernel shim and information sources.
 pub struct Context {
@@ -120,10 +136,11 @@ pub struct Context {
     pub suspend: Arc<dyn handlers::suspend::SuspendOps>,
     /// The armed watchdog, if any (§4.4).
     watchdog: std::sync::Mutex<Option<crate::watchdog::WatchdogHandle>>,
-    /// Handles of the filesystems this process froze (or found frozen),
-    /// held until their drain completes: a thaw drains the filesystem
-    /// each was opened on, whatever its pathnames lead to by then (§4.2).
-    frozen_mounts: std::sync::Mutex<Vec<crate::kernel::Mount>>,
+    /// Handles of the filesystems this process froze (or retained from an
+    /// incomplete recovery drain), held until their drain completes: a thaw
+    /// drains the filesystem each was opened on, whatever its pathnames
+    /// lead to by then (§4.2).
+    frozen_mounts: std::sync::Mutex<Vec<HeldMount>>,
     /// How the next thaw finds what it must drain (§4.2 "Thaw scope").
     thaw_scope: std::sync::Mutex<ThawScope>,
     /// The freeze operation in progress, from `Freezing` until it settles
@@ -341,13 +358,13 @@ impl Context {
 
     /// Takes the held handles of frozen filesystems for a drain; the
     /// guard is short-lived and never held across an `.await`.
-    pub fn take_frozen_mounts(&self) -> Vec<crate::kernel::Mount> {
+    pub fn take_frozen_mounts(&self) -> Vec<HeldMount> {
         std::mem::take(&mut *self.frozen_mounts_slot())
     }
 
     /// Holds handles of filesystems frozen by this process (added to any
     /// already held) until a drain completes them.
-    pub fn hold_frozen_mounts(&self, mounts: Vec<crate::kernel::Mount>) {
+    pub fn hold_frozen_mounts(&self, mounts: Vec<HeldMount>) {
         self.frozen_mounts_slot().extend(mounts);
     }
 
@@ -377,13 +394,11 @@ impl Context {
     /// The lock behind the held handles, for tests that must hold the
     /// driver between a completion and its next decision boundary.
     #[cfg(test)]
-    pub(crate) fn frozen_mounts_lock_for_tests(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
+    pub(crate) fn frozen_mounts_lock_for_tests(&self) -> std::sync::MutexGuard<'_, Vec<HeldMount>> {
         self.frozen_mounts_slot()
     }
 
-    fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<crate::kernel::Mount>> {
+    fn frozen_mounts_slot(&self) -> std::sync::MutexGuard<'_, Vec<HeldMount>> {
         self.frozen_mounts
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

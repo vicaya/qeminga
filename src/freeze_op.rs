@@ -64,7 +64,7 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tracing::instrument::WithSubscriber;
 
-use crate::dispatch::{Context, ThawScope};
+use crate::dispatch::{Context, HeldMount, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target};
 use crate::handlers::fsfreeze::{
     FreezeFailure, FreezeStop, FreezeTaskStage, IncompleteDrain, RecoveryReason, build_plan,
@@ -523,7 +523,7 @@ enum TargetOutcome {
 /// The result of a recovery drain over published handles.
 struct RecoveryPass {
     recovered: u64,
-    keep: Vec<Mount>,
+    keep: Vec<HeldMount>,
     incomplete: Option<IncompleteDrain>,
 }
 
@@ -555,7 +555,7 @@ struct Driver {
     /// The recovery drain in flight, if any (at most one).
     recovery: Option<JoinHandle<RecoveryPass>>,
     /// Handles whose drain did not complete, kept for the watchdog.
-    kept: Vec<Mount>,
+    kept: Vec<HeldMount>,
     unrecoverable: Option<IncompleteDrain>,
     /// A target's outcome is unknown and no descriptor shows for it (a
     /// worker, a drain or a rollback lost): the thaw of what this
@@ -604,7 +604,10 @@ impl Driver {
             match outcome {
                 Ok(TargetOutcome::Frozen(mount)) => {
                     self.frozen += 1;
-                    self.ctx.hold_frozen_mounts(vec![mount]);
+                    self.ctx.hold_frozen_mounts(vec![HeldMount {
+                        mount,
+                        countable: true,
+                    }]);
                     let frozen = self.frozen;
                     self.op.publish(|p| p.frozen = frozen);
                     self.refresh_pass_done();
@@ -615,7 +618,10 @@ impl Driver {
                         mountpoint = %mountpoint,
                         "already frozen by another freezer; retained for thaw"
                     );
-                    self.ctx.hold_frozen_mounts(vec![mount]);
+                    self.ctx.hold_frozen_mounts(vec![HeldMount {
+                        mount,
+                        countable: true,
+                    }]);
                     self.refresh_pass_done();
                 }
                 Ok(TargetOutcome::Skipped) => {

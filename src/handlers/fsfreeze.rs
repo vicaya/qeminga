@@ -71,7 +71,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::dispatch::{Context, ThawScope};
+use crate::dispatch::{Context, HeldMount, ThawScope};
 use crate::freeze_plan::{FreezePlan, Target, filter_freeze_selection};
 use crate::handlers::NoArgs;
 use crate::kernel::{KernelError, KernelOps, Mount};
@@ -974,7 +974,7 @@ pub(crate) struct IncompleteDrain {
 pub(crate) fn rollback(
     kernel: &dyn KernelOps,
     marker: &Marker,
-    held: &mut Vec<Mount>,
+    held: &mut Vec<HeldMount>,
     failed: &Path,
     cause: FreezeStop,
 ) -> FreezeFailure {
@@ -1017,35 +1017,35 @@ pub(crate) fn rollback(
 /// for a later attempt), and the first such target with its reason.
 pub(crate) fn drain_held(
     kernel: &dyn KernelOps,
-    held: Vec<Mount>,
-) -> (u64, Vec<Mount>, Option<IncompleteDrain>) {
+    held: Vec<HeldMount>,
+) -> (u64, Vec<HeldMount>, Option<IncompleteDrain>) {
     let mut recovered = 0;
     let mut incomplete: Option<IncompleteDrain> = None;
     let mut keep = Vec::new();
-    for mount in held.into_iter().rev() {
-        let drained = drain(kernel, &mount);
+    for entry in held.into_iter().rev() {
+        let drained = drain(kernel, &entry.mount);
         if drained.successes > 0 {
             recovered += 1;
         }
         tracing::warn!(
             event = "fsfreeze_rollback",
-            mountpoint = %mount.mountpoint().display(),
+            mountpoint = %entry.mount.mountpoint().display(),
             successes = drained.successes,
             "rolled back"
         );
         if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
             tracing::error!(
                 event = "fsfreeze_rollback_incomplete",
-                mountpoint = %mount.mountpoint().display(),
+                mountpoint = %entry.mount.mountpoint().display(),
                 reason = %detail,
                 "rollback target may still be frozen"
             );
             incomplete.get_or_insert(IncompleteDrain {
-                mountpoint: lossy(mount.mountpoint()),
+                mountpoint: lossy(entry.mount.mountpoint()),
                 kind,
                 detail,
             });
-            keep.push(mount);
+            keep.push(entry);
         }
     }
     (recovered, keep, incomplete)
@@ -1062,7 +1062,9 @@ pub(crate) fn drain_held(
 /// no longer lists are drained too: this process froze them. Without a
 /// plan (a tracked thaw: every obligation is a held descriptor) the held
 /// handles are all there is to drain, and no pathname is consulted. On
-/// return `held` keeps the handles whose drain did not complete.
+/// return `held` keeps the handles whose drain did not complete, along
+/// with whether each handle is countable on the wire under the guest's
+/// mount policy.
 ///
 /// Discovery is not a prerequisite of the drain: when the mount table
 /// could not be read (`plan` is the failure; `EMFILE`, which the held
@@ -1082,7 +1084,7 @@ fn thaw_blocking(
     kernel: &dyn KernelOps,
     marker: &Marker,
     plan: Option<Result<RecoveryPlan, ThawFailure>>,
-    held: &mut Vec<Mount>,
+    held: &mut Vec<HeldMount>,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
     let mut retained = std::mem::take(held);
@@ -1104,8 +1106,8 @@ fn thaw_blocking(
                 let countable = countable_devs
                     .as_ref()
                     .is_none_or(|devs| devs.contains(&target.dev));
-                let mount = match retained.iter().position(|m| m.dev() == target.dev) {
-                    Some(index) => retained.remove(index),
+                let mount = match retained.iter().position(|h| h.mount.dev() == target.dev) {
+                    Some(index) => retained.remove(index).mount,
                     None => match open_target(kernel, target) {
                         Ok(mount) => mount,
                         Err(err) => {
@@ -1149,16 +1151,18 @@ fn thaw_blocking(
         }
     };
     // `held` was filled in reverse mount order (deepest first): drain the
-    // leftovers forward, as the plan and the rollback do.
-    for mount in retained.into_iter().rev() {
+    // leftovers forward, as the plan and the rollback do. Preserve each
+    // retained handle's policy countability so an unauthorized recovery
+    // handle drained across an EMFILE or unmount retry is never disclosed.
+    for entry in retained.into_iter().rev() {
         if planned {
             tracing::warn!(
                 event = "fsfreeze_unplanned_drain",
-                mountpoint = %mount.mountpoint().display(),
+                mountpoint = %entry.mount.mountpoint().display(),
                 "frozen by this process but no longer in the plan; drained"
             );
         }
-        state.drain(kernel, mount, true);
+        state.drain(kernel, entry.mount, entry.countable);
     }
     let ThawState {
         thawed,
@@ -1187,7 +1191,7 @@ struct ThawState {
     /// The first failure to report, if any.
     unrecoverable: Option<ThawFailure>,
     /// Handles whose drain did not complete.
-    keep: Vec<Mount>,
+    keep: Vec<HeldMount>,
 }
 
 impl ThawState {
@@ -1211,7 +1215,7 @@ impl ThawState {
                 "target could not be thawed; draining the remaining targets"
             );
             self.unrecoverable.get_or_insert(failure);
-            self.keep.push(mount);
+            self.keep.push(HeldMount { mount, countable });
         }
     }
 }
@@ -5690,5 +5694,111 @@ mod tests {
         assert!(!desc.contains("/extra"), "{desc}");
         assert_eq!(rig.ctx.state.current(), FreezeState::Frozen);
         assert!(rig.ctx.marker.exists());
+    }
+
+    fn rig_with_allowed_mounts(
+        state: FreezeState,
+        mounts: Arc<dyn MountSource>,
+        allowed: Option<Vec<&str>>,
+    ) -> Rig {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let hooks = Arc::new(Recorder::default());
+        let clock = ManualClock::new();
+        let mut config = Config::default();
+        config.agent.freeze_allowed_mountpoints =
+            allowed.map(|list| list.into_iter().map(str::to_owned).collect());
+        let ctx = Context::new(
+            Arc::new(config),
+            Arc::new(FreezeStateMachine::starting_in(state)),
+            Router::new(Box::new(std::io::sink())),
+            Marker::open(dir.path().join("frozen")).unwrap(),
+        )
+        .with_kernel(kernel.clone())
+        .with_mounts(mounts)
+        .with_hooks(hooks.clone())
+        .with_freeze_clock(Arc::new(clock.clone()));
+        Rig {
+            ctx: Arc::new(ctx),
+            kernel,
+            hooks,
+            clock,
+            _dir: dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn marker_recovery_retry_mountinfo_failure_hides_unauthorized_retained_handle() {
+        let mounts = Arc::new(SwitchableMounts::new(
+            concat!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+                "2 1 8:2 / /secret rw - ext4 /dev/sdb1 rw\n",
+            )
+            .to_owned(),
+        ));
+        let rig = rig_with_allowed_mounts(FreezeState::Frozen, mounts.clone(), Some(vec![]));
+        rig.ctx.marker.create().unwrap();
+        let secret = rig.kernel.open_mount(Path::new("/secret"), (8, 2)).unwrap();
+        rig.kernel.fifreeze(&secret).unwrap();
+        rig.kernel.script_thaw_error("/secret", Errno::EIO);
+
+        // Attempt 1: /secret fails to thaw, so its handle is retained in `held`.
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let err1 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(err1.contains("0 target(s) thawed"), "{err1}");
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 1);
+
+        // Attempt 2: /proc/self/mountinfo fails (EMFILE) while the transient
+        // FITHAW error clears. The retained /secret handle must still be
+        // drained, released, AND excluded from the wire count (0, not 1).
+        rig.kernel.clear_thaw_errors();
+        mounts.fail_reads(true);
+        let err2 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+        assert!(
+            err2.contains("0 target(s) thawed"),
+            "unauthorized retained handle leaked in error count: {err2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn marker_recovery_retry_unplanned_unauthorized_retained_handle_stays_hidden() {
+        struct MutableMounts(std::sync::Mutex<String>);
+        impl MountSource for MutableMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+                Ok(self.0.lock().unwrap().as_bytes().to_vec())
+            }
+        }
+        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
+            concat!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+                "2 1 8:2 / /secret rw - ext4 /dev/sdb1 rw\n",
+            )
+            .to_owned(),
+        )));
+        let rig = rig_with_allowed_mounts(FreezeState::Frozen, mounts.clone(), Some(vec![]));
+        rig.ctx.marker.create().unwrap();
+        let secret = rig.kernel.open_mount(Path::new("/secret"), (8, 2)).unwrap();
+        rig.kernel.fifreeze(&secret).unwrap();
+        rig.kernel.script_thaw_error("/secret", Errno::EIO);
+
+        // Attempt 1 retains /secret because FITHAW failed transiently.
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let err1 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(err1.contains("0 target(s) thawed"), "{err1}");
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        // Attempt 2: /secret is no longer listed in mountinfo, so it reaches
+        // the leftover-handle drain loop. It must still thaw and report 0.
+        rig.kernel.clear_thaw_errors();
+        *mounts.0.lock().unwrap() = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned();
+        let reply = thaw(&rig.ctx, &req).await.unwrap();
+        assert_eq!(reply, json!(0));
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
+        assert!(!rig.ctx.marker.exists());
     }
 }

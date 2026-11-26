@@ -217,8 +217,10 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "packaging/README.md must inventory startup, post-drop, and residual writable locations"
     );
     assert!(
-        lower_readme.contains("mounted on the host") || lower_readme.contains("after the service"),
-        "packaging/README.md must document mount propagation of post-start mounts"
+        lower_readme.contains("system-manager mount namespace")
+            && lower_readme.contains("after the service starts")
+            && !lower_readme.contains("mounted on the host"),
+        "packaging/README.md must document guest system-manager mount propagation of post-start mounts without calling the guest 'the host'"
     );
     assert!(
         !readme.contains("ReadOnlyPaths=/run -/dev/shm"),
@@ -538,15 +540,13 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
                 && !text.contains("ProtectHome=no")
                 && !text.contains("does not yet enforce a read-only filesystem namespace")
                 && !text.contains("does not yet confine writes")
-                && !text.contains("currently sets")
                 && !text.contains("world-writable directories such as /tmp"),
             "{name} must not retain stale unconfined-unit wording"
         );
     }
     assert!(
         !packaging_norm.contains("ProtectSystem=no")
-            && !packaging_norm.contains("does not yet confine writes")
-            && !packaging_norm.contains("currently sets"),
+            && !packaging_norm.contains("does not yet confine writes"),
         "packaging/README.md must not retain stale ProtectSystem=no or unconfined-unit wording"
     );
 

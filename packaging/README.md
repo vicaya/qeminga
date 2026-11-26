@@ -112,11 +112,11 @@ even while `CAP_SYS_ADMIN` is held.
   - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`): the only ordinary-file directory writable to the service (for mounts present at service start), holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
   - `/dev/virtio-ports/org.qemu.guest_agent.0` (`0600 qeminga:qeminga`, symlink to `/dev/vport*`): the read-write virtio-serial character device opened at startup and reopened after disconnect/hot-unplug.
   - Inherited `stderr` journald stream (`StandardError=journal`): structured audit records.
-  - `/sys/power/state` **only** when the operator opts into `suspend_ram` (both `tmpfiles.d/qeminga-suspend.conf` and a `ReadWritePaths=/sys/power/state` drop-in).
+  - `/sys/power/state` **only** when the guest operator opts into `suspend_ram` (both guest-installed `tmpfiles.d/qeminga-suspend.conf` and a guest `ReadWritePaths=/sys/power/state` drop-in).
 - **Residual writable locations:**
   - World-writable character devices under `/dev` (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`), because `PrivateDevices=yes` cannot be enabled without hiding `/dev/virtio-ports/org.qemu.guest_agent.0` (and PTY slaves used in installed-unit tests). Ordinary files on `/dev` itself and on every filesystem already mounted beneath `/dev` (such as `/dev/shm`, `/dev/mqueue`, and `/dev/hugepages`) are recursively locked read-only (`MNT_READONLY`) by `BindReadOnlyPaths=/sys /dev`, which blocks ordinary-file writes and unlinks (`EROFS`) while allowing `O_RDWR` open and I/O on existing character devices (including virtio-serial reopen after disconnect/hotplug).
   - Per-process procfs attribute files under `/proc/self/` (such as `/proc/self/comm` and `/proc/self/oom_score_adj`), which are kernel process interfaces rather than ordinary files.
-  - **Filesystems mounted on the host after the service starts:** per `systemd.exec(5)`, host-to-unit mount propagation passes newly attached mounts into the service's mount namespace with their host mount flags (read-write, still bounded by UID `600` Unix permissions without `CAP_DAC_OVERRIDE`), whereas every filesystem already mounted at service start is remounted `MNT_READONLY`. Restart `qeminga.service` if a static filesystem is mounted after boot and should also be locked `MNT_READONLY`.
+  - **Filesystems mounted in the guest after the service starts:** per `systemd.exec(5)`, mount propagation from the guest's system-manager mount namespace passes newly attached guest mounts into the service's mount namespace with their original mount flags (so a read-write guest mount stays read-write, still bounded by UID `600` Unix permissions without `CAP_DAC_OVERRIDE`, while a read-only guest mount stays read-only), whereas every filesystem already mounted at service start is remounted `MNT_READONLY`. Restart `qeminga.service` if a static guest filesystem is mounted after boot and should also be locked `MNT_READONLY`.
 
 ### Why `PrivateTmp=no` and `ProtectHome=read-only` are chosen
 
@@ -244,10 +244,11 @@ device numbers, or marker paths).
     `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`,
     `SystemCallFilter=~@mount`, and `UMask=0077`), which confines
     ordinary file writes on mounts present at service start to
-    `/run/qeminga` (plus `/sys/power/state` only with an explicit suspend
-    drop-in) while leaving the residual writable objects inventoried
-    above (character devices under `/dev`, `/proc/self/*`, and
-    filesystems mounted after service start).
+    `/run/qeminga` (plus `/sys/power/state` only with guest-installed
+    `tmpfiles.d/qeminga-suspend.conf` and a guest suspend drop-in) while
+    leaving the residual writable objects inventoried above (character
+    devices under `/dev`, `/proc/self/*`, and filesystems mounted in the
+    guest's system-manager mount namespace after service start).
   - *Sockets and IPC:* Under an installed, enforcing seccomp filter
     (required by `hardening = "enforced"`; the filter may be absent or
     logging-only under the development-only opt-out

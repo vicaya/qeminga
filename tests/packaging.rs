@@ -142,6 +142,89 @@ fn unit_provisions_the_state_directory_for_the_service_account() {
 }
 
 #[test]
+fn unit_constrains_filesystem_writes_to_marker_directory() {
+    // #66: the packaged unit remounts the filesystem hierarchy read-only
+    // (ProtectSystem=strict, MNT_READONLY — compatible with FIFREEZE on
+    // O_RDONLY|O_DIRECTORY handles), punches only /run/qeminga for ordinary
+    // file writes, locks /sys and /proc/sys (ProtectKernelTunables=yes),
+    // closes /dev/shm and /dev/mqueue, prevents remounting via ~@mount,
+    // sets UMask=0077, and deliberately keeps PrivateTmp=no, ProtectHome=no,
+    // and PrivateDevices unset so real /tmp, /home, and /dev/virtio-ports
+    // mounts/devices stay reachable.
+    let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
+    assert_eq!(values(&unit, "Service", "ProtectSystem"), ["strict"]);
+    assert_eq!(values(&unit, "Service", "ReadWritePaths"), ["/run/qeminga"]);
+    assert_eq!(values(&unit, "Service", "ProtectKernelTunables"), ["yes"]);
+    let ro = values(&unit, "Service", "ReadOnlyPaths");
+    assert!(ro.contains(&"-/dev/shm"), "{ro:?}");
+    assert!(ro.contains(&"-/dev/mqueue"), "{ro:?}");
+    let sc = values(&unit, "Service", "SystemCallFilter");
+    assert!(sc.contains(&"~@mount"), "{sc:?}");
+    assert_eq!(values(&unit, "Service", "UMask"), ["0077"]);
+    assert_eq!(values(&unit, "Service", "PrivateTmp"), ["no"]);
+    assert_eq!(values(&unit, "Service", "ProtectHome"), ["no"]);
+    assert!(
+        values(&unit, "Service", "PrivateDevices").is_empty(),
+        "PrivateDevices=yes would hide /dev/virtio-ports/org.qemu.guest_agent.0"
+    );
+}
+
+#[test]
+fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
+    // #66: inventory writable objects during startup and after drop,
+    // residual writable locations, custom state_path drop-in, optional
+    // suspend_ram ReadWritePaths=/sys/power/state drop-in, and the
+    // supported systemd baseline.
+    let readme = read("packaging/README.md");
+    let suspend_tmpfiles = read("packaging/tmpfiles.d/qeminga-suspend.conf");
+    let design = read("docs/design.md");
+    for needle in [
+        "ProtectSystem=strict",
+        "ReadWritePaths=/run/qeminga",
+        "ProtectKernelTunables=yes",
+        "-/dev/shm",
+        "~@mount",
+        "UMask=0077",
+        "ReadWritePaths=/sys/power/state",
+        "state_path",
+        "systemd 245",
+        "PrivateTmp=no",
+        "ProtectHome=no",
+        "PrivateDevices",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "packaging/README.md missing {needle:?}"
+        );
+    }
+    let lower_readme = readme.to_ascii_lowercase();
+    assert!(
+        lower_readme.contains("during privileged startup")
+            && lower_readme.contains("after privilege drop")
+            && lower_readme.contains("residual writable"),
+        "packaging/README.md must inventory startup, post-drop, and residual writable locations"
+    );
+    assert!(
+        lower_readme.contains("mounted on the host") || lower_readme.contains("after the service"),
+        "packaging/README.md must document mount propagation of post-start mounts"
+    );
+    assert!(
+        suspend_tmpfiles.contains("ReadWritePaths=/sys/power/state"),
+        "packaging/tmpfiles.d/qeminga-suspend.conf must note the ReadWritePaths=/sys/power/state drop-in"
+    );
+    for needle in [
+        "ProtectSystem=strict",
+        "ReadWritePaths=/run/qeminga",
+        "ProtectKernelTunables=yes",
+        "SystemCallFilter=~@mount",
+        "ReadWritePaths=/sys/power/state",
+        "systemd 245",
+    ] {
+        assert!(design.contains(needle), "docs/design.md missing {needle:?}");
+    }
+}
+
+#[test]
 fn tmpfiles_rule_provisions_the_state_directory_at_boot() {
     // C-20: /run is cleared at boot; the directory the dropped daemon
     // creates its marker in must exist and belong to the service account.
@@ -795,6 +878,15 @@ impl PtyChannel {
         }
     }
 
+    fn open_for_qeminga() -> Self {
+        let pty = Self::open();
+        let (ok, text) = sh("chown", &["600:600", &pty.slave_path]);
+        assert!(ok, "chown {}: {text}", pty.slave_path);
+        let (ok, text) = sh("chmod", &["0600", &pty.slave_path]);
+        assert!(ok, "chmod {}: {text}", pty.slave_path);
+        pty
+    }
+
     /// Sends one request line and returns the reply line, or panics after
     /// ten seconds.
     fn request(&mut self, json: &str) -> String {
@@ -833,12 +925,155 @@ impl PtyChannel {
     }
 }
 
+/// Removes a test file or symlink on drop.
+struct PathGuard(std::path::PathBuf);
+
+impl Drop for PathGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Atomically points symlink `link` at `target`.
+fn repoint_symlink(link: &Path, target: &str) {
+    let tmp = link.with_extension("next");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp).unwrap();
+    std::fs::rename(&tmp, link).unwrap();
+}
+
+/// Checks whether the final mount row at `mountpoint` in `/proc/<pid>/mountinfo`
+/// has `ro` in its per-mount options (field 6).
+fn mountinfo_is_ro(pid: &str, mountpoint: &str) -> bool {
+    let raw = std::fs::read(format!("/proc/{pid}/mountinfo")).unwrap();
+    let entries = qeminga::mountinfo::parse_mountinfo(&raw);
+    entries
+        .iter()
+        .rfind(|e| e.mount_point == Path::new(mountpoint))
+        .is_some_and(|e| e.mount_options.split(',').any(|opt| opt == "ro"))
+}
+
+/// Verifies #66 write confinement inside `qeminga.service`'s mount namespace:
+/// a UID-600-writable ordinary file outside `/run/qeminga` is writable outside
+/// the service namespace, cannot be written or unlinked inside it (`EROFS`),
+/// `/dev/shm` cannot be written (`EROFS`), `/` and `/sys` are mounted `ro`,
+/// while `/run/qeminga` remains writable to UID 600.
+fn assert_unit_write_confinement(pid: &str) {
+    let probe = Path::new("/var/tmp/qeminga-confinement-probe");
+    let shm_probe = Path::new("/dev/shm/qeminga-confinement-probe");
+    let marker_probe = Path::new("/run/qeminga/confinement-probe");
+    let _probe_guard = PathGuard(probe.to_path_buf());
+    let _shm_guard = PathGuard(shm_probe.to_path_buf());
+    let _marker_guard = PathGuard(marker_probe.to_path_buf());
+
+    let _ = std::fs::remove_file(probe);
+    std::fs::write(probe, b"intact\n").unwrap();
+    let (ok, text) = sh("chown", &["qeminga:qeminga", probe.to_str().unwrap()]);
+    assert!(ok, "chown probe: {text}");
+    let (ok, text) = sh("chmod", &["0600", probe.to_str().unwrap()]);
+    assert!(ok, "chmod probe: {text}");
+
+    // Outside the service mount namespace, normal Unix permissions let UID 600 write it.
+    let (ok, text) = sh(
+        "setpriv",
+        &[
+            "--reuid",
+            "600",
+            "--regid",
+            "600",
+            "--clear-groups",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'intact\\n' > \"$1\"",
+            "_",
+            probe.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        ok,
+        "uid 600 must be able to write probe outside unit: {text}"
+    );
+
+    let ns_arg = format!("--mount=/proc/{pid}/ns/mnt");
+    let in_ns = |script: &str, arg: &str| -> (bool, String) {
+        let output = std::process::Command::new("nsenter")
+            .env("LC_ALL", "C")
+            .args([
+                &ns_arg,
+                "--",
+                "setpriv",
+                "--reuid",
+                "600",
+                "--regid",
+                "600",
+                "--clear-groups",
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+                "_",
+                arg,
+            ])
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    };
+
+    let (ok, text) = in_ns("printf 'tampered\\n' > \"$1\"", probe.to_str().unwrap());
+    assert!(
+        !ok && text.contains("Read-only file system"),
+        "write outside /run/qeminga must fail with EROFS: ok={ok} text={text}"
+    );
+    let (ok, text) = in_ns("/bin/rm -- \"$1\"", probe.to_str().unwrap());
+    assert!(
+        !ok && text.contains("Read-only file system"),
+        "unlink outside /run/qeminga must fail with EROFS: ok={ok} text={text}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(probe).unwrap(),
+        "intact\n",
+        "probe file must remain untouched"
+    );
+
+    let (ok, text) = in_ns(": > \"$1\"", shm_probe.to_str().unwrap());
+    assert!(
+        !ok && text.contains("Read-only file system"),
+        "write to /dev/shm must fail with EROFS: ok={ok} text={text}"
+    );
+
+    assert!(
+        mountinfo_is_ro(pid, "/"),
+        "/ must be mounted ro in service mount namespace"
+    );
+    assert!(
+        mountinfo_is_ro(pid, "/sys"),
+        "/sys must be mounted ro in service mount namespace (ProtectKernelTunables=yes)"
+    );
+
+    let (ok, text) = in_ns(
+        ": > \"$1\" && /bin/rm -- \"$1\"",
+        marker_probe.to_str().unwrap(),
+    );
+    assert!(
+        ok,
+        "/run/qeminga must remain writable to uid 600 in service mount namespace: {text}"
+    );
+}
+
 /// The installed unit, not just the binary, freezes and thaws: the
 /// daemon started by systemd, dropped to `qeminga`, must be able to
 /// create its marker in /run/qeminga and remove it again. (With
 /// RuntimeDirectory= it could not: systemd re-applied root ownership
-/// before ExecStart and every freeze failed on the marker.) The channel
-/// is a pty the test holds the master of.
+/// before ExecStart and every freeze failed on the marker.) Also removes
+/// `/run/qeminga` before starting so `ExecStartPre=+` creating it ahead
+/// of `ReadWritePaths=/run/qeminga` is exercised (#66). The channel is a
+/// pty the test holds the master of.
 #[test]
 #[ignore = "needs root and a running systemd (installs the shipped unit for the duration)"]
 fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
@@ -847,7 +1082,7 @@ fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
     let Some(installed) = install_unit(&pty.slave_path) else {
         return;
     };
-    let _ = std::fs::remove_file("/run/qeminga/frozen");
+    let _ = std::fs::remove_dir_all("/run/qeminga");
     let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
     assert!(ok, "systemctl start: {text}");
     let reply = pty.request(r#"{"execute":"guest-ping"}"#);
@@ -860,6 +1095,11 @@ fn privileged_installed_unit_freezes_and_thaws_over_a_pty() {
     let marker = std::fs::metadata("/run/qeminga/frozen")
         .unwrap_or_else(|e| panic!("marker not created by the dropped daemon: {e}"));
     assert_eq!(marker.uid(), 600, "created by the service account");
+    assert_eq!(
+        marker.mode() & 0o777,
+        0o600,
+        "marker mode 0600 (UMask=0077)"
+    );
     let dir = std::fs::metadata("/run/qeminga").unwrap();
     assert_eq!(
         (dir.uid(), dir.mode() & 0o777),
@@ -1031,23 +1271,37 @@ fn privileged_installed_unit_recovers_without_the_channel_device() {
 
 /// The installed artifact under the shipped defaults (enforced
 /// hardening, real kernel): the daemon's effective capabilities,
-/// no-new-privileges, seccomp mode, a prohibited operation and a real
-/// freeze/thaw on the loop ext4 all match the advertised profile, and a
-/// test-kernel request is refused with the marker left alone (#43 §4).
-/// Under the `seccomp-log` compatibility build the same start is refused
-/// outright, which is the negative half of the same property.
+/// no-new-privileges, seccomp mode, filesystem write confinement (#66),
+/// a prohibited operation, a real freeze/thaw with pinned deduplicated
+/// counts on the known loop layout (ext4, bind mount, and xfs when
+/// present), post-drop read-write channel reopen, and SIGKILL crash
+/// recovery all match the advertised profile, and a test-kernel request
+/// is refused with the marker left alone (#43 §4). Under the
+/// `seccomp-log` compatibility build the same start is refused outright,
+/// which is the negative half of the same property.
 #[test]
 #[ignore = "needs root, a running systemd and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
 fn privileged_installed_unit_matches_the_advertised_profile() {
     use std::io::Write;
-    let mount = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
+    use std::os::unix::fs::MetadataExt;
+    let ext4 = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
         .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup");
+    let ext4_bind = std::env::var("QEMINGA_TEST_EXT4_BIND").ok();
+    let xfs = std::env::var("QEMINGA_TEST_XFS_MOUNT").ok();
+    let mut thaw_targets = vec![ext4.clone()];
+    if let Some(ref x) = xfs {
+        thaw_targets.push(x.clone());
+    }
     // A failed assertion between the freeze and the thaw would otherwise
-    // leave the loop ext4 frozen for the rest of the serial run: the
+    // leave a loop filesystem frozen for the rest of the serial run: the
     // unit's drop SIGKILLs the daemon, watchdog included.
-    let _thaw = e2e::ThawGuard::new(std::slice::from_ref(&mount));
-    let mut pty = PtyChannel::open();
-    let Some(installed) = install_unit_with(&pty.slave_path, true) else {
+    let _thaw = e2e::ThawGuard::new(&thaw_targets);
+
+    let channel_link = Path::new("/run/qeminga-test-channel");
+    let _channel_guard = PathGuard(channel_link.to_path_buf());
+    let mut pty1 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty1.slave_path);
+    let Some(installed) = install_unit_with(channel_link.to_str().unwrap(), true) else {
         return;
     };
     let _ = std::fs::remove_file("/run/qeminga/frozen");
@@ -1112,14 +1366,15 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
     assert!(ok, "systemctl start: {text}\n{}", journal());
     assert_eq!(
-        pty.request(r#"{"execute":"guest-ping"}"#),
+        pty1.request(r#"{"execute":"guest-ping"}"#),
         r#"{"return":{}}"#
     );
-    let (_, pid) = sh(
+    let (_, pid_raw) = sh(
         "systemctl",
         &["show", "-p", "MainPID", "--value", "qeminga.service"],
     );
-    let status = std::fs::read_to_string(format!("/proc/{}/status", pid.trim())).unwrap();
+    let pid = pid_raw.trim().to_owned();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let field = |name: &str| -> String {
         status
             .lines()
@@ -1138,24 +1393,73 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     assert_eq!(field("NoNewPrivs:"), "1");
     assert_eq!(field("Seccomp:"), "2", "SECCOMP_MODE_FILTER");
     assert!(field("Uid:").starts_with("600\t600"), "{}", field("Uid:"));
-    // A prohibited operation is refused; a real freeze/thaw works.
-    let reply = pty.request(r#"{"execute":"guest-exec","arguments":{"path":"/bin/true"}}"#);
+
+    // #66: verify write confinement inside the running service's mount namespace.
+    assert_unit_write_confinement(&pid);
+
+    // A prohibited operation is refused; a real freeze/thaw on the known loop
+    // layout (ext4 + bind alias deduplicated, plus xfs when available) works
+    // under ProtectSystem=strict with exact nonzero counts.
+    let reply = pty1.request(r#"{"execute":"guest-exec","arguments":{"path":"/bin/true"}}"#);
     assert!(reply.contains("CommandNotFound"), "{reply}");
-    let reply = pty.request(&format!(
-        r#"{{"execute":"guest-fsfreeze-freeze-list","arguments":{{"mountpoints":["{mount}"]}}}}"#
-    ));
-    assert_eq!(reply, r#"{"return":1}"#, "freeze under the installed unit");
-    assert!(Path::new("/run/qeminga/frozen").exists());
-    let reply = pty.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
-    assert!(reply.starts_with(r#"{"return":"#), "{reply}");
+    let mut requested = vec![ext4.clone()];
+    if let Some(ref bind) = ext4_bind {
+        requested.push(bind.clone());
+    }
+    if let Some(ref x) = xfs {
+        requested.push(x.clone());
+    }
+    let expected_count: u64 = if xfs.is_some() { 2 } else { 1 };
+    let freeze_req = serde_json::json!({
+        "execute": "guest-fsfreeze-freeze-list",
+        "arguments": { "mountpoints": requested },
+    })
+    .to_string();
+    let expected_reply = format!(r#"{{"return":{expected_count}}}"#);
+
+    let reply = pty1.request(&freeze_req);
+    assert_eq!(
+        reply, expected_reply,
+        "pinned freeze count under ProtectSystem=strict for {requested:?}"
+    );
+    let marker = std::fs::metadata("/run/qeminga/frozen").unwrap();
+    assert_eq!(marker.uid(), 600);
+    assert_eq!(marker.mode() & 0o777, 0o600);
+    let reply = pty1.request(r#"{"execute":"guest-fsfreeze-thaw"}"#);
+    assert_eq!(
+        reply, expected_reply,
+        "pinned thaw count under ProtectSystem=strict"
+    );
     assert!(!Path::new("/run/qeminga/frozen").exists());
-    std::fs::File::create(format!("{mount}/installed-unit-probe"))
-        .and_then(|mut f| f.write_all(b"ok"))
-        .expect("the loop filesystem is thawed");
+    for target in &thaw_targets {
+        std::fs::File::create(format!("{target}/installed-unit-probe"))
+            .and_then(|mut f| f.write_all(b"ok"))
+            .unwrap_or_else(|e| panic!("loop filesystem {target} must be thawed: {e}"));
+    }
+
+    // #66: read-write channel reopen after privilege drop under ProtectSystem=strict.
+    let mut pty2 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty2.slave_path);
+    drop(pty1);
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#,
+        "dropped daemon must reopen channel O_RDWR under ProtectSystem=strict"
+    );
+    let (_, pid_after_reopen) = sh(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", "qeminga.service"],
+    );
+    assert_eq!(
+        pid_after_reopen.trim(),
+        pid,
+        "channel reopen must occur in the existing dropped daemon"
+    );
+
     // Every thread, not only the main one (§5.4): the ceiling is per
     // thread, and the freeze and thaw have put the audit writer and the
     // blocking pool to work.
-    let threads = e2e::thread_statuses(pid.trim().parse().unwrap());
+    let threads = e2e::thread_statuses(pid.parse().unwrap());
     let names: Vec<&str> = threads.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"qeminga-audit"), "{names:?}");
     assert!(threads.len() >= 3, "{names:?}");
@@ -1174,6 +1478,55 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
             t.field("Uid:")
         );
     }
+
+    // #66: crash recovery under the confined unit (SIGKILL while frozen ->
+    // Restart=always -> marker recovery drains real ext4/xfs superblocks
+    // and removes the marker under ProtectSystem=strict).
+    let reply = pty2.request(&freeze_req);
+    assert_eq!(reply, expected_reply, "second freeze before SIGKILL");
+    assert!(Path::new("/run/qeminga/frozen").exists());
+    let (ok, text) = sh(
+        "systemctl",
+        &["kill", "--signal=SIGKILL", "qeminga.service"],
+    );
+    assert!(ok, "systemctl kill: {text}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+        let (_, new_pid) = sh(
+            "systemctl",
+            &["show", "-p", "MainPID", "--value", "qeminga.service"],
+        );
+        let new_pid = new_pid.trim();
+        if active.trim() == "active"
+            && !new_pid.is_empty()
+            && new_pid != "0"
+            && new_pid != pid
+            && !Path::new("/run/qeminga/frozen").exists()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "restarted unit did not recover marker after SIGKILL (active={active:?}, new_pid={new_pid:?}, marker={}):\n{}",
+            Path::new("/run/qeminga/frozen").exists(),
+            journal()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-fsfreeze-status"}"#),
+        r#"{"return":"thawed"}"#,
+        "restarted unit must report thawed after crash recovery"
+    );
+    for target in &thaw_targets {
+        std::fs::File::create(format!("{target}/installed-unit-recovery-probe"))
+            .and_then(|mut f| f.write_all(b"recovered"))
+            .unwrap_or_else(|e| {
+                panic!("loop filesystem {target} must be thawed after recovery: {e}")
+            });
+    }
+
     let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
     assert!(ok, "systemctl stop: {text}");
     // The distributed profile cannot be talked into faking the kernel.

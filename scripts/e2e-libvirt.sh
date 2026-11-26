@@ -68,6 +68,26 @@ status_is() {
         *) echo "expected status $1"; return 1 ;;
     esac
 }
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+domfsfreeze_nonzero() {
+    local out
+    out="$(v domfsfreeze "$domain" 2>&1)" || { echo "$out"; return 1; }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq 'Froze [1-9][0-9]* filesystem' || {
+        echo "expected nonzero frozen filesystem count"
+        return 1
+    }
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+domfsthaw_nonzero() {
+    local out
+    out="$(v domfsthaw "$domain" 2>&1)" || { echo "$out"; return 1; }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq 'Thawed [1-9][0-9]* filesystem' || {
+        echo "expected nonzero thawed filesystem count"
+        return 1
+    }
+}
 # The domain's state is exactly $1 ("running", "shut off", ...): the
 # query itself must succeed, and its first line is compared whole, so a
 # failed query or any other state never passes as "stopped".
@@ -109,9 +129,9 @@ esac
 
 step "guest-exec is refused (AC1)" refused_exec
 
-step "domfsfreeze" v domfsfreeze "$domain"
+step "domfsfreeze" domfsfreeze_nonzero
 step "guest-fsfreeze-status is frozen" status_is frozen
-step "domfsthaw" v domfsthaw "$domain"
+step "domfsthaw" domfsthaw_nonzero
 step "guest-fsfreeze-status is thawed" status_is thawed
 step "domifaddr --source agent" v domifaddr "$domain" --source agent
 step "guest-get-osinfo" agent '{"execute":"guest-get-osinfo"}'

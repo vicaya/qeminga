@@ -42,23 +42,34 @@ StandardError=journal
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_BOOT CAP_DAC_READ_SEARCH CAP_DAC_OVERRIDE CAP_SETUID CAP_SETGID CAP_SETPCAP
 AmbientCapabilities=
 # Hardening that does not interfere with FIFREEZE on the real mount table.
+# ProtectSystem=strict remounts the filesystem hierarchy read-only
+# (MNT_READONLY, not SB_RDONLY), so FIFREEZE/FITHAW/FITRIM on
+# O_RDONLY|O_DIRECTORY descriptors still work while ordinary files outside
+# /run/qeminga cannot be modified or unlinked even if writable to uid 600.
+# SystemCallFilter=~@mount prevents undoing the read-only mount namespace
+# even while CAP_SYS_ADMIN is held. PrivateTmp=no and ProtectHome=no are
+# deliberate: PrivateTmp=yes would overmount /tmp and /var/tmp with
+# writable tmpfs mounts, and ProtectHome=yes would hide separate /home
+# mounts from the freeze plan.
+ProtectSystem=strict
+ReadWritePaths=/run/qeminga
+ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+ReadOnlyPaths=-/dev/shm -/dev/mqueue
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
-# Ordinary file writes are currently bounded by guest Unix permissions
-# (UID/GID 600, no CAP_DAC_OVERRIDE after drop) rather than a read-only
-# mount namespace; see design §5.9.
+SystemCallFilter=~@mount
+UMask=0077
 PrivateTmp=no
 ProtectHome=no
-ProtectSystem=no
 
 [Install]
 WantedBy=multi-user.target

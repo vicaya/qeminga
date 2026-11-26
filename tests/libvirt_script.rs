@@ -22,8 +22,8 @@ case "$cmd" in
             domfsfreeze|domfsthaw|domifaddr|domfsinfo|domstate|qemu-agent-command|shutdown) echo "  NAME"; exit 0 ;;
             *) echo "error: command '$1' doesn't exist" >&2; exit 1 ;;
         esac ;;
-    domfsfreeze) echo frozen > "$state"; echo "Froze 1 filesystem(s)"; exit 0 ;;
-    domfsthaw) echo thawed > "$state"; echo "Thawed 1 filesystem(s)"; exit 0 ;;
+    domfsfreeze) echo frozen > "$state"; echo "Froze ${FAKE_FREEZE_COUNT:-1} filesystem(s)"; exit 0 ;;
+    domfsthaw) echo thawed > "$state"; echo "Thawed ${FAKE_FREEZE_COUNT:-1} filesystem(s)"; exit 0 ;;
     domifaddr) printf ' Name       MAC address          Protocol     Address\n lo         00:00:00:00:00:00    ipv4         127.0.0.1/8\n'; exit 0 ;;
     domfsinfo) printf 'Mountpoint   Name   Type   Target\n/            vda1   ext4   vda\n'; exit 0 ;;
     shutdown)
@@ -48,7 +48,7 @@ case "$cmd" in
 esac
 "#;
 
-fn run(exec_accepted: bool) -> (bool, String) {
+fn run_with(exec_accepted: bool, freeze_count: u32) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -71,6 +71,7 @@ fn run(exec_accepted: bool) -> (bool, String) {
         .env("PATH", path)
         .env("FAKE_STATE", dir.path().join("state"))
         .env("EXEC_ACCEPTED", if exec_accepted { "1" } else { "0" })
+        .env("FAKE_FREEZE_COUNT", freeze_count.to_string())
         .output()
         .unwrap();
     let text = format!(
@@ -79,6 +80,10 @@ fn run(exec_accepted: bool) -> (bool, String) {
         String::from_utf8_lossy(&output.stderr)
     );
     (output.status.success(), text)
+}
+
+fn run(exec_accepted: bool) -> (bool, String) {
+    run_with(exec_accepted, 1)
 }
 
 #[test]
@@ -111,5 +116,15 @@ fn script_fails_when_the_guest_accepts_guest_exec() {
         text.contains("-- FAILED: guest-exec is refused (AC1)"),
         "{text}"
     );
+    assert!(text.contains("RESULT: FAIL"), "{text}");
+}
+
+#[test]
+fn script_fails_when_domfsfreeze_freezes_zero_filesystems() {
+    // #66: a read-only remount or mount-namespace bug must never pass
+    // vacuously by freezing zero guest filesystems.
+    let (ok, text) = run_with(false, 0);
+    assert!(!ok, "{text}");
+    assert!(text.contains("-- FAILED: domfsfreeze"), "{text}");
     assert!(text.contains("RESULT: FAIL"), "{text}");
 }

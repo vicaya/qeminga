@@ -67,6 +67,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -374,6 +375,8 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
     // via ENOENT, #63).
     let discover = token.is_recovery_drain() || ctx.thaw_scope() == ThawScope::Discovery;
     let from_thawed = token.is_recovery_drain();
+    let clean_thawed_confirmed = Arc::new(AtomicBool::new(false));
+    let clean_thawed_worker = Arc::clone(&clean_thawed_confirmed);
     let (outcome, held, clean_thawed) = tokio::task::spawn_blocking(move || {
         tracing::dispatcher::with_default(&dispatch, || {
             let mut held = held;
@@ -384,22 +387,18 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // switch the audit router to the freeze-safe ring before any
             // recovery I/O (`on_thawed` flushes back to normal on settlement).
             let clean_thawed = from_thawed && matches!(marker.probe(), Ok(false));
-            if from_thawed && !clean_thawed {
+            if clean_thawed {
+                clean_thawed_worker.store(true, Ordering::Release);
+            } else if from_thawed {
                 audit.enter_ring();
             }
             // Discovery and drain are separate: the handles this process
             // holds are drained whether or not the mount table can be
             // read (`thaw_blocking`), and a tracked thaw reads none.
-            let plan = discover.then(|| {
-                build_recovery_plan(mounts.as_ref(), allowed.as_deref(), clean_thawed)
-            });
-            let outcome = thaw_blocking(
-                kernel.as_ref(),
-                &marker,
-                plan,
-                &mut held,
-                !clean_thawed,
-            );
+            let plan = discover
+                .then(|| build_recovery_plan(mounts.as_ref(), allowed.as_deref(), clean_thawed));
+            let outcome =
+                thaw_blocking(kernel.as_ref(), &marker, plan, &mut held, !clean_thawed);
             (outcome, held, clean_thawed)
         })
     })
@@ -408,13 +407,16 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
         // The task is lost with the descriptors it took: they are no
         // longer evidence of complete ownership, so the next thaw must
         // discover its targets (§4.2 "Thaw scope"), as after a lost
-        // recovery drain in the coordinator.
+        // recovery drain in the coordinator. Preserve the marker-probe
+        // decision (defaulting conservatively to `false` if ENOENT was
+        // never confirmed) so an escalated recovery fails closed to
+        // `Frozen` and re-arms the watchdog.
         tracing::error!(event = "fsfreeze_thaw_lost", error = %err, "thaw drain lost; targets uncertain");
         ctx.set_thaw_scope(ThawScope::Discovery);
         (
             Err(ThawFailure::Task(err.to_string())),
             Vec::new(),
-            from_thawed,
+            clean_thawed_confirmed.load(Ordering::Acquire),
         )
     });
     // Whatever could not be drained keeps its handle for the next attempt.
@@ -6374,5 +6376,80 @@ mod tests {
             Mode::Normal,
             "successful settlement must flush audit router back to normal mode"
         );
+    }
+
+    #[tokio::test]
+    async fn thawed_escalated_worker_loss_preserves_recovery_obligation_and_clean_worker_loss_stays_thawed()
+     {
+        use crate::audit::Mode;
+
+        // 1. Live Thawed service discovers a present marker, then its blocking
+        //    worker panics (PanickingMounts). Must fail closed: publish Frozen,
+        //    retain Ring mode, arm the watchdog, and keep the marker.
+        let dir1 = tempfile::tempdir().unwrap();
+        let mut cfg1 = Config::default();
+        cfg1.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx1 = Arc::new(
+            Context::new(
+                Arc::new(cfg1),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir1.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(Arc::new(FakeKernel::new()))
+            .with_mounts(Arc::new(PanickingMounts))
+            .with_hooks(Arc::new(LifecycleHooks)),
+        );
+        ctx1.marker.create().unwrap();
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+        let err1 = thaw(&ctx1, &req).await.unwrap_err().to_string();
+        assert!(
+            err1.contains("state frozen, marker retained"),
+            "escalated worker loss must report Frozen state: {err1}"
+        );
+        assert_eq!(
+            ctx1.state.current(),
+            FreezeState::Frozen,
+            "escalated worker loss must fail closed to Frozen"
+        );
+        assert_eq!(
+            ctx1.audit.mode(),
+            Mode::Ring,
+            "escalated worker loss into Frozen must retain freeze-safe audit ring"
+        );
+        assert!(
+            ctx1.watchdog_slot().is_some(),
+            "escalated worker loss into Frozen must arm the watchdog"
+        );
+        assert!(ctx1.marker.exists());
+        if let Some(wd) = ctx1.watchdog_slot().take() {
+            wd.cancel();
+        }
+
+        // 2. Live Thawed service confirms marker absence (ENOENT), then its
+        //    blocking worker panics. With no marker obligation, state returns
+        //    to Thawed in normal audit mode without arming the watchdog.
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut cfg2 = Config::default();
+        cfg2.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx2 = Arc::new(
+            Context::new(
+                Arc::new(cfg2),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir2.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(Arc::new(FakeKernel::new()))
+            .with_mounts(Arc::new(PanickingMounts))
+            .with_hooks(Arc::new(LifecycleHooks)),
+        );
+        let err2 = thaw(&ctx2, &req).await.unwrap_err().to_string();
+        assert!(
+            err2.contains("state thawed"),
+            "clean Thawed worker loss must report Thawed state: {err2}"
+        );
+        assert_eq!(ctx2.state.current(), FreezeState::Thawed);
+        assert_eq!(ctx2.audit.mode(), Mode::Normal);
+        assert!(ctx2.watchdog_slot().is_none());
     }
 }

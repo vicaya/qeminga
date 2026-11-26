@@ -63,9 +63,9 @@ in the filter and are bounded by guest Unix permissions (UID/GID 600, with
 `CAP_DAC_OVERRIDE` dropped) and systemd service confinement (the shipped
 unit currently sets `ProtectSystem=no`, `ProtectHome=no`, and
 `PrivateTmp=no`). Under an installed, enforcing seccomp filter (required by
-`hardening = "enforced"`; absent or logging-only under the development-only
-opt-out `hardening = "unenforced-development-only"`), IP socket creation
-(`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every profile;
+`hardening = "enforced"`; the filter may be absent or logging-only under
+the development-only opt-out `hardening = "unenforced-development-only"`),
+IP socket creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are denied in every profile;
 `socket` is absent when `information = false` and currently checks only the
 `AF_NETLINK` family (protocol unrestricted) when enabled, while
 `socketpair`, `sendto`, and `recvfrom` remain unrestricted in `COMMON` for

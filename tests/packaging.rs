@@ -450,14 +450,17 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
     // 4. Residual authority: no overbroad write/socket claim, explicit enforcing
     //    seccomp prerequisite, and explicit unchecked IPC argument limits.
     assert!(
-        !s59.contains("no configuration enables execution, arbitrary file writes, network egress"),
-        "§5.9 must not claim seccomp/unit prevents arbitrary file writes or conflate IP sockets with all socket IPC"
+        !s59.contains("no configuration enables execution, arbitrary file writes, network egress")
+            && !s59.contains("No allowed protocol command writes guest files"),
+        "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
     );
     assert!(
         s59.contains("Unix permissions")
+            && s59.contains("no general-purpose file-write command")
             && s59.contains("CAP_DAC_READ_SEARCH")
             && s59.contains("host channel")
             && s59.contains("unenforced-development-only")
+            && s59.contains("may be absent or logging-only")
             && s59.contains("installed, enforcing seccomp filter")
             && s59.contains("no argument or peer restriction")
             && s59.contains("only the `AF_NETLINK` family"),

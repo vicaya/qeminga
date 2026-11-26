@@ -139,8 +139,9 @@ device numbers, or marker paths).
     `ProtectSystem=no`, `ProtectHome=no`, and `PrivateTmp=no`, so it does
     not yet confine writes to `/run/qeminga` alone.
   - *Sockets and IPC:* Under an installed, enforcing seccomp filter
-    (required by `hardening = "enforced"`; absent or logging-only under
-    the development opt-out `hardening = "unenforced-development-only"`),
+    (required by `hardening = "enforced"`; the filter may be absent or
+    logging-only under the development-only opt-out
+    `hardening = "unenforced-development-only"`),
     IP socket creation (`AF_INET`/`AF_INET6`) and `execve`/`execveat` are
     denied in every profile. With `information = false`, `socket` is
     absent from the filter; with `information = true`, `socket` currently

@@ -66,13 +66,18 @@ unit currently sets `ProtectSystem=no`, `ProtectHome=no`, and
 `hardening = "enforced"`; the filter may be absent or logging-only under
 the development-only opt-out `hardening = "unenforced-development-only"`),
 IP socket creation (`AF_INET`/`AF_INET6`), `connect`/`accept`/`listen`, and
-`execve`/`execveat` are denied in every profile; `socket` and the inventory
-`sendto` rule (`flags == 0`, `addrlen == 12`) are absent when
-`information = false` and constrained to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
-NETLINK_ROUTE)` when enabled, while `socketpair` (`AF_UNIX`, `SOCK_STREAM |
-SOCK_NONBLOCK | SOCK_CLOEXEC`, `0`), peerless `recvfrom`, and peerless
-`sendto` remain in every profile for runtime signal delivery (see
-`docs/design.md` §§5.5, 5.9).
+`execve`/`execveat` are denied in every profile. `socket` is absent when
+`information = false` and restricted to
+`(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` when
+`information = true`. When `information = true`, an additional `sendto`
+rule permits `flags == 0` and `addrlen == 12` (`sizeof(struct sockaddr_nl)`)
+for `getifaddrs(3)` netlink requests (seccomp-BPF cannot inspect the file
+descriptor type or pointed-to address); when `information = false`, that
+rule is absent. In every profile, `socketpair`
+(`AF_UNIX`, `SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC`, `0`), peerless
+`recvfrom` (`src_addr == NULL`, `addrlen == NULL`), and peerless `sendto`
+(`dest_addr == NULL`, `addrlen == 0`) remain allowed for runtime signal
+delivery (see `docs/design.md` §§5.5, 5.9).
 
 Filesystem freezes are bounded by a watchdog (30 s idle, 300 s hard cap by
 default) and survive an agent crash through a recovery marker on tmpfs.

@@ -98,16 +98,18 @@ post-compromise authority (design §5.9):
   `CapEff`, `CapPrm`, and `CapBnd` retain **only** `CAP_SYS_ADMIN` and
   `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty (`CAP_SYS_BOOT`
   absent from all five sets). The seccomp filter omits `reboot`, `sync`,
-  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, and
-  `FITRIM`.
+  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, the
+  inventory `sendto` rule, and `FITRIM` (see *Sockets and IPC* below for
+  the narrowed runtime signal rules).
 - **General-VM / lifecycle profile (`config.toml`, TOML schema default):**
   Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`,
   `guest-network-get-interfaces`, and `guest-get-fsinfo`. `CapEff`,
   `CapPrm`, and `CapBnd` retain `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and
   `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty; seccomp keeps
-  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, the netlink
-  syscalls, and `socket` (`AF_NETLINK` family check only, protocol
-  unrestricted).
+  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, `socket`
+  restricted to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`,
+  the inventory `sendto` rule (`flags == 0`, `addrlen == 12`), and the
+  netlink syscalls.
 - **Custom CVM configs must disable features explicitly:** The CVM
   installation default comes from installing `config-data-protection.toml`.
   An empty or partial `config.toml` is valid even under

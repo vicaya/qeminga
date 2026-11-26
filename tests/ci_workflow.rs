@@ -152,7 +152,6 @@ fn docs_only(paths: &[&str]) -> bool {
 #[test]
 fn markdown_no_check_reads_is_documentation_only() {
     assert!(docs_only(&[
-        "README.md",
         "docs/tasks.md",
         "docs/testing.md",
         "CHANGELOG.md",
@@ -162,14 +161,15 @@ fn markdown_no_check_reads_is_documentation_only() {
 
 #[test]
 fn markdown_a_test_parses_is_code() {
-    // tests/packaging.rs reads design blocks and the packaging README.
+    // tests/packaging.rs reads design blocks, the packaging README, and README.md.
+    assert!(!docs_only(&["README.md"]));
     assert!(!docs_only(&["docs/design.md"]));
-    assert!(!docs_only(&["README.md", "packaging/README.md"]));
+    assert!(!docs_only(&["docs/tasks.md", "packaging/README.md"]));
 }
 
 #[test]
 fn anything_else_and_an_empty_change_run_everything() {
-    assert!(!docs_only(&["README.md", "src/lib.rs"]));
+    assert!(!docs_only(&["docs/tasks.md", "src/lib.rs"]));
     assert!(!docs_only(&[".github/workflows/ci.yml"]));
     assert!(!docs_only(&["Cargo.lock"]));
     assert!(!docs_only(&["docs/notes.markdown"]));

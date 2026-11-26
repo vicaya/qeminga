@@ -475,18 +475,33 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
             && !s59.contains("No allowed protocol command writes guest files"),
         "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
     );
+    let normalize_ws = |s: &str| -> String { s.split_whitespace().collect::<Vec<_>>().join(" ") };
     for (name, text) in [
-        ("docs/design.md §5.9", s59),
-        ("packaging/README.md", packaging.as_str()),
-        ("README.md", readme.as_str()),
+        ("docs/design.md §5.9", normalize_ws(s59)),
+        ("packaging/README.md", normalize_ws(&packaging)),
+        ("README.md", normalize_ws(&readme)),
     ] {
         assert!(
             !text.contains("protocol unrestricted")
+                && !text.contains("AF_NETLINK family check only")
                 && !text.contains("no argument or peer restriction")
-                && !text.contains("leaves the netlink protocol"),
+                && !text.contains("leaves the netlink protocol")
+                && !text.contains("unrestricted socketpair"),
             "{name} must not retain stale unrestricted-netlink or unrestricted-IPC wording"
         );
     }
+    let lifecycle_start = packaging
+        .find("**General-VM / lifecycle profile")
+        .expect("General-VM / lifecycle profile paragraph in packaging/README.md");
+    let lifecycle_end = packaging[lifecycle_start..]
+        .find("- **Custom CVM configs")
+        .map(|off| lifecycle_start + off)
+        .expect("Custom CVM configs paragraph in packaging/README.md");
+    let lifecycle_norm = normalize_ws(&packaging[lifecycle_start..lifecycle_end]);
+    assert!(
+        lifecycle_norm.contains("NETLINK_ROUTE") && lifecycle_norm.contains("addrlen == 12"),
+        "packaging/README.md General-VM profile paragraph must describe NETLINK_ROUTE and inventory sendto: {lifecycle_norm}"
+    );
     assert!(
         s59.contains("Unix permissions")
             && s59.contains("no general-purpose file-write command")

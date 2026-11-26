@@ -7,14 +7,18 @@
 //! in the x86-64 profile, each with the observed need that justifies it.
 //! `ioctl` is restricted by request number to `FIFREEZE` and `FITHAW` (plus
 //! `FITRIM` only when `[features] fstrim = true`), `prctl` to `PR_SET_NAME`,
-//! `socket` to the `AF_NETLINK` family only (protocol currently unrestricted)
-//! when `[features] information = true` (absent when `information = false`),
-//! and `sync`/`reboot` only when `[features] shutdown = true`. Every profile
-//! retains unrestricted `socketpair`, `sendto`, and `recvfrom` in [`COMMON`]
-//! for the runtime signal driver. The default action kills the process; the
-//! `seccomp-log` feature switches it to logging only when `debug_assertions`
-//! are enabled ([`log_mode`]) for compatibility runs (C-17), while Cargo's
-//! standard `release` profile (`debug_assertions = false`) always enforces.
+//! `socket` to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` with an
+//! inventory `sendto` rule (`flags == 0`, `addrlen == 12`) when `[features]
+//! information = true` (both absent when `information = false`), and
+//! `sync`/`reboot` only when `[features] shutdown = true`. Every profile
+//! narrows `socketpair` to `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK |
+//! SOCK_CLOEXEC, 0)`, `recvfrom` to peerless calls (`src_addr == NULL`,
+//! `addrlen == NULL`), and `sendto` to peerless calls (`dest_addr == NULL`,
+//! `addrlen == 0`) for the runtime signal driver. The default action kills the
+//! process; the `seccomp-log` feature switches it to logging only when
+//! `debug_assertions` are enabled ([`log_mode`]) for compatibility runs
+//! (C-17), while Cargo's standard `release` profile (`debug_assertions =
+//! false`) always enforces.
 //!
 //! The filter is installed by `main` after the capability drop and
 //! `PR_SET_NO_NEW_PRIVS` (§5.4 step 6), so `seccomp(2)`/`prctl(2)` need

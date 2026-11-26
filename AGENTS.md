@@ -34,8 +34,8 @@ on both supported architectures (`ubuntu-24.04` for x86-64,
 `ubuntu-24.04-arm` for aarch64); the aarch64 cross-check is the local
 stand-in on an x86-64 machine. A change that touches only Markdown no
 check reads skips every job that builds (`scripts/ci/docs-only.sh`
-decides; `docs/design.md` and `packaging/README.md` are parsed by
-`tests/packaging.rs`, so they count as code and run everything).
+decides; `README.md`, `docs/design.md`, and `packaging/README.md` are
+parsed by `tests/packaging.rs`, so they count as code and run everything).
 
 ```sh
 cargo fmt --all --check

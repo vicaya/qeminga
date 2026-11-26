@@ -40,6 +40,13 @@ case "$cmd" in
                 echo "error: internal error: unable to execute QEMU agent command 'guest-exec': The command guest-exec has not been found" >&2
                 exit 1 ;;
             *guest-fsfreeze-status*) printf '{"return":"%s"}\n' "$(cat "$state")" ;;
+            *guest-fsfreeze-freeze-list*)
+                n="${FAKE_FREEZE_LIST_COUNT:-1}"
+                if [ "$n" -gt 0 ]; then echo frozen > "$state"; fi
+                printf '{"return":%s}\n' "$n" ;;
+            *guest-fsfreeze-thaw*)
+                echo thawed > "$state"
+                printf '{"return":%s}\n' "${FAKE_THAW_LIST_COUNT:-1}" ;;
             *guest-get-osinfo*) echo '{"return":{"id":"debian","name":"Debian GNU/Linux"}}' ;;
             *) echo "error: unknown command" >&2; exit 1 ;;
         esac
@@ -48,7 +55,13 @@ case "$cmd" in
 esac
 "#;
 
-fn run_with(exec_accepted: bool, freeze_count: u32) -> (bool, String) {
+fn run_script(
+    exec_accepted: bool,
+    freeze_count: u32,
+    freeze_mount: Option<&str>,
+    freeze_list_count: u32,
+    thaw_list_count: u32,
+) -> (bool, String) {
     let dir = tempfile::tempdir().unwrap();
     let bin = dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -65,13 +78,19 @@ fn run_with(exec_accepted: bool, freeze_count: u32) -> (bool, String) {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new("bash")
-        .arg(script)
+    let mut cmd = Command::new("bash");
+    cmd.arg(script);
+    if let Some(mount) = freeze_mount {
+        cmd.arg("--freeze-mount").arg(mount);
+    }
+    let output = cmd
         .arg("dom")
         .env("PATH", path)
         .env("FAKE_STATE", dir.path().join("state"))
         .env("EXEC_ACCEPTED", if exec_accepted { "1" } else { "0" })
         .env("FAKE_FREEZE_COUNT", freeze_count.to_string())
+        .env("FAKE_FREEZE_LIST_COUNT", freeze_list_count.to_string())
+        .env("FAKE_THAW_LIST_COUNT", thaw_list_count.to_string())
         .output()
         .unwrap();
     let text = format!(
@@ -80,6 +99,10 @@ fn run_with(exec_accepted: bool, freeze_count: u32) -> (bool, String) {
         String::from_utf8_lossy(&output.stderr)
     );
     (output.status.success(), text)
+}
+
+fn run_with(exec_accepted: bool, freeze_count: u32) -> (bool, String) {
+    run_script(exec_accepted, freeze_count, None, 1, 1)
 }
 
 fn run(exec_accepted: bool) -> (bool, String) {
@@ -126,5 +149,33 @@ fn script_fails_when_domfsfreeze_freezes_zero_filesystems() {
     let (ok, text) = run_with(false, 0);
     assert!(!ok, "{text}");
     assert!(text.contains("-- FAILED: domfsfreeze"), "{text}");
+    assert!(text.contains("RESULT: FAIL"), "{text}");
+}
+
+#[test]
+fn script_exercises_freeze_mount_when_requested() {
+    // #66: ProtectHome=read-only verification exercises freezing and thawing
+    // a dedicated mount under /home by name.
+    let (ok, text) = run_script(false, 2, Some("/home/qeminga-test-vol"), 1, 1);
+    assert!(ok, "{text}");
+    assert!(text.contains("RESULT: PASS (AC16)"), "{text}");
+    for step in [
+        "-- ok: guest-fsfreeze-freeze-list (/home/qeminga-test-vol)",
+        "-- ok: guest-fsfreeze-status is frozen (/home/qeminga-test-vol)",
+        "-- ok: guest-fsfreeze-thaw (/home/qeminga-test-vol)",
+        "-- ok: guest-fsfreeze-status is thawed (/home/qeminga-test-vol)",
+    ] {
+        assert!(text.contains(step), "{step} missing in {text}");
+    }
+}
+
+#[test]
+fn script_fails_when_freeze_mount_returns_zero() {
+    let (ok, text) = run_script(false, 1, Some("/home/qeminga-test-vol"), 0, 0);
+    assert!(!ok, "{text}");
+    assert!(
+        text.contains("-- FAILED: guest-fsfreeze-freeze-list (/home/qeminga-test-vol)"),
+        "{text}"
+    );
     assert!(text.contains("RESULT: FAIL"), "{text}");
 }

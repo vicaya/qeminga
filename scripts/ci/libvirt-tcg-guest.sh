@@ -14,11 +14,29 @@
 set -uo pipefail
 
 src="${1:?usage: guest.sh PAYLOAD_DIR}"
+HOME_TEST_MOUNT="/home/qeminga-test-vol"
+HOME_TEST_IMG="/run/qeminga-home-test.img"
 log() { printf 'qeminga-e2e-guest: %s\n' "$*"; }
+
+# Create and mount a dedicated ext4 filesystem under /home BEFORE starting
+# qeminga.service so ProtectHome=read-only is exercised against a real
+# separate /home volume (read-only for ordinary writes, visible and freezable
+# by guest-fsfreeze-freeze-list; #66).
+prepare_home_filesystem() {
+    modprobe loop 2>/dev/null || true
+    rm -f "$HOME_TEST_IMG"
+    truncate -s 16M "$HOME_TEST_IMG" || return 1
+    chmod 0600 "$HOME_TEST_IMG" || return 1
+    mkfs.ext4 -q -F -b 1024 -m 0 "$HOME_TEST_IMG" || return 1
+    install -d -m 0755 "$HOME_TEST_MOUNT" || return 1
+    mount -o loop "$HOME_TEST_IMG" "$HOME_TEST_MOUNT" || return 1
+    log "install: mounted separate ext4 volume at $HOME_TEST_MOUNT"
+}
 
 install_candidate() {
     log "install: masking qemu-guest-agent"
     systemctl mask --now qemu-guest-agent.service || return 1
+    prepare_home_filesystem || return 1
     install -m 0755 "$src/qeminga" /usr/bin/qeminga || return 1
     install -m 0644 "$src/packaging/sysusers.d/qeminga.conf" /usr/lib/sysusers.d/ || return 1
     systemd-sysusers || return 1
@@ -441,16 +459,26 @@ check_sys_power_confinement() {
 }
 
 check_write_confinement() {
-    local pid="$1" ok=0 p info mnt_id vfs_opts mp
+    local pid="$1" ok=0 p info mnt_id vfs_opts mp root_mnt_id="" home_vol_mnt_id=""
 
     check_ro_dir_confinement "$pid" /var/tmp "/var/tmp" || ok=1
     check_ro_dir_confinement "$pid" /home "/home" || ok=1
+    check_ro_dir_confinement "$pid" "$HOME_TEST_MOUNT" "$HOME_TEST_MOUNT (separate ext4 under /home)" || ok=1
     check_ro_dir_confinement "$pid" /run "/run" || ok=1
+    check_ro_dir_confinement "$pid" /dev "/dev" || ok=1
     check_ro_dir_confinement "$pid" /dev/shm "/dev/shm" || ok=1
 
-    for p in / /run /home; do
+    for p in / /run /home "$HOME_TEST_MOUNT" /dev /dev/shm; do
         if info="$(effective_mount_in_ns "$pid" "$p")"; then
             read -r mnt_id vfs_opts mp <<<"$info"
+            if [ "$p" = "/" ]; then root_mnt_id="$mnt_id"; fi
+            if [ "$p" = "$HOME_TEST_MOUNT" ]; then
+                home_vol_mnt_id="$mnt_id"
+                if [ "$mp" != "$HOME_TEST_MOUNT" ]; then
+                    log "FAILED: $HOME_TEST_MOUNT resolved to mountpoint $mp instead of its own mount"
+                    ok=1
+                fi
+            fi
             if vfs_opts_have "$vfs_opts" ro; then
                 log "ok: effective mount for $p is ro (mnt_id=$mnt_id opts=$vfs_opts mp=$mp)"
             else
@@ -462,6 +490,28 @@ check_write_confinement() {
             ok=1
         fi
     done
+
+    if [ -n "$root_mnt_id" ] && [ -n "$home_vol_mnt_id" ] && [ "$home_vol_mnt_id" != "$root_mnt_id" ]; then
+        log "ok: $HOME_TEST_MOUNT has distinct ro mount id ($home_vol_mnt_id != root $root_mnt_id)"
+    else
+        log "FAILED: $HOME_TEST_MOUNT does not have a distinct mount id from / (root=${root_mnt_id:-unset} vol=${home_vol_mnt_id:-unset})"
+        ok=1
+    fi
+
+    if mountpoint -q /dev/mqueue 2>/dev/null; then
+        if info="$(effective_mount_in_ns "$pid" /dev/mqueue)"; then
+            read -r mnt_id vfs_opts mp <<<"$info"
+            if vfs_opts_have "$vfs_opts" ro; then
+                log "ok: effective mount for /dev/mqueue is ro (mnt_id=$mnt_id opts=$vfs_opts mp=$mp)"
+            else
+                log "FAILED: effective mount for /dev/mqueue is not ro (mnt_id=$mnt_id opts=$vfs_opts mp=$mp)"
+                ok=1
+            fi
+        else
+            log "FAILED: cannot determine effective mount for /dev/mqueue"
+            ok=1
+        fi
+    fi
 
     # /run/qeminga must stay writable to uid 600 inside the service namespace
     # using a unique exclusively-created probe file.

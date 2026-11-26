@@ -1112,7 +1112,7 @@ EOF
         umask 0077
         mktemp "$dir/e2e-libvirt.XXXXXX.log"
     )"
-    if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown "$RUN_DOMAIN_REF" 2>&1 | tee "$e2e_tmp"; then
+    if bash "$REPO/scripts/e2e-libvirt.sh" --connect "$CONNECT_URI" --no-shutdown --freeze-mount /home/qeminga-test-vol "$RUN_DOMAIN_REF" 2>&1 | tee "$e2e_tmp"; then
         e2e_rc=0
     else
         e2e_rc=$?

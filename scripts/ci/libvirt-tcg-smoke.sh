@@ -480,7 +480,7 @@ EOF
     [ "$install" = pass ] || exit 1
 
     say "AC16: scripts/e2e-libvirt.sh"
-    if bash "$REPO/scripts/e2e-libvirt.sh" --connect qemu:///system --no-shutdown "$name" 2>&1 | tee "$OUT/e2e-libvirt.log"; then
+    if bash "$REPO/scripts/e2e-libvirt.sh" --connect qemu:///system --no-shutdown --freeze-mount /home/qeminga-test-vol "$name" 2>&1 | tee "$OUT/e2e-libvirt.log"; then
         mark libvirt_interop pass
     else
         mark libvirt_interop fail

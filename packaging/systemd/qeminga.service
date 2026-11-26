@@ -46,13 +46,18 @@ AmbientCapabilities=
 # (MNT_READONLY, not SB_RDONLY), so FIFREEZE/FITHAW/FITRIM on
 # O_RDONLY|O_DIRECTORY descriptors still work while ordinary files outside
 # /run/qeminga cannot be modified or unlinked even if writable to uid 600.
-# ReadWritePaths=-/run/qeminga carries the leading `-` so ExecStartPre=+
-# can create /run/qeminga on cold start before systemd evaluates the
-# write exception for ExecStart (without `-`, a missing directory fails
-# ExecStartPre=+ with 226/NAMESPACE). BindReadOnlyPaths=/sys and
-# ReadOnlyPaths=/run close the systemd v248-v262 MountAPIVFS quirk where
-# ProtectKernelTunables=yes leaves /sys and /run writable when already
-# mounted, while still letting an explicit suspend drop-in punch
+# /run/qeminga sits directly under root-owned /run so ExecStartPre=+ cannot
+# be redirected across an untrusted ancestor; ReadWritePaths=-/run/qeminga
+# carries the leading `-` so ExecStartPre=+ can create /run/qeminga on cold
+# start before systemd evaluates the write exception for ExecStart (without
+# `-`, a missing directory fails ExecStartPre=+ with 226/NAMESPACE).
+# BindReadOnlyPaths=/sys /dev and ReadOnlyPaths=/run close the systemd
+# MountAPIVFS quirk where ProtectKernelTunables=yes leaves /sys and /run
+# writable when already mounted, AND recursively lock ordinary files on
+# /dev itself plus every filesystem already mounted beneath /dev (/dev/shm,
+# /dev/mqueue, /dev/hugepages, etc.) as MNT_READONLY while keeping existing
+# character devices (/dev/virtio-ports/org.qemu.guest_agent.0, PTYs)
+# openable O_RDWR and still letting an explicit suspend drop-in punch
 # ReadWritePaths=/sys/power/state. ProtectHome=read-only locks /home,
 # /root, and /run/user read-only (which ProtectSystem=strict leaves to
 # ProtectHome=) without hiding separate /home mounts from the freeze
@@ -67,8 +72,8 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-BindReadOnlyPaths=/sys
-ReadOnlyPaths=/run -/dev/shm -/dev/mqueue
+BindReadOnlyPaths=/sys /dev
+ReadOnlyPaths=/run
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

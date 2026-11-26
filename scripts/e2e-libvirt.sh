@@ -8,7 +8,7 @@
 # Exits non-zero unless every step succeeds. Writes a log to stdout that
 # can be attached to the pull request.
 #
-#   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] DOMAIN
+#   scripts/e2e-libvirt.sh [--connect URI] [--no-shutdown] [--freeze-mount PATH] DOMAIN
 #
 # CI runs it under QEMU TCG on both architectures (scripts/ci/libvirt-tcg-smoke.sh)
 # and under real KVM (scripts/ci/libvirt-kvm-smoke.sh on GitHub-hosted x86_64 and
@@ -18,16 +18,22 @@ set -euo pipefail
 
 connect=""
 shutdown=1
+freeze_mount=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --connect) connect="--connect=$2"; shift 2 ;;
         --no-shutdown) shutdown=0; shift ;;
+        --freeze-mount) freeze_mount="$2"; shift 2 ;;
         -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
         *) break ;;
     esac
 done
-[ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] DOMAIN" >&2; exit 64; }
+[ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] [--freeze-mount PATH] DOMAIN" >&2; exit 64; }
 domain="$1"
+if [ -n "$freeze_mount" ] && [[ ! "$freeze_mount" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+    echo "invalid --freeze-mount path: $freeze_mount" >&2
+    exit 64
+fi
 
 # Predictable command output whatever the caller's locale (domstate is
 # parsed below).
@@ -88,6 +94,32 @@ domfsthaw_nonzero() {
         return 1
     }
 }
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+freeze_list_exact() {
+    local mount="$1" want="$2" out
+    out="$(agent "{\"execute\":\"guest-fsfreeze-freeze-list\",\"arguments\":{\"mountpoints\":[\"$mount\"]}}" 2>&1)" || {
+        echo "$out"
+        return 1
+    }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq "\"return\"[[:space:]]*:[[:space:]]*${want}([^0-9]|$)" || {
+        echo "expected exact frozen count $want for $mount"
+        return 1
+    }
+}
+# shellcheck disable=SC2317,SC2329 # invoked through `step` below
+thaw_exact() {
+    local want="$1" out
+    out="$(agent '{"execute":"guest-fsfreeze-thaw"}' 2>&1)" || {
+        echo "$out"
+        return 1
+    }
+    echo "$out"
+    printf '%s\n' "$out" | grep -Eq "\"return\"[[:space:]]*:[[:space:]]*${want}([^0-9]|$)" || {
+        echo "expected exact thawed count $want"
+        return 1
+    }
+}
 # The domain's state is exactly $1 ("running", "shut off", ...): the
 # query itself must succeed, and its first line is compared whole, so a
 # failed query or any other state never passes as "stopped".
@@ -133,6 +165,12 @@ step "domfsfreeze" domfsfreeze_nonzero
 step "guest-fsfreeze-status is frozen" status_is frozen
 step "domfsthaw" domfsthaw_nonzero
 step "guest-fsfreeze-status is thawed" status_is thawed
+if [ -n "$freeze_mount" ]; then
+    step "guest-fsfreeze-freeze-list ($freeze_mount)" freeze_list_exact "$freeze_mount" 1
+    step "guest-fsfreeze-status is frozen ($freeze_mount)" status_is frozen
+    step "guest-fsfreeze-thaw ($freeze_mount)" thaw_exact 1
+    step "guest-fsfreeze-status is thawed ($freeze_mount)" status_is thawed
+fi
 step "domifaddr --source agent" v domifaddr "$domain" --source agent
 step "guest-get-osinfo" agent '{"execute":"guest-get-osinfo"}'
 step "domfsinfo" v domfsinfo "$domain"

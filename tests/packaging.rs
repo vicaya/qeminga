@@ -148,8 +148,10 @@ fn unit_constrains_filesystem_writes_to_marker_directory() {
     // with FIFREEZE on O_RDONLY|O_DIRECTORY handles including separate /home
     // mounts), punches only -/run/qeminga for ordinary file writes (with `-`
     // so ExecStartPre=+ can create an absent directory on cold start), locks
-    // /sys (ProtectKernelTunables=yes + BindReadOnlyPaths=/sys), locks /run,
-    // /dev/shm, and /dev/mqueue, prevents remounting via ~@mount, sets
+    // /sys and /dev (plus every filesystem already mounted beneath /dev, such
+    // as /dev/shm and /dev/mqueue) recursively read-only via
+    // BindReadOnlyPaths=/sys /dev while keeping character-device O_RDWR open
+    // and reopen working, locks /run, prevents remounting via ~@mount, sets
     // UMask=0077, and deliberately keeps PrivateTmp=no and PrivateDevices
     // unset so real /tmp and /dev/virtio-ports stay reachable.
     let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
@@ -161,10 +163,9 @@ fn unit_constrains_filesystem_writes_to_marker_directory() {
     assert_eq!(values(&unit, "Service", "ProtectKernelTunables"), ["yes"]);
     let bro = values(&unit, "Service", "BindReadOnlyPaths");
     assert!(bro.contains(&"/sys"), "{bro:?}");
+    assert!(bro.contains(&"/dev"), "{bro:?}");
     let ro = values(&unit, "Service", "ReadOnlyPaths");
     assert!(ro.contains(&"/run"), "{ro:?}");
-    assert!(ro.contains(&"-/dev/shm"), "{ro:?}");
-    assert!(ro.contains(&"-/dev/mqueue"), "{ro:?}");
     let sc = values(&unit, "Service", "SystemCallFilter");
     assert!(sc.contains(&"~@mount"), "{sc:?}");
     assert_eq!(values(&unit, "Service", "UMask"), ["0077"]);
@@ -179,9 +180,10 @@ fn unit_constrains_filesystem_writes_to_marker_directory() {
 #[test]
 fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
     // #66: inventory writable objects during startup and after drop,
-    // residual writable locations, custom state_path drop-in, optional
-    // suspend_ram ReadWritePaths=/sys/power/state drop-in, and the
-    // supported systemd baseline.
+    // residual writable locations, custom state_path drop-in with its
+    // trusted-parent requirement, optional suspend_ram
+    // ReadWritePaths=/sys/power/state drop-in, and the supported systemd
+    // baseline.
     let readme = read("packaging/README.md");
     let suspend_tmpfiles = read("packaging/tmpfiles.d/qeminga-suspend.conf");
     let design = read("docs/design.md");
@@ -190,8 +192,8 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "ProtectHome=read-only",
         "ReadWritePaths=-/run/qeminga",
         "ProtectKernelTunables=yes",
-        "BindReadOnlyPaths=/sys",
-        "ReadOnlyPaths=/run -/dev/shm -/dev/mqueue",
+        "BindReadOnlyPaths=/sys /dev",
+        "ReadOnlyPaths=/run",
         "~@mount",
         "UMask=0077",
         "ReadWritePaths=/sys/power/state",
@@ -219,6 +221,10 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "packaging/README.md must document mount propagation of post-start mounts"
     );
     assert!(
+        lower_readme.contains("ancestor") && lower_readme.contains("directory descriptor"),
+        "packaging/README.md must document the trusted-parent requirement for custom state_path"
+    );
+    assert!(
         suspend_tmpfiles.contains("ReadWritePaths=/sys/power/state")
             && suspend_tmpfiles.contains("BindReadOnlyPaths=/sys"),
         "packaging/tmpfiles.d/qeminga-suspend.conf must note BindReadOnlyPaths=/sys and ReadWritePaths=/sys/power/state"
@@ -228,14 +234,19 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "ProtectHome=read-only",
         "ReadWritePaths=-/run/qeminga",
         "ProtectKernelTunables=yes",
-        "BindReadOnlyPaths=/sys",
-        "ReadOnlyPaths=/run -/dev/shm -/dev/mqueue",
+        "BindReadOnlyPaths=/sys /dev",
+        "ReadOnlyPaths=/run",
         "SystemCallFilter=~@mount",
         "ReadWritePaths=/sys/power/state",
         "systemd 245",
     ] {
         assert!(design.contains(needle), "docs/design.md missing {needle:?}");
     }
+    let lower_design = design.to_ascii_lowercase();
+    assert!(
+        lower_design.contains("ancestor") && lower_design.contains("directory descriptor"),
+        "docs/design.md §8.4 must document the trusted-parent requirement for custom state_path"
+    );
 }
 
 #[test]
@@ -1160,18 +1171,19 @@ fn assert_ro_dir_confinement(pid: &str, parent: &Path) {
 }
 
 /// Verifies #66 write confinement inside `qeminga.service`'s mount namespace:
-/// unique UID-600-owned directories under `/var/tmp`, `/home`, `/run`, and
-/// `/dev/shm` allow write+unlink outside confinement but fail both with `EROFS`
-/// inside it; the effective mounts serving `/`, `/sys`, `/sys/power/state` (when
-/// present), `/run`, and `/home` are `ro`; and `/run/qeminga` stays writable to
-/// UID 600.
+/// unique UID-600-owned directories under `/var/tmp`, `/home`, `/run`, `/dev`,
+/// and `/dev/shm` allow write+unlink outside confinement but fail both with
+/// `EROFS` inside it; the effective mounts serving `/`, `/sys`,
+/// `/sys/power/state` (when present), `/run`, `/home`, `/dev`, and `/dev/shm`
+/// are `ro`; and `/run/qeminga` stays writable to UID 600.
 fn assert_unit_write_confinement(pid: &str) {
     assert_ro_dir_confinement(pid, Path::new("/var/tmp"));
     assert_ro_dir_confinement(pid, Path::new("/home"));
     assert_ro_dir_confinement(pid, Path::new("/run"));
+    assert_ro_dir_confinement(pid, Path::new("/dev"));
     assert_ro_dir_confinement(pid, Path::new("/dev/shm"));
 
-    let mut ro_targets = vec!["/", "/sys", "/run", "/home"];
+    let mut ro_targets = vec!["/", "/sys", "/run", "/home", "/dev", "/dev/shm"];
     if Path::new("/sys/power/state").exists() {
         ro_targets.push("/sys/power/state");
     }

@@ -321,9 +321,13 @@ device numbers, or marker paths).
   (so narrowing `freeze_allowed_mountpoints` across a crash cannot strand
   an earlier freeze) while reporting only currently visible allowlisted
   counts on the wire and collapsing failures attributable solely to
-  excluded targets to one fixed host-safe reason (per-target ownership in
-  OQ-11 / #69 removes broad marker discovery once a second in-guest
-  freezer is supported).
+  excluded or unverified targets to one fixed host-safe reason — when
+  `/proc/self/mountinfo` cannot be read on a restricted recovery retry,
+  retained descriptors are still drained for guest recovery while their
+  wire credit and specific target error classes remain suppressed until
+  current visibility can be verified (per-target ownership in OQ-11 / #69
+  removes broad marker discovery once a second in-guest freezer is
+  supported).
 - **Mount-binding assumption (v1).** Whether required mount paths come
   from provisioning (`config-data-protection.toml`) or from
   `guest-get-fsinfo`, the guest must keep each required path bound to

@@ -401,8 +401,14 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             // read (`thaw_blocking`), and a tracked thaw reads none.
             let plan = discover
                 .then(|| build_recovery_plan(mounts.as_ref(), allowed.as_deref(), clean_thawed));
-            let outcome =
-                thaw_blocking(kernel.as_ref(), &marker, plan, &mut held, !clean_thawed);
+            let outcome = thaw_blocking(
+                kernel.as_ref(),
+                &marker,
+                plan,
+                &mut held,
+                !clean_thawed,
+                allowed.is_some(),
+            );
             (outcome, held, clean_thawed)
         })
     })
@@ -1157,11 +1163,22 @@ fn thaw_blocking(
     plan: Option<Result<RecoveryPlan, ThawFailure>>,
     held: &mut Vec<HeldMount>,
     remove_marker: bool,
+    restricted: bool,
 ) -> Result<u64, ThawFailure> {
     let mut state = ThawState::default();
     let mut retained = std::mem::take(held);
     let planned = matches!(plan, Some(Ok(_)));
-    let mut restricted_rescan = false;
+    // Under a configured `freeze_allowed_mountpoints` policy, any discovery
+    // drain (`plan.is_some()`) credits wire counts and specific error classes
+    // strictly for targets whose current visibility at an allowlisted path is
+    // verified by a readable mount table. Leftovers in `retained` were either
+    // absent from the fresh plan (`Some(Ok(_))`) or could not be verified
+    // because `/proc/self/mountinfo` was unreadable (`Some(Err(_))`); in both
+    // cases they are still drained for guest recovery while suppressing wire
+    // credit and collapsing errors to `RecoveryIncomplete` (#63). Tracked
+    // thaws (`plan.is_none()`) and unrestricted discovery (`!restricted`)
+    // preserve each descriptor's recorded countability.
+    let suppress_leftovers = restricted && plan.is_some();
     let discovery = match plan {
         None => {
             tracing::info!(
@@ -1175,7 +1192,6 @@ fn thaw_blocking(
             plan,
             countable_devs,
         })) => {
-            restricted_rescan = countable_devs.is_some();
             for target in plan.thaw_order() {
                 let countable = countable_devs
                     .as_ref()
@@ -1229,12 +1245,7 @@ fn thaw_blocking(
         }
     };
     // `held` was filled in reverse mount order (deepest first): drain the
-    // leftovers forward, as the plan and the rollback do. On a successful
-    // restricted marker-recovery rescan, any handle still left in `retained`
-    // is absent from the new plan (so no configured allowlist name covers it
-    // in the current mount table) and is drained without wire credit; on a
-    // tracked thaw or failed mountinfo read (`EMFILE`), preserve the handle's
-    // prior countability (#63).
+    // leftovers forward, as the plan and the rollback do.
     for entry in retained.into_iter().rev() {
         if planned {
             tracing::warn!(
@@ -1243,7 +1254,7 @@ fn thaw_blocking(
                 "frozen by this process but no longer in the plan; drained"
             );
         }
-        let countable = if restricted_rescan {
+        let countable = if suppress_leftovers {
             false
         } else {
             entry.countable
@@ -7040,5 +7051,64 @@ mod tests {
         assert_eq!(thaw(&rig.ctx, &thaw_req).await.unwrap(), json!(0));
         assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
         assert_eq!(rig.ctx.deferred_recovery_mount_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn restricted_recovery_unreadable_mountinfo_suppresses_previously_countable_count_and_error_class()
+     {
+        let mounts = Arc::new(SwitchableMounts::new(
+            concat!(
+                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+                "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+            )
+            .to_owned(),
+        ));
+        let req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // Case A: previously countable descriptor (/data) fails with EACCES
+        // while `/proc/self/mountinfo` is unreadable -> guest still attempts
+        // FITHAW and keeps the handle, while wire collapses to fixed
+        // RecoveryIncomplete with 0 thawed (never exposing PermissionDenied).
+        let rig = rig_with_allowed_mounts(FreezeState::Frozen, mounts.clone(), Some(vec!["/data"]));
+        rig.ctx.marker.create().unwrap();
+        let data = rig.kernel.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        rig.kernel.fifreeze(&data).unwrap();
+        rig.kernel.script_thaw_error("/data", Errno::EIO);
+
+        // Pass 1: /data is visible and allowlisted -> retained with countable=true.
+        let err1 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(err1.contains("FITHAW failed"), "{err1}");
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        // Pass 2: mountinfo unreadable (`EMFILE`) and /data now fails with EACCES.
+        mounts.fail_reads(true);
+        rig.kernel.clear_thaw_errors();
+        rig.kernel.script_thaw_error("/data", Errno::EACCES);
+        let err2 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert_eq!(
+            err2,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(rig.ctx.frozen_mount_count(), 1);
+
+        // Pass 3: mountinfo readable again while /data is still visible at `/data`
+        // and still fails EACCES -> eligibility verified, specific class restored.
+        mounts.fail_reads(false);
+        let err3 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert!(err3.contains("FITHAW permission denied"), "{err3}");
+
+        // Case B: previously countable descriptor (/data) drains cleanly while
+        // `/proc/self/mountinfo` is unreadable -> guest recovery completes on
+        // /data (handle released, superblock unfrozen), while wire reports 0
+        // thawed because current eligibility could not be verified.
+        mounts.fail_reads(true);
+        rig.kernel.clear_thaw_errors();
+        let err4 = thaw(&rig.ctx, &req).await.unwrap_err().to_string();
+        assert_eq!(
+            err4,
+            "cannot build thaw plan (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
+        assert_eq!(rig.ctx.frozen_mount_count(), 0);
     }
 }

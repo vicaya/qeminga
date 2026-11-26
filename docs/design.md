@@ -304,7 +304,7 @@ A successful freeze reply is not a snapshot barrier of indefinite length, and `"
 
 ### 5.1 Static Allowlist via Match Arms
 
-The dispatcher maps each incoming method string through a single static `match` (`Command::from_method`) into an exhaustive `Command` enum, and every subsequent policy check — guest feature enablement (shared with `guest-info`), rate-limit class, frozen-safe gate, session lane, reply suppression, sync sentinel, and handler invocation — is an exhaustive `match` on `Command` with no wildcard default. There is **no dynamic dispatch table**, no plugin loader, and no way to register new handlers at runtime. Adding a command requires a source-code change, an explicit policy choice at every exhaustive `match`, a code review, and a new release.
+The dispatcher maps each incoming method string through a single static `match` (`Command::from_method`) into an exhaustive `Command` enum, and every subsequent per-command policy check — guest feature enablement (shared with `guest-info`), rate-limit class, session lane (`Command::lane`), reply suppression, sync sentinel, and handler invocation — is an exhaustive `match` on `Command` with no wildcard default, while the frozen-safe gate (`Command::is_frozen_safe`) is derived exhaustively from the four `Kind` lane values (`Kind::Control | Kind::Thaw` vs. `Kind::Freeze | Kind::Ordinary`) so lane assignment and freeze-gate admission always agree. There is **no dynamic dispatch table**, no plugin loader, and no way to register new handlers at runtime. Adding a command requires a source-code change, an explicit policy choice at every exhaustive `match`, a code review, and a new release.
 
 ```rust
 // Sketch — see src/handlers/mod.rs and src/dispatch.rs for full implementation

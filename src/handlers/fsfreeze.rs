@@ -6452,4 +6452,86 @@ mod tests {
         assert_eq!(ctx2.audit.mode(), Mode::Normal);
         assert!(ctx2.watchdog_slot().is_none());
     }
+
+    #[test]
+    fn thaw_state_record_failure_keeps_first_excluded_diagnostic_and_upgrades_on_authorized() {
+        let mut state = ThawState::default();
+        // Two consecutive excluded failures keep the first excluded target's diagnostic.
+        state.record_failure(
+            ThawFailure::Incomplete {
+                mountpoint: "/secret1".into(),
+                kind: RecoveryReason::RecoveryIncomplete,
+                reason: "first excluded".into(),
+                thawed: 0,
+            },
+            false,
+        );
+        state.record_failure(
+            ThawFailure::Incomplete {
+                mountpoint: "/secret2".into(),
+                kind: RecoveryReason::RecoveryIncomplete,
+                reason: "second excluded".into(),
+                thawed: 0,
+            },
+            false,
+        );
+        assert!(
+            matches!(
+                &state.unrecoverable,
+                Some(ThawFailure::Incomplete {
+                    mountpoint,
+                    kind: RecoveryReason::RecoveryIncomplete,
+                    ..
+                }) if mountpoint == "/secret1"
+            ),
+            "second excluded failure must not overwrite the first: {:?}",
+            state.unrecoverable
+        );
+
+        // An authorized target failure upgrades the excluded placeholder.
+        state.record_failure(
+            ThawFailure::Incomplete {
+                mountpoint: "/data".into(),
+                kind: RecoveryReason::PermissionDenied,
+                reason: "authorized denied".into(),
+                thawed: 0,
+            },
+            true,
+        );
+        assert!(
+            matches!(
+                &state.unrecoverable,
+                Some(ThawFailure::Incomplete {
+                    mountpoint,
+                    kind: RecoveryReason::PermissionDenied,
+                    ..
+                }) if mountpoint == "/data"
+            ),
+            "authorized failure must upgrade excluded placeholder: {:?}",
+            state.unrecoverable
+        );
+
+        // A later authorized failure keeps the first authorized failure.
+        state.record_failure(
+            ThawFailure::Incomplete {
+                mountpoint: "/data2".into(),
+                kind: RecoveryReason::IoctlFailed,
+                reason: "later authorized".into(),
+                thawed: 0,
+            },
+            true,
+        );
+        assert!(
+            matches!(
+                &state.unrecoverable,
+                Some(ThawFailure::Incomplete {
+                    mountpoint,
+                    kind: RecoveryReason::PermissionDenied,
+                    ..
+                }) if mountpoint == "/data"
+            ),
+            "later authorized failure must not overwrite first authorized failure: {:?}",
+            state.unrecoverable
+        );
+    }
 }

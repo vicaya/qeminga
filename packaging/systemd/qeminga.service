@@ -46,20 +46,29 @@ AmbientCapabilities=
 # (MNT_READONLY, not SB_RDONLY), so FIFREEZE/FITHAW/FITRIM on
 # O_RDONLY|O_DIRECTORY descriptors still work while ordinary files outside
 # /run/qeminga cannot be modified or unlinked even if writable to uid 600.
-# SystemCallFilter=~@mount prevents undoing the read-only mount namespace
-# even while CAP_SYS_ADMIN is held. PrivateTmp=no and ProtectHome=no are
-# deliberate: PrivateTmp=yes would overmount /tmp and /var/tmp with
-# writable tmpfs mounts, and ProtectHome=yes would hide separate /home
-# mounts from the freeze plan.
+# ReadWritePaths=-/run/qeminga carries the leading `-` so ExecStartPre=+
+# can create /run/qeminga on cold start before systemd evaluates the
+# write exception for ExecStart (without `-`, a missing directory fails
+# ExecStartPre=+ with 226/NAMESPACE). BindReadOnlyPaths=/sys and
+# ReadOnlyPaths=/run close the systemd v248-v262 MountAPIVFS quirk where
+# ProtectKernelTunables=yes leaves /sys and /run writable when already
+# mounted, while still letting an explicit suspend drop-in punch
+# ReadWritePaths=/sys/power/state. ProtectHome=read-only locks /home,
+# /root, and /run/user read-only (which ProtectSystem=strict leaves to
+# ProtectHome=) without hiding separate /home mounts from the freeze
+# plan. SystemCallFilter=~@mount prevents undoing the read-only mount
+# namespace even while CAP_SYS_ADMIN is held. PrivateTmp=no is deliberate
+# so /tmp and /var/tmp are not overmounted with writable private tmpfs.
 ProtectSystem=strict
-ReadWritePaths=/run/qeminga
+ReadWritePaths=-/run/qeminga
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-ReadOnlyPaths=-/dev/shm -/dev/mqueue
+BindReadOnlyPaths=/sys
+ReadOnlyPaths=/run -/dev/shm -/dev/mqueue
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -69,7 +78,7 @@ SystemCallArchitectures=native
 SystemCallFilter=~@mount
 UMask=0077
 PrivateTmp=no
-ProtectHome=no
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target

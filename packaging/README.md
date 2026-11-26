@@ -66,7 +66,7 @@ Verify with `systemctl status qeminga` and, from the host,
 `config.toml`, **and** two host-side grants for `/sys/power/state`:
 
 1. Discretionary write access for the service account: the file is `0644 root:root` and none of the daemon's remaining capabilities bypasses that, so install `tmpfiles.d/qeminga-suspend.conf` and run `sudo systemd-tmpfiles --create qeminga-suspend.conf` (OQ-6).
-2. A mount-namespace write exception: `qeminga.service` sets `ProtectKernelTunables=yes`, which mounts `/sys` read-only inside the service's mount namespace. Add a drop-in (for example `/etc/systemd/system/qeminga.service.d/suspend.conf`), then run `sudo systemctl daemon-reload && sudo systemctl restart qeminga.service`:
+2. A mount-namespace write exception: `qeminga.service` mounts `/sys` read-only inside the service's mount namespace (`ProtectKernelTunables=yes` and `BindReadOnlyPaths=/sys`). Add a drop-in (for example `/etc/systemd/system/qeminga.service.d/suspend.conf`), then run `sudo systemctl daemon-reload && sudo systemctl restart qeminga.service`:
 
 ```ini
 [Service]
@@ -74,73 +74,86 @@ ReadWritePaths=/sys/power/state
 ```
 
 Do not install either rule otherwise: together they are what lets the
-account suspend the guest.
+account suspend the guest while leaving neighboring `/sys/power/*`
+attributes read-only.
 
 ## Filesystem write confinement
 
 The shipped unit (`packaging/systemd/qeminga.service`) confines ordinary
 filesystem writes to `/run/qeminga` via `ProtectSystem=strict`,
-`ReadWritePaths=/run/qeminga`, `ProtectKernelTunables=yes`,
-`ReadOnlyPaths=-/dev/shm -/dev/mqueue`, `SystemCallFilter=~@mount`, and
-`UMask=0077` (design §8.4, #66). `ProtectSystem=strict` remounts the
+`ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`,
+`ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys`,
+`ReadOnlyPaths=/run -/dev/shm -/dev/mqueue`,
+`SystemCallFilter=~@mount`, and `UMask=0077` (design §8.4, #66).
+`ProtectSystem=strict` and `ProtectHome=read-only` remount the
 filesystem hierarchy read-only at the mount layer (`MNT_READONLY`, not
 `SB_RDONLY`), so `FIFREEZE`, `FITHAW`, and `FITRIM` on
 `O_RDONLY | O_DIRECTORY` descriptors still work on real `ext4`/`xfs`
-superblocks while ordinary files outside `/run/qeminga` cannot be
-modified or unlinked even when their Unix permissions grant write access
-to UID `600`. `SystemCallFilter=~@mount` (alongside qeminga's own
-seccomp filter omitting mount syscalls and `RestrictNamespaces=yes`)
-prevents undoing the read-only mount namespace even while
-`CAP_SYS_ADMIN` is held.
+superblocks (including separate `/home` mounts) while ordinary files
+outside `/run/qeminga` cannot be modified or unlinked even when their
+Unix permissions grant write access to UID `600`.
+`BindReadOnlyPaths=/sys` and `ReadOnlyPaths=/run` close the systemd
+v248–v262 `MountAPIVFS` interaction where `ProtectKernelTunables=yes`
+otherwise skips remounting already-mounted `/sys` and `/run` read-only,
+while still allowing a suspend drop-in to punch
+`ReadWritePaths=/sys/power/state`. `SystemCallFilter=~@mount` (alongside
+qeminga's own seccomp filter omitting mount syscalls and
+`RestrictNamespaces=yes`) prevents undoing the read-only mount namespace
+even while `CAP_SYS_ADMIN` is held.
 
 ### Writable object inventory (packaged CVM service)
 
 - **During privileged startup (before privilege drop and seccomp):**
-  - `ExecStartPre=+` runs as root in the host mount namespace solely to ensure `/run/qeminga` exists (`mkdir -p`), is owned by `qeminga:qeminga` (`chown`), and is mode `0700` (`chmod`) before `ExecStart` sets up `ReadWritePaths=/run/qeminga`.
-  - `ExecStart=/usr/bin/qeminga` starts inside the confined mount namespace (`ProtectSystem=strict`, `ReadWritePaths=/run/qeminga`, `ProtectKernelTunables=yes`, `ReadOnlyPaths=-/dev/shm -/dev/mqueue`, `SystemCallFilter=~@mount`) as UID `0` with `CapabilityBoundingSet` (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`) to read `/etc/qeminga/config.toml`, pin `/run/qeminga`, open the channel device (`O_RDWR`), drop to UID/GID `600`, drop excess capabilities, set `NoNewPrivs`, and install the seccomp filter — before reading any host input.
+  - `ExecStartPre=+` runs as root without the unit's read-only sandboxing solely to ensure `/run/qeminga` exists (`mkdir -p`), is owned by `qeminga:qeminga` (`chown`), and is mode `0700` (`chmod`) — preserving any pre-existing recovery marker across restarts — before `ExecStart` enters its confined mount namespace. The leading `-` on `ReadWritePaths=-/run/qeminga` is required because systemd still evaluates `ReadWritePaths=` for `ExecStartPre=+`; without `-`, a missing `/run/qeminga` fails `ExecStartPre=+` with `226/NAMESPACE` before `mkdir -p` runs.
+  - `ExecStart=/usr/bin/qeminga` starts inside the confined mount namespace (`ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys`, `ReadOnlyPaths=/run -/dev/shm -/dev/mqueue`, `SystemCallFilter=~@mount`) as UID `0` with `CapabilityBoundingSet` (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`) to read `/etc/qeminga/config.toml`, pin `/run/qeminga`, open the channel device (`O_RDWR`), drop to UID/GID `600`, drop excess capabilities, set `NoNewPrivs`, and install the seccomp filter — before reading any host input.
 - **After privilege drop (serving host input):**
-  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=/run/qeminga`): the only ordinary-file directory writable to the service, holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
+  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`): the only ordinary-file directory writable to the service, holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
   - `/dev/virtio-ports/org.qemu.guest_agent.0` (`0600 qeminga:qeminga`, symlink to `/dev/vport*`): the read-write virtio-serial character device opened at startup and reopened after disconnect/hot-unplug.
   - Inherited `stderr` journald stream (`StandardError=journal`): structured audit records.
   - `/sys/power/state` **only** when the operator opts into `suspend_ram` (both `tmpfiles.d/qeminga-suspend.conf` and a `ReadWritePaths=/sys/power/state` drop-in).
 - **Residual writable locations:**
-  - World-writable character devices under `/dev` (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`), because `PrivateDevices=yes` cannot be enabled without hiding `/dev/virtio-ports/org.qemu.guest_agent.0` (and PTY slaves used in installed-unit tests). Writable filesystems under `/dev` are closed with `ReadOnlyPaths=-/dev/shm -/dev/mqueue`.
+  - World-writable character devices under `/dev` (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`), because `PrivateDevices=yes` cannot be enabled without hiding `/dev/virtio-ports/org.qemu.guest_agent.0` (and PTY slaves used in installed-unit tests). Writable filesystems under `/dev` are closed with `ReadOnlyPaths=/run -/dev/shm -/dev/mqueue`.
   - Per-process procfs attribute files under `/proc/self/` (such as `/proc/self/comm` and `/proc/self/oom_score_adj`), which are kernel process interfaces rather than ordinary files.
   - **Filesystems mounted on the host after the service starts:** per `systemd.exec(5)`, host-to-unit mount propagation passes newly attached mounts into the service's mount namespace with their host mount flags (read-write, still bounded by UID `600` Unix permissions without `CAP_DAC_OVERRIDE`), whereas every filesystem already mounted at service start is remounted `MNT_READONLY`. Restart `qeminga.service` if a static filesystem is mounted after boot and should also be locked `MNT_READONLY`.
 
-### Why `PrivateTmp=no` and `ProtectHome=no` stay off
+### Why `PrivateTmp=no` and `ProtectHome=read-only` are chosen
 
 - `PrivateTmp=no`: `PrivateTmp=yes` would overmount `/tmp` and `/var/tmp` with *writable* private tmpfs mounts. With `ProtectSystem=strict` and `PrivateTmp=no`, `/tmp` and `/var/tmp` are read-only (`MNT_READONLY`) and any real filesystem mounted there stays visible to `FreezePlan`.
-- `ProtectHome=no`: `ProtectHome=yes` would overmount `/home` with an empty tmpfs, hiding separate `/home` ext4/xfs volumes from `FIFREEZE`. With `ProtectSystem=strict` and `ProtectHome=no`, `/home` and `/root` are already read-only (`MNT_READONLY`) while real `/home` mounts remain visible and freezable.
+- `ProtectHome=read-only`: `ProtectSystem=strict` deliberately leaves `/home`, `/root`, and `/run/user` to `ProtectHome=`, so `ProtectHome=no` would leave them writable, while `ProtectHome=yes` would overmount `/home` with an inaccessible node that hides separate `/home` ext4/xfs volumes from `FIFREEZE`. `ProtectHome=read-only` remounts `/home`, `/root`, and `/run/user` `MNT_READONLY` while keeping separate `/home` mounts visible and freezable.
 
 ### Custom marker location (`[agent] state_path`)
 
 If you move `[agent] state_path` out of `/run/qeminga` (it must still
 live on an unfreezable filesystem such as `tmpfs`; startup refuses a
 freezable path), provision the parent directory (`0700 qeminga:qeminga`)
-via `tmpfiles.d` / an `ExecStartPre=+` drop-in **and** grant it write
-access in a unit drop-in (resetting `ReadWritePaths=` first if
-`/run/qeminga` is no longer needed):
+via `tmpfiles.d` and an `ExecStartPre=+` drop-in **and** grant it write
+access with the leading `-` prefix (resetting `ExecStartPre=` and
+`ReadWritePaths=` first so `/run/qeminga` is no longer created or left
+writable, and keeping `-` so an absent directory can be created by
+`ExecStartPre=+` on cold start without failing with `226/NAMESPACE`
+while preserving any pre-existing marker across restarts):
 
 ```ini
 [Service]
+ExecStartPre=
 ExecStartPre=+/usr/bin/mkdir -p /run/custom-qeminga
 ExecStartPre=+/usr/bin/chown qeminga:qeminga /run/custom-qeminga
 ExecStartPre=+/usr/bin/chmod 0700 /run/custom-qeminga
 ReadWritePaths=
-ReadWritePaths=/run/custom-qeminga
+ReadWritePaths=-/run/custom-qeminga
 ```
 
 ### Supported systemd baseline
 
 All directives in `packaging/systemd/qeminga.service` are supported on
 **systemd 245 or newer** (matching the existing `ProtectClock=yes`
-baseline; `ProtectSystem=strict` and `ProtectKernelTunables=yes` require
-systemd 232+, `ReadWritePaths=`, `ReadOnlyPaths=`, and
-`SystemCallFilter=~@mount` require systemd 231+, `RestrictSUIDSGID=` and
-`ProtectHostname=` require 242+, and `ProtectKernelLogs=` requires 244+).
-This covers Ubuntu 20.04+, Debian 11+, and RHEL 9+ (CI verifies Ubuntu
-24.04 with systemd 255 on both `x86_64` and `aarch64`).
+baseline; `ProtectHome=read-only` requires 227+, `ReadWritePaths=`,
+`ReadOnlyPaths=`, and `SystemCallFilter=~@mount` require 231+,
+`ProtectSystem=strict` and `ProtectKernelTunables=yes` require 232+,
+`BindReadOnlyPaths=` requires 233+, `RestrictSUIDSGID=` and
+`ProtectHostname=` require 242+, and `ProtectKernelLogs=` requires
+244+). This covers Ubuntu 20.04+, Debian 11+, and RHEL 9+ (CI verifies
+Ubuntu 24.04 with systemd 255 on both `x86_64` and `aarch64`).
 
 ## Changing the freeze cap
 

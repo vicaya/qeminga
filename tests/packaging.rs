@@ -221,6 +221,10 @@ fn packaging_docs_cover_write_confinement_custom_marker_suspend_and_baseline() {
         "packaging/README.md must document mount propagation of post-start mounts"
     );
     assert!(
+        !readme.contains("ReadOnlyPaths=/run -/dev/shm"),
+        "packaging/README.md must not retain stale ReadOnlyPaths=/run -/dev/shm directives"
+    );
+    assert!(
         lower_readme.contains("ancestor") && lower_readme.contains("directory descriptor"),
         "packaging/README.md must document the trusted-parent requirement for custom state_path"
     );

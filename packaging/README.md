@@ -82,20 +82,22 @@ attributes read-only.
 The shipped unit (`packaging/systemd/qeminga.service`) confines ordinary
 filesystem writes to `/run/qeminga` via `ProtectSystem=strict`,
 `ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`,
-`ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys`,
-`ReadOnlyPaths=/run -/dev/shm -/dev/mqueue`,
-`SystemCallFilter=~@mount`, and `UMask=0077` (design §8.4, #66).
-`ProtectSystem=strict` and `ProtectHome=read-only` remount the
-filesystem hierarchy read-only at the mount layer (`MNT_READONLY`, not
-`SB_RDONLY`), so `FIFREEZE`, `FITHAW`, and `FITRIM` on
-`O_RDONLY | O_DIRECTORY` descriptors still work on real `ext4`/`xfs`
+`ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys /dev`,
+`ReadOnlyPaths=/run`, `SystemCallFilter=~@mount`, and `UMask=0077`
+(design §8.4, #66). `ProtectSystem=strict` and `ProtectHome=read-only`
+remount the filesystem hierarchy read-only at the mount layer
+(`MNT_READONLY`, not `SB_RDONLY`), so `FIFREEZE`, `FITHAW`, and `FITRIM`
+on `O_RDONLY | O_DIRECTORY` descriptors still work on real `ext4`/`xfs`
 superblocks (including separate `/home` mounts) while ordinary files
 outside `/run/qeminga` cannot be modified or unlinked even when their
 Unix permissions grant write access to UID `600`.
-`BindReadOnlyPaths=/sys` and `ReadOnlyPaths=/run` close the systemd
+`BindReadOnlyPaths=/sys /dev` and `ReadOnlyPaths=/run` close the systemd
 v248–v262 `MountAPIVFS` interaction where `ProtectKernelTunables=yes`
 otherwise skips remounting already-mounted `/sys` and `/run` read-only,
-while still allowing a suspend drop-in to punch
+and recursively lock ordinary files on `/dev` itself plus every
+filesystem already mounted beneath `/dev` (`/dev/shm`, `/dev/mqueue`,
+`/dev/hugepages`, etc.) read-only while keeping existing character
+devices openable `O_RDWR` and still allowing a suspend drop-in to punch
 `ReadWritePaths=/sys/power/state`. `SystemCallFilter=~@mount` (alongside
 qeminga's own seccomp filter omitting mount syscalls and
 `RestrictNamespaces=yes`) prevents undoing the read-only mount namespace

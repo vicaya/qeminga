@@ -30,9 +30,12 @@ while [ $# -gt 0 ]; do
 done
 [ $# -eq 1 ] || { echo "usage: $0 [--connect URI] [--no-shutdown] [--freeze-mount PATH] DOMAIN" >&2; exit 64; }
 domain="$1"
-if [ -n "$freeze_mount" ] && [[ ! "$freeze_mount" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
-    echo "invalid --freeze-mount path: $freeze_mount" >&2
-    exit 64
+if [ -n "$freeze_mount" ]; then
+    if [[ "$freeze_mount" != /* ]]; then
+        echo "invalid --freeze-mount path (must be absolute): $freeze_mount" >&2
+        exit 64
+    fi
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for --freeze-mount" >&2; exit 69; }
 fi
 
 # Predictable command output whatever the caller's locale (domstate is
@@ -94,16 +97,28 @@ domfsthaw_nonzero() {
         return 1
     }
 }
+# Shared parser for top-level QGA integer `return` counts: requires a single
+# JSON object whose top-level `return` is an exact non-negative integer equal
+# to $2 (rejecting fractional numbers, strings, nested objects, and malformed
+# or concatenated JSON).
+# shellcheck disable=SC2317,SC2329 # invoked through `freeze_list_exact` and `thaw_exact`
+qga_return_is_exact_int() {
+    local json="$1" want="$2"
+    printf '%s\n' "$json" | jq -se --argjson want "$want" \
+        'length == 1 and (.[0] | type == "object" and has("return") and (.return | type == "number" and . == floor and . == $want and (tostring | test("^[0-9]+$"))))' \
+        >/dev/null 2>&1
+}
 # shellcheck disable=SC2317,SC2329 # invoked through `step` below
 freeze_list_exact() {
-    local mount="$1" want="$2" out
-    out="$(agent "{\"execute\":\"guest-fsfreeze-freeze-list\",\"arguments\":{\"mountpoints\":[\"$mount\"]}}" 2>&1)" || {
+    local mount="$1" want="$2" req out
+    req="$(jq -nc --arg mount "$mount" '{execute: "guest-fsfreeze-freeze-list", arguments: {mountpoints: [$mount]}}')" || return 1
+    out="$(agent "$req" 2>&1)" || {
         echo "$out"
         return 1
     }
     echo "$out"
-    printf '%s\n' "$out" | grep -Eq "\"return\"[[:space:]]*:[[:space:]]*${want}([^0-9]|$)" || {
-        echo "expected exact frozen count $want for $mount"
+    qga_return_is_exact_int "$out" "$want" || {
+        echo "expected exact integer return $want for $mount"
         return 1
     }
 }
@@ -115,8 +130,8 @@ thaw_exact() {
         return 1
     }
     echo "$out"
-    printf '%s\n' "$out" | grep -Eq "\"return\"[[:space:]]*:[[:space:]]*${want}([^0-9]|$)" || {
-        echo "expected exact thawed count $want"
+    qga_return_is_exact_int "$out" "$want" || {
+        echo "expected exact integer return $want"
         return 1
     }
 }

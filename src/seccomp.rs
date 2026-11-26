@@ -149,6 +149,11 @@ pub const SIGNAL_SOCKETPAIR_TYPE: u64 = SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEX
 /// `getifaddrs(3)` when creating its `NETLINK_ROUTE` socket.
 pub const NETLINK_SOCKET_TYPE: u64 = SOCK_RAW | SOCK_CLOEXEC;
 
+/// `sizeof(struct sockaddr_nl)` (`12` bytes on both supported Linux targets):
+/// exact destination address length passed by glibc's `getifaddrs(3)` to
+/// `sendto(2)` with `flags == 0`.
+pub const SOCKADDR_NL_LEN: u64 = 12;
+
 /// Syscalls needed on both targets, grouped by the §5.5 surfaces table.
 pub const COMMON: &[&str] = &[
     // File, metadata and channel I/O.
@@ -233,9 +238,10 @@ pub const COMMON: &[&str] = &[
 /// `guest-get-osinfo`, `statfs`/`fstatfs` for `guest-get-fsinfo`, and the
 /// netlink exchange of `getifaddrs(3)` for `guest-network-get-interfaces`
 /// (`socket` is listed separately, restricted to `AF_NETLINK` +
-/// `SOCK_RAW | SOCK_CLOEXEC` + `NETLINK_ROUTE`; `sendto` is unrestricted
-/// only when `information = true`, and restricted to peerless `send(2)`
-/// otherwise). Absent from the profile when `[features] information = false`.
+/// `SOCK_RAW | SOCK_CLOEXEC` + `NETLINK_ROUTE`, and an additional `sendto`
+/// rule permits `flags == 0` with `addrlen == SOCKADDR_NL_LEN` alongside the
+/// peerless `send(2)` rule present in every profile). Absent from the
+/// profile when `[features] information = false`.
 pub const INFORMATION: &[&str] = &[
     "uname",
     "statfs",
@@ -281,10 +287,10 @@ pub const AF_NETLINK: u64 = 16;
 /// restricted to `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)`,
 /// `recvfrom` restricted to peerless `recv(2)` (`src_addr == NULL`,
 /// `addrlen == NULL`), `sendto` restricted to peerless `send(2)`
-/// (`dest_addr == NULL`, `addrlen == 0`) when `information = false` (and
-/// unrestricted for `getifaddrs(3)` netlink requests when `information =
-/// true`), and only with their consumer the information syscalls with
-/// `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` and the
+/// (`dest_addr == NULL`, `addrlen == 0`) in every profile, and only with
+/// their consumer the information syscalls with
+/// `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`, a second
+/// `sendto` rule for `flags == 0` and `addrlen == SOCKADDR_NL_LEN`, and the
 /// power syscalls.
 pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
     let plain = |name: &&'static str| Rule {
@@ -334,19 +340,18 @@ pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
         conditions: vec![ArgEq::qword(4, 0), ArgEq::qword(5, 0)],
     });
     // Signal driver writes via `send(fd, buf, len, MSG_NOSIGNAL)` ->
-    // `sendto(..., NULL, 0)`. When `information = false` (CVM profile),
-    // disallow any destination address (`dest_addr == NULL && addrlen == 0`);
-    // when `information = true`, `getifaddrs(3)` passes a `sockaddr_nl`
-    // pointer to `sendto` (and `sendmsg` is already enabled for netlink).
+    // `sendto(..., NULL, 0)`: permitted in every profile.
     out.push(Rule {
         syscall: "sendto",
-        conditions: if authority.information {
-            Vec::new()
-        } else {
-            vec![ArgEq::qword(4, 0), ArgEq::dword(5, 0)]
-        },
+        conditions: vec![ArgEq::qword(4, 0), ArgEq::dword(5, 0)],
     });
     if authority.information {
+        // glibc `getifaddrs(3)` sends its netlink dump request via
+        // `sendto(fd, &req, sizeof(req), 0, &nladdr, sizeof(struct sockaddr_nl))`.
+        out.push(Rule {
+            syscall: "sendto",
+            conditions: vec![ArgEq::dword(3, 0), ArgEq::dword(5, SOCKADDR_NL_LEN)],
+        });
         // glibc `getifaddrs(3)` creates `socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
         // NETLINK_ROUTE)`. Without `CAP_NET_ADMIN` (dropped in §5.4), route
         // netlink cannot modify links or routes; other netlink protocols
@@ -628,6 +633,10 @@ mod tests {
         assert_eq!(
             NETLINK_ROUTE_VAL,
             u64::try_from(nix::libc::NETLINK_ROUTE).unwrap()
+        );
+        assert_eq!(
+            SOCKADDR_NL_LEN,
+            u64::try_from(std::mem::size_of::<nix::libc::sockaddr_nl>()).unwrap()
         );
 
         let targets = [
@@ -920,10 +929,12 @@ mod tests {
                     );
                 }
 
-                // sendto: peerless send() allowed in every profile; addressed
-                // sendto() denied when !information (including pointers with
-                // zero low 32 bits, proving 64-bit qword checks) and allowed
-                // when information = true (for getifaddrs netlink request).
+                // sendto: peerless send() allowed in every profile; netlink
+                // sendto(flags == 0, addrlen == sizeof(sockaddr_nl)) allowed
+                // only when information = true; unrelated flags or destination
+                // lengths (e.g., sockaddr_in=16, sockaddr_un=110) and non-null
+                // pointers with addrlen=0 (including high-bits-only) denied in
+                // every profile.
                 assert_eq!(
                     eval_bpf(
                         &bpf,
@@ -934,22 +945,46 @@ mod tests {
                     SECCOMP_RET_ALLOW,
                     "{target:?} {label}: peerless sendto (signal driver) must be allowed"
                 );
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        arch,
+                        sys_sendto,
+                        [9, 0x1000, 20, 0, 0x7fff_1234, SOCKADDR_NL_LEN]
+                    ),
+                    if auth.information {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    },
+                    "{target:?} {label}: netlink sendto(flags=0, addrlen=sizeof(sockaddr_nl))"
+                );
                 for (case, args) in [
-                    ("addr + len", [9, 0x1000, 20, 0, 0x7fff_1234, 12]),
                     (
-                        "high-bits-only addr",
+                        "high-bits-only addr with addrlen=0",
                         [9, 0x1000, 1, 0, 0x7fff_0000_0000, 0],
                     ),
-                    ("nonzero addrlen only", [9, 0x1000, 1, 0, 0, 12]),
+                    (
+                        "sockaddr_nl len with nonzero flags",
+                        [
+                            9,
+                            0x1000,
+                            20,
+                            MSG_NOSIGNAL_VAL,
+                            0x7fff_1234,
+                            SOCKADDR_NL_LEN,
+                        ],
+                    ),
+                    ("sockaddr_in len (16)", [9, 0x1000, 20, 0, 0x7fff_1234, 16]),
+                    (
+                        "sockaddr_un len (110)",
+                        [9, 0x1000, 20, 0, 0x7fff_1234, 110],
+                    ),
                 ] {
                     assert_eq!(
                         eval_bpf(&bpf, arch, sys_sendto, args),
-                        if auth.information {
-                            SECCOMP_RET_ALLOW
-                        } else {
-                            expected_deny
-                        },
-                        "{target:?} {label}: sendto({case})"
+                        expected_deny,
+                        "{target:?} {label}: sendto({case}) must be denied"
                     );
                 }
 
@@ -1191,16 +1226,25 @@ mod tests {
                     "{target:?}: {forbidden} must be absent"
                 );
             }
-            // No duplicates.
+            // Only ioctl (3 rules) and sendto (2 rules in FULL: peerless +
+            // netlink sockaddr_nl) repeat.
             let mut sorted = names.clone();
             sorted.sort_unstable();
             sorted.dedup();
             assert_eq!(
-                sorted.len() + 2,
+                sorted.len() + 3,
                 names.len(),
-                "only ioctl repeats (3 rules)"
+                "only ioctl (3 rules) and sendto (2 rules) repeat in FULL"
             );
             assert_eq!(names.iter().filter(|n| **n == "prctl").count(), 1);
+            assert_eq!(names.iter().filter(|n| **n == "ioctl").count(), 3);
+            assert_eq!(names.iter().filter(|n| **n == "sendto").count(), 2);
+            // In CVM (information = false), sendto has only the peerless rule.
+            let dp_names: Vec<&str> = rules(target, &Authority::data_protection())
+                .iter()
+                .map(|r| r.syscall)
+                .collect();
+            assert_eq!(dp_names.iter().filter(|n| **n == "sendto").count(), 1);
         }
     }
 
@@ -1294,18 +1338,27 @@ mod tests {
     /// profiles in child processes and verifies against the real Linux kernel:
     /// - CVM signal delivery (`SIGTERM` over Tokio/mio's `AF_UNIX` `SOCK_STREAM`
     ///   socketpair) succeeds and exits cleanly;
-    /// - under an enforcing filter (`!log_mode()`), disallowed `socketpair`
-    ///   (`SOCK_DGRAM`), CVM `socket(AF_NETLINK, ...)` (`getifaddrs`),
-    ///   `socket(AF_INET, ...)`, and peer-addressed `sendto` are killed with
-    ///   `SIGSYS`.
+    /// - under an enforcing filter (`!log_mode()`), each disallowed single
+    ///   syscall (`socketpair(AF_UNIX, SOCK_DGRAM|...)`, CVM
+    ///   `socket(AF_NETLINK, ...)`, `socket(AF_INET, ...)`,
+    ///   `socket(AF_NETLINK, ..., NETLINK_KOBJECT_UEVENT)`, and addressed
+    ///   Unix `sendto` in both CVM and full profiles) is killed immediately
+    ///   with `SIGSYS`; returning from the call (even with an OS error) exits
+    ///   with status 99 so a later denied syscall can never mask a failure.
     #[test]
     #[ignore = "installs a seccomp filter on the test process (run in the privileged job)"]
     fn privileged_cvm_signal_delivery_and_socket_denials() {
+        use nix::sys::socket::{
+            AddressFamily, SockFlag, SockProtocol, SockType, socket, socketpair,
+        };
         use std::os::unix::net::UnixDatagram;
         use std::os::unix::process::ExitStatusExt;
 
-        const ENV: &str = "QEMINGA_SECCOMP_IPC_CASE";
-        if let Ok(case) = std::env::var(ENV) {
+        const ENV_CASE: &str = "QEMINGA_SECCOMP_IPC_CASE";
+        const ENV_PEER: &str = "QEMINGA_SECCOMP_IPC_PEER";
+        const RETURNED_WITHOUT_SIGSYS: i32 = 99;
+
+        if let Ok(case) = std::env::var(ENV_CASE) {
             let dp = Authority::data_protection();
             match case.as_str() {
                 "cvm-sigterm" => {
@@ -1329,34 +1382,73 @@ mod tests {
                 "cvm-dgram-socketpair" => {
                     nix::sys::prctl::set_no_new_privs().unwrap();
                     install(&profile(Target::current(), &dp).unwrap()).unwrap();
-                    let _ = UnixDatagram::pair();
+                    let _ = socketpair(
+                        AddressFamily::Unix,
+                        SockType::Datagram,
+                        None,
+                        SockFlag::SOCK_NONBLOCK | SockFlag::SOCK_CLOEXEC,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
                 }
                 "cvm-netlink-socket" => {
                     nix::sys::prctl::set_no_new_privs().unwrap();
                     install(&profile(Target::current(), &dp).unwrap()).unwrap();
-                    let _ = nix::ifaddrs::getifaddrs();
+                    let _ = socket(
+                        AddressFamily::Netlink,
+                        SockType::Raw,
+                        SockFlag::SOCK_CLOEXEC,
+                        SockProtocol::NetlinkRoute,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
                 }
                 "cvm-addressed-sendto" => {
-                    // Create an unconnected Unix datagram socket BEFORE
-                    // installing the filter to verify `sendto` with a
-                    // non-null peer address is killed even on an existing fd.
-                    let dir = tempfile::tempdir().unwrap();
-                    let sock_path = dir.path().join("peer.sock");
-                    let _peer = UnixDatagram::bind(&sock_path).unwrap();
+                    let sock_path = std::env::var_os(ENV_PEER).unwrap();
                     let sender = UnixDatagram::unbound().unwrap();
                     nix::sys::prctl::set_no_new_privs().unwrap();
                     install(&profile(Target::current(), &dp).unwrap()).unwrap();
-                    let _ = sender.send_to(b"x", &sock_path);
+                    let _ = sender.send_to(b"x", sock_path);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
                 }
                 "full-inet-socket" => {
                     nix::sys::prctl::set_no_new_privs().unwrap();
                     install(&profile(Target::current(), &FULL).unwrap()).unwrap();
-                    let _ = std::net::TcpListener::bind("127.0.0.1:0");
+                    let _ = socket(
+                        AddressFamily::Inet,
+                        SockType::Stream,
+                        SockFlag::SOCK_CLOEXEC,
+                        None,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "full-uevent-netlink-socket" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &FULL).unwrap()).unwrap();
+                    let _ = socket(
+                        AddressFamily::Netlink,
+                        SockType::Raw,
+                        SockFlag::SOCK_CLOEXEC,
+                        SockProtocol::NetlinkKObjectUEvent,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "full-unix-sendto" => {
+                    let sock_path = std::env::var_os(ENV_PEER).unwrap();
+                    let sender = UnixDatagram::unbound().unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&profile(Target::current(), &FULL).unwrap()).unwrap();
+                    let _ = sender.send_to(b"x", sock_path);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
                 }
                 other => panic!("unknown child case: {other}"),
             }
             return;
         }
+
+        // Parent owns the temp socket directory so a SIGSYS-killed child
+        // never leaves behind a socket file.
+        let dir = tempfile::tempdir().unwrap();
+        let peer_path = dir.path().join("peer.sock");
+        let _peer = UnixDatagram::bind(&peer_path).unwrap();
 
         let run_child = |case: &str| {
             std::process::Command::new(std::env::current_exe().unwrap())
@@ -1366,7 +1458,8 @@ mod tests {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env(ENV, case)
+                .env(ENV_CASE, case)
+                .env(ENV_PEER, &peer_path)
                 .output()
                 .unwrap()
         };
@@ -1386,13 +1479,15 @@ mod tests {
                 "cvm-netlink-socket",
                 "cvm-addressed-sendto",
                 "full-inet-socket",
+                "full-uevent-netlink-socket",
+                "full-unix-sendto",
             ] {
                 let out = run_child(denied);
                 assert_eq!(
                     out.status.signal(),
                     Some(nix::libc::SIGSYS),
-                    "{denied} must be killed by SIGSYS under enforcing filter; status={:?}\nstdout={}\nstderr={}",
-                    out.status,
+                    "{denied} must be killed by SIGSYS on the tested syscall (exit {:?} means it returned without SIGSYS); stdout={}\nstderr={}",
+                    out.status.code(),
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
                 );

@@ -737,3 +737,41 @@ figures for the current tip of their source branch (checked before
 generating and before every push), so a slow run for an older commit
 never overwrites a newer one's badges; overlapping writers of the badges
 branch are resolved by regenerating on the fetched tip and retrying.
+
+## AI maintenance workflow
+
+The nightly AI maintenance workflow (`.github/workflows/ai-maintenance.yml`)
+is developer tooling and does not touch the daemon. Its scripts have an
+offline self-test that uses fake provider adapters, fake `gh` and `docker`
+commands and a local remote, so it needs no network or API keys.
+`tests/ai_maintenance.rs` runs it as part of `cargo test`, along with checks
+on the workflow's isolation properties:
+
+```sh
+.github/actions/ai-maintenance/test/selftest.sh
+```
+
+With `--docker`, the self-test runs attempts in real containers instead: a
+probe inside an attempt looks for the other attempts' keys in every file and
+process it can see, and for the runner's files. It needs a Docker daemon and
+network access to build the image, so it runs in the privileged suite as
+`privileged_ai_maintenance_attempts_see_only_their_own_key`:
+
+```sh
+.github/actions/ai-maintenance/test/selftest.sh --docker
+```
+
+With `--image`, it builds the agent's image with the workflow's
+`container-setup` (this repository's Rust toolchain and `python3`) and runs
+repository checks in an attempt there as the agent's user. It takes several
+minutes and runs in the privileged suite as
+`privileged_ai_maintenance_image_runs_the_repository_checks`. Behind a
+TLS-intercepting proxy, point `AI_SELFTEST_IMAGE` at a base image that
+trusts the proxy's CA:
+
+```sh
+.github/actions/ai-maintenance/test/selftest.sh --image
+```
+
+Setup, the key-pool format and the security model are in
+`.github/actions/ai-maintenance/README.md`.

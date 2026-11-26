@@ -1,0 +1,64 @@
+# shellcheck shell=bash
+# Template for a new provider. Copy to providers/<name>.sh, where <name> is
+# the provider's name in the key pool (for example "provider2"). It may use
+# the helpers in lib.sh (ai_log, ai_npm_install, ai_report_effort) and
+# these variables:
+#
+#   AI_TOOLS_DIR     install CLIs here: this provider's own directory,
+#                    fresh for the run, read-only during its attempts
+#   AI_ATTEMPT_DIR   writable output directory of this attempt (outside the
+#                    checkout)
+#
+# Both functions run in containers of the sandbox image, as an
+# unprivileged user. provider_install runs once per run, with network
+# access but without any key, prompt or file of the run: only AI_TOOLS_DIR
+# is mounted (writable), with the runner's Node.js and npm. provider_run
+# runs in the attempt's container, in a copy of the repository checkout,
+# with Node.js on PATH and AI_TOOLS_DIR read-only; nothing else of the
+# runner is visible there.
+
+# Optional: extra extended regex (case-insensitive) for errors that mean
+# "this key is exhausted, try the next one". The common patterns (429,
+# quota, rate limit, 401, billing, overloaded, ...) always apply.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_EXHAUSTED_REGEX=''
+
+# Optional: variables of the runner the install step needs (versions,
+# download pins), space-separated; nothing else reaches it.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_INSTALL_ENV='PROVIDER2_VERSION'
+
+# Optional: pool options that hold credentials under a name the run would
+# not recognise as one (README, Key pool), as space-separated dotted paths
+# ("auth.value"); they are then masked, withheld and refused like keys.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_SECRET_OPTIONS=''
+
+# Optional: the file in AI_ATTEMPT_DIR holding the CLI's transcript; it is
+# uploaded (scrubbed) as transcript.jsonl. No other file the attempt
+# writes is uploaded, except final.md and error.txt.
+# shellcheck disable=SC2034 # read by run.sh
+PROVIDER_TRANSCRIPT=''
+
+# Install the CLI (idempotent). Pin a version.
+provider_install() {
+    ai_npm_install "$AI_TOOLS_DIR/provider2" "provider2-cli@${PROVIDER2_VERSION:-1.2.3}"
+}
+
+# provider_run KEY PROMPT_FILE FINAL_FILE MODEL OPTIONS_JSON EFFORT
+#   KEY           the API key for this attempt; pass it only to the CLI
+#   PROMPT_FILE   the full prompt (preamble + instructions)
+#   FINAL_FILE    write the agent's final message here (the PR description)
+#   MODEL         model to use, or empty for the CLI's default
+#   OPTIONS_JSON  the pool entry's options, e.g. {"base_url": "..."}
+#   EFFORT        low | medium | high | xhigh | max, or empty for the CLI's
+#                 default; map it onto the CLI's own levels, and call
+#                 `ai_report_effort LEVEL` when the CLI runs with another
+# Print progress to stdout/stderr (it becomes the attempt log) and return
+# 0 only when the agent finished its task.
+provider_run() {
+    local key=$1 prompt=$2 final=$3 model=$4 options=$5 effort=${6:-} base_url
+    base_url=$(jq -r '.base_url // ""' <<<"$options")
+    PROVIDER2_API_KEY="$key" PROVIDER2_BASE_URL="$base_url" "$AI_TOOLS_DIR/provider2/node_modules/.bin/provider2" \
+        --prompt-file "$prompt" ${model:+--model "$model"} ${effort:+--reasoning "$effort"} --yes --last-message "$final"
+}

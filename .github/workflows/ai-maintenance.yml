@@ -1,0 +1,270 @@
+# Nightly AI maintenance (.github/actions/ai-maintenance/README.md).
+#
+# Nightly, a coding agent (Claude Code, Codex or Antigravity, chosen from
+# the ordered key pool in secret AI_KEY_POOL) follows the instructions in
+# secret AI_MAINTENANCE_PROMPT and, when it changed something, the workflow
+# opens a pull request. The workflow then watches that pull request: trusted
+# review feedback starts a review round (the agent addresses it, the fix is
+# pushed and the agent's reply posted), and once no feedback arrives for
+# AI_MAINTENANCE_QUIET_MINUTES the watch ends and the nightly schedule
+# carries on.
+#
+# Isolation: the agent job holds the API keys and a read-only token, but
+# the agent itself runs in a container per attempt that receives only that
+# attempt's key and a copy of the checkout: the runner's files, processes
+# and credentials (the cache service's included) stay outside, and the job
+# restores and saves no cache. The agent's work leaves its job only as a
+# patch artifact. Pushing, opening and commenting on pull requests happen
+# in a job that has write access but no keys and runs no agent, using the
+# action scripts from this workflow's own commit, never the pull request's.
+#
+# Portable: copy this file and .github/actions/ai-maintenance/ into another
+# repository, set the secrets, and adapt the "Repository setup" steps.
+name: AI maintenance
+
+on:
+  schedule:
+    - cron: "41 2 * * *" # nightly, 02:41 UTC
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: nightly (a new maintenance pass) or review (watch a maintenance PR)
+        type: choice
+        options: [nightly, review]
+        default: nightly
+      pr:
+        description: "review: pull request number"
+        default: ""
+      since:
+        description: "review: feedback after this UTC time (such as 2026-01-31T12:00:00Z) is new; for the first round"
+        default: ""
+      state-run:
+        description: "review: the run whose watch state to continue from (set by the workflow for later rounds)"
+        default: ""
+      round:
+        description: "review: review round number"
+        default: "0"
+      models:
+        description: 'One-off models instead of AI_MAINTENANCE_MODELS, e.g. {"claude":"claude-opus-5-5 high"}'
+        default: ""
+      instructions:
+        description: "One-off instructions instead of the AI_MAINTENANCE_PROMPT secret (visible in the run's metadata)"
+        default: ""
+      dry-run:
+        description: "nightly: run the agent but publish nothing"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: ai-maintenance-${{ inputs.mode == 'review' && inputs.pr || 'nightly' }}
+  cancel-in-progress: false
+
+env:
+  # Repository variables (Settings → Secrets and variables → Actions →
+  # Variables) tune the workflow without editing it.
+  BRANCH_PREFIX: ${{ vars.AI_MAINTENANCE_BRANCH_PREFIX || 'ai-maintenance/' }}
+  ACTION_DIR: _ai-maintenance # trusted copy of the action, from github.sha
+
+jobs:
+  # Review mode: wait for feedback on the pull request, or for the quiet
+  # period to pass. Read-only.
+  watch:
+    name: watch for review feedback
+    if: inputs.mode == 'review'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    # actions: read for the previous round's state artifact.
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.watch.outputs.status }}
+      head-ref: ${{ steps.watch.outputs.head-ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.ACTION_DIR }}
+          sparse-checkout: .github/actions/ai-maintenance
+          persist-credentials: false
+      # Later rounds continue from the state the previous round's watch
+      # left as an artifact of its run.
+      - if: inputs.state-run != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-maintenance-watch-state
+          path: ${{ runner.temp }}/ai-watch-state
+          run-id: ${{ inputs.state-run }}
+          github-token: ${{ github.token }}
+      - id: watch
+        uses: ./_ai-maintenance/.github/actions/ai-maintenance/watch
+        with:
+          pr: ${{ inputs.pr }}
+          since: ${{ inputs.since }}
+          since-file: ${{ inputs.state-run != '' && format('{0}/ai-watch-state/state.txt', runner.temp) || '' }}
+          branch-prefix: ${{ env.BRANCH_PREFIX }}
+          quiet-minutes: ${{ vars.AI_MAINTENANCE_QUIET_MINUTES || '90' }}
+          trusted-bots: ${{ vars.AI_MAINTENANCE_TRUSTED_BOTS }}
+
+  # The agent: API keys, read-only token, result as an artifact.
+  maintain:
+    name: agent run
+    needs: watch
+    if: >-
+      always() && !cancelled() &&
+      (inputs.mode != 'review' || needs.watch.outputs.status == 'feedback')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      status: ${{ steps.agent.outputs.status }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.ACTION_DIR }}
+          sparse-checkout: .github/actions/ai-maintenance
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: work
+          ref: ${{ inputs.mode == 'review' && needs.watch.outputs.head-ref || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - if: inputs.mode == 'review'
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-maintenance-feedback
+          path: ${{ runner.temp }}/ai-feedback
+
+      - id: agent
+        uses: ./_ai-maintenance/.github/actions/ai-maintenance
+        with:
+          key-pool: ${{ secrets.AI_KEY_POOL }}
+          instructions: ${{ inputs.instructions || secrets.AI_MAINTENANCE_PROMPT }}
+          extra-prompt-file: ${{ inputs.mode == 'review' && format('{0}/ai-feedback/feedback.md', runner.temp) || '' }}
+          routing: ${{ vars.AI_MAINTENANCE_ROUTING || 'ordered' }}
+          fallback-on: ${{ vars.AI_MAINTENANCE_FALLBACK_ON || 'exhausted' }}
+          # Provider -> "<model> [effort]", e.g. {"claude":"claude-opus-5-5 high"}.
+          # A pool entry's "model" wins, then this (a dispatch input, else a
+          # repository variable; a literal value works too), then each CLI's
+          # defaults.
+          models: ${{ inputs.models || vars.AI_MAINTENANCE_MODELS }}
+          attempt-timeout: ${{ vars.AI_MAINTENANCE_ATTEMPT_TIMEOUT || '60m' }}
+          # "true": no free-form agent text or transcripts are published.
+          private-instructions: ${{ vars.AI_MAINTENANCE_PRIVATE_INSTRUCTIONS || 'false' }}
+          working-directory: work
+          # --- Repository setup: what the agent needs to build and test,
+          # installed into its container image (as root, in a throwaway
+          # copy of the checkout; the agent itself cannot install anything).
+          # Adapt this when copying the workflow to another repository.
+          # (python3: scripts/ci/coverage-gate.py and its test. The
+          # privileged test suite builds this image and runs a check in it.)
+          container-image: ubuntu:24.04
+          container-setup: |
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends build-essential curl python3 >/dev/null
+            export RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo
+            curl --proto '=https' --tlsv1.2 -fsSL -o /tmp/rustup-init \
+              "https://static.rust-lang.org/rustup/dist/$(uname -m)-unknown-linux-gnu/rustup-init"
+            chmod +x /tmp/rustup-init
+            /tmp/rustup-init -y -q --no-modify-path --profile minimal --default-toolchain none
+            rm /tmp/rustup-init
+            /opt/rust/cargo/bin/rustup toolchain install  # rust-toolchain.toml
+            chmod -R a+rwX /opt/rust
+            printf '%s\n' RUSTUP_HOME=/opt/rust/rustup CARGO_HOME=/opt/rust/cargo \
+              'PATH=/opt/rust/cargo/bin:$PATH' >>/etc/ai-maintenance/env
+          # --- End of repository setup.
+          branch-prefix: ${{ env.BRANCH_PREFIX }}
+          # Nightly runs pause while a maintenance pull request is open.
+          max-open-prs: ${{ inputs.mode == 'review' && '0' || vars.AI_MAINTENANCE_MAX_OPEN_PRS || '1' }}
+
+  # Write access, no API keys, no agent: push and open or update the PR.
+  publish:
+    name: publish
+    needs: [watch, maintain]
+    if: >-
+      always() && !cancelled() && needs.maintain.result == 'success' && !inputs.dry-run &&
+      (needs.maintain.outputs.status == 'changed' ||
+       (inputs.mode == 'review' && needs.maintain.outputs.status == 'unchanged'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      pr-number: ${{ steps.publish.outputs.pr-number }}
+      published-at: ${{ steps.publish.outputs.published-at }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.ACTION_DIR }}
+          sparse-checkout: .github/actions/ai-maintenance
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          path: work
+          ref: ${{ inputs.mode == 'review' && needs.watch.outputs.head-ref || '' }}
+          persist-credentials: false
+      - id: publish
+        uses: ./_ai-maintenance/.github/actions/ai-maintenance/publish
+        with:
+          mode: ${{ inputs.mode == 'review' && 'update' || 'create' }}
+          working-directory: work
+          # A GitHub App token or fine-grained PAT (contents and pull
+          # requests: write) lets CI run on the pull request; pushes made
+          # with GITHUB_TOKEN start no workflows.
+          github-token: ${{ secrets.AI_MAINTENANCE_TOKEN || github.token }}
+          pr: ${{ inputs.pr }}
+          round: ${{ inputs.round }}
+          branch-prefix: ${{ env.BRANCH_PREFIX }}
+          draft: ${{ vars.AI_MAINTENANCE_DRAFT || 'false' }}
+          labels: ${{ vars.AI_MAINTENANCE_LABELS }}
+
+  # Start (or restart) the watch on the pull request as a new run, so the
+  # quiet period is measured from the latest change.
+  follow-up:
+    name: watch the pull request next
+    needs: [watch, publish]
+    if: always() && !cancelled() && needs.publish.result == 'success' && needs.publish.outputs.pr-number != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      pull-requests: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          PR: ${{ needs.publish.outputs.pr-number }}
+          ROUND: ${{ inputs.round }}
+          PUBLISHED_AT: ${{ needs.publish.outputs.published-at }}
+          MAX_ROUNDS: ${{ vars.AI_MAINTENANCE_MAX_REVIEW_ROUNDS || '5' }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          # One-off dispatch overrides carry into the review rounds.
+          MODELS: ${{ inputs.models }}
+          INSTRUCTIONS: ${{ inputs.instructions }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # Later rounds continue from this run's watch state (an
+          # artifact: it outgrows the dispatch inputs' 65,535 characters).
+          if [ "$MODE" = review ]; then
+            round=$((ROUND + 1)) from=(-f state-run="$GITHUB_RUN_ID")
+          else
+            round=1 from=(-f since="$PUBLISHED_AT")
+          fi
+          if [ "$round" -gt "$MAX_ROUNDS" ]; then
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body "Automated follow-up stopped after $MAX_ROUNDS review rounds; further feedback needs a human. <!-- ai-maintenance -->"
+            exit 0
+          fi
+          # .github/workflows/<file>.yml from owner/repo/.github/workflows/<file>.yml@ref
+          workflow=${WORKFLOW_REF#"$GITHUB_REPOSITORY/"}
+          workflow=${workflow%@*}
+          args=(-f mode=review -f pr="$PR" "${from[@]}" -f round="$round")
+          [ -n "$MODELS" ] && args+=(-f models="$MODELS")
+          [ -n "$INSTRUCTIONS" ] && args+=(-f instructions="$INSTRUCTIONS")
+          gh workflow run "$workflow" --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" "${args[@]}"
+          echo "watching PR #$PR for review feedback (round $round)"

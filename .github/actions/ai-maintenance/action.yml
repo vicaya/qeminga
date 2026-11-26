@@ -1,0 +1,155 @@
+name: AI maintenance (agent run)
+description: >-
+  Runs a coding-agent CLI (Claude Code, Codex, Antigravity, or another
+  provider adapter) on a copy of the checkout with an API key chosen from
+  an ordered key pool, falling back to the next key when one is exhausted,
+  and uploads the agent's changes as a patch artifact. Each attempt runs in
+  its own container with only its own key; the runner's files, processes
+  and credentials stay outside. Needs Docker and no write access: publish/
+  opens the pull request from a separate job.
+
+inputs:
+  key-pool:
+    description: 'JSON key pool, e.g. [{"claude":["k1","k2"]},{"gpt":["k3"]},{"gemini":["k4"]}]. Pass a secret.'
+    required: true
+  instructions:
+    description: The maintenance instructions (pass a secret or a file's contents).
+    required: true
+  private-instructions:
+    description: >-
+      "true" publishes no free-form agent text (the PR description and
+      replies become a fixed text) and no transcripts, and keeps the agent's
+      output off the job log. Either way, the instructions are withheld
+      wherever the agent quotes them verbatim.
+    default: "false"
+  extra-prompt-file:
+    description: Optional Markdown file appended to the prompt (the review feedback in review rounds). When set, it must be a readable file, or the run stops; an empty one adds nothing.
+    default: ""
+  routing:
+    description: "Routing strategy: ordered (default) or round-robin."
+    default: ordered
+  fallback-on:
+    description: "Fall back to the next key when an attempt is: exhausted (quota, rate limit, bad key; default) or any (any failure)."
+    default: exhausted
+  models:
+    description: >-
+      Optional JSON object of provider -> "<model> [effort]", e.g.
+      {"claude":"claude-opus-5-5 high","gemini":"high"}. The effort (low,
+      medium, high, xhigh, max) is optional, and a level alone keeps the
+      CLI's default model. A pool entry's "model" wins.
+    default: ""
+  attempt-timeout:
+    description: Time limit per attempt, as a timeout(1) duration.
+    default: 60m
+  working-directory:
+    description: The checkout the agent works on (a copy of it; the checkout itself is left as it is).
+    default: .
+  container-image:
+    description: >-
+      Base image of the attempt containers. The runner's Node.js and the
+      provider CLIs are mounted into it, so it should use the runner's C
+      library (the default matches ubuntu-24.04 runners).
+    default: ubuntu:24.04
+  container-setup:
+    description: >-
+      Shell script run as root once per run while building the image, in a
+      throwaway copy of the checkout: install what the agent needs to build
+      and test (toolchains, packages). The agent runs as an unprivileged user
+      and cannot install anything itself. KEY=VALUE lines appended to
+      /etc/ai-maintenance/env (PATH, CARGO_HOME, ...) apply to the attempts.
+    default: ""
+  node-version:
+    description: Node.js for the npm-installed CLIs; empty to use the runner's.
+    default: "22"
+  claude-code-version:
+    description: "@anthropic-ai/claude-code version."
+    default: 2.1.319
+  codex-version:
+    description: "@openai/codex version."
+    default: 0.167.0
+  github-token:
+    description: Read access to pull requests, for max-open-prs.
+    default: ${{ github.token }}
+  max-open-prs:
+    description: Skip the run while this many maintenance PRs (from this repository, on branch-prefix branches) are open; 0 disables the check.
+    default: "0"
+  branch-prefix:
+    description: Branch prefix of maintenance pull requests.
+    default: ai-maintenance/
+  result-artifact:
+    description: Name of the artifact holding the result.
+    default: ai-maintenance-result
+
+outputs:
+  status:
+    description: changed, unchanged, failed or skipped.
+    value: ${{ steps.gate.outputs.skip == 'true' && 'skipped' || steps.run.outputs.status || 'failed' }}
+  provider:
+    description: The provider that completed the run.
+    value: ${{ steps.run.outputs.provider }}
+  model:
+    description: Its model (empty means the CLI's default).
+    value: ${{ steps.run.outputs.model }}
+  effort:
+    description: The reasoning effort its CLI ran with (empty means the CLI's default).
+    value: ${{ steps.run.outputs.effort }}
+  title:
+    description: First line of the agent's final message.
+    value: ${{ steps.run.outputs.title }}
+  base-sha:
+    description: The commit the agent started from.
+    value: ${{ steps.run.outputs.base-sha }}
+  logs-complete:
+    description: false when a log could not be published (listed in INCOMPLETE.txt in the logs artifact).
+    value: ${{ steps.run.outputs.logs-complete }}
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.node-version != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - id: gate
+      if: inputs.max-open-prs != '0'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        MAX: ${{ inputs.max-open-prs }}
+      run: '"$GITHUB_ACTION_PATH/gate.sh"'
+
+    - id: run
+      if: steps.gate.outputs.skip != 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        AI_KEY_POOL: ${{ inputs.key-pool }}
+        AI_INSTRUCTIONS: ${{ inputs.instructions }}
+        AI_PRIVATE_INSTRUCTIONS: ${{ inputs.private-instructions }}
+        AI_EXTRA_PROMPT_FILE: ${{ inputs.extra-prompt-file }}
+        AI_ROUTING: ${{ inputs.routing }}
+        AI_FALLBACK_ON: ${{ inputs.fallback-on }}
+        AI_MODELS: ${{ inputs.models }}
+        AI_ATTEMPT_TIMEOUT: ${{ inputs.attempt-timeout }}
+        AI_SANDBOX_IMAGE: ${{ inputs.container-image }}
+        AI_SANDBOX_SETUP: ${{ inputs.container-setup }}
+        AI_STATE_DIR: ${{ runner.temp }}/ai-maintenance
+        CLAUDE_CODE_VERSION: ${{ inputs.claude-code-version }}
+        CODEX_VERSION: ${{ inputs.codex-version }}
+      run: '"$GITHUB_ACTION_PATH/run.sh"'
+
+    - if: steps.run.outputs.status == 'changed' || steps.run.outputs.status == 'unchanged'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.result-artifact }}
+        path: ${{ steps.run.outputs.result-dir }}
+        retention-days: 7
+
+    - if: always() && steps.run.outputs.logs-dir != ''
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.result-artifact }}-logs
+        path: ${{ steps.run.outputs.logs-dir }}
+        retention-days: 14

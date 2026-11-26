@@ -1,0 +1,95 @@
+name: AI maintenance (watch for review feedback)
+description: >-
+  Polls a maintenance pull request for trusted review feedback until there
+  is some, or until a quiet period passes without any. Read-only.
+
+inputs:
+  pr:
+    description: Pull request number.
+    required: true
+  since:
+    description: Feedback up to here is handled - a UTC time such as 2026-01-31T12:00:00Z (the first round).
+    default: ""
+  since-file:
+    description: A file holding the state the previous watch wrote (its state artifact); wins over since.
+    default: ""
+  github-token:
+    description: Read access to pull requests.
+    default: ${{ github.token }}
+  branch-prefix:
+    description: Only pull requests from this repository on branches with this prefix are handled.
+    default: ai-maintenance/
+  quiet-minutes:
+    description: Stop after this many minutes without feedback.
+    default: "90"
+  poll-seconds:
+    description: Polling interval.
+    default: "300"
+  settle-seconds:
+    description: After feedback appears, wait until none newer arrives for this long.
+    default: "300"
+  trusted-associations:
+    description: Author associations whose feedback counts.
+    default: OWNER,MEMBER,COLLABORATOR
+  trusted-bots:
+    description: Comma-separated bot logins whose reviews count.
+    default: ""
+  feedback-artifact:
+    description: Name of the artifact holding the feedback.
+    default: ai-maintenance-feedback
+  state-artifact:
+    description: Name of the artifact holding the state for the next round (pass it as since-file there).
+    default: ai-maintenance-watch-state
+
+outputs:
+  status:
+    description: feedback, quiet, closed or ignored.
+    value: ${{ steps.watch.outputs.status }}
+  feedback-file:
+    description: The feedback handed over (Markdown), also uploaded as the feedback artifact.
+    value: ${{ steps.watch.outputs.feedback-file }}
+  state-file:
+    description: The state after this hand-over (the feedback items handed over, by ID and body digest), also uploaded as the state artifact; items over the size budget wait for the next round.
+    value: ${{ steps.watch.outputs.state-file }}
+  head-ref:
+    description: The pull request's branch.
+    value: ${{ steps.watch.outputs.head-ref }}
+  head-sha:
+    description: The pull request's head commit.
+    value: ${{ steps.watch.outputs.head-sha }}
+
+runs:
+  using: composite
+  steps:
+    - id: watch
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        PR: ${{ inputs.pr }}
+        SINCE: ${{ inputs.since }}
+        SINCE_FILE: ${{ inputs.since-file }}
+        BRANCH_PREFIX: ${{ inputs.branch-prefix }}
+        QUIET_MINUTES: ${{ inputs.quiet-minutes }}
+        POLL_SECONDS: ${{ inputs.poll-seconds }}
+        SETTLE_SECONDS: ${{ inputs.settle-seconds }}
+        TRUSTED_ASSOCIATIONS: ${{ inputs.trusted-associations }}
+        TRUSTED_BOTS: ${{ inputs.trusted-bots }}
+      # The feedback and the state go to a fresh directory of this
+      # invocation's own (the feedback-file and state-file outputs).
+      run: '"$GITHUB_ACTION_PATH/../watch.sh"'
+
+    - if: steps.watch.outputs.status == 'feedback'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.feedback-artifact }}
+        path: ${{ steps.watch.outputs.feedback-file }}
+        retention-days: 7
+
+    # The state grows with every item handed over: it travels to the next
+    # round as an artifact of this run, not as a workflow input.
+    - if: steps.watch.outputs.status == 'feedback'
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.state-artifact }}
+        path: ${{ steps.watch.outputs.state-file }}
+        retention-days: 7

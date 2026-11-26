@@ -89,19 +89,22 @@ pub enum ThawScope {
     Discovery,
 }
 
-/// A held mount handle together with whether thawing it may increment
-/// the host-visible wire count under the guest's mount policy (§4.2, #63).
+/// A held mount handle together with the disclosure decision recorded for its
+/// last pass under the guest's mount policy (§4.2, #63).
 ///
-/// Handles published by a policy-authorized freeze are always countable.
-/// Handles retained from an incomplete marker-recovery drain preserve the
-/// countability of their discovery pass so later retries — including when
-/// `/proc/self/mountinfo` cannot be read or the mountpoint disappears —
-/// still drain them without disclosing an unauthorized mount count.
+/// Handles published by a policy-authorized freeze record `countable: true`,
+/// which a tracked thaw (reading no mount table) or an unrestricted discovery
+/// drain uses directly. Under a configured `freeze_allowed_mountpoints` policy,
+/// restricted discovery verifies current eligibility against a readable mount
+/// table again and suppresses wire credit and specific target error classes
+/// for any retained descriptor it cannot verify (whether absent from the fresh
+/// plan or unverified because `/proc/self/mountinfo` could not be read).
 #[derive(Debug)]
 pub struct HeldMount {
     /// The verified mount handle to drain.
     pub mount: crate::kernel::Mount,
-    /// `true` when thawing this superblock may be counted on the wire.
+    /// Disclosure decision recorded for the last pass (`true` when the last
+    /// pass authorized wire counts and specific error classes for this target).
     pub countable: bool,
 }
 

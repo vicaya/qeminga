@@ -1526,19 +1526,24 @@ mod tests {
         _dir: tempfile::TempDir,
     }
 
-    /// A mount table whose read can be made to fail (`EMFILE`, as when
-    /// the retained handles exhausted the descriptors) and to work again.
+    /// A mount table whose contents can be replaced mid-test and whose reads
+    /// can be made to fail (`EMFILE`, as when the retained handles exhausted
+    /// the descriptors) and to work again.
     struct SwitchableMounts {
-        table: String,
+        table: std::sync::Mutex<String>,
         fail: std::sync::atomic::AtomicBool,
     }
 
     impl SwitchableMounts {
-        fn new(table: String) -> Self {
+        fn new(table: impl Into<String>) -> Self {
             SwitchableMounts {
-                table,
+                table: std::sync::Mutex::new(table.into()),
                 fail: std::sync::atomic::AtomicBool::new(false),
             }
+        }
+
+        fn set_table(&self, table: impl Into<String>) {
+            *self.table.lock().unwrap() = table.into();
         }
 
         fn fail_reads(&self, fail: bool) {
@@ -1553,7 +1558,7 @@ mod tests {
                     "cannot read /proc/self/mountinfo: Too many open files (os error 24)".into(),
                 ));
             }
-            Ok(self.table.clone().into_bytes())
+            Ok(self.table.lock().unwrap().as_bytes().to_vec())
         }
     }
 
@@ -6201,18 +6206,9 @@ mod tests {
 
     #[tokio::test]
     async fn marker_recovery_retry_unplanned_unauthorized_retained_handle_stays_hidden() {
-        struct MutableMounts(std::sync::Mutex<String>);
-        impl MountSource for MutableMounts {
-            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
-                Ok(self.0.lock().unwrap().as_bytes().to_vec())
-            }
-        }
-        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
-            concat!(
-                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
-                "2 1 8:2 / /secret rw - ext4 /dev/sdb1 rw\n",
-            )
-            .to_owned(),
+        let mounts = Arc::new(SwitchableMounts::new(concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /secret rw - ext4 /dev/sdb1 rw\n",
         )));
         let rig = rig_with_allowed_mounts(FreezeState::Frozen, mounts.clone(), Some(vec![]));
         rig.ctx.marker.create().unwrap();
@@ -6229,7 +6225,7 @@ mod tests {
         // Attempt 2: /secret is no longer listed in mountinfo, so it reaches
         // the leftover-handle drain loop. It must still thaw and report 0.
         rig.kernel.clear_thaw_errors();
-        *mounts.0.lock().unwrap() = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned();
+        mounts.set_table("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
         let reply = thaw(&rig.ctx, &req).await.unwrap();
         assert_eq!(reply, json!(0));
         assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
@@ -6239,18 +6235,9 @@ mod tests {
 
     #[tokio::test]
     async fn marker_recovery_retry_formerly_countable_disappeared_handle_drains_and_reports_zero() {
-        struct MutableMounts(std::sync::Mutex<String>);
-        impl MountSource for MutableMounts {
-            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
-                Ok(self.0.lock().unwrap().as_bytes().to_vec())
-            }
-        }
-        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
-            concat!(
-                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
-                "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
-            )
-            .to_owned(),
+        let mounts = Arc::new(SwitchableMounts::new(concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
         )));
         let rig = rig_with_allowed_mounts(FreezeState::Frozen, mounts.clone(), Some(vec!["/data"]));
         rig.ctx.marker.create().unwrap();
@@ -6270,7 +6257,7 @@ mod tests {
         // descriptor, remove the marker, and report 0 because no configured
         // allowlist name covers 8:2 in the current table (#63).
         rig.kernel.clear_thaw_errors();
-        *mounts.0.lock().unwrap() = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned();
+        mounts.set_table("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
         let reply = thaw(&rig.ctx, &req).await.unwrap();
         assert_eq!(reply, json!(0));
         assert_eq!(rig.kernel.tracked_frozen_superblocks(), 0);
@@ -6281,18 +6268,9 @@ mod tests {
     #[tokio::test]
     async fn clean_thawed_rescan_excludes_disappeared_retained_handle_from_count_and_error_detail()
     {
-        struct MutableMounts(std::sync::Mutex<String>);
-        impl MountSource for MutableMounts {
-            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
-                Ok(self.0.lock().unwrap().as_bytes().to_vec())
-            }
-        }
-        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
-            concat!(
-                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
-                "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
-            )
-            .to_owned(),
+        let mounts = Arc::new(SwitchableMounts::new(concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
         )));
         let rig = rig_with_allowed_mounts(FreezeState::Thawed, mounts.clone(), Some(vec!["/data"]));
         let data = rig.kernel.open_mount(Path::new("/data"), (8, 2)).unwrap();
@@ -6309,7 +6287,7 @@ mod tests {
         assert_eq!(rig.ctx.deferred_recovery_mount_count(), 1);
 
         // /data disappears from mountinfo before the second clean Thawed rescan.
-        *mounts.0.lock().unwrap() = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned();
+        mounts.set_table("1 0 8:1 / / rw - ext4 /dev/sda1 rw\n");
 
         // Attempt 2a (failure on disappeared retained handle): must collapse to
         // fixed RecoveryIncomplete rather than disclosing FITHAW permission denied.
@@ -6718,12 +6696,6 @@ mod tests {
 
     #[tokio::test]
     async fn later_freeze_after_clean_rescan_preserves_excluded_cleanup_without_disclosing_it() {
-        struct MutableMounts(std::sync::Mutex<String>);
-        impl MountSource for MutableMounts {
-            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
-                Ok(self.0.lock().unwrap().as_bytes().to_vec())
-            }
-        }
         let table = concat!(
             "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
             "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
@@ -6735,7 +6707,7 @@ mod tests {
         // recovery handle on `/data` (8:2) via the real clean-Thawed rescan path.
         let setup_carried_over = |thaw_err_on_data: Option<Errno>| async move {
             let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
-            let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(table.to_owned())));
+            let mounts = Arc::new(SwitchableMounts::new(table));
             let rig = rig_with_allowed_mounts(
                 FreezeState::Thawed,
                 mounts.clone(),
@@ -6753,11 +6725,10 @@ mod tests {
 
             // /data disappears from mountinfo; second clean rescan marks it
             // countable = false and stays Thawed with the handle still held.
-            *mounts.0.lock().unwrap() = concat!(
+            mounts.set_table(concat!(
                 "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
                 "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
-            )
-            .to_owned();
+            ));
             rig.kernel.clear_thaw_errors();
             rig.kernel.script_thaw_error("/data", Errno::EACCES);
             let err = thaw(&rig.ctx, &thaw_req).await.unwrap_err().to_string();
@@ -6848,12 +6819,9 @@ mod tests {
         //     excluded handle (`countable == false`) held on `frozen_mounts`
         //     (RecoveryIncomplete) and pass 2 fails on authorized `/app` (EPERM):
         //     `Driver::record_recovery` upgrades unrecoverable_reason to PermissionDenied.
-        let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(
-            concat!(
-                "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
-                "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
-            )
-            .to_owned(),
+        let mounts = Arc::new(SwitchableMounts::new(concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
         )));
         let rig = rig_with_allowed_mounts(FreezeState::Thawed, mounts, Some(vec!["/app"]));
         let secret = rig.kernel.open_mount(Path::new("/secret"), (8, 9)).unwrap();
@@ -6908,12 +6876,6 @@ mod tests {
     #[tokio::test]
     async fn tracked_thaw_and_rollback_isolate_current_operation_from_earlier_thawed_recovery_handle()
      {
-        struct MutableMounts(std::sync::Mutex<String>);
-        impl MountSource for MutableMounts {
-            fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
-                Ok(self.0.lock().unwrap().as_bytes().to_vec())
-            }
-        }
         let table = concat!(
             "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
             "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
@@ -6927,7 +6889,7 @@ mod tests {
         // removes `/data` from mountinfo WITHOUT running a second rescan.
         let setup_old_countable = |thaw_err_on_data: Option<Errno>| async move {
             let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
-            let mounts = Arc::new(MutableMounts(std::sync::Mutex::new(table.to_owned())));
+            let mounts = Arc::new(SwitchableMounts::new(table));
             let rig = rig_with_allowed_mounts(
                 FreezeState::Thawed,
                 mounts.clone(),
@@ -6944,11 +6906,10 @@ mod tests {
             assert_eq!(rig.ctx.deferred_recovery_mount_count(), 1);
 
             // `/data` disappears from mountinfo before the next cycle begins.
-            *mounts.0.lock().unwrap() = concat!(
+            mounts.set_table(concat!(
                 "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
                 "3 1 8:3 / /app rw - ext4 /dev/sdc1 rw\n",
-            )
-            .to_owned();
+            ));
             rig.kernel.clear_thaw_errors();
             if let Some(errno) = thaw_err_on_data {
                 rig.kernel.script_thaw_error("/data", errno);

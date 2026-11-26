@@ -298,6 +298,216 @@ fn cvm_installation_defaults_to_data_protection_profile_and_documents_single_fre
 }
 
 #[test]
+fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
+    // #65: operator guidance in docs/design.md (§5.5, §5.9, §12) and
+    // packaging/README.md must agree with the shipped executable policy
+    // (packaging/systemd/qeminga.service, packaging/config*.toml,
+    // src/config.rs, src/kernel/caps.rs, src/seccomp.rs, src/lib.rs).
+    use std::collections::BTreeSet;
+
+    let design = read("docs/design.md");
+    let packaging = read("packaging/README.md");
+    let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
+
+    let dp_cfg = Config::parse(&read("packaging/config-data-protection.toml")).unwrap();
+    let gen_cfg = Config::parse(&read("packaging/config.toml")).unwrap();
+    let empty_cfg = Config::parse("").unwrap();
+    let dp_auth = dp_cfg.authority();
+    let gen_auth = gen_cfg.authority();
+    let empty_auth = empty_cfg.authority();
+    assert_eq!(
+        empty_auth, gen_auth,
+        "empty TOML defaults must still match the general-VM lifecycle authority"
+    );
+
+    let cap_names = |auth: &qeminga::config::Authority| -> BTreeSet<String> {
+        qeminga::kernel::caps::final_capability_set(auth)
+            .into_iter()
+            .map(|c| format!("{c:?}"))
+            .collect()
+    };
+    let dp_caps = cap_names(&dp_auth);
+    let gen_caps = cap_names(&gen_auth);
+    let dropped_in_dp: BTreeSet<&String> = gen_caps.difference(&dp_caps).collect();
+    assert!(
+        dropped_in_dp.iter().any(|c| c.as_str() == "CAP_SYS_BOOT"),
+        "expected CAP_SYS_BOOT to be dropped in data-protection profile: {dp_caps:?} vs {gen_caps:?}"
+    );
+
+    // Extract §5.9 up to §5.10 so assertions target the authority section.
+    let s59_start = design
+        .find("### 5.9 Authority Follows the Configuration")
+        .expect("design §5.9");
+    let s59_end = design[s59_start..]
+        .find("### 5.10 ")
+        .map(|off| s59_start + off)
+        .expect("design §5.10");
+    let s59 = &design[s59_start..s59_end];
+
+    // 1. Compare unit filesystem-confinement settings against both docs so
+    //    changing the unit without updating the docs (or vice versa) fails.
+    for key in ["ProtectSystem", "ProtectHome", "PrivateTmp"] {
+        let vals = values(&unit, "Service", key);
+        assert_eq!(
+            vals.len(),
+            1,
+            "qeminga.service must specify exactly one {key}= value: {vals:?}"
+        );
+        let directive = format!("{key}={}", vals[0]);
+        assert!(
+            s59.contains(&directive),
+            "docs/design.md §5.9 must match shipped unit directive `{directive}`"
+        );
+        assert!(
+            packaging.contains(&directive),
+            "packaging/README.md must match shipped unit directive `{directive}`"
+        );
+    }
+
+    // 2. Parse the §5.9 profile comparison table column-by-column and compare
+    //    each profile cell against the corresponding config's derived authority.
+    let table_rows: Vec<Vec<&str>> = s59
+        .lines()
+        .filter(|l| l.starts_with('|'))
+        .map(|l| {
+            l.trim_matches('|')
+                .split('|')
+                .map(str::trim)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let header = table_rows.first().expect("§5.9 profile comparison header");
+    assert_eq!(header.len(), 3, "expected 3-column table: {header:?}");
+    assert!(
+        header[1].contains("config-data-protection.toml") && header[2].contains("config.toml"),
+        "§5.9 table columns must be CVM (col 1) and general-VM (col 2): {header:?}"
+    );
+
+    let row_by_prefix = |prefix: &str| -> &[&str] {
+        table_rows
+            .iter()
+            .find(|r| r.len() == 3 && r[0].starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing §5.9 table row starting with `{prefix}`"))
+    };
+
+    let cap_row = row_by_prefix("Post-drop UID/GID and capabilities");
+    let (cvm_caps_cell, gen_caps_cell) = (cap_row[1], cap_row[2]);
+    for set in ["CapEff", "CapPrm", "CapBnd", "CapInh", "CapAmb"] {
+        assert!(
+            cvm_caps_cell.contains(set) && gen_caps_cell.contains(set),
+            "§5.9 capability cells must name all five sets ({set}): CVM={cvm_caps_cell:?} GEN={gen_caps_cell:?}"
+        );
+    }
+    for cap in &dp_caps {
+        assert!(
+            cvm_caps_cell.contains(cap.as_str()),
+            "CVM capability cell must include {cap}: {cvm_caps_cell}"
+        );
+    }
+    for cap in &dropped_in_dp {
+        assert!(
+            cvm_caps_cell.contains(&format!("`{cap}` absent")),
+            "CVM capability cell must state `{cap}` is absent: {cvm_caps_cell}"
+        );
+        assert!(
+            !gen_caps_cell.contains(&format!("`{cap}` absent")),
+            "general-VM capability cell must not claim `{cap}` is absent: {gen_caps_cell}"
+        );
+    }
+    for cap in &gen_caps {
+        assert!(
+            gen_caps_cell.contains(cap.as_str()),
+            "general-VM capability cell must include {cap}: {gen_caps_cell}"
+        );
+    }
+
+    let seccomp_row = row_by_prefix("Seccomp filter differences");
+    assert!(!dp_auth.information && gen_auth.information);
+    assert!(
+        seccomp_row[1].contains("Omits")
+            && seccomp_row[1].contains("`socket`")
+            && seccomp_row[1].contains("socketpair")
+            && seccomp_row[1].contains("sendto")
+            && seccomp_row[1].contains("recvfrom"),
+        "CVM seccomp cell must distinguish omitted socket from retained socketpair/sendto/recvfrom: {}",
+        seccomp_row[1]
+    );
+    assert!(
+        seccomp_row[2].contains("AF_NETLINK") && seccomp_row[2].contains("protocol unrestricted"),
+        "general-VM seccomp cell must describe AF_NETLINK family-only check: {}",
+        seccomp_row[2]
+    );
+
+    // 3. CVM installation default vs. TOML schema defaults must stay distinct.
+    assert!(
+        s59.contains("CVM installation default vs. TOML schema defaults")
+            && s59.contains("default to `true`")
+            && packaging.contains("Custom CVM configs must disable features explicitly")
+            && packaging.contains("default to `true`"),
+        "both docs/design.md §5.9 and packaging/README.md must warn that omitted TOML feature keys default to true"
+    );
+
+    // 4. Residual authority: no overbroad write/socket claim, explicit enforcing
+    //    seccomp prerequisite, and explicit unchecked IPC argument limits.
+    assert!(
+        !s59.contains("no configuration enables execution, arbitrary file writes, network egress")
+            && !s59.contains("No allowed protocol command writes guest files"),
+        "§5.9 must not claim seccomp/unit prevents arbitrary file writes or that protocol operations never write the marker/power state"
+    );
+    assert!(
+        s59.contains("Unix permissions")
+            && s59.contains("no general-purpose file-write command")
+            && s59.contains("CAP_DAC_READ_SEARCH")
+            && s59.contains("host channel")
+            && s59.contains("unenforced-development-only")
+            && s59.contains("may be absent or logging-only")
+            && s59.contains("installed, enforcing seccomp filter")
+            && s59.contains("no argument or peer restriction")
+            && s59.contains("only the `AF_NETLINK` family"),
+        "§5.9 must document permissions, broad reads, enforcing-filter scope, and unchecked IPC arguments"
+    );
+
+    // 5. Reconcile AC3 and AC25 with the five Linux capability sets and shutdown switch.
+    let ac_row = |id: &str| -> &str {
+        design
+            .lines()
+            .find(|l| l.starts_with(&format!("| {id} |")))
+            .unwrap_or_else(|| panic!("missing {id} row in docs/design.md"))
+    };
+    let ac3 = ac_row("AC3");
+    let ac25 = ac_row("AC25");
+    for set in ["CapEff", "CapPrm", "CapBnd", "CapInh", "CapAmb"] {
+        assert!(ac3.contains(set), "AC3 must name {set}: {ac3}");
+        assert!(ac25.contains(set), "AC25 must name {set}: {ac25}");
+    }
+    assert!(
+        ac3.contains("[features] shutdown = true") && ac3.contains("shutdown = false"),
+        "AC3 must qualify CAP_SYS_BOOT by [features] shutdown: {ac3}"
+    );
+    assert!(
+        !ac25.contains("in every set") && ac25.contains("absent from all five sets"),
+        "AC25 must name the five sets accurately instead of saying 'in every set': {ac25}"
+    );
+
+    // 6. Packaging guide and §5.5: build instructions must name debug_assertions
+    //    and not attribute a release startup failure to `seccomp-log`.
+    assert!(
+        !packaging
+            .contains("and `seccomp-log` would fail the enforced hardening\ncheck at startup"),
+        "packaging/README.md must not attribute a release startup failure to seccomp-log"
+    );
+    assert!(
+        design.contains("debug_assertions")
+            && packaging.contains("debug_assertions")
+            && packaging.contains("test-fakes")
+            && packaging.contains("unenforced-development-only")
+            && packaging.contains("no argument or peer restriction")
+            && packaging.contains("leaves the netlink protocol"),
+        "docs/design.md §5.5 and packaging/README.md must align on debug_assertions, enforcing-filter scope, and IPC argument limits"
+    );
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

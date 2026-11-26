@@ -30,16 +30,18 @@ default = []
 # The runtime half lives in `[features]` of config.toml.
 seccomp = ["dep:seccompiler"]
 # Compatibility builds (design §5.5, C-17): same profile, but an unlisted
-# syscall is logged instead of killing the process. Effective in debug
-# builds only (`seccomp::log_mode`), so a release built with
-# `--all-features` still enforces.
+# syscall is logged instead of killing the process. Effective only when
+# `debug_assertions` are enabled (`seccomp::log_mode`), so Cargo's standard
+# `release` profile (`debug_assertions = false`) still enforces even with
+# `seccomp-log`; `--all-features` fails at compile time when
+# `debug_assertions = false` because of the `test-fakes` guard in `src/lib.rs`.
 seccomp-log = ["seccomp"]
 suspend_ram = []
 # End-to-end test support (T4.7): lets the real binary swap `LinuxKernel`
 # for the scripted fake when QEMINGA_TEST_FAKE_KERNEL is set, so the
-# unprivileged E2E suite can observe `guest-shutdown` silence. Never enable
-# it in a release build (build releases with `--features seccomp`, not
-# `--all-features`).
+# unprivileged E2E suite can observe `guest-shutdown` silence. Rejected at
+# compile time whenever `debug_assertions = false` (`src/lib.rs`); build
+# releases with `--features seccomp`, never `--all-features`.
 test-fakes = []
 
 [dependencies]

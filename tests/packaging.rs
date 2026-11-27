@@ -816,9 +816,13 @@ fn cooperative_freeze_ownership_preconditions_and_default_sole_freezer_are_docum
     assert!(
         inventory_lower.contains("by default")
             && inventory.contains("freeze_ownership_dir")
-            && inventory.contains("#data-protection-profile-and-cvm-deployment-guidance")
+            && inventory.contains("#cooperative-freeze-ownership")
             && inventory_lower.contains("drop-in"),
-        "writable-object inventory must qualify /run/qeminga as default and link the opt-in cooperative ownership drop-in:\n{inventory}"
+        "writable-object inventory must qualify /run/qeminga as default and link directly to #cooperative-freeze-ownership:\n{inventory}"
+    );
+    assert!(
+        readme.contains("<a id=\"cooperative-freeze-ownership\"></a>"),
+        "packaging/README.md must define the #cooperative-freeze-ownership anchor target"
     );
     for needle in [
         "freeze_ownership_dir",

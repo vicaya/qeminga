@@ -832,12 +832,18 @@ fn begin_cgroup_restart_generation(
     assert_eq!(exec_sock.as_raw_fd(), IPC_FD);
 
     let run_dir_fd = open_owned_run_dir(run_dir, 0);
-    if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
-        drop((exec_sock, parser_sock));
-        verify_prev_generation_reaped_before_restart(&run_dir_fd, expected_gen1_marker);
-        return None;
+    match fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW) {
+        Ok(_) => {
+            drop((exec_sock, parser_sock));
+            verify_prev_generation_reaped_before_restart(&run_dir_fd, expected_gen1_marker);
+            None
+        }
+        Err(Errno::ENOENT) => Some((exec_sock, parser_sock, run_dir_fd)),
+        Err(err) => panic!(
+            "unexpected fstatat error probing gen1_parser_pid in {}: {err}",
+            run_dir.display()
+        ),
     }
-    Some((exec_sock, parser_sock, run_dir_fd))
 }
 
 /// Executed by Generation 2 of a `run_self_probe_in_cgroup_restart` unit before

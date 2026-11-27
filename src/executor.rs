@@ -2932,12 +2932,25 @@ mod tests {
         );
 
         // Wait until the reopen worker is past its cancelable sleep and inside
-        // the blocking opener, then send SIGTERM so `stop_requested` latches
-        // BEFORE the reopen completes with terminal EBUSY.
+        // the blocking opener, send SIGTERM, and wait for the executor's signal
+        // audit record so `stop_requested` is guaranteed latched before the
+        // reopen worker completes with terminal EBUSY.
+        let sink_check = sink.clone();
         tokio::task::spawn_blocking(move || {
             opener_entered.wait();
             let _ = stop_tx.send("SIGTERM");
-            std::thread::sleep(Duration::from_millis(50));
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let so_far = String::from_utf8_lossy(&sink_check.0.lock().unwrap()).into_owned();
+                if so_far.contains("\"event\":\"signal\"") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "executor did not latch SIGTERM before releasing reopen worker: {so_far}"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
             opener_release.wait();
         })
         .await

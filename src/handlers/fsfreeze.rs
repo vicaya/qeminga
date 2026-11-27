@@ -233,16 +233,6 @@ pub async fn freeze_list(ctx: &Arc<Context>, req: &Request) -> Result<Value, Err
     run_freeze(ctx, args.mountpoints).await
 }
 
-/// Typed IPC helper for `guest-fsfreeze-freeze` and
-/// `guest-fsfreeze-freeze-list` returning closed [`crate::ipc::IpcErrorCode`]
-/// values with zero guest paths or device numbers.
-pub async fn execute_freeze_ipc(
-    ctx: &Arc<Context>,
-    restrict: Option<Vec<String>>,
-) -> Result<u64, crate::ipc::IpcErrorCode> {
-    execute_freeze_ipc_with_published(ctx, restrict, || {}).await
-}
-
 /// Typed IPC freeze helper that invokes `on_published` synchronously as soon
 /// as `begin_freeze()` has moved the state machine to `Freezing` and
 /// `crate::freeze_op::start` has published the active [`crate::freeze_op::FreezeOp`]

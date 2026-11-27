@@ -39,8 +39,8 @@
 //!   streams per direction.
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::collections::{BTreeMap, VecDeque};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nix::errno::Errno;
 
@@ -51,8 +51,13 @@ use crate::handlers::Command;
 use crate::handlers::fsfreeze::{
     FreezeFailure, FreezeStop, FreezeTaskStage, RecoveryReason, ThawFailure,
 };
-use crate::handlers::fsinfo::{FilesystemInfo, MAX_FSINFO_REPLY_BYTES};
-use crate::handlers::fstrim::{MAX_FSTRIM_REPLY_BYTES, TrimResponse, TrimResult};
+use crate::handlers::fsinfo::{
+    FilesystemInfo, MAX_FSINFO_REPLY_BYTES, fsinfo_busy_error, fsinfo_timeout_error,
+};
+pub use crate::handlers::fstrim::TrimPathOutcome;
+use crate::handlers::fstrim::{
+    FstrimOversize, MAX_FSTRIM_REPLY_BYTES, TrimEntry, TrimResponse, TrimResult,
+};
 use crate::handlers::info::CommandInfo;
 use crate::handlers::interfaces::{Interface, IpAddress, MAX_INTERFACES_REPLY_BYTES};
 use crate::handlers::osinfo::{MAX_OSINFO_REPLY_BYTES, OsInfo};
@@ -750,24 +755,6 @@ impl FsInfoDto {
     }
 }
 
-/// Closed per-path outcome in [`TrimPathDto`] (zero arbitrary error strings).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrimPathOutcome {
-    /// `FITRIM` succeeded with `trimmed` bytes and effective `minimum`.
-    Trimmed {
-        /// Discarded byte count.
-        trimmed: u64,
-        /// Effective minimum extent applied by the kernel.
-        minimum: u64,
-    },
-    /// Opening the target failed with `EPERM`/`EACCES`; no `FITRIM` issued.
-    OpenPermissionDenied,
-    /// No mountpoint opened on the planned superblock; no `FITRIM` issued.
-    TargetUnreachable,
-    /// `FITRIM` ioctl returned a kernel errno.
-    IoctlErrno(i32),
-}
-
 /// Binary IPC DTO for one [`TrimResult`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrimPathDto {
@@ -778,34 +765,18 @@ pub struct TrimPathDto {
 }
 
 impl TrimPathDto {
+    /// Builds an IPC DTO directly from a typed [`TrimEntry`] collected by
+    /// [`crate::handlers::fstrim::trim_plan_entries`].
+    pub fn from_entry(entry: &TrimEntry) -> Self {
+        Self {
+            path: entry.path.clone(),
+            outcome: entry.outcome,
+        }
+    }
+
     /// Converts back to QAPI [`TrimResult`].
     pub fn to_handler(&self) -> TrimResult {
-        match self.outcome {
-            TrimPathOutcome::Trimmed { trimmed, minimum } => TrimResult {
-                path: self.path.clone(),
-                trimmed: Some(trimmed),
-                minimum: Some(minimum),
-                error: None,
-            },
-            TrimPathOutcome::OpenPermissionDenied => TrimResult {
-                path: self.path.clone(),
-                trimmed: None,
-                minimum: None,
-                error: Some("target open permission denied; no FITRIM issued".to_owned()),
-            },
-            TrimPathOutcome::TargetUnreachable => TrimResult {
-                path: self.path.clone(),
-                trimmed: None,
-                minimum: None,
-                error: Some("target unreachable; no FITRIM issued".to_owned()),
-            },
-            TrimPathOutcome::IoctlErrno(raw) => TrimResult {
-                path: self.path.clone(),
-                trimmed: None,
-                minimum: None,
-                error: Some(Errno::from_raw(raw).to_string()),
-            },
-        }
+        self.outcome.to_trim_result(self.path.clone())
     }
 
     /// Converts a slice of DTOs into a [`TrimResponse`].
@@ -1414,8 +1385,9 @@ impl IpcErrorCode {
                 trimmed_targets,
                 failed_targets,
                 ..
-            } => ProtoError::Internal(format!(
-                "fstrim trimmed {trimmed_targets} target(s) ({failed_targets} failed), but reply exceeds the 1 MiB response bound"
+            } => ProtoError::Internal(FstrimOversize::format_host_description(
+                trimmed_targets,
+                failed_targets,
             )),
             Self::ReplyTooLarge {
                 command,
@@ -1425,12 +1397,8 @@ impl IpcErrorCode {
                 "{}: the reply would be {reply_bytes} bytes on the wire, over the {limit_bytes} byte bound; not truncated",
                 command.name()
             )),
-            Self::FsinfoBusy => ProtoError::Internal(
-                "too many filesystem information walks in progress; retry later".to_owned(),
-            ),
-            Self::FsinfoTimeout => {
-                ProtoError::Internal("filesystem information walk timed out".to_owned())
-            }
+            Self::FsinfoBusy => fsinfo_busy_error(),
+            Self::FsinfoTimeout => fsinfo_timeout_error(),
             Self::HandlerFailed { command } => {
                 ProtoError::Internal(format!("{} failed", command.name()))
             }
@@ -3138,8 +3106,112 @@ impl StreamAssembler {
     }
 }
 
-/// Sends a complete typed request over `SOCK_SEQPACKET` as one or more
-/// `<= 32 KiB` chunks (never attaches file descriptors).
+/// Outcome of attempting to flush queued packets from an [`IpcOutbox`] onto a
+/// (typically non-blocking) `SOCK_SEQPACKET` socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// Every queued packet was accepted by the kernel socket buffer.
+    Drained,
+    /// Socket send buffer is full (`EAGAIN`/`EWOULDBLOCK`); the unsent chunk
+    /// remains at the head of the outbox so a later [`IpcOutbox::flush`] call
+    /// after writable readiness resumes at the exact next chunk sequence.
+    WouldBlock,
+}
+
+#[derive(Debug)]
+struct PendingPacket {
+    bytes: Vec<u8>,
+    fd: Option<OwnedFd>,
+}
+
+/// Resumable, cursor-preserving chunk writer for non-blocking `SOCK_SEQPACKET`
+/// IPC sockets (OQ-10 §4.1, #77/#78).
+///
+/// Multi-chunk requests and responses are split once on enqueue and drained in
+/// order by [`IpcOutbox::flush`]. When the kernel reports `EAGAIN`/`EWOULDBLOCK`
+/// mid-stream, the unsent chunk stays at the head of the queue (together with
+/// any `OkChannelFd` `OwnedFd` on chunk 0) so retrying on writable readiness
+/// continues from the exact unsent `chunk_seq` rather than restarting at `0`.
+#[derive(Debug, Default)]
+pub struct IpcOutbox {
+    queue: VecDeque<PendingPacket>,
+}
+
+impl IpcOutbox {
+    /// Creates an empty outbox.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `true` when no chunks remain to be sent.
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Number of queued `SOCK_SEQPACKET` packets not yet accepted by the kernel.
+    pub fn pending_packets(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Encodes and queues a complete typed request (`<= 64 KiB`, `1..=2` chunks,
+    /// zero attached descriptors).
+    pub fn push_request(
+        &mut self,
+        session_gen: u64,
+        req_id: u64,
+        req: &IpcRequest,
+    ) -> Result<(), EncodeError> {
+        let chunks = encode_request_chunks(session_gen, req_id, req)?;
+        for bytes in chunks {
+            self.queue.push_back(PendingPacket { bytes, fd: None });
+        }
+        Ok(())
+    }
+
+    /// Encodes and queues a complete typed response. `channel_fd` MUST be
+    /// `Some` if and only if `resp == IpcResponse::OkChannelFd`, and is attached
+    /// strictly to chunk `0` and closed as soon as chunk `0` is accepted by the
+    /// kernel (or if the outbox is dropped).
+    pub fn push_response(
+        &mut self,
+        session_gen: u64,
+        req_id: u64,
+        resp: &IpcResponse,
+        mut channel_fd: Option<OwnedFd>,
+    ) -> Result<(), EncodeError> {
+        let is_handoff = matches!(resp, IpcResponse::OkChannelFd);
+        if is_handoff != channel_fd.is_some() {
+            return Err(EncodeError::InvalidDescriptorAttachment);
+        }
+        let chunks = encode_response_chunks(session_gen, req_id, resp)?;
+        for (idx, bytes) in chunks.into_iter().enumerate() {
+            let fd = if idx == 0 { channel_fd.take() } else { None };
+            self.queue.push_back(PendingPacket { bytes, fd });
+        }
+        Ok(())
+    }
+
+    /// Flushes queued chunks onto `sock` until the queue drains or the socket
+    /// reports `EAGAIN`/`EWOULDBLOCK`.
+    pub fn flush(&mut self, sock: BorrowedFd<'_>) -> Result<FlushOutcome, Errno> {
+        while let Some(front) = self.queue.front() {
+            match send_packet(sock, &front.bytes, front.fd.as_ref().map(AsFd::as_fd)) {
+                Ok(()) => {
+                    let _ = self.queue.pop_front();
+                }
+                Err(Errno::EAGAIN) => return Ok(FlushOutcome::WouldBlock),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(FlushOutcome::Drained)
+    }
+}
+
+/// Sends a complete typed request over a **blocking** `SOCK_SEQPACKET` socket
+/// as one or more `<= 32 KiB` chunks (never attaches file descriptors).
+///
+/// Non-blocking callers must use [`IpcOutbox`] so `EAGAIN` mid-stream preserves
+/// the chunk cursor instead of restarting at `chunk_seq == 0`.
 pub fn send_request(
     sock: BorrowedFd<'_>,
     session_gen: u64,
@@ -3153,9 +3225,12 @@ pub fn send_request(
     Ok(())
 }
 
-/// Sends a complete typed response over `SOCK_SEQPACKET` as one or more
-/// `<= 32 KiB` chunks. `channel_fd` MUST be `Some` if and only if
-/// `resp == IpcResponse::OkChannelFd`.
+/// Sends a complete typed response over a **blocking** `SOCK_SEQPACKET` socket
+/// as one or more `<= 32 KiB` chunks. `channel_fd` MUST be `Some` if and only
+/// if `resp == IpcResponse::OkChannelFd`.
+///
+/// Non-blocking callers must use [`IpcOutbox`] so `EAGAIN` mid-stream preserves
+/// the chunk cursor instead of restarting at `chunk_seq == 0`.
 pub fn send_response(
     sock: BorrowedFd<'_>,
     session_gen: u64,
@@ -3216,6 +3291,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
 
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::unistd::pipe;
     use proptest::prelude::*;
 
@@ -3223,8 +3299,160 @@ mod tests {
     use crate::audit::project_method;
     use crate::kernel::ipc::{send_packet_fds, seqpacket_pair};
 
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    fn nonblocking_pipe() -> (OwnedFd, OwnedFd) {
+        let (r, w) = pipe().unwrap();
+        let flags = OFlag::from_bits_truncate(fcntl(&r, FcntlArg::F_GETFL).unwrap());
+        fcntl(&r, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+        (r, w)
+    }
+
+    fn assert_pipe_open(read_end: &OwnedFd, context: &str) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(read_end, &mut byte),
+            Err(Errno::EAGAIN),
+            "{context}: expected write end to remain open"
+        );
+    }
+
+    fn assert_pipe_closed(read_end: &OwnedFd, context: &str) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(read_end, &mut byte),
+            Ok(0),
+            "{context}: write end remained open (received descriptor leaked)"
+        );
+    }
+
+    #[test]
+    fn ipc_outbox_resumes_multi_chunk_streams_across_nonblocking_backpressure() {
+        let (parser_sock, exec_sock) = seqpacket_pair(true).unwrap();
+
+        // Build a large (~800 KiB, ~25 chunks) OkFsInfo response that exceeds
+        // Linux's default AF_UNIX socket buffer so a non-blocking sender MUST
+        // encounter EAGAIN mid-stream before the slow reader drains.
+        let big_fs: Vec<FsInfoDto> = (0..6_500)
+            .map(|i| FsInfoDto {
+                name: format!("fs-{i}"),
+                mountpoint: format!("/mnt/backpressure/volume_{i:04}/{}", "x".repeat(80)),
+                fs_type: "ext4".to_owned(),
+                used_bytes: Some(i * 4096),
+                total_bytes: Some(i * 8192),
+            })
+            .collect();
+        let big_resp = IpcResponse::OkFsInfo(big_fs);
+        let expected_chunks = encode_response_chunks(9, 1, &big_resp).unwrap().len();
+        assert!(
+            expected_chunks >= 10,
+            "need many chunks to fill socket buffer"
+        );
+
+        let mut exec_outbox = IpcOutbox::new();
+        exec_outbox.push_response(9, 1, &big_resp, None).unwrap();
+        assert_eq!(exec_outbox.pending_packets(), expected_chunks);
+
+        // First flush on non-blocking socket with an un-draining receiver must
+        // queue some prefix of chunks and stop mid-stream with WouldBlock.
+        let first = exec_outbox.flush(exec_sock.as_fd()).unwrap();
+        assert_eq!(
+            first,
+            FlushOutcome::WouldBlock,
+            "large multi-chunk response must trigger real EAGAIN backpressure"
+        );
+        assert!(
+            exec_outbox.pending_packets() > 0 && exec_outbox.pending_packets() < expected_chunks,
+            "some chunks must have queued before WouldBlock (remaining={}, total={expected_chunks})",
+            exec_outbox.pending_packets()
+        );
+
+        // Interleave slow single-packet reads with outbox flushes; the stream
+        // must complete exactly once with zero duplicate/restarted chunk 0.
+        let mut parser_asm = StreamAssembler::new(PeerRole::Parser);
+        let mut assembled = Vec::new();
+        let mut would_block_hits = 1usize;
+        for _ in 0..(expected_chunks * 4) {
+            if !exec_outbox.is_empty()
+                && exec_outbox.flush(exec_sock.as_fd()).unwrap() == FlushOutcome::WouldBlock
+            {
+                would_block_hits += 1;
+            }
+            match recv_packet(parser_sock.as_fd(), MAX_PACKET_BYTES) {
+                Ok(Some(pkt)) => {
+                    if let Some(AssembledMessage::Response(resp)) = parser_asm.push(pkt).unwrap() {
+                        assembled.push(resp);
+                    }
+                }
+                Err(Errno::EAGAIN) => {}
+                other => panic!("unexpected recv_packet result: {other:?}"),
+            }
+            if exec_outbox.is_empty() && !assembled.is_empty() {
+                break;
+            }
+        }
+        assert!(exec_outbox.is_empty());
+        assert!(would_block_hits >= 1);
+        assert_eq!(assembled.len(), 1, "response must assemble exactly once");
+        assert_eq!(assembled[0].session_gen, 9);
+        assert_eq!(assembled[0].req_id, 1);
+        assert_eq!(assembled[0].response, big_resp);
+        assert_eq!(parser_asm.active_streams(), 0);
+
+        // Connection remains completely usable in both directions, including
+        // multi-chunk request + OkChannelFd SCM_RIGHTS through IpcOutbox.
+        let mut parser_outbox = IpcOutbox::new();
+        let big_list = IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(
+            (0..600)
+                .map(|i| format!("/vol/sub_{i:04}/{}", "p".repeat(50)))
+                .collect(),
+        ));
+        parser_outbox.push_request(9, 2, &big_list).unwrap();
+        assert!(parser_outbox.pending_packets() >= 2);
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+        let mut req_got = None;
+        while !parser_outbox.is_empty() || req_got.is_none() {
+            let _ = parser_outbox.flush(parser_sock.as_fd()).unwrap();
+            match recv_packet(exec_sock.as_fd(), MAX_PACKET_BYTES) {
+                Ok(Some(pkt)) => {
+                    if let Some(AssembledMessage::Request(req)) = exec_asm.push(pkt).unwrap() {
+                        req_got = Some(req);
+                    }
+                }
+                Err(Errno::EAGAIN) => {}
+                other => panic!("unexpected exec recv: {other:?}"),
+            }
+        }
+        assert_eq!(req_got.unwrap().request, big_list);
+
+        // OkChannelFd via IpcOutbox hands off and drops its OwnedFd once flushed.
+        let (r_end, w_end) = nonblocking_pipe();
+        exec_outbox
+            .push_response(9, 3, &IpcResponse::OkChannelFd, Some(w_end))
+            .unwrap();
+        assert_eq!(
+            exec_outbox.flush(exec_sock.as_fd()).unwrap(),
+            FlushOutcome::Drained
+        );
+        let pkt = recv_packet(parser_sock.as_fd(), MAX_PACKET_BYTES)
+            .unwrap()
+            .unwrap();
+        let Some(AssembledMessage::Response(handoff)) = parser_asm.push(pkt).unwrap() else {
+            panic!("expected OkChannelFd");
+        };
+        assert_eq!(handoff.response, IpcResponse::OkChannelFd);
+        assert_pipe_open(&r_end, "handoff fd owned by parser");
+        drop(handoff);
+        assert_pipe_closed(&r_end, "handoff fd closed after parser drop");
+
+        // Mismatched fd attachment rejected cleanly by IpcOutbox::push_response.
+        let (_, w_extra) = nonblocking_pipe();
+        assert_eq!(
+            exec_outbox.push_response(9, 4, &IpcResponse::OkEmpty, Some(w_extra)),
+            Err(EncodeError::InvalidDescriptorAttachment)
+        );
+        assert_eq!(
+            exec_outbox.push_response(9, 4, &IpcResponse::OkChannelFd, None),
+            Err(EncodeError::InvalidDescriptorAttachment)
+        );
     }
 
     fn raw_pkt(bytes: Vec<u8>) -> RawPacket {
@@ -3510,86 +3738,73 @@ mod tests {
             TransportError::Protocol(ProtocolViolation::InvalidChannelHandoffAncillary)
         ));
 
-        // 3. OkChannelFd with 2 fds is rejected and leaks ZERO descriptors.
-        let before_two = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let (p2, _) = pipe().unwrap();
-            send_packet_fds(
-                exec_sock.as_fd(),
-                &zero_fd_pkt[0],
-                &[p1.as_fd(), p2.as_fd()],
-            )
-            .unwrap();
-            let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
-            assert!(matches!(
-                err,
-                TransportError::Protocol(ProtocolViolation::InvalidChannelHandoffAncillary)
-            ));
-        }
-        assert_eq!(open_fd_count(), before_two, "leaked fd on 2-fd OkChannelFd");
+        // 3. OkChannelFd with 2 fds is rejected and closes both received fds.
+        let (r1, w1) = nonblocking_pipe();
+        let (r2, w2) = nonblocking_pipe();
+        send_packet_fds(
+            exec_sock.as_fd(),
+            &zero_fd_pkt[0],
+            &[w1.as_fd(), w2.as_fd()],
+        )
+        .unwrap();
+        drop((w1, w2));
+        assert_pipe_open(&r1, "2-fd OkChannelFd queued");
+        assert_pipe_open(&r2, "2-fd OkChannelFd queued");
+        let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Protocol(ProtocolViolation::InvalidChannelHandoffAncillary)
+        ));
+        assert_pipe_closed(&r1, "rejected 2-fd OkChannelFd fd 1");
+        assert_pipe_closed(&r2, "rejected 2-fd OkChannelFd fd 2");
 
-        // 4. OkChannelFd with 4 fds triggers MSG_CTRUNC and leaks ZERO descriptors.
-        let before_four = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let (p2, _) = pipe().unwrap();
-            let (p3, _) = pipe().unwrap();
-            let (p4, _) = pipe().unwrap();
-            send_packet_fds(
-                exec_sock.as_fd(),
-                &zero_fd_pkt[0],
-                &[p1.as_fd(), p2.as_fd(), p3.as_fd(), p4.as_fd()],
-            )
-            .unwrap();
-            let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
-            assert!(matches!(
-                err,
-                TransportError::Protocol(ProtocolViolation::ControlMessageTruncated)
-            ));
+        // 4. OkChannelFd with 4 fds triggers MSG_CTRUNC and closes every fd.
+        let (r1, w1) = nonblocking_pipe();
+        let (r2, w2) = nonblocking_pipe();
+        let (r3, w3) = nonblocking_pipe();
+        let (r4, w4) = nonblocking_pipe();
+        send_packet_fds(
+            exec_sock.as_fd(),
+            &zero_fd_pkt[0],
+            &[w1.as_fd(), w2.as_fd(), w3.as_fd(), w4.as_fd()],
+        )
+        .unwrap();
+        drop((w1, w2, w3, w4));
+        let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Protocol(ProtocolViolation::ControlMessageTruncated)
+        ));
+        for (idx, r) in [&r1, &r2, &r3, &r4].into_iter().enumerate() {
+            assert_pipe_closed(r, &format!("rejected MSG_CTRUNC OkChannelFd fd {idx}"));
         }
-        assert_eq!(
-            open_fd_count(),
-            before_four,
-            "leaked fd on MSG_CTRUNC OkChannelFd"
-        );
 
         // 5. Non-handoff response (OkEmpty) carrying an unexpected fd is rejected
-        //    and leaks ZERO descriptors.
-        let before_non_handoff = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let ok_pkt = encode_response_chunks(5, 3, &IpcResponse::OkEmpty).unwrap();
-            send_packet(exec_sock.as_fd(), &ok_pkt[0], Some(p1.as_fd())).unwrap();
-            let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
-            assert!(matches!(
-                err,
-                TransportError::Protocol(ProtocolViolation::UnexpectedAncillaryData)
-            ));
-        }
-        assert_eq!(
-            open_fd_count(),
-            before_non_handoff,
-            "leaked fd on unexpected non-handoff fd"
-        );
+        //    and closes the received fd.
+        let (r1, w1) = nonblocking_pipe();
+        let ok_pkt = encode_response_chunks(5, 3, &IpcResponse::OkEmpty).unwrap();
+        send_packet(exec_sock.as_fd(), &ok_pkt[0], Some(w1.as_fd())).unwrap();
+        drop(w1);
+        assert_pipe_open(&r1, "unexpected non-handoff fd queued");
+        let err = recv_response(parser_sock.as_fd(), &mut parser_asm).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Protocol(ProtocolViolation::UnexpectedAncillaryData)
+        ));
+        assert_pipe_closed(&r1, "rejected unexpected non-handoff fd");
 
-        // 6. Parser -> executor packet carrying ANY fd is rejected and leaks ZERO descriptors.
-        let before_exec = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let ping_pkt = encode_request_chunks(5, 4, &IpcRequest::Ping).unwrap();
-            send_packet(parser_sock.as_fd(), &ping_pkt[0], Some(p1.as_fd())).unwrap();
-            let err = recv_request(exec_sock.as_fd(), &mut exec_asm).unwrap_err();
-            assert!(matches!(
-                err,
-                TransportError::Protocol(ProtocolViolation::UnexpectedAncillaryData)
-            ));
-        }
-        assert_eq!(
-            open_fd_count(),
-            before_exec,
-            "leaked fd on parser -> executor SCM_RIGHTS"
-        );
+        // 6. Parser -> executor packet carrying ANY fd is rejected and closes it.
+        let (r1, w1) = nonblocking_pipe();
+        let ping_pkt = encode_request_chunks(5, 4, &IpcRequest::Ping).unwrap();
+        send_packet(parser_sock.as_fd(), &ping_pkt[0], Some(w1.as_fd())).unwrap();
+        drop(w1);
+        assert_pipe_open(&r1, "parser -> executor SCM_RIGHTS queued");
+        let err = recv_request(exec_sock.as_fd(), &mut exec_asm).unwrap_err();
+        assert!(matches!(
+            err,
+            TransportError::Protocol(ProtocolViolation::UnexpectedAncillaryData)
+        ));
+        assert_pipe_closed(&r1, "rejected parser -> executor SCM_RIGHTS fd");
 
         // 7. send_response rejects mismatched descriptor attachment on the sender side too.
         let (p1, _) = pipe().unwrap();
@@ -4424,6 +4639,22 @@ mod tests {
             assert_eq!(got.response, IpcResponse::Err(code));
             assert!(!code.to_proto_error().to_string().is_empty());
         }
+        assert_eq!(
+            IpcErrorCode::FsinfoBusy.to_proto_error().to_string(),
+            fsinfo_busy_error().to_string()
+        );
+        assert_eq!(
+            IpcErrorCode::FsinfoTimeout.to_proto_error().to_string(),
+            fsinfo_timeout_error().to_string()
+        );
+        let typed_entry = TrimEntry {
+            path: "/data".to_owned(),
+            outcome: TrimPathOutcome::IoctlErrno(Errno::EOPNOTSUPP as i32),
+        };
+        assert_eq!(
+            TrimPathDto::from_entry(&typed_entry).to_handler(),
+            typed_entry.to_result()
+        );
 
         // 3. EncodeError guards & send_response descriptor attachment mismatch.
         assert!(matches!(

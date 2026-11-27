@@ -299,8 +299,14 @@ pub const AF_NETLINK: u64 = 16;
 /// (`dword`) in the parser and in the CVM executor profile.
 pub const IPC_FD: u64 = crate::ipc::IPC_FD as u64;
 
-/// Syscalls allowed in the zero-privilege, zero-filesystem parser process on
-/// both targets (OQ-10 §3.2, §5.4).
+/// Syscalls allowed in the zero-privilege, zero-filesystem, single-threaded
+/// `ppoll` parser process on both targets (OQ-10 §3.2, §5.3, §5.4).
+///
+/// Both `clone` and `clone3` (as well as `fork`/`vfork`/`execve`/`execveat`)
+/// are omitted: the parser serves its pre-opened channel descriptor and
+/// `IPC_FD = 3` on a single `ppoll` loop after installing this filter, so a
+/// compromised parser cannot fork a detached child process that escapes
+/// `PR_SET_PDEATHSIG(SIGKILL)` supervision.
 pub const PARSER_COMMON: &[&str] = &[
     // Pre-opened descriptor I/O only (verified virtio channel fd, /dev/null on
     // fds 0/1/2, and IPC_FD = 3). Zero path-taking or filesystem-opening
@@ -311,7 +317,7 @@ pub const PARSER_COMMON: &[&str] = &[
     "writev",
     "close",
     "fcntl",
-    // Runtime and reactor: memory management.
+    // Runtime memory management.
     "brk",
     "mmap",
     "munmap",
@@ -319,16 +325,10 @@ pub const PARSER_COMMON: &[&str] = &[
     "mremap",
     "madvise",
     "membarrier",
-    // Threads and process lifecycle (Tokio runtime workers and clean exit).
-    "clone",
-    "clone3",
-    "set_robust_list",
-    "get_robust_list",
-    "set_tid_address",
+    // Single-threaded process lifecycle (no clone/clone3/fork/vfork/execve).
     "gettid",
     "getpid",
     "tgkill",
-    "rseq",
     "futex",
     "futex_waitv",
     "sched_yield",
@@ -1734,10 +1734,14 @@ mod tests {
             "setsockopt",
             "getsockopt",
             "shutdown",
-            // Zero kernel/process/privilege authority.
+            // Zero kernel/process/privilege authority (including process & thread
+            // creation so the parser cannot fork a child that escapes
+            // PR_SET_PDEATHSIG supervision).
             "ioctl",
             "execve",
             "execveat",
+            "clone",
+            "clone3",
             "fork",
             "vfork",
             "wait4",
@@ -1779,6 +1783,10 @@ mod tests {
             wait4: u32,
             kill: u32,
             execve: u32,
+            clone: u32,
+            clone3: u32,
+            fork: Option<u32>,
+            vfork: Option<u32>,
         }
 
         let targets = [
@@ -1804,6 +1812,10 @@ mod tests {
                 wait4: 61,
                 kill: 62,
                 execve: 59,
+                clone: 56,
+                clone3: 435,
+                fork: Some(57),
+                vfork: Some(58),
             },
             TargetSyscalls {
                 target: Target::Aarch64,
@@ -1827,6 +1839,10 @@ mod tests {
                 wait4: 260,
                 kill: 129,
                 execve: 221,
+                clone: 220,
+                clone3: 435,
+                fork: None,
+                vfork: None,
             },
         ];
 
@@ -1939,6 +1955,46 @@ mod tests {
                     ),
                     expected_deny,
                     "{:?}: syscall {denied_nr} must be denied in parser",
+                    ts.target
+                );
+            }
+            // Separate-process creation (fork/vfork/clone(SIGCHLD)/clone3) and
+            // thread creation (clone(CLONE_THREAD)) are all denied in the
+            // single-threaded ppoll parser serving profile.
+            const SIGCHLD_FLAG: u64 = 17;
+            const CLONE_VM_VFORK_SIGCHLD: u64 = 0x0000_4100 | SIGCHLD_FLAG;
+            const CLONE_THREAD_FLAGS: u64 = 0x0001_0900;
+            for (case, flags) in [
+                ("fork-style clone(SIGCHLD)", SIGCHLD_FLAG),
+                ("vfork-style clone", CLONE_VM_VFORK_SIGCHLD),
+                ("thread-style clone", CLONE_THREAD_FLAGS),
+            ] {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.clone, [flags, 0, 0, 0, 0, 0]),
+                    expected_deny,
+                    "{:?}: parser must deny {case}",
+                    ts.target
+                );
+            }
+            assert_eq!(
+                eval_bpf(&bpf, ts.arch, ts.clone3, [0x1000, 88, 0, 0, 0, 0]),
+                expected_deny,
+                "{:?}: parser must deny clone3",
+                ts.target
+            );
+            if let Some(fork_nr) = ts.fork {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, fork_nr, [0; 6]),
+                    expected_deny,
+                    "{:?}: parser must deny fork",
+                    ts.target
+                );
+            }
+            if let Some(vfork_nr) = ts.vfork {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, vfork_nr, [0; 6]),
+                    expected_deny,
+                    "{:?}: parser must deny vfork",
                     ts.target
                 );
             }
@@ -2334,6 +2390,12 @@ mod tests {
                     let _ = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
                     std::process::exit(RETURNED_WITHOUT_SIGSYS);
                 }
+                "parser-clone-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = std::thread::Builder::new().spawn(|| {});
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
                 "executor-cvm-ipc-and-wait4-allowed" => {
                     let (local, peer) = setup_ipc_pair_pinned();
                     let (chan_r, _chan_w) = pipe().unwrap();
@@ -2348,26 +2410,34 @@ mod tests {
                     nix::sys::prctl::set_no_new_privs().unwrap();
                     install(&executor_profile(Target::current(), &dp).unwrap()).unwrap();
 
-                    let mut asm = crate::ipc::StreamAssembler::new(crate::ipc::PeerRole::Executor);
-                    let got = crate::ipc::recv_request(local.as_fd(), &mut asm)
-                        .unwrap()
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
                         .unwrap();
-                    assert_eq!(got.request, crate::ipc::IpcRequest::RequestChannelReopen);
-                    crate::ipc::send_response(
-                        local.as_fd(),
-                        4,
-                        9,
-                        &crate::ipc::IpcResponse::OkChannelFd,
-                        Some(chan_r.as_fd()),
-                    )
-                    .unwrap();
-                    // Verify readlinkat (sysfs subsystem check) and wait4 (child reaping).
-                    let exe = readlinkat(AT_FDCWD, "/proc/self/exe").unwrap();
-                    assert!(!exe.is_empty());
-                    assert_eq!(
-                        waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)),
-                        Err(nix::errno::Errno::ECHILD)
-                    );
+                    rt.block_on(async {
+                        let mut asm =
+                            crate::ipc::StreamAssembler::new(crate::ipc::PeerRole::Executor);
+                        let got = crate::ipc::recv_request(local.as_fd(), &mut asm)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(got.request, crate::ipc::IpcRequest::RequestChannelReopen);
+                        crate::ipc::send_response(
+                            local.as_fd(),
+                            4,
+                            9,
+                            &crate::ipc::IpcResponse::OkChannelFd,
+                            Some(chan_r.as_fd()),
+                        )
+                        .unwrap();
+                        // Verify readlinkat (sysfs subsystem check) and wait4 (child reaping).
+                        let exe = readlinkat(AT_FDCWD, "/proc/self/exe").unwrap();
+                        assert!(!exe.is_empty());
+                        assert_eq!(
+                            waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)),
+                            Err(nix::errno::Errno::ECHILD)
+                        );
+                    });
                     drop(peer);
                     println!("EXECUTOR_CVM_OK");
                 }
@@ -2433,6 +2503,7 @@ mod tests {
                 "parser-sendmsg-wrong-fd-denied",
                 "parser-recvmsg-wrong-fd-denied",
                 "parser-wait4-denied",
+                "parser-clone-denied",
                 "executor-cvm-sendmsg-wrong-fd-denied",
                 "executor-cvm-recvmsg-wrong-fd-denied",
                 "executor-cvm-kill-denied",

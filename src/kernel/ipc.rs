@@ -103,8 +103,9 @@ pub fn dup_above_cloexec(fd: OwnedFd, min_fd: RawFd) -> Result<OwnedFd, Errno> {
 /// Moves `fd` onto exact descriptor number `target_fd` with `FD_CLOEXEC` set
 /// and closes the original descriptor (if distinct).
 ///
-/// Fails with [`Errno::EBUSY`] if `target_fd` is already open by another
-/// descriptor, so a live [`OwnedFd`] in the same process is never clobbered.
+/// Uses `fcntl(F_DUPFD_CLOEXEC, target_fd)` so `target_fd` is reserved
+/// atomically without ever clobbering an existing open descriptor. Fails with
+/// [`Errno::EBUSY`] if `target_fd` is already occupied.
 pub fn pin_unused_fd_cloexec(fd: OwnedFd, target_fd: RawFd) -> Result<OwnedFd, Errno> {
     if target_fd < 0 {
         return Err(Errno::EINVAL);
@@ -118,26 +119,23 @@ pub fn pin_unused_fd_cloexec(fd: OwnedFd, target_fd: RawFd) -> Result<OwnedFd, E
         }
         return Ok(fd);
     }
-    // SAFETY: `F_GETFD` only probes whether `target_fd` currently exists in
-    // this process's descriptor table.
-    let probe = unsafe { libc::fcntl(target_fd, libc::F_GETFD) };
-    if probe >= 0 {
-        return Err(Errno::EBUSY);
-    }
-    let probe_err = Errno::last();
-    if probe_err != Errno::EBADF {
-        return Err(probe_err);
-    }
-    // SAFETY: `fd` is valid and `target_fd` was just verified unused (`EBADF`)
-    // before installing the duplicate atomically with `O_CLOEXEC`.
-    let rc = unsafe { libc::dup3(fd.as_raw_fd(), target_fd, libc::O_CLOEXEC) };
-    if rc < 0 {
+    // Atomically claim the lowest unused descriptor >= `target_fd` without ever
+    // replacing an existing open descriptor (eliminating any check-then-dup race).
+    // SAFETY: `fd` is a valid owned descriptor; `F_DUPFD_CLOEXEC` allocates a
+    // brand-new descriptor `>= target_fd` with `FD_CLOEXEC` set or returns `-1`.
+    let new_raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, target_fd) };
+    if new_raw < 0 {
         return Err(Errno::last());
     }
-    // SAFETY: `dup3` succeeded and created sole ownership of `target_fd`.
-    let pinned = unsafe { OwnedFd::from_raw_fd(target_fd) };
+    // SAFETY: `new_raw` was freshly allocated by `fcntl(F_DUPFD_CLOEXEC)` and
+    // is uniquely owned by this function.
+    let candidate = unsafe { OwnedFd::from_raw_fd(new_raw) };
+    if new_raw != target_fd {
+        drop(candidate);
+        return Err(Errno::EBUSY);
+    }
     drop(fd);
-    Ok(pinned)
+    Ok(candidate)
 }
 
 /// Sends a single `SOCK_SEQPACKET` message carrying `payload` and zero or one
@@ -373,13 +371,34 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::AsFd;
 
-    use nix::fcntl::{FcntlArg, FdFlag, fcntl};
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
     use nix::unistd::pipe;
 
     use super::*;
 
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd").unwrap().count()
+    fn nonblocking_pipe() -> (OwnedFd, OwnedFd) {
+        let (r, w) = pipe().unwrap();
+        let flags = OFlag::from_bits_truncate(fcntl(&r, FcntlArg::F_GETFL).unwrap());
+        fcntl(&r, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK)).unwrap();
+        (r, w)
+    }
+
+    fn assert_pipe_open(read_end: &OwnedFd, context: &str) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(read_end, &mut byte),
+            Err(Errno::EAGAIN),
+            "{context}: expected write end to remain open"
+        );
+    }
+
+    fn assert_pipe_closed(read_end: &OwnedFd, context: &str) {
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            nix::unistd::read(read_end, &mut byte),
+            Ok(0),
+            "{context}: write end remained open (received descriptor leaked)"
+        );
     }
 
     #[test]
@@ -433,46 +452,42 @@ mod tests {
 
         // 2. Two fds fit inside the 2-slot control buffer so caller sees
         //    `fds.len() == 2` without MSG_CTRUNC, and dropping RawPacket
-        //    closes both descriptors.
-        let before_two = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let (p2, _) = pipe().unwrap();
-            send_packet_fds(a.as_fd(), b"two", &[p1.as_fd(), p2.as_fd()]).unwrap();
-            let pkt = recv_packet(b.as_fd(), 32).unwrap().unwrap();
-            assert!(!pkt.cmsg_truncated);
-            assert_eq!(pkt.fds.len(), 2);
-            drop(pkt);
-        }
-        assert_eq!(
-            open_fd_count(),
-            before_two,
-            "dropping rejected 2-fd packet must not leak descriptors"
-        );
+        //    closes both received descriptors (verified per pipe, immune to
+        //    parallel test threads).
+        let (r1, w1) = nonblocking_pipe();
+        let (r2, w2) = nonblocking_pipe();
+        send_packet_fds(a.as_fd(), b"two", &[w1.as_fd(), w2.as_fd()]).unwrap();
+        drop((w1, w2));
+        assert_pipe_open(&r1, "2-fd queued fd 1");
+        assert_pipe_open(&r2, "2-fd queued fd 2");
+        let pkt = recv_packet(b.as_fd(), 32).unwrap().unwrap();
+        assert!(!pkt.cmsg_truncated);
+        assert_eq!(pkt.fds.len(), 2);
+        assert_pipe_open(&r1, "2-fd held by RawPacket fd 1");
+        assert_pipe_open(&r2, "2-fd held by RawPacket fd 2");
+        drop(pkt);
+        assert_pipe_closed(&r1, "dropped 2-fd RawPacket fd 1");
+        assert_pipe_closed(&r2, "dropped 2-fd RawPacket fd 2");
 
         // 3. Four fds overflow the 2-slot control buffer -> kernel sets
         //    MSG_CTRUNC and dropping RawPacket closes every delivered fd.
-        let before_four = open_fd_count();
-        {
-            let (p1, _) = pipe().unwrap();
-            let (p2, _) = pipe().unwrap();
-            let (p3, _) = pipe().unwrap();
-            let (p4, _) = pipe().unwrap();
-            send_packet_fds(
-                a.as_fd(),
-                b"four",
-                &[p1.as_fd(), p2.as_fd(), p3.as_fd(), p4.as_fd()],
-            )
-            .unwrap();
-            let pkt = recv_packet(b.as_fd(), 32).unwrap().unwrap();
-            assert!(pkt.cmsg_truncated, "expected real kernel MSG_CTRUNC");
-            drop(pkt);
+        let (r1, w1) = nonblocking_pipe();
+        let (r2, w2) = nonblocking_pipe();
+        let (r3, w3) = nonblocking_pipe();
+        let (r4, w4) = nonblocking_pipe();
+        send_packet_fds(
+            a.as_fd(),
+            b"four",
+            &[w1.as_fd(), w2.as_fd(), w3.as_fd(), w4.as_fd()],
+        )
+        .unwrap();
+        drop((w1, w2, w3, w4));
+        let pkt = recv_packet(b.as_fd(), 32).unwrap().unwrap();
+        assert!(pkt.cmsg_truncated, "expected real kernel MSG_CTRUNC");
+        drop(pkt);
+        for (idx, r) in [&r1, &r2, &r3, &r4].into_iter().enumerate() {
+            assert_pipe_closed(r, &format!("dropped MSG_CTRUNC RawPacket fd {idx}"));
         }
-        assert_eq!(
-            open_fd_count(),
-            before_four,
-            "dropping MSG_CTRUNC packet must close every delivered descriptor"
-        );
 
         // 4. Clean peer EOF returns Ok(None).
         drop(a);
@@ -508,11 +523,16 @@ mod tests {
         let (a, b) = seqpacket_pair(false).unwrap();
         let occupied = b.as_raw_fd();
         // Attempting to pin onto an already-open descriptor fails with EBUSY
-        // and leaves both descriptors intact.
+        // and leaves the existing descriptor completely untouched.
         let (c, d) = seqpacket_pair(false).unwrap();
         assert_eq!(
             pin_unused_fd_cloexec(c, occupied).unwrap_err(),
             Errno::EBUSY
+        );
+        send_packet(a.as_fd(), b"intact", None).unwrap();
+        assert_eq!(
+            recv_packet(b.as_fd(), 32).unwrap().unwrap().bytes,
+            b"intact"
         );
         assert_eq!(dup_above_cloexec(d, -1).unwrap_err(), Errno::EINVAL);
 
@@ -528,11 +548,28 @@ mod tests {
         let same = pin_unused_fd_cloexec(moved, same_num).unwrap();
         assert_eq!(same.as_raw_fd(), same_num);
 
-        // Find a guaranteed-free high fd slot, pin `same` onto it, and verify
-        // the socket pair still passes packets cleanly.
-        let target_fd = same_num + 25;
-        let pinned = pin_unused_fd_cloexec(same, target_fd).unwrap();
-        assert_eq!(pinned.as_raw_fd(), target_fd);
+        // Pin onto a high unused descriptor slot and verify FD_CLOEXEC + traffic.
+        let mut pinned = None;
+        let mut chosen_target = 0;
+        let mut cur = Some(same);
+        for candidate in 200..260 {
+            let fd = cur.take().unwrap();
+            let dup = fd.try_clone().unwrap();
+            match pin_unused_fd_cloexec(dup, candidate) {
+                Ok(ok) => {
+                    chosen_target = candidate;
+                    pinned = Some(ok);
+                    drop(fd);
+                    break;
+                }
+                Err(Errno::EBUSY) => {
+                    cur = Some(fd);
+                }
+                Err(other) => panic!("unexpected pin error: {other}"),
+            }
+        }
+        let pinned = pinned.expect("found unused high fd slot");
+        assert_eq!(pinned.as_raw_fd(), chosen_target);
         // SAFETY: `F_GETFD` only reads flags on the live owned descriptor.
         let pinned_flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFD) };
         assert_ne!(pinned_flags & libc::FD_CLOEXEC, 0);

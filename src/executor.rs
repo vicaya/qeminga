@@ -17,11 +17,14 @@
 //!    port name, or explicit `pty-test-only` devpts check), passing only the
 //!    single verified descriptor via `SCM_RIGHTS` and closing its own copy;
 //! 7. supervision without `CAP_KILL`: on `ipc_protocol_violation` or parser
-//!    crash/EOF, closes `IPC_FD` immediately, reaps via `wait4(WNOHANG)`, and
+//!    crash/EOF, closes `IPC_FD` immediately (revoking all executor authority
+//!    and ending cooperating parsers on `EOF`), reaps via `wait4(WNOHANG)`, and
 //!    **always waits until `FreezeState == Thawed`** (keeping held mount fds,
-//!    recovery marker, and watchdog alive) before exiting non-zero so
-//!    `PR_SET_PDEATHSIG(SIGKILL)` and systemd `KillMode=control-group` clean up
-//!    any uncooperative parser and restart the unit cleanly.
+//!    recovery marker, and watchdog alive) before exiting non-zero so systemd's
+//!    `KillMode=control-group` cleans up any uncooperative UID-`601` parser
+//!    (`SIGTERM`, then `SIGKILL` after `TimeoutStopSec`) before launching a
+//!    replacement generation (with `PR_SET_PDEATHSIG(SIGKILL)` additionally
+//!    covering same-UID or `CAP_KILL`-holding invocations).
 #![forbid(unsafe_code)]
 
 use std::collections::VecDeque;
@@ -29,6 +32,7 @@ use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -293,6 +297,18 @@ struct ExecutorState {
     reopen_gate: Arc<Semaphore>,
     op_slots: Semaphore,
     lanes: Arc<ExecutorLaneGate>,
+    /// Permanently latched to `true` on the first stop signal (`SIGTERM`/`SIGINT`).
+    ///
+    /// While `Frozen`, C-21 defers executor exit so a legitimate host can still
+    /// observe `"frozen"` and thaw cleanly, but once `stopping` is latched:
+    /// - every non-frozen-safe command (including any `FsfreezeFreeze` or
+    ///   `FsfreezeFreezeList` already queued behind `FsfreezeThaw`) is
+    ///   permanently denied at `evaluate_command_gates`, preventing a
+    ///   compromised parser from re-freezing after thaw;
+    /// - `FsfreezeStatus` stops refreshing the idle watchdog heartbeat,
+    ///   preventing heartbeat spam from stretching a freeze toward
+    ///   `TimeoutStopSec`.
+    stopping: AtomicBool,
 }
 
 /// Executor-owned channel reopen backoff (§5.7) immune to parser spoofing:
@@ -484,6 +500,7 @@ where
         reopen_gate: Arc::new(Semaphore::new(1)),
         op_slots: Semaphore::new(MAX_IN_FLIGHT_OPS),
         lanes: Arc::new(ExecutorLaneGate::default()),
+        stopping: AtomicBool::new(false),
     });
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<OutboundReply>(MAX_IN_FLIGHT_OPS * 2);
@@ -510,6 +527,9 @@ where
         // replies the peer is not accepting so shutdown never depends on an
         // untrusted parser (design §5.7).
         if stop_requested {
+            if ctx.state.current() == FreezeState::Thawed {
+                let _ = reopen_cancel_tx.send(true);
+            }
             if ctx.state.current() == FreezeState::Thawed && tasks.is_empty() {
                 let mut terminal_err: Option<OpenError> = None;
                 while let Ok(reply) = reply_rx.try_recv() {
@@ -582,12 +602,14 @@ where
             }
         }
 
-        let can_read_ipc = !outbox_backpressured(&outbox);
+        let can_read_ipc = !outbox_backpressured(&outbox)
+            && !(stop_requested && ctx.state.current() == FreezeState::Thawed);
 
         tokio::select! {
             name = &mut signal, if signal_pending => {
                 signal_pending = false;
                 stop_requested = true;
+                state.stopping.store(true, Ordering::SeqCst);
                 tracing::info!(event = "signal", signal = name, "stop requested");
                 if ctx.state.current() == FreezeState::Thawed {
                     let _ = reopen_cancel_tx.send(true);
@@ -663,15 +685,17 @@ where
                     Ok(mut guard) => {
                         let mut read_exit: Option<Result<(), ExecutorExitError>> = None;
                         loop {
-                            if outbox_backpressured(&outbox) {
+                            if outbox_backpressured(&outbox)
+                                || (stop_requested && ctx.state.current() == FreezeState::Thawed)
+                            {
                                 break;
                             }
                             match recv_packet(async_ipc.as_fd(), MAX_PACKET_BYTES) {
                                 Ok(Some(pkt)) => match assembler.push(pkt) {
                                     Ok(Some(AssembledMessage::Request(req))) => {
                                         if stop_requested && ctx.state.current() == FreezeState::Thawed {
-                                            // Stop already accepted while Thawed: do not start new work.
-                                            continue;
+                                            // Stop already accepted while Thawed: stop reading immediately.
+                                            break;
                                         }
                                         if let Err(err) = dispatch_ipc_request(
                                             Arc::clone(&state),
@@ -952,7 +976,9 @@ fn evaluate_command_gates(
             reason::RATE_LIMITED,
             IpcErrorCode::RateLimited { class: rl.class },
         ))
-    } else if state.ctx.state.is_frozen_for_gate() && !cmd.is_frozen_safe() {
+    } else if (state.ctx.state.is_frozen_for_gate() || state.stopping.load(Ordering::SeqCst))
+        && !cmd.is_frozen_safe()
+    {
         Err((reason::FROZEN, IpcErrorCode::Frozen))
     } else {
         Ok(())
@@ -1106,6 +1132,15 @@ async fn handle_channel_reopen(
     _reopen_permit: OwnedSemaphorePermit,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> OutboundReply {
+    if *cancel.borrow() {
+        return OutboundReply {
+            session_gen,
+            req_id,
+            response: IpcResponse::Err(IpcErrorCode::ChannelRetryLater),
+            channel_fd: None,
+            terminal_channel_err: None,
+        };
+    }
     let (sleep_dur, was_open) = {
         let mut backoff = state
             .reopen_backoff
@@ -1123,7 +1158,7 @@ async fn handle_channel_reopen(
     if !sleep_dur.is_zero() {
         tokio::select! {
             () = tokio::time::sleep(sleep_dur) => {}
-            _ = cancel.changed() => {
+            _ = cancel.wait_for(|v| *v) => {
                 return OutboundReply {
                     session_gen,
                     req_id,
@@ -1133,6 +1168,15 @@ async fn handle_channel_reopen(
                 };
             }
         }
+    }
+    if *cancel.borrow() {
+        return OutboundReply {
+            session_gen,
+            req_id,
+            response: IpcResponse::Err(IpcErrorCode::ChannelRetryLater),
+            channel_fd: None,
+            terminal_channel_err: None,
+        };
     }
 
     let path = state.channel_path.clone();
@@ -1232,7 +1276,12 @@ async fn execute_command_request(
         }
         IpcRequest::Sync { id } | IpcRequest::SyncDelimited { id } => IpcResponse::OkI64(id),
         IpcRequest::FsfreezeStatus => {
-            IpcResponse::OkFreezeStatus(fsfreeze::execute_status_ipc(ctx))
+            let status = if state.stopping.load(Ordering::SeqCst) {
+                crate::ipc::WireFreezeStatus::from_state(ctx.state.current())
+            } else {
+                fsfreeze::execute_status_ipc(ctx)
+            };
+            IpcResponse::OkFreezeStatus(status)
         }
         IpcRequest::FsfreezeFreeze => {
             match fsfreeze::execute_freeze_ipc_with_published(ctx, None, publish_freeze).await {
@@ -3127,5 +3176,266 @@ mod tests {
             "all 4 admitted IPC commands must increment Context::handler_calls"
         );
         drop(parser_sock);
+    }
+
+    #[tokio::test]
+    async fn executor_denies_new_or_queued_freeze_after_stop_signal_while_frozen() {
+        // Codex Security Review P1: when SIGTERM arrives while Frozen, a
+        // compromised parser must NOT be able to submit `FsfreezeThaw` followed
+        // by `FsfreezeFreeze` (or `FsfreezeFreezeList`) to re-freeze after thaw
+        // and carry the freeze past TimeoutStopSec. C-21 frozen-safe status and
+        // thaw remain served, while non-frozen-safe commands are permanently
+        // denied once stop is requested.
+        let sink = SharedSink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::INFO,
+            router.clone(),
+        ));
+        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let table = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let state_dir = tempfile::Builder::new()
+            .prefix("qeminga-exec-stop-refreeze-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let marker_path = state_dir.path().join("frozen");
+        let marker = Marker::open(&marker_path).unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                router.clone(),
+                marker,
+            )
+            .with_kernel(Arc::clone(&kernel) as Arc<dyn crate::kernel::KernelOps>)
+            .with_mounts(Arc::new(StaticMounts(table.to_owned()))),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let stop_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_fired_sig = Arc::clone(&stop_fired);
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+        let exec_task = tokio::spawn(
+            serve_ipc_with_backoff(
+                Arc::clone(&ctx),
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+                opener,
+                true,
+                None,
+                false,
+                async move {
+                    let sig = stop_rx.await.unwrap_or("SIGTERM");
+                    stop_fired_sig.store(true, std::sync::atomic::Ordering::SeqCst);
+                    sig
+                },
+                Duration::from_millis(10),
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .with_subscriber(dispatch.clone()),
+        );
+
+        let parser_sock = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            // 1. Freeze filesystem.
+            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::FsfreezeFreeze).unwrap();
+            let fr = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fr.response, IpcResponse::OkCount(1));
+
+            // 2. Send SIGTERM while Frozen and wait until the signal future has
+            //    resolved and the executor loop has observed it.
+            let _ = stop_tx.send("SIGTERM");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !stop_fired.load(std::sync::atomic::Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "executor did not poll stop signal future"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+
+            // 3. C-21: status still works while frozen (and proves another
+            //    select! iteration completed after SIGTERM was latched).
+            send_request(parser_sock.as_fd(), 1, 2, &IpcRequest::FsfreezeStatus).unwrap();
+            let st = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                st.response,
+                IpcResponse::OkFreezeStatus(crate::ipc::WireFreezeStatus::Frozen)
+            );
+
+            // 4. Compromised parser pipelines FsfreezeThaw IMMEDIATELY followed
+            //    by FsfreezeFreeze and FsfreezeFreezeList in the same burst.
+            send_request(parser_sock.as_fd(), 1, 3, &IpcRequest::FsfreezeThaw).unwrap();
+            send_request(parser_sock.as_fd(), 1, 4, &IpcRequest::FsfreezeFreeze).unwrap();
+            send_request(
+                parser_sock.as_fd(),
+                1,
+                5,
+                &IpcRequest::FsfreezeFreezeList(FreezeListSelection::Omitted),
+            )
+            .unwrap();
+
+            // Thaw succeeds; any reply to the trailing freeze attempts MUST be
+            // an error (or IPC EOF after immediate stop), NEVER OkCount(1)!
+            let mut saw_thaw_ok = false;
+            loop {
+                match recv_response(parser_sock.as_fd(), &mut asm) {
+                    Ok(Some(resp)) => match resp.req_id {
+                        3 => {
+                            assert_eq!(resp.response, IpcResponse::OkCount(1));
+                            saw_thaw_ok = true;
+                        }
+                        4 | 5 => {
+                            assert_eq!(
+                                resp.response,
+                                IpcResponse::Err(IpcErrorCode::Frozen),
+                                "re-freeze attempt req_id={} after SIGTERM must be denied, got {:?}",
+                                resp.req_id,
+                                resp.response
+                            );
+                        }
+                        other => panic!("unexpected req_id {other}: {:?}", resp.response),
+                    },
+                    Ok(None) => break,
+                    Err(err) => panic!("unexpected IPC error: {err}"),
+                }
+            }
+            assert!(saw_thaw_ok, "C-21 thaw reply must be delivered before stop");
+            parser_sock
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), exec_task)
+            .await
+            .expect("executor must exit promptly once thaw completes without re-freezing")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(
+            !marker_path.exists(),
+            "marker must remain removed after thaw + stop"
+        );
+        let freeze_calls = kernel
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, crate::kernel::fake::Call::Fifreeze(_)))
+            .count();
+        assert_eq!(
+            freeze_calls, 1,
+            "fifreeze must have run only once (never re-frozen after SIGTERM)"
+        );
+        drop(parser_sock);
+    }
+
+    #[tokio::test]
+    async fn executor_stops_refreshing_watchdog_heartbeat_after_stop_signal() {
+        // Codex Security Review P1: once SIGTERM is latched while Frozen,
+        // `FsfreezeStatus` still answers `Frozen` (C-21) but must NOT refresh
+        // the idle watchdog, so a compromised parser spamming heartbeats cannot
+        // stretch a frozen shutdown past `fsfreeze_idle_timeout_secs`.
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let table = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let state_dir = tempfile::Builder::new()
+            .prefix("qeminga-exec-stop-hb-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let marker_path = state_dir.path().join("frozen");
+        let marker = Marker::open(&marker_path).unwrap();
+        let mut cfg = Config::default();
+        cfg.agent.fsfreeze_idle_timeout_secs = 1;
+        cfg.agent.fsfreeze_max_timeout_secs = 60;
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(cfg),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(Arc::clone(&kernel) as Arc<dyn crate::kernel::KernelOps>)
+            .with_mounts(Arc::new(StaticMounts(table.to_owned())))
+            .with_hooks(Arc::new(crate::handlers::fsfreeze::LifecycleHooks)),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            Arc::clone(&ctx),
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            async move { stop_rx.await.unwrap_or("SIGTERM") },
+            Duration::from_millis(10),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+
+        let ctx_check = Arc::clone(&ctx);
+        let parser_thread = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::FsfreezeFreeze).unwrap();
+            let fr = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fr.response, IpcResponse::OkCount(1));
+            assert_eq!(ctx_check.state.current(), FreezeState::Frozen);
+
+            let _ = stop_tx.send("SIGTERM");
+
+            // Spam FsfreezeStatus heartbeats every 150ms for up to 4s. Without
+            // heartbeat suppression on stop, the 1s idle watchdog would never
+            // fire during this 4s window (hard cap is 60s).
+            let deadline = std::time::Instant::now() + Duration::from_secs(4);
+            let mut req_id = 2u64;
+            let mut saw_ipc_eof = false;
+            while std::time::Instant::now() < deadline {
+                if send_request(parser_sock.as_fd(), 1, req_id, &IpcRequest::FsfreezeStatus)
+                    .is_err()
+                {
+                    saw_ipc_eof = true;
+                    break;
+                }
+                req_id += 1;
+                match recv_response(parser_sock.as_fd(), &mut asm) {
+                    Ok(Some(_)) => {}
+                    Ok(None) | Err(_) => {
+                        saw_ipc_eof = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            assert!(
+                saw_ipc_eof,
+                "idle watchdog must still fire and close IPC despite post-SIGTERM FsfreezeStatus heartbeat spam"
+            );
+        });
+
+        tokio::time::timeout(Duration::from_secs(6), exec_task)
+            .await
+            .expect("executor must thaw at idle timeout and exit despite heartbeat spam")
+            .unwrap()
+            .unwrap();
+        parser_thread.await.unwrap();
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert!(!marker_path.exists());
     }
 }

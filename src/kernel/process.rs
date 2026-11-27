@@ -101,10 +101,17 @@ pub struct ParserSpawnSpec {
 
 /// Handle to the spawned parser child owned by the executor.
 ///
-/// The executor runs as UID `600` without `CAP_KILL`, so this handle never
-/// calls `kill(2)`; it only reaps the child via `wait4(2)` (`waitpid`), while
-/// termination is enforced by closing `IPC_FD`, `PR_SET_PDEATHSIG(SIGKILL)`,
-/// and systemd's `KillMode=control-group` (OQ-10 §5.3).
+/// The executor runs as UID `600` without `CAP_KILL` (and the shipped systemd
+/// unit excludes `CAP_KILL` from `CapabilityBoundingSet` from startup), so
+/// this handle never calls `kill(2)` and Linux's `check_kill_permission()`
+/// denies cross-UID `PR_SET_PDEATHSIG` delivery from UID `600` (or `CAP_KILL`-
+/// less UID `0`) to UID `601`. Closing `IPC_FD` immediately revokes all
+/// executor authority and ends cooperating parsers on `EOF`, `wait4(2)` reaps
+/// exited children, and systemd's `KillMode=control-group` (or an equivalent
+/// cgroup/process-group supervisor for direct launches) terminates any
+/// uncooperative UID-`601` parser on `MainPID` exit (`SIGTERM`, then `SIGKILL`
+/// after `TimeoutStopSec`) before starting a replacement generation (OQ-10
+/// §5.3).
 #[derive(Debug)]
 pub struct ParserChild {
     pid: Pid,
@@ -604,8 +611,14 @@ pub fn adopt_inherited_fd_cloexec(raw_fd: RawFd) -> Result<OwnedFd, Errno> {
 
 /// Arms `PR_SET_PDEATHSIG(SIGKILL)` and immediately checks whether
 /// `getppid() == expected_ppid` to close the Linux parent-death race
-/// (OQ-10 §3.2). Must be called **after** `setresuid`/`setresgid` because
-/// credential transitions clear `pdeath_signal` on Linux.
+/// (OQ-10 §3.2, §5.3). Must be called **after** `setresuid`/`setresgid`
+/// because credential transitions clear `pdeath_signal` on Linux.
+///
+/// On Linux, `forget_original_parent()` checks `check_kill_permission()`, so
+/// `PR_SET_PDEATHSIG(SIGKILL)` delivers `SIGKILL` when the exiting parent
+/// shares the child's UID or holds `CAP_KILL`; cross-UID termination without
+/// `CAP_KILL` (UID `600` -> UID `601`) is guaranteed instead by systemd's
+/// `KillMode=control-group` (or an equivalent cgroup supervisor).
 ///
 /// Returns `Ok(true)` when the parent still matches `expected_ppid`, or
 /// `Ok(false)` if the parent has already exited and this child was reparented.

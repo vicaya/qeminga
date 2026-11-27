@@ -283,6 +283,11 @@ fn tmpfiles_rule_provisions_the_state_directory_at_boot() {
 #[test]
 fn timeout_stop_exceeds_the_freeze_cap_plus_margin() {
     let unit = parse_unit(&read("packaging/systemd/qeminga.service"));
+    assert_eq!(
+        values(&unit, "Service", "KillMode"),
+        vec!["control-group"],
+        "qeminga.service must keep KillMode=control-group to terminate an uncooperative UID-601 parser without CAP_KILL on UID 600"
+    );
     let stop = values(&unit, "Service", "TimeoutStopSec")[0];
     let secs: u64 = stop.strip_suffix('s').unwrap_or(stop).parse().unwrap();
     let config = Config::parse(&read("packaging/config.toml")).unwrap();

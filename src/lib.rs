@@ -20,6 +20,7 @@ compile_error!(
 
 pub mod audit;
 pub mod channel;
+pub mod channel_verify;
 pub mod config;
 pub mod daemon;
 pub mod dispatch;

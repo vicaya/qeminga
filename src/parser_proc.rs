@@ -71,6 +71,13 @@ use crate::proto::{Error as ProtoError, Request, Response, arguments, parse_requ
 /// Read buffer size per channel `read(2)`.
 const CHANNEL_READ_CHUNK: usize = 4096;
 
+/// Maximum channel `read(2)` calls and bytes drained per `ppoll` turn before
+/// returning to `ppoll` so continuous delimiter-free host input (such as while
+/// `FrameDecoder` discards an oversized frame) can never starve `IPC_FD`
+/// responses or EOF handling.
+const MAX_CHANNEL_READS_PER_TURN: usize = 16;
+const MAX_CHANNEL_READ_BYTES_PER_TURN: usize = MAX_CHANNEL_READS_PER_TURN * CHANNEL_READ_CHUNK;
+
 /// Parsed CLI options for the internal `--internal-parser` child entry point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParserOptions {
@@ -1055,10 +1062,16 @@ fn service_open_channel_revents(
         });
     }
 
-    // 6c. Read host input when readable and not backpressure-paused.
+    // 6c. Read host input when readable and not backpressure-paused, capped per
+    // `ppoll` turn so continuous delimiter-free input cannot starve `IPC_FD`.
     if revents.contains(PollFlags::POLLIN) && !sess.input_paused() {
+        let mut reads_this_turn = 0usize;
+        let mut bytes_this_turn = 0usize;
         loop {
-            if sess.input_paused() {
+            if sess.input_paused()
+                || reads_this_turn >= MAX_CHANNEL_READS_PER_TURN
+                || bytes_this_turn >= MAX_CHANNEL_READ_BYTES_PER_TURN
+            {
                 break;
             }
             match nix::unistd::read(sess.fd.as_fd(), read_buf) {
@@ -1070,14 +1083,15 @@ fn service_open_channel_revents(
                     });
                 }
                 Ok(n) => {
+                    reads_this_turn += 1;
+                    bytes_this_turn = bytes_this_turn.saturating_add(n);
                     for event in sess.decoder.push(&read_buf[..n]) {
                         sess.slots
                             .push_back(ParserSlot::Waiting(prepare_frame(event)));
                     }
                     sess.admit(session_gen, next_req_id, retired, ipc_outbox)?;
                 }
-                Err(Errno::EAGAIN) => break,
-                Err(Errno::EINTR) => continue,
+                Err(Errno::EAGAIN | Errno::EINTR) => break,
                 Err(_) => {
                     sess.write_failed = true;
                     sess.wire_outbox.abandon();
@@ -2209,5 +2223,58 @@ mod tests {
 
         drop(exec_sock);
         assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);
+    }
+
+    #[test]
+    fn service_open_channel_revents_bounds_delimiter_free_read_turn() {
+        // Codex Security Review P2: continuous delimiter-free host bytes while
+        // `FrameDecoder` is discarding an oversized frame emit zero slots so
+        // `input_paused()` stays false. A single `ppoll` turn MUST cap channel
+        // reads/bytes and return to `ppoll` rather than draining unboundedly.
+        let (mut host, ch_fd) = unix_stream_pair();
+        // Send 128 KiB (> 64 KiB single-frame bound) of delimiter-free bytes
+        // from a feeder thread so a smaller socket buffer cannot deadlock.
+        let feeder = thread::spawn(move || {
+            let chunk = vec![b'A'; 4096];
+            for _ in 0..32 {
+                if host.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+            host
+        });
+        // Give the feeder a moment to fill the kernel socket buffer well past
+        // the per-turn byte cap (64 KiB).
+        thread::sleep(Duration::from_millis(50));
+
+        let mut sess = OpenSession::new(ch_fd);
+        let mut next_req_id = 1u64;
+        let mut ipc_outbox = IpcOutbox::new();
+        let mut read_buf = [0u8; CHANNEL_READ_CHUNK];
+
+        let outcome = service_open_channel_revents(
+            &mut sess,
+            PollFlags::POLLIN,
+            1,
+            &mut next_req_id,
+            &[],
+            &mut ipc_outbox,
+            &mut read_buf,
+        )
+        .unwrap();
+        assert_eq!(outcome, ChannelEventOutcome::Continue);
+
+        // Unread bytes MUST still remain in the socket buffer because the read
+        // loop returned to `ppoll` after hitting its per-turn budget instead of
+        // draining the entire 128 KiB stream until `EAGAIN`.
+        let mut probe = [0u8; 64];
+        let remaining = nix::unistd::read(sess.fd.as_fd(), &mut probe);
+        assert!(
+            matches!(remaining, Ok(n) if n > 0),
+            "channel read turn must stop at its per-turn budget while bytes remain (got {remaining:?})"
+        );
+
+        drop(sess);
+        let _ = feeder.join();
     }
 }

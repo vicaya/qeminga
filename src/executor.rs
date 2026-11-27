@@ -331,15 +331,8 @@ struct ReopenBackoff {
 impl ReopenBackoff {
     fn new(had_initial_channel: bool, initial_backoff: Duration, max_backoff: Duration) -> Self {
         Self {
-            // If startup already tried and failed to open the channel, begin
-            // with `initial_backoff`; if startup opened a channel, the first
-            // reopen after a session that carried commands uses `initial_backoff`.
-            delay: if had_initial_channel {
-                Duration::ZERO
-            } else {
-                initial_backoff
-            },
-            saw_command_since_open: had_initial_channel,
+            delay: initial_backoff,
+            saw_command_since_open: false,
             has_open_channel: had_initial_channel,
             initial_backoff,
             max_backoff,
@@ -354,8 +347,9 @@ impl ReopenBackoff {
         let was_open = std::mem::replace(&mut self.has_open_channel, false);
         let sleep = if self.saw_command_since_open {
             self.saw_command_since_open = false;
-            self.delay = self.initial_backoff;
-            self.initial_backoff
+            let sleep = self.initial_backoff.min(self.max_backoff);
+            self.delay = (sleep * 2).min(self.max_backoff);
+            sleep
         } else {
             let sleep = self.delay.clamp(self.initial_backoff, self.max_backoff);
             self.delay = (sleep * 2).min(self.max_backoff);
@@ -365,8 +359,10 @@ impl ReopenBackoff {
     }
 
     fn note_open_succeeded(&mut self) {
+        // Preserve accumulated `delay` across empty open->close sessions; only
+        // a real command admitted via `note_command()` resets the backoff
+        // schedule back to `initial_backoff` (design §5.7).
         self.has_open_channel = true;
-        self.delay = self.initial_backoff;
     }
 }
 
@@ -4058,5 +4054,43 @@ mod tests {
             replies, MAX_IPC_READS_PER_TURN,
             "executor must process exactly one bounded turn ({MAX_IPC_READS_PER_TURN} packets) before latching ready stop signal (saw {replies} replies)"
         );
+    }
+
+    #[test]
+    fn reopen_backoff_doubles_across_empty_successful_opens_and_resets_only_after_command() {
+        // Codex P2: repeated empty open->close sessions (no admitted command)
+        // must double backoff 1s -> 2s -> 4s -> 8s -> 16s -> 30s (design §5.7)
+        // rather than resetting to 1s on `note_open_succeeded()`.
+        let mut backoff = ReopenBackoff::new(true, Duration::from_secs(1), Duration::from_secs(30));
+        let expected_empty = [1u64, 2, 4, 8, 16, 30, 30];
+        for secs in expected_empty {
+            let (sleep, was_open) = backoff.next_sleep();
+            assert!(was_open);
+            assert_eq!(
+                sleep,
+                Duration::from_secs(secs),
+                "empty open->close sessions must double backoff up to 30s"
+            );
+            backoff.note_open_succeeded();
+        }
+
+        // Admitting a command resets the next reopen sleep to 1s, and a
+        // subsequent empty session resumes doubling at 2s.
+        backoff.note_command();
+        assert_eq!(backoff.next_sleep(), (Duration::from_secs(1), true));
+        backoff.note_open_succeeded();
+        assert_eq!(backoff.next_sleep(), (Duration::from_secs(2), true));
+
+        // Startup without an initial channel: failed opens double, an empty
+        // open preserves accumulated backoff, and a command resets it.
+        let mut deferred =
+            ReopenBackoff::new(false, Duration::from_secs(1), Duration::from_secs(30));
+        assert_eq!(deferred.next_sleep(), (Duration::from_secs(1), false));
+        assert_eq!(deferred.next_sleep(), (Duration::from_secs(2), false));
+        deferred.note_open_succeeded();
+        assert_eq!(deferred.next_sleep(), (Duration::from_secs(4), true));
+        deferred.note_open_succeeded();
+        deferred.note_command();
+        assert_eq!(deferred.next_sleep(), (Duration::from_secs(1), true));
     }
 }

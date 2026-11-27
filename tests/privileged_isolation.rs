@@ -1924,15 +1924,18 @@ time.sleep(60)
 "#;
 
 fn run_cvm_malicious_ipc_child(run_dir: &Path, marker_dir: &Path) {
-    let run_dir_fd = open_owned_run_dir(run_dir, 0);
-    if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
-        verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_MALICIOUS_IPC_OK");
-        return;
+    {
+        let run_dir_fd = open_owned_run_dir(run_dir, 0);
+        if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
+            verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_MALICIOUS_IPC_OK");
+            return;
+        }
     }
 
     let uid600 = qeminga_account("qeminga", 600);
     let _uid601 = qeminga_account("qeminga-parser", 601);
 
+    // `run_dir_fd` is closed above so fd 3 (`IPC_FD`) is free for pinning.
     let (exec_raw, parser_sock) = seqpacket_pair(true).unwrap();
     let exec_sock = pin_unused_fd_cloexec(exec_raw, IPC_FD).unwrap();
     assert_eq!(exec_sock.as_raw_fd(), IPC_FD);
@@ -1952,13 +1955,13 @@ fn run_cvm_malicious_ipc_child(run_dir: &Path, marker_dir: &Path) {
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    {
+    let mut gen1_result = {
+        let run_dir_fd = open_owned_run_dir(run_dir, 0);
         let mut pid_file = create_exclusive_regular_file(&run_dir_fd, "gen1_parser_pid").unwrap();
         writeln!(pid_file, "{child_pid}").unwrap();
         pid_file.flush().unwrap();
-    }
-    let mut gen1_result = create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap();
-    drop(run_dir_fd);
+        create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap()
+    };
 
     chown(marker_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
     std::fs::set_permissions(marker_dir, Permissions::from_mode(0o700)).unwrap();
@@ -3429,15 +3432,18 @@ time.sleep(60)
 "#;
 
 fn run_cvm_violation_while_frozen_child(mount: &str, run_dir: &Path, marker_dir: &Path) {
-    let run_dir_fd = open_owned_run_dir(run_dir, 0);
-    if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
-        verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_VIOLATION_FROZEN_OK");
-        return;
+    {
+        let run_dir_fd = open_owned_run_dir(run_dir, 0);
+        if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
+            verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_VIOLATION_FROZEN_OK");
+            return;
+        }
     }
 
     let uid600 = qeminga_account("qeminga", 600);
     let _uid601 = qeminga_account("qeminga-parser", 601);
 
+    // `run_dir_fd` is closed above so fd 3 (`IPC_FD`) is free for pinning.
     let (exec_raw, parser_sock) = seqpacket_pair(true).unwrap();
     let exec_sock = pin_unused_fd_cloexec(exec_raw, IPC_FD).unwrap();
     assert_eq!(exec_sock.as_raw_fd(), IPC_FD);
@@ -3458,13 +3464,13 @@ fn run_cvm_violation_while_frozen_child(mount: &str, run_dir: &Path, marker_dir:
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    {
+    let mut gen1_result = {
+        let run_dir_fd = open_owned_run_dir(run_dir, 0);
         let mut pid_file = create_exclusive_regular_file(&run_dir_fd, "gen1_parser_pid").unwrap();
         writeln!(pid_file, "{child_pid}").unwrap();
         pid_file.flush().unwrap();
-    }
-    let mut gen1_result = create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap();
-    drop(run_dir_fd);
+        create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap()
+    };
 
     chown(marker_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
     std::fs::set_permissions(marker_dir, Permissions::from_mode(0o700)).unwrap();

@@ -109,7 +109,8 @@ even while `CAP_SYS_ADMIN` is held.
   - `ExecStartPre=+` runs as root without the unit's read-only sandboxing solely to ensure `/run/qeminga` exists (`mkdir -p`), is owned by `qeminga:qeminga` (`chown`), and is mode `0700` (`chmod`) — preserving any pre-existing recovery marker across restarts — before `ExecStart` enters its confined mount namespace. The leading `-` on `ReadWritePaths=-/run/qeminga` is required because systemd still evaluates `ReadWritePaths=` for `ExecStartPre=+`; without `-`, a missing `/run/qeminga` fails `ExecStartPre=+` with `226/NAMESPACE` before `mkdir -p` runs.
   - `ExecStart=/usr/bin/qeminga` starts inside the confined mount namespace (`ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`, `SystemCallFilter=~@mount`) as UID `0` with `CapabilityBoundingSet` (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`) to read `/etc/qeminga/config.toml`, pin `/run/qeminga`, open the channel device (`O_RDWR`), drop to UID/GID `600`, drop excess capabilities, set `NoNewPrivs`, and install the seccomp filter — before reading any host input.
 - **After privilege drop (serving host input):**
-  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`): the only ordinary-file directory writable to the service (for mounts present at service start), holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
+  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`): the default ordinary-file directory writable to the service for mounts present at service start (by default, the only such directory when `[agent] freeze_ownership_dir` is unset), holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
+  - Shared cooperative freeze-ownership claim directory (`[agent] freeze_ownership_dir`) **only** when the guest operator opts into cooperative multi-freezer mode and grants write access through a guest systemd drop-in; see [Single-freezer assumption (default) and cooperative multi-freezer mode](#cooperative-freeze-ownership) below for the directory ownership, permission, and drop-in requirements.
   - `/dev/virtio-ports/org.qemu.guest_agent.0` (`0600 qeminga:qeminga`, symlink to `/dev/vport*`): the read-write virtio-serial character device opened at startup and reopened after disconnect/hot-unplug.
   - Inherited `stderr` journald stream (`StandardError=journal`): structured audit records.
   - `/sys/power/state` **only** when the guest operator opts into `suspend_ram` (both guest-installed `tmpfiles.d/qeminga-suspend.conf` and a guest `ReadWritePaths=/sys/power/state` drop-in).
@@ -244,8 +245,11 @@ device numbers, or marker paths).
     `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`,
     `SystemCallFilter=~@mount`, and `UMask=0077`), which confines
     ordinary file writes on mounts present at service start to
-    `/run/qeminga` (plus `/sys/power/state` only with guest-installed
-    `tmpfiles.d/qeminga-suspend.conf` and a guest suspend drop-in) while
+    `/run/qeminga` by default (plus any configured
+    `[agent] freeze_ownership_dir` only with the [cooperative-ownership
+    drop-in](#cooperative-freeze-ownership) below, and `/sys/power/state`
+    only with guest-installed `tmpfiles.d/qeminga-suspend.conf` and a
+    guest suspend drop-in) while
     leaving the residual writable objects inventoried above (character
     devices under `/dev`, `/proc/self/*`, and filesystems mounted in the
     guest's system-manager mount namespace after service start).
@@ -340,7 +344,7 @@ device numbers, or marker paths).
   Replacing a required path with another eligible filesystem before
   `guest-fsfreeze-freeze-list` still yields a matching freeze and thaw
   count because reply-local `fs-N` identifiers cannot detect remounts.
-- **Single-freezer assumption (default) and cooperative multi-freezer mode (OQ-11, #69).**
+- <a id="cooperative-freeze-ownership"></a>**Single-freezer assumption (default) and cooperative multi-freezer mode (OQ-11, #69).**
   By default (`[agent] freeze_ownership_dir` unset), design §4.2 assumes
   qeminga is the sole freezer in the guest: a host-requested
   `guest-fsfreeze-thaw` while qeminga is already `Thawed` runs a

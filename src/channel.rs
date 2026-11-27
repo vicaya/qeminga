@@ -997,7 +997,7 @@ const MAX_DRAIN_BYTES: usize = 64 * 1024;
 /// Peer state of an already-open channel descriptor, inferred from a
 /// non-blocking `ppoll(2)` probe (§5.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HostState {
+pub(crate) enum HostState {
     /// Connected (or no disconnect indicated): start a session.
     Ready,
     /// Open Linux `virtio_console` port whose host side is disconnected:
@@ -1011,7 +1011,7 @@ enum HostState {
 /// Input-queue boundary state carried alongside a retained open channel
 /// descriptor for disconnects observed by the guest (§5.7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InputQueue {
+pub(crate) enum InputQueue {
     /// No observed disconnect remains un-drained (freshly opened descriptor, or
     /// an observed disconnected virtio port drained to EOF/`EAGAIN` while still
     /// disconnected). Note that Linux `virtio_console` exposes only the current
@@ -1051,7 +1051,7 @@ enum HostWait {
 
 /// Outcome of draining unread bytes from a host-disconnected virtio-serial port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainOutcome {
+pub(crate) enum DrainOutcome {
     /// Receive queue emptied (`Ok(0)` / `EAGAIN`), establishing a clean boundary.
     Drained,
     /// Host stayed disconnected, but [`MAX_DRAIN_BYTES`] was reached before the
@@ -1067,7 +1067,7 @@ enum DrainOutcome {
 /// 0.31 does not expose it as a named [`PollFlags`] constant, so we pass it via
 /// `from_bits_retain` and check it explicitly (and `PollFd::revents()` also
 /// fails closed to `None` when unknown bits are returned).
-const POLLRDHUP_FLAG: PollFlags = PollFlags::from_bits_retain(nix::libc::POLLRDHUP);
+pub(crate) const POLLRDHUP_FLAG: PollFlags = PollFlags::from_bits_retain(nix::libc::POLLRDHUP);
 
 #[derive(Debug, Clone, Copy)]
 struct ServeTimers {
@@ -1075,7 +1075,7 @@ struct ServeTimers {
     host_wait: Backoff,
 }
 
-fn classify_channel_revents(revents: PollFlags) -> HostState {
+pub(crate) fn classify_channel_revents(revents: PollFlags) -> HostState {
     if revents.intersects(PollFlags::POLLERR | PollFlags::POLLNVAL | POLLRDHUP_FLAG) {
         return HostState::Closed;
     }
@@ -1095,7 +1095,7 @@ fn classify_channel_revents(revents: PollFlags) -> HostState {
     HostState::Ready
 }
 
-fn poll_host_state(fd: BorrowedFd<'_>) -> HostState {
+pub(crate) fn poll_host_state(fd: BorrowedFd<'_>) -> HostState {
     use nix::poll::{PollFd, ppoll};
     use nix::sys::time::TimeSpec;
 
@@ -1134,7 +1134,7 @@ fn is_host_disconnect_end(end: &SessionEnd) -> bool {
 /// replacement peer, so the function returns [`DrainOutcome::Reset`] to force a
 /// close-and-reopen transport reset rather than feeding unverified bytes into
 /// ordinary dispatch.
-fn drain_disconnected_input<P>(fd: BorrowedFd<'_>, probe: &P) -> DrainOutcome
+pub(crate) fn drain_disconnected_input<P>(fd: BorrowedFd<'_>, probe: &P) -> DrainOutcome
 where
     P: Fn(BorrowedFd<'_>) -> HostState + Send + Sync,
 {

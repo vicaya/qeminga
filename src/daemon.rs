@@ -58,6 +58,9 @@ use crate::state::{FreezeState, FreezeStateMachine};
 /// The service account (§5.4, §8.3).
 pub const SERVICE_USER: &str = "qeminga";
 
+/// The dedicated zero-capability parser account (OQ-10 §3.2, #78).
+pub const PARSER_USER: &str = "qeminga-parser";
+
 /// `EX_USAGE`.
 pub const EX_USAGE: u8 = 64;
 /// `EX_UNAVAILABLE`: the channel cannot be served (already open).

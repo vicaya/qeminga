@@ -45,16 +45,16 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use e2e::{Agent, SpawnOptions, ThawGuard, dev_of, handle};
 use nix::errno::Errno;
-use nix::fcntl::{AT_FDCWD, FcntlArg, OFlag, fcntl, open, openat};
+use nix::fcntl::{AT_FDCWD, AtFlags, FcntlArg, OFlag, fcntl, open, openat};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{Signal, kill};
-use nix::sys::stat::{Mode, fstat, major, minor};
-use nix::unistd::{Gid, Pid, Uid, UnlinkatFlags, chown, pipe, unlinkat};
+use nix::sys::stat::{Mode, fchmod, fstat, fstatat, major, minor};
+use nix::unistd::{Gid, Pid, Uid, UnlinkatFlags, chown, fchown, mkdir, pipe, unlinkat};
 use serde_json::{Value, json};
 use tracing::instrument::WithSubscriber;
 
@@ -213,11 +213,129 @@ impl FileSnapshot {
     }
 }
 
+/// An exclusively created boundary fixture file whose `(dev, ino)` is verified
+/// via `fstatat(..., AT_SYMLINK_NOFOLLOW)` before teardown unlinks it.
+struct OwnedFixtureFile {
+    parent_dir: PathBuf,
+    name: String,
+    dev: u64,
+    ino: u64,
+}
+
+impl OwnedFixtureFile {
+    fn try_create_exclusive(
+        parent_dir: &Path,
+        name: &str,
+        uid: Uid,
+        gid: Gid,
+        mode: u32,
+        bytes: &[u8],
+    ) -> Result<Self, Errno> {
+        let dirfd = open(
+            parent_dir,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )?;
+        let fd = openat(
+            &dirfd,
+            name,
+            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::from_bits_truncate(0o600),
+        )?;
+        fchown(&fd, Some(uid), Some(gid))?;
+        fchmod(&fd, Mode::from_bits_truncate(mode))?;
+        let mut file = File::from(fd);
+        file.write_all(bytes)
+            .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(nix::libc::EIO)))?;
+        let st = fstat(&file)?;
+        Ok(OwnedFixtureFile {
+            parent_dir: parent_dir.to_path_buf(),
+            name: name.to_owned(),
+            dev: st.st_dev,
+            ino: st.st_ino,
+        })
+    }
+}
+
+impl Drop for OwnedFixtureFile {
+    fn drop(&mut self) {
+        let Ok(dirfd) = open(
+            &self.parent_dir,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        if let Ok(st) = fstatat(&dirfd, self.name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+            && (st.st_dev, st.st_ino) == (self.dev, self.ino)
+        {
+            let _ = unlinkat(&dirfd, self.name.as_str(), UnlinkatFlags::NoRemoveDir);
+        }
+    }
+}
+
+/// An exclusively created directory whose `(dev, ino)` is verified before
+/// teardown calls `rmdir` on it; pre-existing directories are never mutated or
+/// removed.
+struct OwnedFixtureDir {
+    parent_dir: PathBuf,
+    name: String,
+    dev: u64,
+    ino: u64,
+}
+
+impl OwnedFixtureDir {
+    fn try_create_exclusive(parent_dir: &Path, name: &str, mode: u32) -> Option<Self> {
+        let full = parent_dir.join(name);
+        match mkdir(&full, Mode::from_bits_truncate(0o700)) {
+            Ok(()) => {
+                let dfd = open(
+                    &full,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                    Mode::empty(),
+                )
+                .unwrap();
+                fchown(&dfd, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+                fchmod(&dfd, Mode::from_bits_truncate(mode)).unwrap();
+                let st = fstat(&dfd).unwrap();
+                Some(OwnedFixtureDir {
+                    parent_dir: parent_dir.to_path_buf(),
+                    name: name.to_owned(),
+                    dev: st.st_dev,
+                    ino: st.st_ino,
+                })
+            }
+            Err(Errno::EEXIST) => None,
+            Err(e) => panic!("mkdir {}: {e}", full.display()),
+        }
+    }
+}
+
+impl Drop for OwnedFixtureDir {
+    fn drop(&mut self) {
+        let Ok(parent_fd) = open(
+            &self.parent_dir,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) else {
+            return;
+        };
+        if let Ok(st) = fstatat(&parent_fd, self.name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+            && (st.st_dev, st.st_ino) == (self.dev, self.ino)
+        {
+            let _ = unlinkat(&parent_fd, self.name.as_str(), UnlinkatFlags::RemoveDir);
+        }
+    }
+}
+
 /// The four synthetic guest secrets and unrelated writable files required
-/// simultaneously by `docs/isolation-design.md` §6.
+/// simultaneously by `docs/isolation-design.md` §6, acquired exclusively with
+/// descriptor-pinned ownership/mode and identity-verified teardown.
 struct BoundaryFixtures {
     snapshots: Vec<FileSnapshot>,
-    created_etc_config: bool,
+    // Field drop order is declaration order: files unlink before dirs rmdir.
+    _owned_files: Vec<OwnedFixtureFile>,
+    _owned_dirs: Vec<OwnedFixtureDir>,
 }
 
 impl BoundaryFixtures {
@@ -226,61 +344,80 @@ impl BoundaryFixtures {
         let uid600 = qeminga_account("qeminga", 600);
         let _uid601 = qeminga_account("qeminga-parser", 601);
 
-        std::fs::create_dir_all(SECRET_DIR).unwrap();
-        chown(
-            Path::new(SECRET_DIR),
-            Some(Uid::from_raw(0)),
-            Some(Gid::from_raw(0)),
-        )
-        .unwrap();
-        std::fs::set_permissions(SECRET_DIR, Permissions::from_mode(0o755)).unwrap();
+        let mut owned_dirs = Vec::new();
+        let mut owned_files = Vec::new();
 
-        for (path, bytes, uid, gid, mode) in [
+        if let Some(d) = OwnedFixtureDir::try_create_exclusive(
+            Path::new("/var/lib"),
+            "qeminga-boundary-test",
+            0o755,
+        ) {
+            owned_dirs.push(d);
+        }
+
+        for (parent, name, bytes, uid, gid, mode) in [
             (
-                ROOT_SECRET_PATH,
+                Path::new(SECRET_DIR),
+                "root-secret",
                 ROOT_SECRET_BYTES,
                 Uid::from_raw(0),
                 Gid::from_raw(0),
                 0o600u32,
             ),
             (
-                WORLD_SECRET_PATH,
+                Path::new(SECRET_DIR),
+                "world-secret",
                 WORLD_SECRET_BYTES,
                 Uid::from_raw(0),
                 Gid::from_raw(0),
                 0o644,
             ),
             (
-                UID600_FILE_PATH,
+                Path::new("/tmp"),
+                "qeminga-boundary-uid600",
                 UID600_FILE_BYTES,
                 uid600.uid,
                 uid600.gid,
                 0o600,
             ),
             (
-                WORLD_FILE_PATH,
+                Path::new("/tmp"),
+                "qeminga-boundary-world",
                 WORLD_FILE_BYTES,
                 Uid::from_raw(0),
                 Gid::from_raw(0),
                 0o666,
             ),
         ] {
-            let _ = std::fs::remove_file(path);
-            std::fs::write(path, bytes).unwrap();
-            chown(Path::new(path), Some(uid), Some(gid)).unwrap();
-            std::fs::set_permissions(path, Permissions::from_mode(mode)).unwrap();
+            let owned =
+                OwnedFixtureFile::try_create_exclusive(parent, name, uid, gid, mode, bytes)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "boundary fixture {}/{name} must not pre-exist (exclusive creation failed: {e})",
+                            parent.display()
+                        )
+                    });
+            owned_files.push(owned);
         }
 
         // Ensure `/etc/qeminga/config.toml` exists for Check 2's read probe,
-        // cleaning it up only if we created it.
-        let created_etc_config = if !Path::new(CONFIG_PATH).exists() {
-            std::fs::create_dir_all("/etc/qeminga").unwrap();
-            std::fs::write(CONFIG_PATH, b"[agent]\nlog_level = \"info\"\n").unwrap();
-            std::fs::set_permissions(CONFIG_PATH, Permissions::from_mode(0o644)).unwrap();
-            true
-        } else {
-            false
-        };
+        // creating and owning it (and `/etc/qeminga`) only when absent.
+        if let Some(d) = OwnedFixtureDir::try_create_exclusive(Path::new("/etc"), "qeminga", 0o755)
+        {
+            owned_dirs.push(d);
+        }
+        match OwnedFixtureFile::try_create_exclusive(
+            Path::new("/etc/qeminga"),
+            "config.toml",
+            Uid::from_raw(0),
+            Gid::from_raw(0),
+            0o644,
+            b"[agent]\nlog_level = \"info\"\n",
+        ) {
+            Ok(owned) => owned_files.push(owned),
+            Err(Errno::EEXIST) => {}
+            Err(e) => panic!("create {CONFIG_PATH}: {e}"),
+        }
 
         let snapshots = [
             ROOT_SECRET_PATH,
@@ -294,31 +431,14 @@ impl BoundaryFixtures {
 
         BoundaryFixtures {
             snapshots,
-            created_etc_config,
+            _owned_files: owned_files,
+            _owned_dirs: owned_dirs,
         }
     }
 
     fn assert_all_intact(&self) {
         for snap in &self.snapshots {
             snap.assert_intact();
-        }
-    }
-}
-
-impl Drop for BoundaryFixtures {
-    fn drop(&mut self) {
-        for path in [
-            ROOT_SECRET_PATH,
-            WORLD_SECRET_PATH,
-            UID600_FILE_PATH,
-            WORLD_FILE_PATH,
-        ] {
-            let _ = std::fs::remove_file(path);
-        }
-        let _ = std::fs::remove_dir(SECRET_DIR);
-        if self.created_etc_config {
-            let _ = std::fs::remove_file(CONFIG_PATH);
-            let _ = std::fs::remove_dir("/etc/qeminga");
         }
     }
 }
@@ -404,7 +524,7 @@ fn run_self_probe(test_name: &str, probe: &str, aux: Option<&str>) -> std::proce
     cmd.args([
         "--exact",
         test_name,
-        "--ignored",
+        "--include-ignored",
         "--nocapture",
         "--test-threads=1",
     ])
@@ -593,60 +713,75 @@ impl StatfsSource for StaticStatfs {
     }
 }
 
-/// Private bind mount of a dedicated `0700 root:root` subdirectory on the real
-/// ext4 superblock so opening the mountpoint exercises `CAP_DAC_READ_SEARCH`
-/// without mutating the source loop mount's root inode permissions.
+/// Private bind mount of a unique per-run `0700 root:root` subdirectory on the
+/// real ext4 superblock so opening the mountpoint exercises
+/// `CAP_DAC_READ_SEARCH` without mutating the source loop mount's root inode or
+/// touching any fixed path on ext4.
 struct PrivateBindMount {
-    path: PathBuf,
-    backing_subdir: PathBuf,
+    // Drop runs `PrivateBindMount::drop` (umount) before dropping fields.
+    mount_dir: tempfile::TempDir,
+    _backing_subdir: tempfile::TempDir,
 }
 
 impl PrivateBindMount {
-    fn create(source: &str, at: PathBuf, mode: u32) -> Self {
-        let backing_subdir = Path::new(source).join("qeminga-oq10-0700-sub");
-        let _ = std::fs::remove_dir_all(&backing_subdir);
-        std::fs::create_dir(&backing_subdir).unwrap();
-        chown(
-            &backing_subdir,
-            Some(Uid::from_raw(0)),
-            Some(Gid::from_raw(0)),
+    fn create(source: &str, mount_parent: &Path, mode: u32) -> Self {
+        let backing_subdir = tempfile::Builder::new()
+            .prefix("qeminga-oq10-0700-sub-")
+            .tempdir_in(source)
+            .unwrap();
+        let dfd = open(
+            backing_subdir.path(),
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
         )
         .unwrap();
-        std::fs::set_permissions(&backing_subdir, Permissions::from_mode(mode)).unwrap();
+        fchown(&dfd, Some(Uid::from_raw(0)), Some(Gid::from_raw(0))).unwrap();
+        fchmod(&dfd, Mode::from_bits_truncate(mode)).unwrap();
+        drop(dfd);
 
-        let _ = std::fs::remove_dir(&at);
-        std::fs::create_dir(&at).unwrap();
+        let mount_dir = tempfile::Builder::new()
+            .prefix("qeminga-oq10-0700-mnt-")
+            .tempdir_in(mount_parent)
+            .unwrap();
         let status = ProcessCommand::new("mount")
             .args([
                 "--bind",
-                backing_subdir.to_str().unwrap(),
-                at.to_str().unwrap(),
+                backing_subdir.path().to_str().unwrap(),
+                mount_dir.path().to_str().unwrap(),
             ])
             .status()
             .unwrap();
         assert!(
             status.success(),
             "mount --bind {} -> {}",
-            backing_subdir.display(),
-            at.display()
+            backing_subdir.path().display(),
+            mount_dir.path().display()
         );
         let status = ProcessCommand::new("mount")
-            .args(["--make-private", at.to_str().unwrap()])
+            .args(["--make-private", mount_dir.path().to_str().unwrap()])
             .status()
             .unwrap();
-        assert!(status.success(), "mount --make-private {}", at.display());
+        assert!(
+            status.success(),
+            "mount --make-private {}",
+            mount_dir.path().display()
+        );
         PrivateBindMount {
-            path: at,
-            backing_subdir,
+            mount_dir,
+            _backing_subdir: backing_subdir,
         }
+    }
+
+    fn path(&self) -> &Path {
+        self.mount_dir.path()
     }
 }
 
 impl Drop for PrivateBindMount {
     fn drop(&mut self) {
-        let _ = ProcessCommand::new("umount").arg(&self.path).status();
-        let _ = std::fs::remove_dir(&self.path);
-        let _ = std::fs::remove_dir_all(&self.backing_subdir);
+        let _ = ProcessCommand::new("umount")
+            .arg(self.mount_dir.path())
+            .status();
     }
 }
 
@@ -1058,6 +1193,12 @@ sock.close()
 fn run_cvm_channel_verify_child(work_dir: &Path) {
     let uid600 = qeminga_account("qeminga", 600);
 
+    // Pin executor IPC socket to `IPC_FD = 3` FIRST while fd 3 is guaranteed
+    // unused (before opening the 4 PTY fixtures that would otherwise claim it).
+    let (exec_raw, peer_sock) = seqpacket_pair(false).unwrap();
+    let exec_sock = pin_unused_fd_cloexec(exec_raw, IPC_FD).unwrap();
+    assert_eq!(exec_sock.as_raw_fd(), IPC_FD);
+
     let regular = work_dir.join("regular");
     std::fs::write(&regular, b"not-a-device").unwrap();
     std::fs::set_permissions(&regular, Permissions::from_mode(0o666)).unwrap();
@@ -1118,12 +1259,8 @@ fn run_cvm_channel_verify_child(work_dir: &Path) {
     symlink(&pty_v1.slave_path, &udev_link).unwrap();
     std::fs::set_permissions(&udev_dir, Permissions::from_mode(0o755)).unwrap();
 
-    // Pin executor IPC socket to `IPC_FD = 3` and spawn the peer child with the
-    // other end before dropping privileges or installing CVM executor seccomp.
-    let (exec_raw, peer_sock) = seqpacket_pair(false).unwrap();
-    let exec_sock = pin_unused_fd_cloexec(exec_raw, IPC_FD).unwrap();
-    assert_eq!(exec_sock.as_raw_fd(), IPC_FD);
-
+    // Spawn the peer child with the other IPC socket end before dropping
+    // privileges or installing CVM executor seccomp.
     let mut peer = spawn_parser(ParserSpawnSpec {
         exe: PathBuf::from("/usr/bin/python3"),
         args: vec![
@@ -1476,28 +1613,26 @@ fn run_cvm_malicious_ipc_child(state_dir: &Path) {
         tracing::Level::INFO,
         router.clone(),
     ));
+    tracing::dispatcher::set_global_default(dispatch).unwrap();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
-    let exit = rt.block_on(
-        serve_ipc_with_backoff(
-            Arc::clone(&ctx),
-            exec_sock,
-            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
-            opener,
-            false,
-            Some(child),
-            false,
-            std::future::pending::<&'static str>(),
-            Duration::from_millis(20),
-            Duration::from_millis(50),
-            Duration::from_millis(20),
-        )
-        .with_subscriber(dispatch),
-    );
+    let exit = rt.block_on(serve_ipc_with_backoff(
+        Arc::clone(&ctx),
+        exec_sock,
+        PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+        opener,
+        false,
+        Some(child),
+        false,
+        std::future::pending::<&'static str>(),
+        Duration::from_millis(20),
+        Duration::from_millis(50),
+        Duration::from_millis(20),
+    ));
 
     assert!(
         matches!(exit, Err(ExecutorExitError::ProtocolViolation(_))),
@@ -1770,15 +1905,13 @@ if len(r2) < 23 or r2[17] != 0x0b:
 sock.close()
 "#;
 
-async fn run_check4_audit_sink_isolation(drop_to_uid601: bool) {
-    let sink = SharedSink::default();
-    let router = Router::new(Box::new(sink.clone()));
+async fn run_check4_executor_subprocess(drop_to_uid601: bool) {
+    let router = Router::stderr().unwrap();
     let dispatch = tracing::Dispatch::new(qeminga::audit::subscriber(
         tracing::Level::INFO,
         router.clone(),
     ));
-    let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
-    tracing::callsite::rebuild_interest_cache();
+    tracing::dispatcher::set_global_default(dispatch).unwrap();
 
     let state_dir = tempfile::Builder::new()
         .prefix("qeminga-oq10-c4-")
@@ -1825,7 +1958,6 @@ async fn run_check4_audit_sink_isolation(drop_to_uid601: bool) {
         Duration::from_millis(20),
         Duration::from_millis(20),
     )
-    .with_subscriber(dispatch.clone())
     .await;
 
     assert!(
@@ -1839,8 +1971,24 @@ async fn run_check4_audit_sink_isolation(drop_to_uid601: bool) {
         "mock audit-injection parser exited unexpectedly: {wait_status:?}"
     );
     assert!(router.settle(Duration::from_secs(2)));
+    println!("CHECK4_EXECUTOR_OK");
+    let _ = std::io::stdout().flush();
+}
 
-    let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+fn verify_check4_captured_stderr(test_name: &str) {
+    let out = run_self_probe(test_name, "audit-sink-executor", None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let logs = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("CHECK4_EXECUTOR_OK"),
+        "check4 executor subprocess failed: {:?}\nstdout={stdout}\nstderr={logs}",
+        out.status
+    );
+    assert!(
+        !stdout.contains("9999") && !stdout.contains("\"outcome\":\"allowed\""),
+        "forged audit payload leaked onto executor stdout: {stdout}"
+    );
+
     let cmd_lines: Vec<&str> = logs
         .lines()
         .filter(|l| l.contains("\"event\":\"command_received\""))
@@ -1859,7 +2007,7 @@ async fn run_check4_audit_sink_isolation(drop_to_uid601: bool) {
     );
     assert!(
         !logs.contains("9999") && !logs.contains("\"outcome\":\"allowed\""),
-        "forged audit payload leaked into authoritative stream: {logs}"
+        "forged audit payload leaked into authoritative stderr audit pipe: {logs}"
     );
 
     let obs_lines: Vec<&str> = logs
@@ -1878,14 +2026,24 @@ async fn run_check4_audit_sink_isolation(drop_to_uid601: bool) {
 
 #[tokio::test]
 async fn oq10_check4_audit_sink_isolation_probe_unprivileged() {
-    run_check4_audit_sink_isolation(false).await;
+    if let Ok(probe) = std::env::var(ENV_PROBE) {
+        assert_eq!(probe, "audit-sink-executor");
+        run_check4_executor_subprocess(false).await;
+        return;
+    }
+    verify_check4_captured_stderr("oq10_check4_audit_sink_isolation_probe_unprivileged");
 }
 
 #[tokio::test]
 #[ignore = "needs root and qeminga-parser account (OQ-10 §6 Check 4)"]
 async fn privileged_oq10_check4_audit_sink_isolation_probe() {
+    if let Ok(probe) = std::env::var(ENV_PROBE) {
+        assert_eq!(probe, "audit-sink-executor");
+        run_check4_executor_subprocess(true).await;
+        return;
+    }
     let fixtures = BoundaryFixtures::setup();
-    run_check4_audit_sink_isolation(true).await;
+    verify_check4_captured_stderr("privileged_oq10_check4_audit_sink_isolation_probe");
     fixtures.assert_all_intact();
 }
 
@@ -1893,9 +2051,8 @@ async fn privileged_oq10_check4_audit_sink_isolation_probe() {
 
 struct BarrierFreezeKernel {
     inner: FakeKernel,
-    entered: Barrier,
-    release: Barrier,
-    armed: Mutex<bool>,
+    entered_tx: Mutex<Option<mpsc::SyncSender<()>>>,
+    release_rx: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl KernelOps for BarrierFreezeKernel {
@@ -1904,15 +2061,15 @@ impl KernelOps for BarrierFreezeKernel {
     }
 
     fn fifreeze(&self, mount: &Mount) -> Result<(), KernelError> {
-        let should_gate = {
-            let mut armed = self.armed.lock().unwrap();
-            let v = *armed;
-            *armed = false;
-            v
-        };
-        if should_gate {
-            self.entered.wait();
-            self.release.wait();
+        let gate = (
+            self.entered_tx.lock().unwrap().take(),
+            self.release_rx.lock().unwrap().take(),
+        );
+        if let (Some(entered_tx), Some(release_rx)) = gate {
+            let _ = entered_tx.send(());
+            // Unblocks either on explicit release or when the driver drops
+            // `release_tx` during unwind, so a failed test never hangs.
+            let _ = release_rx.recv();
         }
         self.inner.fifreeze(mount)
     }
@@ -1951,13 +2108,17 @@ async fn run_check5_deterministic_reconnect() {
     let marker_path = state_dir.path().join("frozen");
     let marker = Marker::open(&marker_path).unwrap();
 
+    let (entered_tx, entered_rx) = mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
     let kernel = Arc::new(BarrierFreezeKernel {
         inner: FakeKernel::new(),
-        entered: Barrier::new(2),
-        release: Barrier::new(2),
-        armed: Mutex::new(true),
+        entered_tx: Mutex::new(Some(entered_tx)),
+        release_rx: Mutex::new(Some(release_rx)),
     });
+    // Enable `information` so session G+1's queued `guest-get-osinfo` (Kind::Ordinary)
+    // is authorized by config and waits in ExecutorLaneGate behind session G's freeze.
     let mut cfg = Config::default();
+    cfg.features.information = true;
     cfg.agent.fsfreeze_idle_timeout_secs = 30;
     cfg.agent.fsfreeze_max_timeout_secs = 60;
     let ctx = Arc::new(
@@ -2013,53 +2174,90 @@ async fn run_check5_deterministic_reconnect() {
     let parser_thread = std::thread::spawn(move || run_parser_loop(parser_sock, Some(pty1_slave)));
 
     let ctx_check = Arc::clone(&ctx);
-    let kernel_driver = Arc::clone(&kernel);
     let marker_check = marker_path.clone();
     tokio::task::spawn_blocking(move || {
         // Session G: send guest-fsfreeze-freeze with id=42 and wait until the
         // executor is inside `fifreeze`.
         pty1.send_line(r#"{"execute":"guest-fsfreeze-freeze","id":42}"#);
-        kernel_driver.entered.wait();
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("executor did not enter fifreeze");
 
         // Disconnect session G completely (closing both master and slave holder
         // yields POLLHUP on the parser's channel fd so it bumps session_gen and
         // sends RequestChannelReopen -> receives pty2_slave via SCM_RIGHTS).
         drop(pty1);
 
-        // Wait until opener has handed pty2_slave to the parser (session G+1 active).
+        // Deterministic readiness signal on session G+1: `guest-fsfreeze-status`
+        // (Kind::Control) succeeds immediately while session G's freeze is still
+        // blocked at the barrier (wire status is "frozen" while internal state
+        // is `FreezeState::Freezing`), proving pty2 is installed and live.
+        let mut p2_buf = Vec::new();
+        assert_eq!(
+            pty2.request(
+                &mut p2_buf,
+                r#"{"execute":"guest-fsfreeze-status","id":100}"#
+            ),
+            json!({"return": "frozen", "id": 100}),
+            "session G+1 must be live while session G's freeze is still blocked"
+        );
+        assert_eq!(
+            ctx_check.state.current(),
+            FreezeState::Freezing,
+            "session G's freeze must still be in-flight when session G+1 becomes ready"
+        );
+
+        // Send a reused-id=42 Ordinary request (`guest-get-osinfo`) followed by
+        // a Control probe (`guest-ping`, id=101). Because IPC_FD is ordered:
+        //   1. Parser registers (G+1, id=42) in its pending table and sends GetOsInfo(42).
+        //   2. Executor parks GetOsInfo(42) in ExecutorLaneGate behind session G's freeze.
+        //   3. Executor executes Ping(101) immediately and bumps `ctx.handler_calls()`
+        //      (audit lines stay buffered in `Mode::Ring` while Freezing), proving
+        //      deterministically that (G+1, id=42) is actively pending in BOTH peers!
+        let calls_before = ctx_check.handler_calls();
+        pty2.send_line(r#"{"execute":"guest-get-osinfo","id":42}"#);
+        pty2.send_line(r#"{"execute":"guest-ping","id":101}"#);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while pty2_slave_slot.lock().unwrap().is_some() {
+        while ctx_check.handler_calls() <= calls_before {
             assert!(
                 Instant::now() < deadline,
-                "parser did not reopen channel into session G+1"
+                "executor did not admit trailing Ping(101) behind pending GetOsInfo(42) (calls={})",
+                ctx_check.handler_calls()
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(2));
         }
 
-        // Release session G's blocked `fifreeze`: executor completes the freeze,
-        // sets FreezeState::Frozen, retains marker & watchdog, and sends session G's
-        // late `OkCount(1)` reply to the parser (which MUST discard it!).
-        kernel_driver.release.wait();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while ctx_check.state.current() != FreezeState::Frozen {
-            assert!(Instant::now() < deadline, "executor did not reach Frozen");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // Release session G's blocked `fifreeze` WHILE (G+1, id=42) is actively
+        // pending in the parser: executor finishes session G's freeze, transitions
+        // to Frozen, keeps marker & watchdog, sends session G's late `OkCount(1)`
+        // (which the parser MUST discard!), and then completes (G+1, id=42) with
+        // Frozen followed in wire order by Ping(101).
+        release_tx.send(()).unwrap();
+
+        let raw_42 = pty2
+            .read_line(&mut p2_buf, Duration::from_secs(10))
+            .expect("session G+1 reply for id=42");
+        let reply_42: Value = serde_json::from_slice(&raw_42).unwrap();
+        assert_eq!(reply_42["id"], 42);
+        assert_eq!(
+            reply_42["error"]["class"], "GenericError",
+            "session G+1 id=42 must receive its own Frozen error, never session G's return:1 ({reply_42})"
+        );
+        assert!(
+            reply_42.get("return").is_none(),
+            "stale session G return:1 leaked into session G+1: {reply_42}"
+        );
+
+        let raw_101 = pty2
+            .read_line(&mut p2_buf, Duration::from_secs(10))
+            .expect("session G+1 reply for trailing Ping(101)");
+        let reply_101: Value = serde_json::from_slice(&raw_101).unwrap();
+        assert_eq!(reply_101, json!({"return": {}, "id": 101}));
+
+        assert_eq!(ctx_check.state.current(), FreezeState::Frozen);
         assert!(
             marker_check.exists(),
             "executor must retain recovery marker after session G disconnect"
-        );
-        // Give the parser a moment to receive and discard session G's late reply.
-        std::thread::sleep(Duration::from_millis(50));
-
-        // Session G+1 reuses the EXACT same QGA `id: 42` for `guest-ping`:
-        // it must receive ONLY `{"return":{},"id":42}` (never session G's `1`).
-        let mut p2_buf = Vec::new();
-        let ping_reply = pty2.request(&mut p2_buf, r#"{"execute":"guest-ping","id":42}"#);
-        assert_eq!(
-            ping_reply,
-            json!({"return": {}, "id": 42}),
-            "session G+1 received stale session G reply instead of its own ping reply"
         );
 
         // Confirm executor preserved Frozen state and watchdog, then thaw cleanly.
@@ -2096,9 +2294,107 @@ async fn run_check5_deterministic_reconnect() {
         "session G freeze audit record must be preserved: {logs}"
     );
     assert!(
-        logs.contains("\"method\":\"guest-ping\"") && logs.contains("\"id\":42"),
-        "session G+1 ping audit record must be recorded: {logs}"
+        logs.contains("\"method\":\"guest-get-osinfo\"") && logs.contains("\"id\":42"),
+        "session G+1 reused-id request audit record must be recorded: {logs}"
     );
+
+    // Sub-case B: hold session G+1's normal `guest-ping` (reused id=42) actively
+    // pending in `run_parser_loop` while session G's late `OkCount(1)` (and even
+    // a stale-generation reply with a colliding req_id) arrives first on IPC_FD.
+    tokio::task::spawn_blocking(|| {
+        let mut pty1 = TestPty::open(false);
+        let mut pty2 = TestPty::open(false);
+        let pty1_slave = pty1.open_slave_nonblock();
+        let pty2_slave = pty2.open_slave_nonblock();
+
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        let flags = OFlag::from_bits_retain(fcntl(parser_sock.as_fd(), FcntlArg::F_GETFL).unwrap());
+        fcntl(
+            parser_sock.as_fd(),
+            FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+        )
+        .unwrap();
+
+        let parser_thread =
+            std::thread::spawn(move || run_parser_loop(parser_sock, Some(pty1_slave)));
+        let mut asm = StreamAssembler::new(PeerRole::Executor);
+
+        // 1. Session G sends freeze(id=42); executor holds it without replying yet.
+        pty1.send_line(r#"{"execute":"guest-fsfreeze-freeze","id":42}"#);
+        let old_req = recv_request(exec_sock.as_fd(), &mut asm).unwrap().unwrap();
+        assert_eq!(old_req.request, IpcRequest::FsfreezeFreeze);
+
+        // 2. Disconnect session G and complete RequestChannelReopen with pty2_slave.
+        drop(pty1);
+        let reopen_req = recv_request(exec_sock.as_fd(), &mut asm).unwrap().unwrap();
+        assert_eq!(reopen_req.request, IpcRequest::RequestChannelReopen);
+        assert!(reopen_req.session_gen > old_req.session_gen);
+        send_response(
+            exec_sock.as_fd(),
+            reopen_req.session_gen,
+            reopen_req.req_id,
+            &IpcResponse::OkChannelFd,
+            Some(pty2_slave.as_fd()),
+        )
+        .unwrap();
+        drop(pty2_slave);
+
+        // 3. Session G+1 sends normal `guest-ping` reusing `id: 42`; wait until
+        //    the executor receives it over IPC_FD (100% guaranteed pending in parser).
+        pty2.send_line(r#"{"execute":"guest-ping","id":42}"#);
+        let new_ping = recv_request(exec_sock.as_fd(), &mut asm).unwrap().unwrap();
+        assert_eq!(new_ping.session_gen, reopen_req.session_gen);
+        assert_eq!(new_ping.request, IpcRequest::Ping);
+
+        // 4. Deliver session G's late `OkCount(1)` (and a stale-gen reply reusing
+        //    `new_ping.req_id`) BEFORE answering `new_ping` with `OkEmpty`.
+        send_response(
+            exec_sock.as_fd(),
+            old_req.session_gen,
+            old_req.req_id,
+            &IpcResponse::OkCount(1),
+            None,
+        )
+        .unwrap();
+        send_response(
+            exec_sock.as_fd(),
+            old_req.session_gen,
+            new_ping.req_id,
+            &IpcResponse::OkCount(99),
+            None,
+        )
+        .unwrap();
+        send_response(
+            exec_sock.as_fd(),
+            new_ping.session_gen,
+            new_ping.req_id,
+            &IpcResponse::OkEmpty,
+            None,
+        )
+        .unwrap();
+
+        let mut p2_buf = Vec::new();
+        let raw = pty2
+            .read_line(&mut p2_buf, Duration::from_secs(10))
+            .expect("normal guest-ping reply on session G+1");
+        let reply: Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(
+            reply,
+            json!({"return": {}, "id": 42}),
+            "session G+1 must receive ONLY its own pending guest-ping reply"
+        );
+        assert!(
+            pty2.read_line(&mut p2_buf, Duration::from_millis(100))
+                .is_none(),
+            "no stale session G reply may leak to session G+1"
+        );
+
+        drop(exec_sock);
+        drop(pty2);
+        assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2110,7 +2406,51 @@ async fn oq10_check5_deterministic_reconnect_and_late_reply_isolation_unprivileg
 #[ignore = "OQ-10 §6 Check 5 privileged runner verification"]
 async fn privileged_oq10_check5_deterministic_reconnect_and_late_reply_isolation() {
     let fixtures = BoundaryFixtures::setup();
+    // Layer 1: deterministic barrier-synchronized late-reply isolation (pending reused id=42).
     run_check5_deterministic_reconnect().await;
+
+    // Layer 2: deployed process-pair (QEMINGA_RELEASE_BINARY in enforced CI) real
+    // SCM_RIGHTS reconnect under UID 600/601 + enforcing seccomp filters.
+    tokio::task::spawn_blocking(|| {
+        let mut agent = Agent::spawn_with(cvm_real_kernel(""));
+        agent.wait_for_stderr("\"event\":\"privileges_dropped\"", e2e::REPLY_TIMEOUT);
+        assert_eq!(
+            agent.request(r#"{"execute":"guest-ping","id":501}"#),
+            json!({"return": {}, "id": 501})
+        );
+        let parser_pid = wait_for_parser_child(agent.pid());
+        let before = e2e::thread_statuses(parser_pid);
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].field("Uid:"), "601\t601\t601\t601");
+        if cfg!(feature = "seccomp") {
+            assert_eq!(before[0].field("Seccomp:"), "2");
+        }
+
+        // Trigger real disconnect + RequestChannelReopen + SCM_RIGHTS handoff,
+        // then send a distinct command reusing the exact same QGA id (501).
+        agent.reopen_channel();
+        assert_eq!(
+            agent.request_timeout(
+                r#"{"execute":"guest-fsfreeze-status","id":501}"#,
+                e2e::REOPEN_TIMEOUT
+            ),
+            json!({"return": "thawed", "id": 501})
+        );
+        assert_eq!(
+            agent.request(r#"{"execute":"guest-ping","id":502}"#),
+            json!({"return": {}, "id": 502})
+        );
+        assert_eq!(
+            wait_for_parser_child(agent.pid()),
+            parser_pid,
+            "parser child must survive ordinary channel reconnect without respawning"
+        );
+        assert!(agent.stop().success());
+        wait_for_pid_gone(parser_pid, Duration::from_secs(5));
+    })
+    .await
+    .unwrap();
+
     fixtures.assert_all_intact();
 }
 
@@ -2464,7 +2804,108 @@ async fn oq10_check6_large_payloads_osinfo_and_mixed_outcome_fstrim_unprivileged
 #[ignore = "OQ-10 §6 Check 6 privileged runner verification"]
 async fn privileged_oq10_check6_large_payloads_osinfo_and_mixed_outcome_fstrim() {
     let fixtures = BoundaryFixtures::setup();
+    // Layer 1: deterministic synthetic large-payload bounds (>256 KiB & >1 MiB
+    // fsinfo, >256-entry freeze-list + #63, 48 KiB os-release > 32 KiB chunk,
+    // 5001-target mixed-outcome >1 MiB fstrim).
     run_check6_large_payloads().await;
+
+    // Layer 2: deployed process-pair (QEMINGA_RELEASE_BINARY in enforced CI)
+    // exercising multi-chunk (>32 KiB, >256-entry) freeze-list + #63 allowlist
+    // and opted-in inventory traffic under UID 600/601 + enforcing seccomp.
+    tokio::task::spawn_blocking(|| {
+        let ext4 = ext4_mount();
+        let _thaw = ThawGuard::new(std::slice::from_ref(&ext4));
+        let mut agent = Agent::spawn_with(SpawnOptions {
+            fake_kernel: false,
+            agent_extra: format!("freeze_allowed_mountpoints = [\"{ext4}\"]\n"),
+            features_extra: "shutdown = false\ninformation = true\nfstrim = false\n".to_owned(),
+            enforce_hardening: is_enforced_seccomp(),
+            binary: release_or_test_binary(),
+            ..Default::default()
+        });
+        agent.wait_for_stderr("\"event\":\"privileges_dropped\"", e2e::REPLY_TIMEOUT);
+
+        // Multi-chunk IPC request: 301 mountpoints totaling > 32 KiB (spanning
+        // 2 SOCK_SEQPACKET chunks from parser -> executor while staying < 64 KiB).
+        let pad = "a".repeat(100);
+        let mut list_multichunk = vec![ext4.clone()];
+        for i in 0..300u32 {
+            list_multichunk.push(format!("/oq10-unauth-{pad}-{i:03}"));
+        }
+        let req = json!({
+            "execute": "guest-fsfreeze-freeze-list",
+            "arguments": { "mountpoints": list_multichunk },
+            "id": 650
+        })
+        .to_string();
+        assert!(
+            req.len() > 32 * 1024 && req.len() < 64 * 1024,
+            "expected multi-chunk (>32 KiB, <64 KiB) freeze-list frame, got {} bytes",
+            req.len()
+        );
+        assert_eq!(
+            agent.request(&req),
+            json!({"return": 1, "id": 650}),
+            "deployed process pair must reassemble multi-chunk freeze-list and filter to allowlisted ext4"
+        );
+        assert_eq!(
+            agent.request(r#"{"execute":"guest-fsfreeze-thaw","id":651}"#),
+            json!({"return": 1, "id": 651})
+        );
+        assert_eq!(
+            agent.request(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":[]},"id":652}"#
+            ),
+            json!({"return": 0, "id": 652})
+        );
+        assert_eq!(
+            agent.request(
+                r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/oq10-unauth-only"]},"id":653}"#
+            ),
+            json!({"return": 0, "id": 653})
+        );
+
+        // Opted-in inventory commands across the deployed enforcing process pair.
+        let osinfo = agent.request(r#"{"execute":"guest-get-osinfo","id":654}"#);
+        assert!(
+            osinfo["return"].is_object(),
+            "expected osinfo object: {osinfo}"
+        );
+        let ifaces = agent.request(r#"{"execute":"guest-network-get-interfaces","id":655}"#);
+        assert!(
+            ifaces["return"].is_array(),
+            "expected interfaces array: {ifaces}"
+        );
+        let fsinfo = agent.request(r#"{"execute":"guest-get-fsinfo","id":656}"#);
+        assert!(
+            fsinfo["return"].is_array(),
+            "expected fsinfo array: {fsinfo}"
+        );
+        assert_eq!(
+            agent.request(r#"{"execute":"guest-ping","id":657}"#),
+            json!({"return": {}, "id": 657})
+        );
+
+        // Even with `information = true`, the parser child retains identical
+        // zero-capability UID-601 seccomp confinement.
+        let parser_pid = wait_for_parser_child(agent.pid());
+        let threads = e2e::thread_statuses(parser_pid);
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].name, "qeminga-parser");
+        assert_eq!(threads[0].field("Uid:"), "601\t601\t601\t601");
+        for set in ["CapEff:", "CapPrm:", "CapBnd:", "CapInh:", "CapAmb:"] {
+            assert_eq!(threads[0].field(set), "0000000000000000", "{set}");
+        }
+        assert_eq!(threads[0].field("NoNewPrivs:"), "1");
+        if cfg!(feature = "seccomp") {
+            assert_eq!(threads[0].field("Seccomp:"), "2");
+        }
+        assert!(agent.stop().success());
+        wait_for_pid_gone(parser_pid, Duration::from_secs(5));
+    })
+    .await
+    .unwrap();
+
     fixtures.assert_all_intact();
 }
 
@@ -2578,6 +3019,7 @@ fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
         tracing::Level::INFO,
         router.clone(),
     ));
+    tracing::dispatcher::set_global_default(dispatch).unwrap();
 
     let started = Instant::now();
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -2585,22 +3027,19 @@ fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
         .enable_all()
         .build()
         .unwrap();
-    let exit = rt.block_on(
-        serve_ipc_with_backoff(
-            Arc::clone(&ctx),
-            exec_sock,
-            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
-            opener,
-            false,
-            Some(child),
-            false,
-            std::future::pending::<&'static str>(),
-            Duration::from_millis(20),
-            Duration::from_millis(50),
-            Duration::from_millis(25),
-        )
-        .with_subscriber(dispatch),
-    );
+    let exit = rt.block_on(serve_ipc_with_backoff(
+        Arc::clone(&ctx),
+        exec_sock,
+        PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+        opener,
+        false,
+        Some(child),
+        false,
+        std::future::pending::<&'static str>(),
+        Duration::from_millis(20),
+        Duration::from_millis(50),
+        Duration::from_millis(25),
+    ));
     let elapsed = started.elapsed();
 
     assert!(
@@ -2620,8 +3059,9 @@ fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
     let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
     assert!(
         logs.contains("\"event\":\"ipc_protocol_violation\"")
+            && logs.contains("\"event\":\"watchdog_thaw\"")
             && logs.contains("\"event\":\"fsfreeze_thawed\""),
-        "expected both protocol violation and autonomous thaw in logs:\n{logs}"
+        "expected protocol violation, watchdog_thaw, and fsfreeze_thawed in logs:\n{logs}"
     );
     println!("CVM_VIOLATION_FROZEN_OK");
     let _ = std::io::stdout().flush();
@@ -2648,14 +3088,15 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     let ext4 = ext4_mount();
     let second = SecondFs::new();
     let second_mount = second.mount.clone();
-    let _thaw = ThawGuard::new(&[ext4.clone(), second_mount.clone()]);
 
     // Create a mode-0700 root:root private bind mount of the real ext4 loop fs
-    // to prove the executor's CAP_DAC_READ_SEARCH still opens protected mountpoints.
+    // BEFORE `_thaw` so LIFO unwinding drops `_thaw` first (thawing both
+    // superblocks) before `PrivateBindMount::drop` unmounts and removes its
+    // backing directory on ext4.
     let base = Path::new(&ext4).parent().unwrap().to_path_buf();
-    let protected_bind =
-        PrivateBindMount::create(&ext4, base.join("qeminga-oq10-0700-mount"), 0o700);
-    let protected_mount = protected_bind.path.to_str().unwrap().to_owned();
+    let protected_bind = PrivateBindMount::create(&ext4, &base, 0o700);
+    let protected_mount = protected_bind.path().to_str().unwrap().to_owned();
+    let _thaw = ThawGuard::new(&[ext4.clone(), second_mount.clone()]);
     assert_eq!(
         std::fs::metadata(&protected_mount).unwrap().mode() & 0o777,
         0o700

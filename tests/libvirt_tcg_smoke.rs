@@ -1091,8 +1091,12 @@ fn the_guest_script_verifies_live_parser_isolation_and_uid601_dac_confinement() 
         "exec_stderr_id",
         "exec_port_fds != 0",
         "setpriv --reuid 601 --regid 601 --clear-groups",
+        "world-writable",
+        "world-writable O_WRONLY allowed outside unit",
         "expect_err(\"root-secret rdonly\"",
         "expect_err(\"uid600-file rdonly\"",
+        "expect_err(\"world-file wronly\", world_file, os.O_WRONLY, errno.EROFS)",
+        "os.unlink(world_file)",
         "expect_err(\"virtio-port rdwr\"",
         "expect_err(\"/run/qeminga dir\"",
     ] {

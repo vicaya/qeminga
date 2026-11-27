@@ -705,8 +705,13 @@ PY
         ok=1
     fi
 
-    # Verify UID 601 DAC boundary inside the service's mount namespace.
-    local secret_dir uid600_dir secret_file uid600_file
+    # Verify UID 601 DAC and unit-layer read-only mount boundaries inside the
+    # service's mount namespace (OQ-10 §6 Checks 2-3):
+    # - 0600 root:root secret and 0600 qeminga:qeminga file fail EACCES (DAC)
+    # - 0666 world-writable file on /tmp (present at service startup) is
+    #   openable O_WRONLY to UID 601 outside the unit, and MUST fail EROFS on
+    #   both O_WRONLY open and unlink inside the service's mount namespace.
+    local secret_dir uid600_dir secret_file uid600_file world_file
     secret_dir="$(mktemp -d /var/lib/qeminga-parser-probe.XXXXXX)" || {
         log "FAILED: cannot create temp dir under /var/lib"
         return 1
@@ -718,46 +723,105 @@ PY
     }
     secret_file="$secret_dir/root-secret"
     uid600_file="$uid600_dir/uid600-secret"
-    printf 'synthetic-root-secret-oq10\n' > "$secret_file"
-    chown 0:0 "$secret_file"
-    chmod 0600 "$secret_file"
-    printf 'untouched-uid600\n' > "$uid600_file"
-    chown 600:600 "$uid600_file"
-    chmod 0600 "$uid600_file"
-    chmod 0755 "$secret_dir" "$uid600_dir"
+    world_file="$uid600_dir/world-writable"
 
-    if out="$(nsenter --mount="/proc/$pid/ns/mnt" -- setpriv --reuid 601 --regid 601 --clear-groups -- python3 - "$secret_file" "$uid600_file" /dev/virtio-ports/org.qemu.guest_agent.0 /run/qeminga <<'PY' 2>&1
+    if ! python3 - "$secret_dir" "$uid600_dir" <<'PY'
+import os, sys
+
+secret_dir, tmp_dir = sys.argv[1:3]
+
+def make_file(parent, name, uid, gid, mode, data):
+    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dfd,
+        )
+        try:
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, mode)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+make_file(secret_dir, "root-secret", 0, 0, 0o600, b"synthetic-root-secret-oq10\n")
+make_file(tmp_dir, "uid600-secret", 600, 600, 0o600, b"untouched-uid600\n")
+make_file(tmp_dir, "world-writable", 0, 0, 0o666, b"untouched-world\n")
+for d in (secret_dir, tmp_dir):
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchmod(dfd, 0o755)
+    finally:
+        os.close(dfd)
+PY
+    then
+        log "FAILED: cannot initialize exclusive parser boundary probe files"
+        rm -rf -- "$secret_dir" "$uid600_dir"
+        return 1
+    fi
+
+    # Outside the service namespace, UID 601 MUST be able to open the 0666 file
+    # O_WRONLY (zero bytes written), establishing that DAC does not mask EROFS.
+    if out="$(setpriv --reuid 601 --regid 601 --clear-groups -- python3 - "$world_file" <<'PY' 2>&1
+import os, sys
+
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CLOEXEC)
+os.close(fd)
+print("world-writable O_WRONLY allowed outside unit")
+PY
+    )"; then
+        log "ok: parser UID 601 outside-unit baseline verified ($out)"
+    else
+        log "FAILED: parser UID 601 could not open 0666 fixture outside unit: $out"
+        ok=1
+    fi
+
+    if out="$(nsenter --mount="/proc/$pid/ns/mnt" -- setpriv --reuid 601 --regid 601 --clear-groups -- python3 - "$secret_file" "$uid600_file" "$world_file" /dev/virtio-ports/org.qemu.guest_agent.0 /run/qeminga <<'PY' 2>&1
 import errno, os, sys
 
-secret_file, uid600_file, port_path, run_dir = sys.argv[1:5]
+secret_file, uid600_file, world_file, port_path, run_dir = sys.argv[1:6]
 
-def expect_err(label, path, flags, allowed):
+def expect_err(label, path, flags, want):
     try:
         fd = os.open(path, flags | os.O_CLOEXEC)
     except OSError as exc:
-        if exc.errno not in allowed:
-            names = [errno.errorcode.get(e, str(e)) for e in allowed]
+        if exc.errno != want:
+            want_name = errno.errorcode.get(want, str(want))
             got = errno.errorcode.get(exc.errno, str(exc.errno))
-            raise RuntimeError(f"{label}: got {got}, expected one of {names}")
+            raise RuntimeError(f"{label}: got {got}, expected {want_name}")
     else:
         os.close(fd)
         raise RuntimeError(f"{label}: unexpectedly succeeded as uid 601")
 
-expect_err("root-secret rdonly", secret_file, os.O_RDONLY, (errno.EACCES,))
-expect_err("uid600-file rdonly", uid600_file, os.O_RDONLY, (errno.EACCES,))
-expect_err("uid600-file wronly", uid600_file, os.O_WRONLY, (errno.EACCES, errno.EROFS))
-expect_err("virtio-port rdwr", port_path, os.O_RDWR, (errno.EACCES,))
-expect_err("/run/qeminga dir", run_dir, os.O_RDONLY | os.O_DIRECTORY, (errno.EACCES,))
-print("uid601 denied root-secret, uid600-file, virtio-port, /run/qeminga")
+expect_err("root-secret rdonly", secret_file, os.O_RDONLY, errno.EACCES)
+expect_err("uid600-file rdonly", uid600_file, os.O_RDONLY, errno.EACCES)
+expect_err("world-file wronly", world_file, os.O_WRONLY, errno.EROFS)
+try:
+    os.unlink(world_file)
+except OSError as exc:
+    if exc.errno != errno.EROFS:
+        got = errno.errorcode.get(exc.errno, str(exc.errno))
+        raise RuntimeError(f"world-file unlink: got {got}, expected EROFS")
+else:
+    raise RuntimeError("world-file unlink unexpectedly succeeded as uid 601")
+expect_err("virtio-port rdwr", port_path, os.O_RDWR, errno.EACCES)
+expect_err("/run/qeminga dir", run_dir, os.O_RDONLY | os.O_DIRECTORY, errno.EACCES)
+print("uid601 denied root-secret/uid600-file/virtio-port/run (EACCES) and world-file write/unlink (EROFS)")
 PY
     )"; then
-        log "ok: parser UID 601 DAC boundary verified ($out)"
+        log "ok: parser UID 601 DAC and unit-layer EROFS boundary verified ($out)"
     else
-        log "FAILED: parser UID 601 DAC boundary probe failed: $out"
+        log "FAILED: parser UID 601 boundary probe failed: $out"
         ok=1
     fi
 
-    if [ "$(cat "$secret_file")" != "synthetic-root-secret-oq10" ] || [ "$(cat "$uid600_file")" != "untouched-uid600" ]; then
+    if [ "$(cat "$secret_file")" != "synthetic-root-secret-oq10" ] \
+        || [ "$(cat "$uid600_file")" != "untouched-uid600" ] \
+        || [ "$(cat "$world_file")" != "untouched-world" ]; then
         log "FAILED: parser boundary probe fixtures were modified"
         ok=1
     fi

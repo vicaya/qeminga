@@ -100,6 +100,8 @@ const RETURNED_WITHOUT_SIGSYS: i32 = 99;
 const ENV_PROBE: &str = "QEMINGA_OQ10_PROBE";
 const ENV_AUX: &str = "QEMINGA_OQ10_AUX";
 const ENV_AUX2: &str = "QEMINGA_OQ10_AUX2";
+const ENV_AUX3: &str = "QEMINGA_OQ10_AUX3";
+const MAX_RESULT_MARKER_BYTES: usize = 256;
 
 // ---- Shared helpers --------------------------------------------------------
 
@@ -589,20 +591,157 @@ fn run_self_probe(test_name: &str, probe: &str, aux: Option<&str>) -> std::proce
     cmd.output().unwrap()
 }
 
+/// Opens a mode-`0700` directory owned by `expected_uid` without following
+/// symlinks so privileged test result/PID files never live in a directory
+/// writable by an unprivileged UID.
+fn open_owned_run_dir(path: &Path, expected_uid: u32) -> OwnedFd {
+    let dir_fd = open(
+        path,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .unwrap_or_else(|e| panic!("open run_dir {} failed: {e}", path.display()));
+    let st = fstat(&dir_fd).unwrap();
+    assert_eq!(
+        st.st_uid,
+        expected_uid,
+        "run_dir {} must be owned by uid {expected_uid}, found uid {}",
+        path.display(),
+        st.st_uid
+    );
+    assert_eq!(
+        st.st_mode & 0o777,
+        0o700,
+        "run_dir {} must have mode 0700, found {:04o}",
+        path.display(),
+        st.st_mode & 0o777
+    );
+    dir_fd
+}
+
+/// Creates a regular mode-`0600` file exclusively inside `dir_fd` without
+/// following symlinks or overwriting pre-existing entries.
+fn create_exclusive_regular_file(dir_fd: &OwnedFd, name: &str) -> std::io::Result<File> {
+    let fd = openat(
+        dir_fd,
+        name,
+        OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
+    Ok(File::from(fd))
+}
+
+/// Reads a regular file inside `dir_fd` without following symlinks, enforcing
+/// an upper byte bound and never echoing raw bytes on failure.
+fn read_bounded_regular_file(
+    dir_fd: &OwnedFd,
+    name: &str,
+    max_bytes: usize,
+) -> Result<String, String> {
+    let fd = openat(
+        dir_fd,
+        name,
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| format!("{name}: openat failed ({e})"))?;
+    let st = fstat(&fd).map_err(|e| format!("{name}: fstat failed ({e})"))?;
+    if (st.st_mode & SFlag::S_IFMT.bits()) != SFlag::S_IFREG.bits() {
+        return Err(format!("{name}: not a regular file"));
+    }
+    let file = File::from(fd);
+    let mut buf = Vec::with_capacity(max_bytes.min(MAX_RESULT_MARKER_BYTES) + 1);
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("{name}: read failed ({e})"))?;
+    if buf.len() > max_bytes {
+        return Err(format!("{name}: exceeds {max_bytes}-byte bound"));
+    }
+    String::from_utf8(buf).map_err(|_| format!("{name}: non-UTF-8 content"))
+}
+
+/// Verifies that `name` inside `dir_fd` is a bounded regular file containing
+/// the exact single-line marker `expected_marker`, without echoing file bytes
+/// in diagnostics.
+fn verify_exact_marker_file(
+    dir_fd: &OwnedFd,
+    name: &str,
+    expected_marker: &str,
+) -> Result<(), String> {
+    let raw = read_bounded_regular_file(dir_fd, name, MAX_RESULT_MARKER_BYTES)?;
+    if raw.trim_end_matches('\n') == expected_marker && raw.lines().count() == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: exact marker mismatch (expected `{expected_marker}`, {} bytes)",
+            raw.len()
+        ))
+    }
+}
+
+/// Verifies that `gen2_result` inside `dir_fd` is a bounded regular file with
+/// exact `GEN2_CLEAN_CGROUP_OK`, matching `old_pid=<expected_old_pid>`, and a
+/// numeric `replacement_pid=<pid>` line (never echoing arbitrary bytes).
+fn verify_gen2_result_file(dir_fd: &OwnedFd, expected_old_pid: u32) -> Result<(), String> {
+    let raw = read_bounded_regular_file(dir_fd, "gen2_result", MAX_RESULT_MARKER_BYTES)?;
+    let lines: Vec<&str> = raw.lines().collect();
+    if lines.len() != 3 || lines[0] != "GEN2_CLEAN_CGROUP_OK" {
+        return Err(format!(
+            "gen2_result: unexpected header/line count ({} lines, {} bytes)",
+            lines.len(),
+            raw.len()
+        ));
+    }
+    let old_ok = lines[1]
+        .strip_prefix("old_pid=")
+        .and_then(|s| s.parse::<u32>().ok())
+        == Some(expected_old_pid);
+    let repl_ok = lines[2]
+        .strip_prefix("replacement_pid=")
+        .and_then(|s| s.parse::<u32>().ok())
+        .is_some();
+    if old_ok && repl_ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "gen2_result: unexpected pid fields (old_ok={old_ok}, repl_ok={repl_ok})"
+        ))
+    }
+}
+
+/// Parses a bounded decimal PID file inside `dir_fd` without echoing contents
+/// on parse failure.
+fn parse_pid_file(dir_fd: &OwnedFd, name: &str) -> Result<u32, String> {
+    let raw = read_bounded_regular_file(dir_fd, name, 32)?;
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|_| format!("{name}: invalid pid ({} bytes)", raw.len()))
+}
+
 /// Runs a two-generation supervision probe inside a transient systemd service
 /// unit configured with `KillMode=control-group`, `TimeoutStopSec=2s`,
-/// `SendSIGKILL=yes`, `RuntimeMaxSec=30s`, and `Restart=on-failure`.
+/// `SendSIGKILL=yes`, `RuntimeMaxSec=30s`, `Restart=no`,
+/// `RestartForceExitStatus=<gen1_exit_code>`, and `StartLimitBurst=2`.
 ///
-/// Generation 1 writes its mock UID-601 parser PID into `state_dir/gen1_parser_pid`
-/// and its completion marker into `state_dir/gen1_result`, then exits non-zero
-/// while the uncooperative `SIG_IGN` UID-601 parser is still alive. Systemd
-/// enforces `KillMode=control-group` (`SIGTERM`, then `SIGKILL` after
-/// `TimeoutStopSec=2s`) before starting Generation 2, which verifies BEFORE
-/// serving that `old_pid` is gone and `cgroup.procs` contains only Generation 2,
-/// writes `state_dir/gen2_result`, and exits `0`.
+/// Only the deliberate Generation-1 exit status triggers a single replacement
+/// attempt: any verifier assertion panic (`101`), `RuntimeMaxSec` timeout, or
+/// signal failure terminates the unit immediately on that attempt.
+///
+/// Generation 1 writes its mock UID-601 parser PID into root-owned
+/// `run_dir/gen1_parser_pid` and retains an exclusively-created
+/// `run_dir/gen1_result` fd across the privilege drop (using a separate
+/// UID-600 `marker_dir` for the freeze marker), then exits with
+/// `gen1_exit_code` while the uncooperative `SIG_IGN` UID-601 parser is still
+/// alive. Systemd enforces `KillMode=control-group` (`SIGTERM`, then `SIGKILL`
+/// after `TimeoutStopSec=2s`) before starting Generation 2, which verifies
+/// BEFORE serving that `old_pid` is gone and unified cgroup v2 `cgroup.procs`
+/// contains only Generation 2, writes `run_dir/gen2_result` exclusively, and
+/// exits `0`.
 fn run_self_probe_in_cgroup_restart(
     test_name: &str,
     probe: &str,
+    gen1_exit_code: i32,
     extra_env: &[(&str, &str)],
 ) -> (std::process::Output, String) {
     assert!(
@@ -611,6 +750,7 @@ fn run_self_probe_in_cgroup_restart(
     );
     let exe = std::env::current_exe().unwrap();
     let unit = format!("qeminga-oq10-{probe}-{}.service", std::process::id());
+    let force_status = format!("RestartForceExitStatus={gen1_exit_code}");
     let mut cmd = ProcessCommand::new("systemd-run");
     cmd.args([
         "--wait",
@@ -627,13 +767,15 @@ fn run_self_probe_in_cgroup_restart(
         "-p",
         "RuntimeMaxSec=30s",
         "-p",
-        "Restart=on-failure",
+        "Restart=no",
+        "-p",
+        &force_status,
         "-p",
         "RestartSec=100ms",
         "-p",
         "StartLimitIntervalSec=60s",
         "-p",
-        "StartLimitBurst=3",
+        "StartLimitBurst=2",
         "-E",
         &format!("{ENV_PROBE}={probe}"),
     ]);
@@ -672,19 +814,13 @@ fn unit_journal_tail(unit: &str) -> String {
 
 /// Executed by Generation 2 of a `run_self_probe_in_cgroup_restart` unit before
 /// serving anything: verifies Generation 1 completed its assertions, the
-/// previous uncooperative UID-601 parser PID is already gone, and the service
-/// cgroup contains ONLY Generation 2's own PID.
-fn verify_prev_generation_reaped_before_restart(state_dir: &Path, expected_gen1_marker: &str) {
-    let old_pid: u32 = std::fs::read_to_string(state_dir.join("gen1_parser_pid"))
-        .expect("gen1_parser_pid missing in restarted generation")
-        .trim()
-        .parse()
-        .expect("invalid gen1_parser_pid");
-    let gen1_result = std::fs::read_to_string(state_dir.join("gen1_result")).unwrap_or_default();
-    assert!(
-        gen1_result.contains(expected_gen1_marker),
-        "generation 1 did not record `{expected_gen1_marker}` before restart (got `{gen1_result}`)"
-    );
+/// previous uncooperative UID-601 parser PID is already gone, and the unified
+/// cgroup v2 service cgroup contains ONLY Generation 2's own PID.
+fn verify_prev_generation_reaped_before_restart(run_dir_fd: &OwnedFd, expected_gen1_marker: &str) {
+    let old_pid = parse_pid_file(run_dir_fd, "gen1_parser_pid")
+        .expect("valid gen1_parser_pid required in restarted generation");
+    verify_exact_marker_file(run_dir_fd, "gen1_result", expected_gen1_marker)
+        .expect("generation 1 did not record exact completion marker before restart");
 
     let old_proc = PathBuf::from(format!("/proc/{old_pid}"));
     if old_proc.exists() {
@@ -697,39 +833,44 @@ fn verify_prev_generation_reaped_before_restart(state_dir: &Path, expected_gen1_
         }
     }
 
+    assert!(
+        Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
+        "unified cgroup v2 hierarchy (/sys/fs/cgroup/cgroup.controllers) is required to verify empty service cgroup before replacement"
+    );
     let my_pid = std::process::id();
     let self_cgroup =
         std::fs::read_to_string("/proc/self/cgroup").expect("read /proc/self/cgroup in gen2");
-    if Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
-        let rel = self_cgroup
-            .lines()
-            .find_map(|l| l.strip_prefix("0::"))
-            .map(|s| s.trim().trim_start_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| {
-                panic!("expected unified 0:: cgroup entry in /proc/self/cgroup:\n{self_cgroup}")
-            });
-        let procs_path = Path::new("/sys/fs/cgroup").join(rel).join("cgroup.procs");
-        let procs_raw = std::fs::read_to_string(&procs_path)
-            .unwrap_or_else(|e| panic!("read {}: {e}", procs_path.display()));
-        let pids: Vec<u32> = procs_raw
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(|l| l.trim().parse::<u32>().unwrap())
-            .collect();
-        assert_eq!(
-            pids,
-            vec![my_pid],
-            "service cgroup {} must contain ONLY replacement generation pid {my_pid}, found {pids:?}",
-            procs_path.display()
-        );
-    }
+    let rel = self_cgroup
+        .lines()
+        .find_map(|l| l.strip_prefix("0::"))
+        .map(|s| s.trim().trim_start_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            panic!("expected unified 0:: cgroup entry in /proc/self/cgroup:\n{self_cgroup}")
+        });
+    let procs_path = Path::new("/sys/fs/cgroup").join(rel).join("cgroup.procs");
+    let procs_raw = std::fs::read_to_string(&procs_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", procs_path.display()));
+    let pids: Vec<u32> = procs_raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| l.trim().parse::<u32>().unwrap())
+        .collect();
+    assert_eq!(
+        pids,
+        vec![my_pid],
+        "service cgroup {} must contain ONLY replacement generation pid {my_pid}, found {pids:?}",
+        procs_path.display()
+    );
 
-    std::fs::write(
-        state_dir.join("gen2_result"),
-        format!("GEN2_CLEAN_CGROUP_OK\nold_pid={old_pid}\nreplacement_pid={my_pid}\n"),
+    let mut gen2_file = create_exclusive_regular_file(run_dir_fd, "gen2_result")
+        .expect("create gen2_result exclusively in root-owned run_dir");
+    writeln!(
+        gen2_file,
+        "GEN2_CLEAN_CGROUP_OK\nold_pid={old_pid}\nreplacement_pid={my_pid}"
     )
     .unwrap();
+    gen2_file.flush().unwrap();
     std::process::exit(0);
 }
 
@@ -1782,9 +1923,10 @@ for w in w_fds:
 time.sleep(60)
 "#;
 
-fn run_cvm_malicious_ipc_child(state_dir: &Path) {
-    if state_dir.join("gen1_parser_pid").exists() {
-        verify_prev_generation_reaped_before_restart(state_dir, "CVM_MALICIOUS_IPC_OK");
+fn run_cvm_malicious_ipc_child(run_dir: &Path, marker_dir: &Path) {
+    let run_dir_fd = open_owned_run_dir(run_dir, 0);
+    if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
+        verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_MALICIOUS_IPC_OK");
         return;
     }
 
@@ -1810,11 +1952,17 @@ fn run_cvm_malicious_ipc_child(state_dir: &Path) {
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    std::fs::write(state_dir.join("gen1_parser_pid"), format!("{child_pid}\n")).unwrap();
-    let mut gen1_result = File::create(state_dir.join("gen1_result")).unwrap();
+    {
+        let mut pid_file = create_exclusive_regular_file(&run_dir_fd, "gen1_parser_pid").unwrap();
+        writeln!(pid_file, "{child_pid}").unwrap();
+        pid_file.flush().unwrap();
+    }
+    let mut gen1_result = create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap();
+    drop(run_dir_fd);
 
-    chown(state_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
-    let marker = Marker::open(state_dir.join("frozen")).unwrap();
+    chown(marker_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
+    std::fs::set_permissions(marker_dir, Permissions::from_mode(0o700)).unwrap();
+    let marker = Marker::open(marker_dir.join("frozen")).unwrap();
 
     // Drop to UID/GID 600 with CVM authority (no CAP_KILL, no CAP_SYS_BOOT),
     // start the audit writer thread under the dropped ceiling, then install
@@ -1972,8 +2120,9 @@ fn privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill
                 return;
             }
             "cvm-malicious-ipc" => {
-                let state_dir = PathBuf::from(std::env::var(ENV_AUX).unwrap());
-                run_cvm_malicious_ipc_child(&state_dir);
+                let run_dir = PathBuf::from(std::env::var(ENV_AUX).unwrap());
+                let marker_dir = PathBuf::from(std::env::var(ENV_AUX2).unwrap());
+                run_cvm_malicious_ipc_child(&run_dir, &marker_dir);
                 return;
             }
             other => panic!("unknown check3 probe: {other}"),
@@ -2047,40 +2196,46 @@ fn privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill
 
     // 3c. StreamAssembler cmsg/MSG_CTRUNC/MSG_TRUNC fd closure on both peers,
     // plus live enforcing CVM executor + uncooperative SIG_IGN UID-601 mock
-    // parser inside a `KillMode=control-group` + `Restart=on-failure` systemd
-    // transient unit proving cgroup supervision terminates Generation 1's
-    // uncooperative UID-601 parser and empties the cgroup BEFORE Generation 2
-    // starts (without `CAP_KILL` on UID 600).
+    // parser inside a `KillMode=control-group` + `Restart=no` +
+    // `RestartForceExitStatus=42` systemd transient unit proving cgroup
+    // supervision terminates Generation 1's uncooperative UID-601 parser and
+    // empties the cgroup BEFORE Generation 2 starts (without `CAP_KILL` on UID
+    // 600), and that any verifier failure or timeout is immediately terminal.
     verify_stream_assembler_cmsg_and_trunc_fd_closure();
 
-    let mal_state_dir = tempfile::Builder::new()
-        .prefix("qeminga-oq10-c3-mal-")
+    let mal_run_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-c3-run-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    std::fs::set_permissions(mal_run_dir.path(), Permissions::from_mode(0o700)).unwrap();
+    let mal_marker_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-c3-mkr-")
         .tempdir_in("/dev/shm")
         .unwrap();
     let (mal_out, mal_unit) = run_self_probe_in_cgroup_restart(
         "privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill",
         "cvm-malicious-ipc",
-        &[(ENV_AUX, mal_state_dir.path().to_str().unwrap())],
+        42,
+        &[
+            (ENV_AUX, mal_run_dir.path().to_str().unwrap()),
+            (ENV_AUX2, mal_marker_dir.path().to_str().unwrap()),
+        ],
     );
-    let mal_gen1 =
-        std::fs::read_to_string(mal_state_dir.path().join("gen1_result")).unwrap_or_default();
-    let mal_gen2 =
-        std::fs::read_to_string(mal_state_dir.path().join("gen2_result")).unwrap_or_default();
+    let mal_run_fd = open_owned_run_dir(mal_run_dir.path(), 0);
+    let mal_pid = parse_pid_file(&mal_run_fd, "gen1_parser_pid");
+    let mal_gen1 = verify_exact_marker_file(&mal_run_fd, "gen1_result", "CVM_MALICIOUS_IPC_OK");
+    let mal_gen2 = mal_pid
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|&pid| verify_gen2_result_file(&mal_run_fd, pid));
     assert!(
-        mal_out.status.success()
-            && mal_gen1.contains("CVM_MALICIOUS_IPC_OK")
-            && mal_gen2.contains("GEN2_CLEAN_CGROUP_OK"),
-        "cvm-malicious-ipc 2-generation cgroup restart check failed: {:?}\ngen1={mal_gen1}\ngen2={mal_gen2}\nstderr={}\njournal:\n{}",
+        mal_out.status.success() && mal_gen1.is_ok() && mal_gen2.is_ok(),
+        "cvm-malicious-ipc 2-generation cgroup restart check failed: {:?}\ngen1={mal_gen1:?}\ngen2={mal_gen2:?}\nstderr={}\njournal:\n{}",
         mal_out.status,
         String::from_utf8_lossy(&mal_out.stderr),
         unit_journal_tail(&mal_unit)
     );
-    let mock_pid: u32 = std::fs::read_to_string(mal_state_dir.path().join("gen1_parser_pid"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    wait_for_pid_gone(mock_pid, Duration::from_secs(3));
+    wait_for_pid_gone(mal_pid.unwrap(), Duration::from_secs(3));
 
     fixtures.assert_all_intact();
 }
@@ -3273,9 +3428,10 @@ sock.send(bytes([99] * 23))
 time.sleep(60)
 "#;
 
-fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
-    if state_dir.join("gen1_parser_pid").exists() {
-        verify_prev_generation_reaped_before_restart(state_dir, "CVM_VIOLATION_FROZEN_OK");
+fn run_cvm_violation_while_frozen_child(mount: &str, run_dir: &Path, marker_dir: &Path) {
+    let run_dir_fd = open_owned_run_dir(run_dir, 0);
+    if fstatat(&run_dir_fd, "gen1_parser_pid", AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
+        verify_prev_generation_reaped_before_restart(&run_dir_fd, "CVM_VIOLATION_FROZEN_OK");
         return;
     }
 
@@ -3302,11 +3458,17 @@ fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    std::fs::write(state_dir.join("gen1_parser_pid"), format!("{child_pid}\n")).unwrap();
-    let mut gen1_result = File::create(state_dir.join("gen1_result")).unwrap();
+    {
+        let mut pid_file = create_exclusive_regular_file(&run_dir_fd, "gen1_parser_pid").unwrap();
+        writeln!(pid_file, "{child_pid}").unwrap();
+        pid_file.flush().unwrap();
+    }
+    let mut gen1_result = create_exclusive_regular_file(&run_dir_fd, "gen1_result").unwrap();
+    drop(run_dir_fd);
 
-    chown(state_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
-    let marker_path = state_dir.join("frozen");
+    chown(marker_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
+    std::fs::set_permissions(marker_dir, Permissions::from_mode(0o700)).unwrap();
+    let marker_path = marker_dir.join("frozen");
     let marker = Marker::open(&marker_path).unwrap();
 
     drop_privileges_to(uid600, &SystemCaps, &Authority::data_protection()).unwrap();
@@ -3393,8 +3555,13 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     if let Ok(probe) = std::env::var(ENV_PROBE) {
         if probe == "cvm-violation-while-frozen" {
             let mount = std::env::var(ENV_AUX).expect("ENV_AUX must carry mount");
-            let state_dir = std::env::var(ENV_AUX2).expect("ENV_AUX2 must carry state_dir");
-            run_cvm_violation_while_frozen_child(&mount, Path::new(&state_dir));
+            let run_dir = std::env::var(ENV_AUX2).expect("ENV_AUX2 must carry run_dir");
+            let marker_dir = std::env::var(ENV_AUX3).expect("ENV_AUX3 must carry marker_dir");
+            run_cvm_violation_while_frozen_child(
+                &mount,
+                Path::new(&run_dir),
+                Path::new(&marker_dir),
+            );
             return;
         }
         panic!("unknown check7 probe: {probe}");
@@ -3484,44 +3651,48 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     drop(agent);
 
     // 3b. ipc_protocol_violation while Frozen under enforcing CVM executor filter
-    //     inside a `KillMode=control-group` + `Restart=on-failure` + `RuntimeMaxSec=30s`
-    //     systemd transient unit -> Generation 1 closes IPC_FD, keeps watchdog +
-    //     marker alive until autonomous thaw completes, exits non-zero, and
-    //     systemd cgroup supervision terminates the sleeping SIG_IGN UID-601
-    //     mock parser and empties the cgroup BEFORE Generation 2 starts (without
-    //     CAP_KILL on UID 600).
-    let viol_state_dir = tempfile::Builder::new()
-        .prefix("qeminga-oq10-c7v-")
+    //     inside a `KillMode=control-group` + `Restart=no` +
+    //     `RestartForceExitStatus=43` + `RuntimeMaxSec=30s` systemd transient
+    //     unit -> Generation 1 closes IPC_FD, keeps watchdog + marker alive
+    //     until autonomous thaw completes, exits 43, and systemd cgroup
+    //     supervision terminates the sleeping SIG_IGN UID-601 mock parser and
+    //     empties the cgroup BEFORE Generation 2 starts (without CAP_KILL on
+    //     UID 600), with any verifier failure or timeout immediately terminal.
+    let viol_run_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-c7v-run-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    std::fs::set_permissions(viol_run_dir.path(), Permissions::from_mode(0o700)).unwrap();
+    let viol_marker_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-c7v-mkr-")
         .tempdir_in("/dev/shm")
         .unwrap();
     let (viol, viol_unit) = run_self_probe_in_cgroup_restart(
         "privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_and_intact_fixtures",
         "cvm-violation-while-frozen",
+        43,
         &[
             (ENV_AUX, &protected_mount),
-            (ENV_AUX2, viol_state_dir.path().to_str().unwrap()),
+            (ENV_AUX2, viol_run_dir.path().to_str().unwrap()),
+            (ENV_AUX3, viol_marker_dir.path().to_str().unwrap()),
         ],
     );
+    let viol_run_fd = open_owned_run_dir(viol_run_dir.path(), 0);
+    let viol_pid = parse_pid_file(&viol_run_fd, "gen1_parser_pid");
     let viol_gen1 =
-        std::fs::read_to_string(viol_state_dir.path().join("gen1_result")).unwrap_or_default();
-    let viol_gen2 =
-        std::fs::read_to_string(viol_state_dir.path().join("gen2_result")).unwrap_or_default();
+        verify_exact_marker_file(&viol_run_fd, "gen1_result", "CVM_VIOLATION_FROZEN_OK");
+    let viol_gen2 = viol_pid
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|&pid| verify_gen2_result_file(&viol_run_fd, pid));
     assert!(
-        viol.status.success()
-            && viol_gen1.contains("CVM_VIOLATION_FROZEN_OK")
-            && viol_gen2.contains("GEN2_CLEAN_CGROUP_OK"),
-        "cvm-violation-while-frozen 2-generation cgroup restart check failed: {:?}\ngen1={viol_gen1}\ngen2={viol_gen2}\nstderr={}\njournal:\n{}",
+        viol.status.success() && viol_gen1.is_ok() && viol_gen2.is_ok(),
+        "cvm-violation-while-frozen 2-generation cgroup restart check failed: {:?}\ngen1={viol_gen1:?}\ngen2={viol_gen2:?}\nstderr={}\njournal:\n{}",
         viol.status,
         String::from_utf8_lossy(&viol.stderr),
         unit_journal_tail(&viol_unit)
     );
-    let viol_parser_pid: u32 =
-        std::fs::read_to_string(viol_state_dir.path().join("gen1_parser_pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-    wait_for_pid_gone(viol_parser_pid, Duration::from_secs(3));
+    wait_for_pid_gone(viol_pid.unwrap(), Duration::from_secs(3));
     assert_writable_within(
         &protected_mount,
         "after-violation-watchdog (protected)",
@@ -3734,4 +3905,69 @@ fn oq10_fixture_and_writable_probe_helpers_unprivileged() {
         0,
         "assert_writable_within must leave zero probe files behind"
     );
+
+    // 5. Exclusive run_dir result/PID helpers refuse symlinks, pre-existing
+    //    files, oversized files, and mismatched markers without echoing bytes.
+    let run_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-rundir-test-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    std::fs::set_permissions(run_dir.path(), Permissions::from_mode(0o700)).unwrap();
+    let run_fd = open_owned_run_dir(run_dir.path(), uid.as_raw());
+
+    let mut f = create_exclusive_regular_file(&run_fd, "gen1_result").unwrap();
+    writeln!(f, "CVM_MALICIOUS_IPC_OK").unwrap();
+    f.flush().unwrap();
+    assert_eq!(
+        create_exclusive_regular_file(&run_fd, "gen1_result")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    verify_exact_marker_file(&run_fd, "gen1_result", "CVM_MALICIOUS_IPC_OK").unwrap();
+
+    // Symlink target must be rejected without reading or overwriting it.
+    let target = probe_dir.path().join("secret-runner-file");
+    std::fs::write(&target, b"SECRET-RUNNER-BYTES-DO-NOT-ECHO").unwrap();
+    symlink(&target, run_dir.path().join("gen2_result")).unwrap();
+    assert!(create_exclusive_regular_file(&run_fd, "gen2_result").is_err());
+    let link_err = verify_gen2_result_file(&run_fd, 1234).unwrap_err();
+    assert!(
+        !link_err.contains("SECRET-RUNNER-BYTES-DO-NOT-ECHO"),
+        "symlink rejection must not echo target bytes: {link_err}"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        b"SECRET-RUNNER-BYTES-DO-NOT-ECHO"
+    );
+    std::fs::remove_file(run_dir.path().join("gen2_result")).unwrap();
+
+    // Mismatched or oversized regular files must not echo raw bytes.
+    let mut bad = create_exclusive_regular_file(&run_fd, "bad_marker").unwrap();
+    bad.write_all(b"UNEXPECTED-SECRET-TOKEN").unwrap();
+    let mismatch =
+        verify_exact_marker_file(&run_fd, "bad_marker", "CVM_MALICIOUS_IPC_OK").unwrap_err();
+    assert!(
+        !mismatch.contains("UNEXPECTED-SECRET-TOKEN"),
+        "mismatch diagnostic must not echo raw bytes: {mismatch}"
+    );
+    let mut big = create_exclusive_regular_file(&run_fd, "oversized").unwrap();
+    big.write_all(&vec![b'X'; MAX_RESULT_MARKER_BYTES + 32])
+        .unwrap();
+    let too_big =
+        verify_exact_marker_file(&run_fd, "oversized", "CVM_MALICIOUS_IPC_OK").unwrap_err();
+    assert!(too_big.contains("exceeds"), "unexpected error: {too_big}");
+
+    // Valid PID and gen2_result round-trip.
+    let mut pid_f = create_exclusive_regular_file(&run_fd, "gen1_parser_pid").unwrap();
+    writeln!(pid_f, "4321").unwrap();
+    assert_eq!(parse_pid_file(&run_fd, "gen1_parser_pid").unwrap(), 4321);
+    let mut g2 = create_exclusive_regular_file(&run_fd, "gen2_result").unwrap();
+    writeln!(
+        g2,
+        "GEN2_CLEAN_CGROUP_OK\nold_pid=4321\nreplacement_pid=5432"
+    )
+    .unwrap();
+    verify_gen2_result_file(&run_fd, 4321).unwrap();
+    assert!(verify_gen2_result_file(&run_fd, 9999).is_err());
 }

@@ -4067,6 +4067,431 @@ mod tests {
         }
     }
 
+    #[test]
+    fn all_responses_error_codes_dto_conversions_and_encode_bounds_round_trip() {
+        // 1. All simple + capability responses + DTO handler round-trips.
+        let (parser_sock, exec_sock) = seqpacket_pair(false).unwrap();
+        let mut parser_asm = StreamAssembler::new(PeerRole::Parser);
+
+        let caps: Vec<CommandCapability> = Command::ALL
+            .iter()
+            .enumerate()
+            .map(|(i, &command)| CommandCapability {
+                command,
+                enabled: i % 2 == 0,
+                success_response: !matches!(command, Command::Shutdown | Command::SuspendRam),
+            })
+            .collect();
+        for cap in &caps {
+            let info = cap.to_command_info();
+            assert_eq!(info.name, cap.command.name());
+            assert_eq!(info.enabled, cap.enabled);
+            assert_eq!(info.success_response, cap.success_response);
+        }
+
+        assert_eq!(
+            WireFreezeStatus::from_state(FreezeState::Thawed).as_str(),
+            "thawed"
+        );
+        assert_eq!(
+            WireFreezeStatus::from_state(FreezeState::Freezing).as_str(),
+            "frozen"
+        );
+        assert_eq!(
+            WireFreezeStatus::from_state(FreezeState::Frozen).as_str(),
+            "frozen"
+        );
+        assert_eq!(
+            WireFreezeStatus::from_state(FreezeState::Thawing).as_str(),
+            "frozen"
+        );
+
+        let iface_handler = Interface {
+            name: "eth0".into(),
+            hardware_address: Some("52:54:00:aa:bb:cc".into()),
+            ip_addresses: vec![
+                IpAddress {
+                    ip_address: "192.0.2.10".into(),
+                    ip_address_type: "ipv4",
+                    prefix: 24,
+                },
+                IpAddress {
+                    ip_address: "2001:db8::1".into(),
+                    ip_address_type: "ipv6",
+                    prefix: 64,
+                },
+            ],
+        };
+        let iface_dto = InterfaceDto::from_handler(&iface_handler).unwrap();
+        assert_eq!(iface_dto.to_handler(), iface_handler);
+        assert!(
+            IpAddressDto::from_handler(&IpAddress {
+                ip_address: "x".into(),
+                ip_address_type: "unknown",
+                prefix: 0,
+            })
+            .is_none()
+        );
+
+        let fs_handler = FilesystemInfo {
+            name: "fs-1".into(),
+            mountpoint: "/data".into(),
+            fs_type: "ext4".into(),
+            used_bytes: Some(123),
+            total_bytes: Some(456),
+            disk: Vec::new(),
+        };
+        let fs_dto = FsInfoDto::from_handler(&fs_handler);
+        assert_eq!(fs_dto.to_handler(), fs_handler);
+
+        let trim_dtos = vec![
+            TrimPathDto {
+                path: "/".into(),
+                outcome: TrimPathOutcome::Trimmed {
+                    trimmed: 8192,
+                    minimum: 4096,
+                },
+            },
+            TrimPathDto {
+                path: "/secret".into(),
+                outcome: TrimPathOutcome::OpenPermissionDenied,
+            },
+            TrimPathDto {
+                path: "/gone".into(),
+                outcome: TrimPathOutcome::TargetUnreachable,
+            },
+            TrimPathDto {
+                path: "/ro".into(),
+                outcome: TrimPathOutcome::IoctlErrno(Errno::EOPNOTSUPP as i32),
+            },
+        ];
+        let trim_resp = TrimPathDto::to_trim_response(&trim_dtos);
+        assert_eq!(trim_resp.paths.len(), 4);
+        assert_eq!(trim_resp.paths[0].trimmed, Some(8192));
+        assert!(
+            trim_resp.paths[1]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("permission denied")
+        );
+        assert!(
+            trim_resp.paths[2]
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("unreachable")
+        );
+        assert!(trim_resp.paths[3].error.is_some());
+
+        // ProjectedMethod round-trip for both Full and Projected.
+        let full_mf = MethodField::Full("guest-nope".into());
+        let pm_full = ProjectedMethod::from_method_field(&full_mf).unwrap();
+        assert_eq!(pm_full.to_method_field(), full_mf);
+        let proj_mf = crate::audit::project_method(&"z".repeat(MAX_METHOD_BYTES + 20));
+        let pm_proj = ProjectedMethod::from_method_field(&proj_mf).unwrap();
+        assert_eq!(pm_proj.to_method_field(), proj_mf);
+        assert!(
+            ProjectedMethod::from_method_field(&MethodField::Full(
+                "a".repeat(MAX_METHOD_BYTES + 1)
+            ))
+            .is_none()
+        );
+
+        let simple_responses = vec![
+            IpcResponse::OkEmpty,
+            IpcResponse::OkInfo(caps),
+            IpcResponse::OkI64(-42),
+            IpcResponse::OkFreezeStatus(WireFreezeStatus::Thawed),
+            IpcResponse::OkFreezeStatus(WireFreezeStatus::Frozen),
+            IpcResponse::OkCount(7),
+            IpcResponse::OkInterfaces(vec![iface_dto]),
+            IpcResponse::OkFsInfo(vec![fs_dto]),
+            IpcResponse::OkFstrim(trim_dtos),
+            IpcResponse::OkSilent,
+            IpcResponse::OkAck,
+        ];
+        for (i, resp) in simple_responses.into_iter().enumerate() {
+            send_response(exec_sock.as_fd(), 10, i as u64, &resp, None).unwrap();
+            let got = recv_response(parser_sock.as_fd(), &mut parser_asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.response, resp);
+            assert!(got.channel_fd.is_none());
+        }
+
+        // 2. Every remaining IpcErrorCode, MarkerHostReason, FreezeStopReason,
+        //    RecoveryReason, TransitionOp, CommandClass, FreezeTaskStage, AbortActivity.
+        let all_marker_reasons = [
+            MarkerError::InvalidPath { path: "/x".into() },
+            MarkerError::Directory {
+                path: "/x".into(),
+                errno: Errno::ENOENT,
+            },
+            MarkerError::AlreadyPresent { path: "/x".into() },
+            MarkerError::Absent { path: "/x".into() },
+            MarkerError::Io {
+                path: "/x".into(),
+                op: "open",
+                errno: Errno::EACCES,
+            },
+            MarkerError::Io {
+                path: "/x".into(),
+                op: "fsync",
+                errno: Errno::EIO,
+            },
+            MarkerError::Io {
+                path: "/x".into(),
+                op: "unlink",
+                errno: Errno::EROFS,
+            },
+            MarkerError::Io {
+                path: "/x".into(),
+                op: "stat",
+                errno: Errno::EIO,
+            },
+        ];
+        for err in &all_marker_reasons {
+            let r = MarkerHostReason::from_marker_error(err);
+            assert_eq!(r.host_reason(), err.host_reason());
+            let code = IpcErrorCode::FreezeMarkerFailed { reason: r };
+            let chunks = encode_response_chunks(1, 1, &IpcResponse::Err(code)).unwrap();
+            let Some(AssembledMessage::Response(got)) = parser_asm
+                .push(raw_pkt(chunks.into_iter().next().unwrap()))
+                .unwrap()
+            else {
+                panic!("expected err");
+            };
+            assert_eq!(got.response, IpcResponse::Err(code));
+            assert!(code.to_proto_error().to_string().contains(r.host_reason()));
+        }
+
+        let all_stops = [
+            FreezeStop::Ioctl(crate::kernel::KernelError::Errno(Errno::EPERM)),
+            FreezeStop::Ioctl(crate::kernel::KernelError::Open(Errno::ENOENT)),
+            FreezeStop::Ioctl(crate::kernel::KernelError::WrongFilesystem {
+                expected: (8, 1),
+                found: (8, 2),
+            }),
+            FreezeStop::Ioctl(crate::kernel::KernelError::Errno(Errno::EIO)),
+            FreezeStop::Unreachable {
+                attempts: "/x".into(),
+                permission_denied: true,
+            },
+            FreezeStop::Unreachable {
+                attempts: "/x".into(),
+                permission_denied: false,
+            },
+            FreezeStop::OwnershipAmbiguous("ambig".into()),
+            FreezeStop::OwnershipError(crate::ownership::OwnershipError::OpenDir {
+                path: "/run/o".into(),
+                errno: Errno::EACCES,
+            }),
+            FreezeStop::OwnershipError(crate::ownership::OwnershipError::NotOwnedBySelf {
+                dev: (8, 1),
+            }),
+            FreezeStop::OwnershipReleaseFailed {
+                kind: RecoveryReason::DrainDidNotConverge,
+                detail: "d".into(),
+            },
+        ];
+        for stop in &all_stops {
+            let reason = FreezeStopReason::from_freeze_stop(stop);
+            assert_eq!(reason.host_reason(), stop.host_reason());
+            let code = IpcErrorCode::FreezeHard {
+                cause: reason,
+                rolled_back: 1,
+            };
+            let chunks = encode_response_chunks(1, 2, &IpcResponse::Err(code)).unwrap();
+            let Some(AssembledMessage::Response(got)) = parser_asm
+                .push(raw_pkt(chunks.into_iter().next().unwrap()))
+                .unwrap()
+            else {
+                panic!("expected err");
+            };
+            assert_eq!(got.response, IpcResponse::Err(code));
+        }
+
+        let all_recovery = [
+            RecoveryReason::TargetUnreachable,
+            RecoveryReason::TargetOpenFailed,
+            RecoveryReason::TargetOpenPermissionDenied,
+            RecoveryReason::PermissionDenied,
+            RecoveryReason::IoctlFailed,
+            RecoveryReason::DrainDidNotConverge,
+            RecoveryReason::RecoveryIncomplete,
+            RecoveryReason::WorkerLost,
+            RecoveryReason::DrainLost,
+            RecoveryReason::MarkerRetained,
+            RecoveryReason::OwnershipAmbiguous,
+            RecoveryReason::OwnershipError,
+        ];
+        for kind in all_recovery {
+            let code = IpcErrorCode::ThawIncomplete {
+                kind,
+                thawed: 0,
+                final_state: FreezeState::Frozen,
+                marker_retained: true,
+            };
+            let chunks = encode_response_chunks(1, 3, &IpcResponse::Err(code)).unwrap();
+            let Some(AssembledMessage::Response(got)) = parser_asm
+                .push(raw_pkt(chunks.into_iter().next().unwrap()))
+                .unwrap()
+            else {
+                panic!("expected err");
+            };
+            assert_eq!(got.response, IpcResponse::Err(code));
+        }
+
+        let extra_errors = [
+            IpcErrorCode::Disabled {
+                command: Command::GetFsInfo,
+            },
+            IpcErrorCode::Frozen,
+            IpcErrorCode::RateLimited {
+                class: CommandClass::PingSync,
+            },
+            IpcErrorCode::RateLimited {
+                class: CommandClass::Get,
+            },
+            IpcErrorCode::RateLimited {
+                class: CommandClass::FsfreezeFreeze,
+            },
+            IpcErrorCode::RateLimited {
+                class: CommandClass::Unlimited,
+            },
+            IpcErrorCode::RateLimited {
+                class: CommandClass::Fstrim,
+            },
+            IpcErrorCode::RateLimited {
+                class: CommandClass::Shutdown,
+            },
+            IpcErrorCode::InvalidArguments {
+                command: Command::Sync,
+            },
+            IpcErrorCode::TransitionConflict {
+                op: TransitionOp::BeginFreeze,
+                current: FreezeState::Freezing,
+            },
+            IpcErrorCode::TransitionConflict {
+                op: TransitionOp::ClaimThaw,
+                current: FreezeState::Thawing,
+            },
+            IpcErrorCode::FreezeTaskFailed {
+                stage: FreezeTaskStage::Preparation,
+            },
+            IpcErrorCode::FreezeTaskFailed {
+                stage: FreezeTaskStage::MarkerRemoval,
+            },
+            IpcErrorCode::FreezeAborted {
+                cause: AbortCause::Deadline,
+                frozen: 1,
+                activity: AbortActivity::Idle,
+            },
+            IpcErrorCode::ThawAbortPending {
+                activity: AbortActivity::Preparing,
+                thawed: 0,
+            },
+            IpcErrorCode::ThawAbortPending {
+                activity: AbortActivity::InFlightFifreeze,
+                thawed: 2,
+            },
+            IpcErrorCode::ThawAbortPending {
+                activity: AbortActivity::Idle,
+                thawed: 3,
+            },
+            IpcErrorCode::ReplyTooLarge {
+                command: Command::GetFsInfo,
+                reply_bytes: 2_000_000,
+                limit_bytes: MAX_FSINFO_IPC_BYTES as u64,
+            },
+            IpcErrorCode::FsinfoBusy,
+            IpcErrorCode::FsinfoTimeout,
+            IpcErrorCode::HandlerFailed {
+                command: Command::Shutdown,
+            },
+            IpcErrorCode::ChannelRetryLater,
+            IpcErrorCode::ChannelTerminalBusy,
+        ];
+        for (i, code) in extra_errors.into_iter().enumerate() {
+            let chunks = encode_response_chunks(3, i as u64, &IpcResponse::Err(code)).unwrap();
+            let Some(AssembledMessage::Response(got)) = parser_asm
+                .push(raw_pkt(chunks.into_iter().next().unwrap()))
+                .unwrap()
+            else {
+                panic!("expected err");
+            };
+            assert_eq!(got.response, IpcResponse::Err(code));
+            assert!(!code.to_proto_error().to_string().is_empty());
+        }
+
+        // 3. EncodeError guards & send_response descriptor attachment mismatch.
+        assert!(matches!(
+            encode_request_chunks(
+                1,
+                1,
+                &IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(vec![
+                    "a".repeat(MAX_FREEZE_LIST_ENTRY_BYTES + 1)
+                ])),
+            ),
+            Err(EncodeError::FreezeListEntryTooLong { .. })
+        ));
+        assert!(matches!(
+            encode_request_chunks(
+                1,
+                1,
+                &IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(
+                    (0..20).map(|_| "b".repeat(4000)).collect()
+                )),
+            ),
+            Err(EncodeError::PayloadTooLarge { .. })
+        ));
+        assert!(matches!(
+            encode_request_chunks(
+                1,
+                1,
+                &IpcRequest::ReportParseRejection(ParseRejection {
+                    kind: ParseRejectionKind::UnknownMethod,
+                    frame_len: 100,
+                    id: None,
+                    method: Some(ProjectedMethod::Full("c".repeat(MAX_METHOD_BYTES + 1))),
+                }),
+            ),
+            Err(EncodeError::ValueOutOfRange(_))
+        ));
+        assert!(matches!(
+            encode_response_chunks(
+                1,
+                1,
+                &IpcResponse::OkOsInfo(Box::new(OsInfo {
+                    pretty_name: Some("p".repeat(MAX_OSINFO_IPC_BYTES + 1)),
+                    ..OsInfo::default()
+                })),
+            ),
+            Err(EncodeError::PayloadTooLarge { .. })
+        ));
+        let (r_fd, _w_fd) = pipe().unwrap();
+        assert!(matches!(
+            send_response(exec_sock.as_fd(), 1, 1, &IpcResponse::OkChannelFd, None),
+            Err(TransportError::Encode(
+                EncodeError::InvalidDescriptorAttachment
+            ))
+        ));
+        assert!(matches!(
+            send_response(
+                exec_sock.as_fd(),
+                1,
+                1,
+                &IpcResponse::OkEmpty,
+                Some(r_fd.as_fd()),
+            ),
+            Err(TransportError::Encode(
+                EncodeError::InvalidDescriptorAttachment
+            ))
+        ));
+        assert_eq!(parser_asm.buffered_bytes(), 0);
+    }
+
     proptest! {
         #[test]
         fn decoder_never_panics_on_arbitrary_packets(

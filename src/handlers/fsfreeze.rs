@@ -202,19 +202,22 @@ pub struct FreezeListArgs {
     pub mountpoints: Option<Vec<String>>,
 }
 
-/// `guest-fsfreeze-status`: `"frozen"` whenever the state is not `Thawed`
-/// (C-7); refreshes the watchdog only while `Frozen`.
-pub async fn status(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
-    let NoArgs {} = arguments(req)?;
+/// Typed IPC helper for `guest-fsfreeze-status`: returns `"frozen"` whenever
+/// the state is not `Thawed` (C-7) and refreshes the watchdog only while
+/// `Frozen`.
+pub fn execute_status_ipc(ctx: &Arc<Context>) -> crate::ipc::WireFreezeStatus {
     let state = ctx.state.current();
     if state == FreezeState::Frozen {
         ctx.hooks.on_heartbeat(ctx);
     }
-    Ok(json!(if state.is_frozen_for_gate() {
-        "frozen"
-    } else {
-        "thawed"
-    }))
+    crate::ipc::WireFreezeStatus::from_state(state)
+}
+
+/// `guest-fsfreeze-status`: `"frozen"` whenever the state is not `Thawed`
+/// (C-7); refreshes the watchdog only while `Frozen`.
+pub async fn status(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
+    let NoArgs {} = arguments(req)?;
+    Ok(json!(execute_status_ipc(ctx).as_str()))
 }
 
 /// `guest-fsfreeze-freeze`: freezes the whole plan.
@@ -228,6 +231,101 @@ pub async fn freeze(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
 pub async fn freeze_list(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
     let args: FreezeListArgs = arguments(req)?;
     run_freeze(ctx, args.mountpoints).await
+}
+
+/// Typed IPC helper for `guest-fsfreeze-freeze` and
+/// `guest-fsfreeze-freeze-list` returning closed [`crate::ipc::IpcErrorCode`]
+/// values with zero guest paths or device numbers.
+pub async fn execute_freeze_ipc(
+    ctx: &Arc<Context>,
+    restrict: Option<Vec<String>>,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    let effective =
+        filter_freeze_selection(restrict.as_deref(), ctx.config.freeze_allowed_mountpoints());
+    let token =
+        ctx.state
+            .begin_freeze()
+            .map_err(|err| crate::ipc::IpcErrorCode::TransitionConflict {
+                op: crate::ipc::TransitionOp::BeginFreeze,
+                current: err.current,
+            })?;
+    if effective.as_deref() == Some(&[]) {
+        ctx.state.freeze_failed(token);
+        tracing::info!(
+            event = "fsfreeze_empty_selection",
+            "freeze selection admitted zero targets; settled thawed without I/O"
+        );
+        return Ok(0);
+    }
+    ctx.hooks.on_freezing(ctx);
+    let reply = crate::freeze_op::start(Arc::clone(ctx), token, effective);
+    match reply.await {
+        Ok(Ok(frozen)) => Ok(frozen),
+        Ok(Err(failure)) => Err(crate::ipc::IpcErrorCode::from_freeze_failure(&failure)),
+        Err(_) => Err(crate::ipc::IpcErrorCode::FreezeTaskFailed {
+            stage: FreezeTaskStage::Preparation,
+        }),
+    }
+}
+
+/// Typed IPC helper for `guest-fsfreeze-thaw` returning closed
+/// [`crate::ipc::IpcErrorCode`] values with zero guest paths or device numbers.
+pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::IpcErrorCode> {
+    let token = match ctx.state.claim_thaw() {
+        Ok(token) => token,
+        Err(err) => match ctx.freeze_op() {
+            Some(op) => return join_operation_typed(ctx, &op).await,
+            None => ctx.state.claim_thaw().map_err(|_| {
+                crate::ipc::IpcErrorCode::TransitionConflict {
+                    op: crate::ipc::TransitionOp::ClaimThaw,
+                    current: err.current,
+                }
+            })?,
+        },
+    };
+    run_thaw_typed(ctx, token).await
+}
+
+async fn join_operation_typed(
+    ctx: &Arc<Context>,
+    op: &crate::freeze_op::FreezeOp,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
+        op.wait_for_settlement().await;
+        let token =
+            ctx.state
+                .claim_thaw()
+                .map_err(|err| crate::ipc::IpcErrorCode::TransitionConflict {
+                    op: crate::ipc::TransitionOp::ClaimThaw,
+                    current: err.current,
+                })?;
+        return run_thaw_typed(ctx, token).await;
+    }
+    let progress = op.progress();
+    match progress.settled {
+        Some(FreezeState::Thawed) => Ok(progress.recovered),
+        Some(state) => Err(crate::ipc::IpcErrorCode::ThawIncomplete {
+            kind: progress
+                .unrecoverable_reason
+                .unwrap_or(RecoveryReason::RecoveryIncomplete),
+            thawed: progress.recovered,
+            final_state: state,
+            marker_retained: true,
+        }),
+        None => {
+            let activity = if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
+                crate::ipc::AbortActivity::Preparing
+            } else if progress.in_flight.is_some() {
+                crate::ipc::AbortActivity::InFlightFifreeze
+            } else {
+                crate::ipc::AbortActivity::Idle
+            };
+            Err(crate::ipc::IpcErrorCode::ThawAbortPending {
+                activity,
+                thawed: progress.recovered,
+            })
+        }
+    }
 }
 
 /// `guest-fsfreeze-thaw`: drains every planned filesystem. While a freeze
@@ -361,6 +459,17 @@ async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result
 /// The thaw drain shared by the handler and the watchdog: the caller has
 /// already won `claim_thaw` and passes the token.
 pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error> {
+    run_thaw_typed(ctx, token)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)
+}
+
+/// Typed variant of [`run_thaw`] returning closed [`crate::ipc::IpcErrorCode`]
+/// values shared between direct QGA handlers and the isolated IPC executor.
+pub async fn run_thaw_typed(
+    ctx: &Arc<Context>,
+    token: ThawToken,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
     ctx.hooks.on_thaw_claimed(ctx);
     let kernel = Arc::clone(&ctx.kernel);
     let mounts = Arc::clone(&ctx.mounts);
@@ -534,8 +643,10 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             ctx.set_thaw_scope(ThawScope::Discovery);
             ctx.state.thaw_succeeded(token);
             tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
-            Err(Error::Internal(
-                failure.host_description(FreezeState::Thawed),
+            Err(crate::ipc::IpcErrorCode::from_thaw_failure(
+                &failure,
+                FreezeState::Thawed,
+                false,
             ))
         }
         Err(failure) => {
@@ -552,10 +663,11 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             } else {
                 tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; recovery marker unavailable");
             }
-            Err(Error::Internal(failure.host_description_with_marker(
+            Err(crate::ipc::IpcErrorCode::from_thaw_failure(
+                &failure,
                 FreezeState::Frozen,
                 marker_retained,
-            )))
+            ))
         }
     }
 }

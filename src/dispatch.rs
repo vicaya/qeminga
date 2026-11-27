@@ -455,6 +455,12 @@ impl Context {
         self.handler_calls.load(Ordering::SeqCst)
     }
 
+    /// Increments the handler invocation counter (shared by direct dispatch
+    /// and the isolated IPC executor).
+    pub(crate) fn record_handler_call(&self) {
+        self.handler_calls.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// A context with default configuration, a thawed state machine, an
     /// audit router that discards output, and a marker in the temporary
     /// directory that nothing creates unless a test freezes.

@@ -24,6 +24,7 @@ pub mod channel_verify;
 pub mod config;
 pub mod daemon;
 pub mod dispatch;
+pub mod executor;
 pub mod framing;
 pub mod freeze_op;
 pub mod freeze_plan;

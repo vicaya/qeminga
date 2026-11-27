@@ -17,6 +17,7 @@ pub mod caps;
 pub mod fake;
 pub mod ioctl;
 pub mod ipc;
+pub mod process;
 pub mod shutdown;
 pub mod statx;
 

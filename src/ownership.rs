@@ -274,6 +274,11 @@ impl LinuxOwnershipStore {
         };
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
         let dir = open(&path, flags, Mode::empty()).map_err(open_err)?;
+        let dir = if std::os::fd::AsRawFd::as_raw_fd(&dir) <= crate::ipc::IPC_FD {
+            crate::kernel::ipc::dup_above_cloexec(dir, crate::ipc::IPC_FD + 1).map_err(open_err)?
+        } else {
+            dir
+        };
         let st = fstat(&dir).map_err(open_err)?;
         let fs = fstatfs(&dir).map_err(open_err)?;
         let dev = (

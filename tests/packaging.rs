@@ -310,22 +310,33 @@ fn udev_rule_matches_design_byte_for_byte() {
 #[test]
 fn sysusers_creates_qeminga_600_without_login_shell() {
     let text = read("packaging/sysusers.d/qeminga.conf");
-    let user = text
-        .lines()
-        .find(|l| l.starts_with("u "))
-        .expect("a `u` line");
-    let fields: Vec<&str> = user.split_whitespace().collect();
-    assert_eq!(fields[1], "qeminga");
-    assert_eq!(fields[2], "600:600");
-    assert!(user.ends_with("/usr/sbin/nologin"), "{user}");
-    let group = text
-        .lines()
-        .find(|l| l.starts_with("g "))
-        .expect("a `g` line");
-    assert_eq!(
-        group.split_whitespace().collect::<Vec<_>>(),
-        ["g", "qeminga", "600"]
-    );
+    let users: Vec<&str> = text.lines().filter(|l| l.starts_with("u ")).collect();
+    let groups: Vec<&str> = text.lines().filter(|l| l.starts_with("g ")).collect();
+    assert_eq!(users.len(), 2, "{users:?}");
+    assert_eq!(groups.len(), 2, "{groups:?}");
+
+    for (expected_name, expected_ids, expected_gid) in [
+        ("qeminga", "600:600", "600"),
+        ("qeminga-parser", "601:601", "601"),
+    ] {
+        let user = users
+            .iter()
+            .find(|l| l.split_whitespace().nth(1) == Some(expected_name))
+            .unwrap_or_else(|| panic!("missing `u {expected_name}` line in:\n{text}"));
+        let fields: Vec<&str> = user.split_whitespace().collect();
+        assert_eq!(fields[1], expected_name);
+        assert_eq!(fields[2], expected_ids);
+        assert!(user.ends_with("/usr/sbin/nologin"), "{user}");
+
+        let group = groups
+            .iter()
+            .find(|l| l.split_whitespace().nth(1) == Some(expected_name))
+            .unwrap_or_else(|| panic!("missing `g {expected_name}` line in:\n{text}"));
+        assert_eq!(
+            group.split_whitespace().collect::<Vec<_>>(),
+            ["g", expected_name, expected_gid]
+        );
+    }
 }
 
 #[test]

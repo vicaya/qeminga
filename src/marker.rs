@@ -125,6 +125,11 @@ impl Marker {
         };
         let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC;
         let dir = open(parent, flags, Mode::empty()).map_err(directory)?;
+        let dir = if std::os::fd::AsRawFd::as_raw_fd(&dir) <= crate::ipc::IPC_FD {
+            crate::kernel::ipc::dup_above_cloexec(dir, crate::ipc::IPC_FD + 1).map_err(directory)?
+        } else {
+            dir
+        };
         let st = fstat(&dir).map_err(directory)?;
         let dev = (
             u32::try_from(major(st.st_dev)).unwrap_or(u32::MAX),

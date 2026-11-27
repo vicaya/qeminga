@@ -215,15 +215,17 @@ fn open_pty() -> Pty {
 /// *not* root), so every test would otherwise report the daemon's exit 77.
 /// Fail once, before spawning, with the fix.
 pub fn require_service_account_when_root() {
-    if nix::unistd::geteuid().is_root()
-        && nix::unistd::User::from_name("qeminga").unwrap().is_none()
-    {
-        panic!(
-            "running as root without the `qeminga` account: the daemon refuses to start (cannot drop privileges, exit 77). \
-             Create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` \
-             (or `groupadd -g 600 qeminga && useradd -r -u 600 -g 600 -M -s /usr/sbin/nologin qeminga`), \
-             or run the tests unprivileged."
-        );
+    if nix::unistd::geteuid().is_root() {
+        for account in ["qeminga", "qeminga-parser"] {
+            if nix::unistd::User::from_name(account).unwrap().is_none() {
+                panic!(
+                    "running as root without the `{account}` account: the daemon refuses to start (cannot drop privileges, exit 77). \
+                     Create both accounts with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` \
+                     (or groupadd/useradd for `qeminga` 600:600 and `qeminga-parser` 601:601), \
+                     or run the tests unprivileged."
+                );
+            }
+        }
     }
 }
 

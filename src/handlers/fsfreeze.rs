@@ -284,11 +284,18 @@ pub async fn execute_freeze_ipc_with_published(
 
 /// Typed IPC helper for `guest-fsfreeze-thaw` returning closed
 /// [`crate::ipc::IpcErrorCode`] values with zero guest paths or device numbers.
+///
+/// While a freeze operation is unresolved (`Freezing`, or the recovery of an
+/// aborted one), the thaw joins it instead of starting a drain of its own: it
+/// requests the abort and reports the operation's outcome (§4.4). No target is
+/// ever drained by two owners.
 pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::IpcErrorCode> {
     let token = match ctx.state.claim_thaw() {
         Ok(token) => token,
         Err(err) => match ctx.freeze_op() {
             Some(op) => return join_operation_typed(ctx, &op).await,
+            // The operation may have settled between the claim and the
+            // look-up: one more claim before refusing.
             None => ctx.state.claim_thaw().map_err(|_| {
                 crate::ipc::IpcErrorCode::TransitionConflict {
                     op: crate::ipc::TransitionOp::ClaimThaw,
@@ -300,6 +307,21 @@ pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::Ipc
     run_thaw_typed(ctx, token).await
 }
 
+/// A thaw that joins the freeze operation in progress: it requests the abort
+/// and is answered at once, conservatively, from the operation's current
+/// progress. It never waits for the recovery (a blocked `FITHAW` would hold
+/// the session with it) and never reports a complete thaw while the operation
+/// can still freeze a target: the host learns the outcome from
+/// `guest-fsfreeze-status`, which answers `frozen` until the operation has
+/// settled `Thawed`.
+///
+/// The request and the operation's own commit compete on one transition: when
+/// the operation had already committed (a freeze that succeeded a moment ago,
+/// or a settlement of its own), nothing is aborted, the operation's settlement
+/// is awaited (the driver is past every blocking call by then) and the thaw
+/// takes the ordinary path from the published state, so a thaw is never told
+/// "recovery pending" by an operation that then publishes a successful
+/// `Frozen`.
 async fn join_operation_typed(
     ctx: &Arc<Context>,
     op: &crate::freeze_op::FreezeOp,
@@ -326,111 +348,54 @@ async fn join_operation_typed(
             final_state: state,
             marker_retained: true,
         }),
-        None => {
-            let activity = if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
-                crate::ipc::AbortActivity::Preparing
-            } else if progress.in_flight.is_some() {
-                crate::ipc::AbortActivity::InFlightFifreeze
-            } else {
-                crate::ipc::AbortActivity::Idle
-            };
-            Err(crate::ipc::IpcErrorCode::ThawAbortPending {
-                activity,
-                thawed: progress.recovered,
-            })
-        }
+        None => Err(abort_pending_error(&progress)),
     }
 }
 
-/// `guest-fsfreeze-thaw`: drains every planned filesystem. While a freeze
-/// operation is unresolved (`Freezing`, or the recovery of an aborted one),
-/// the thaw joins it instead of starting a drain of its own: it requests
-/// the abort, waits for the recovery pass over the targets frozen so far,
-/// and reports the operation's outcome (§4.4). No target is ever drained
-/// by two owners.
+/// Maps an unsettled freeze operation's progress to its closed host-safe
+/// `ThawAbortPending` error code (design §4.4, §5.9, AC27).
+fn abort_pending_error(progress: &crate::freeze_op::Progress) -> crate::ipc::IpcErrorCode {
+    let activity = if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
+        crate::ipc::AbortActivity::Preparing
+    } else if progress.in_flight.is_some() {
+        crate::ipc::AbortActivity::InFlightFifreeze
+    } else {
+        crate::ipc::AbortActivity::Idle
+    };
+    crate::ipc::IpcErrorCode::ThawAbortPending {
+        activity,
+        thawed: progress.recovered,
+    }
+}
+
+/// `guest-fsfreeze-thaw`: drains every planned filesystem (delegating through
+/// [`execute_thaw_ipc`] so direct QGA and isolated IPC share one abort/join
+/// implementation).
 pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
-    let token = match ctx.state.claim_thaw() {
-        Ok(token) => token,
-        Err(err) => match ctx.freeze_op() {
-            Some(op) => return join_operation(ctx, &op).await,
-            // The operation may have settled between the claim and the
-            // look-up: one more claim before refusing.
-            None => ctx
-                .state
-                .claim_thaw()
-                .map_err(|_| Error::Internal(format!("cannot thaw: {err}")))?,
-        },
-    };
-    let count = run_thaw(ctx, token).await?;
+    let count = execute_thaw_ipc(ctx)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)?;
     Ok(json!(count))
 }
 
-/// A thaw that joins the freeze operation in progress: it requests the
-/// abort and is answered at once, conservatively, from the operation's
-/// current progress. It never waits for the recovery (a blocked `FITHAW`
-/// would hold the session with it) and never reports a complete thaw
-/// while the operation can still freeze a target: the host learns the
-/// outcome from `guest-fsfreeze-status`, which answers `frozen` until the
-/// operation has settled `Thawed`.
-///
-/// The request and the operation's own commit compete on one transition:
-/// when the operation had already committed (a freeze that succeeded a
-/// moment ago, or a settlement of its own), nothing is aborted, the
-/// operation's settlement is awaited (the driver is past every blocking
-/// call by then) and the thaw takes the ordinary path from the published
-/// state, so a thaw is never told "recovery pending" by an operation that
-/// then publishes a successful `Frozen`.
+#[cfg(test)]
 async fn join_operation(
     ctx: &Arc<Context>,
     op: &crate::freeze_op::FreezeOp,
 ) -> Result<Value, Error> {
-    if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
-        op.wait_for_settlement().await;
-        let token = ctx
-            .state
-            .claim_thaw()
-            .map_err(|err| Error::Internal(format!("cannot thaw: {err}")))?;
-        let count = run_thaw(ctx, token).await?;
-        return Ok(json!(count));
-    }
-    let progress = op.progress();
-    match progress.settled {
-        Some(FreezeState::Thawed) => Ok(json!(progress.recovered)),
-        Some(state) => {
-            let reason = progress
-                .unrecoverable_reason
-                .map(RecoveryReason::host_reason)
-                .unwrap_or("recovery incomplete");
-            Err(Error::Internal(format!(
-                "thaw joined the aborted freeze: {} target(s) thawed; {reason}; state {state}, marker retained",
-                progress.recovered,
-            )))
-        }
-        None => Err(Error::Internal(format_joining_pending(&progress))),
-    }
+    let count = join_operation_typed(ctx, op)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)?;
+    Ok(json!(count))
 }
 
-/// Host-facing reply for a `guest-fsfreeze-thaw` joining an unsettled
-/// freeze operation (design §4.4, §5.9, AC27). Across the unsettled window —
-/// preparation, transition in `commit_abort`, recovery draining, and
-/// finalisation after marker removal — the reply uses the fixed
-/// `"abort accepted, recovery pending"` wording together with the observed
-/// thawed count and in-flight activity, avoiding stale state or marker claims.
+#[cfg(test)]
 fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
-    if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
-        return "thaw requested: abort accepted, recovery pending (preparation still in flight)"
-            .to_owned();
+    match abort_pending_error(progress).to_proto_error() {
+        Error::Internal(desc) => desc,
+        other => other.to_string(),
     }
-    let activity = if progress.in_flight.is_some() {
-        ", a FIFREEZE is still in flight"
-    } else {
-        ""
-    };
-    format!(
-        "thaw requested: abort accepted, recovery pending ({} target(s) thawed so far{activity})",
-        progress.recovered,
-    )
 }
 
 /// The freeze algorithm shared by `freeze` and `freeze-list`: claim

@@ -511,8 +511,24 @@ where
         // untrusted parser (design §5.7).
         if stop_requested {
             if ctx.state.current() == FreezeState::Thawed && tasks.is_empty() {
+                let mut terminal_err: Option<OpenError> = None;
                 while let Ok(reply) = reply_rx.try_recv() {
-                    if reply.terminal_channel_err.is_none() {
+                    if let Some(term_err) = reply.terminal_channel_err {
+                        tracing::error!(
+                            event = "channel_lost",
+                            error = %term_err,
+                            "channel lost for good; exiting once thawed"
+                        );
+                        let _ = outbox.push_response(
+                            reply.session_gen,
+                            reply.req_id,
+                            &IpcResponse::Err(IpcErrorCode::ChannelTerminalBusy),
+                            None,
+                        );
+                        if terminal_err.is_none() {
+                            terminal_err = Some(term_err);
+                        }
+                    } else {
                         let _ = outbox.push_response(
                             reply.session_gen,
                             reply.req_id,
@@ -523,6 +539,9 @@ where
                 }
                 if !outbox.is_empty() {
                     let _ = outbox.flush(async_ipc.as_fd());
+                }
+                if let Some(err) = terminal_err {
+                    break Err(ExecutorExitError::ChannelTerminal(err));
                 }
                 if !outbox.is_empty() {
                     tracing::debug!(
@@ -2858,5 +2877,239 @@ mod tests {
             .await
             .expect("dropping unacquired Ordinary ticket must unblock waiting Freeze");
         drop(freeze2_guard);
+    }
+
+    #[tokio::test]
+    async fn executor_preserves_completed_terminal_reopen_error_on_graceful_stop() {
+        // Astra review: when a reopen worker completes with terminal EBUSY and
+        // SIGTERM arrives before `reply_rx.recv()` processes it, the graceful
+        // stop drain must preserve `ExecutorExitError::ChannelTerminal` and log
+        // `channel_lost` rather than silently returning `Ok(())`.
+        let sink = SharedSink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::INFO,
+            router.clone(),
+        ));
+        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
+
+        let ctx = Arc::new(Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            router.clone(),
+            Marker::for_tests(),
+        ));
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener_entered = Arc::new(std::sync::Barrier::new(2));
+        let opener_release = Arc::new(std::sync::Barrier::new(2));
+        let entered_clone = Arc::clone(&opener_entered);
+        let release_clone = Arc::clone(&opener_release);
+        let opener: VerifiedOpenFn = Arc::new(move |p| {
+            entered_clone.wait();
+            release_clone.wait();
+            Err(OpenError::AlreadyOpen { path: p.to_owned() })
+        });
+
+        send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::RequestChannelReopen).unwrap();
+
+        let exec_task = tokio::spawn(
+            serve_ipc_with_backoff(
+                ctx,
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+                opener,
+                false,
+                None,
+                false,
+                async move { stop_rx.await.unwrap_or("SIGTERM") },
+                Duration::from_millis(10),
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .with_subscriber(dispatch.clone()),
+        );
+
+        // Wait until the reopen worker is past its cancelable sleep and inside
+        // the blocking opener, then send SIGTERM so `stop_requested` latches
+        // BEFORE the reopen completes with terminal EBUSY.
+        tokio::task::spawn_blocking(move || {
+            opener_entered.wait();
+            let _ = stop_tx.send("SIGTERM");
+            std::thread::sleep(Duration::from_millis(50));
+            opener_release.wait();
+        })
+        .await
+        .unwrap();
+
+        let res = exec_task.await.unwrap();
+
+        assert!(
+            matches!(
+                res,
+                Err(ExecutorExitError::ChannelTerminal(
+                    OpenError::AlreadyOpen { .. }
+                ))
+            ),
+            "expected ChannelTerminal(AlreadyOpen), got {res:?}"
+        );
+        drop(parser_sock);
+        assert!(router.settle(Duration::from_secs(2)));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("\"event\":\"channel_lost\""),
+            "expected channel_lost audit event: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_ipc_thaw_joins_inflight_freeze_and_clears_marker() {
+        // Astra review: deterministically gate FIFREEZE in flight, send
+        // FsfreezeThaw over IPC to verify ThawAbortPending(InFlightFifreeze),
+        // then release the gate and assert the aborted freeze removes the
+        // recovery marker and settles Thawed.
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let gate = kernel.script_freeze_gate("/");
+        let _release_guard = gate.release_on_drop();
+        let table = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let state_dir = tempfile::Builder::new()
+            .prefix("qeminga-exec-thaw-join-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let marker_path = state_dir.path().join("frozen");
+        let marker = Marker::open(&marker_path).unwrap();
+        let router = Router::new(Box::new(std::io::sink()));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::INFO,
+            router.clone(),
+        ));
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                router,
+                marker,
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(table.to_owned()))),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+
+        let exec_task = tokio::spawn(
+            serve_ipc_with_backoff(
+                Arc::clone(&ctx),
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+                opener,
+                true,
+                None,
+                false,
+                async move { stop_rx.await.unwrap_or("SIGTERM") },
+                Duration::from_millis(10),
+                Duration::from_millis(20),
+                Duration::from_millis(20),
+            )
+            .with_subscriber(dispatch),
+        );
+
+        let ctx_check = Arc::clone(&ctx);
+        let marker_check = marker_path.clone();
+        let parser_sock = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            // 1. Start freeze; wait until FIFREEZE is blocked at the gate.
+            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::FsfreezeFreeze).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while gate.waiting() == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "FIFREEZE never reached gate"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(ctx_check.state.current(), FreezeState::Freezing);
+            assert!(
+                marker_check.exists(),
+                "recovery marker must exist while FIFREEZE is in flight"
+            );
+
+            // 2. Send FsfreezeThaw over IPC while FIFREEZE is in flight:
+            //    must join the active FreezeOp and return ThawAbortPending.
+            send_request(parser_sock.as_fd(), 1, 2, &IpcRequest::FsfreezeThaw).unwrap();
+            let thaw_reply = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(thaw_reply.req_id, 2);
+            assert_eq!(
+                thaw_reply.response,
+                IpcResponse::Err(IpcErrorCode::ThawAbortPending {
+                    activity: crate::ipc::AbortActivity::InFlightFifreeze,
+                    thawed: 0,
+                })
+            );
+
+            // 3. Release the blocked FIFREEZE: freeze aborts, drains the late
+            //    frozen target, removes the recovery marker, and settles Thawed.
+            gate.release();
+            let freeze_reply = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(freeze_reply.req_id, 1);
+            assert!(
+                matches!(
+                    freeze_reply.response,
+                    IpcResponse::Err(IpcErrorCode::FreezeAborted { .. })
+                ),
+                "expected FreezeAborted reply, got {:?}",
+                freeze_reply.response
+            );
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while ctx_check.state.current() != FreezeState::Thawed
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(ctx_check.state.current(), FreezeState::Thawed);
+            assert!(
+                !marker_check.exists(),
+                "recovery marker must be removed after aborted freeze settles Thawed"
+            );
+
+            // 4. Normal freeze -> thaw round-trip verifying real state and marker transitions.
+            send_request(parser_sock.as_fd(), 1, 3, &IpcRequest::FsfreezeFreeze).unwrap();
+            let fr = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fr.response, IpcResponse::OkCount(1));
+            assert_eq!(ctx_check.state.current(), FreezeState::Frozen);
+            assert!(marker_check.exists());
+
+            send_request(parser_sock.as_fd(), 1, 4, &IpcRequest::FsfreezeThaw).unwrap();
+            let tr = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(tr.response, IpcResponse::OkCount(1));
+            assert_eq!(ctx_check.state.current(), FreezeState::Thawed);
+            assert!(!marker_check.exists());
+
+            let _ = stop_tx.send("SIGTERM");
+            parser_sock
+        })
+        .await
+        .unwrap();
+
+        exec_task.await.unwrap().unwrap();
+        assert_eq!(
+            ctx.handler_calls(),
+            4,
+            "all 4 admitted IPC commands must increment Context::handler_calls"
+        );
+        drop(parser_sock);
     }
 }

@@ -1128,37 +1128,84 @@ impl PtyChannel {
     /// Sends one request line and returns the reply line, or panics after
     /// ten seconds.
     fn request(&mut self, json: &str) -> String {
+        self.request_in_phase("request", json)
+    }
+
+    /// Sends one request line in a named test `phase` and returns the reply
+    /// line, reporting phase, request, poll flags, transport errno, partial
+    /// bytes, and the unit journal on any failure.
+    fn request_in_phase(&mut self, phase: &str, json: &str) -> String {
         use std::io::{Read, Write};
         use std::os::fd::AsFd;
-        self.master.write_all(json.as_bytes()).unwrap();
-        self.master.write_all(b"\n").unwrap();
+        let dump_journal = || -> String {
+            let (_, journal) = sh(
+                "journalctl",
+                &["-u", "qeminga.service", "-b", "--no-pager", "-n", "40"],
+            );
+            journal
+        };
+        if let Err(err) = self
+            .master
+            .write_all(json.as_bytes())
+            .and_then(|()| self.master.write_all(b"\n"))
+        {
+            panic!(
+                "PTY write failed in phase {phase:?} on {} for {json}: {err}\njournal:\n{}",
+                self.slave_path,
+                dump_journal()
+            );
+        }
         let mut line = Vec::new();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
-            assert!(
-                !left.is_zero(),
-                "no reply to {json}: {:?}",
-                String::from_utf8_lossy(&line)
-            );
+            if left.is_zero() {
+                panic!(
+                    "PTY timeout in phase {phase:?} on {} for {json}; partial={:?}\njournal:\n{}",
+                    self.slave_path,
+                    String::from_utf8_lossy(&line),
+                    dump_journal()
+                );
+            }
             let mut fds = [nix::poll::PollFd::new(
                 self.master.as_fd(),
                 nix::poll::PollFlags::POLLIN,
             )];
             let ready =
-                nix::poll::poll(&mut fds, nix::poll::PollTimeout::try_from(left).unwrap()).unwrap();
+                match nix::poll::poll(&mut fds, nix::poll::PollTimeout::try_from(left).unwrap()) {
+                    Ok(n) => n,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(err) => panic!(
+                        "PTY poll failed in phase {phase:?} on {} for {json}: {err}\njournal:\n{}",
+                        self.slave_path,
+                        dump_journal()
+                    ),
+                };
             if ready == 0 {
                 continue;
             }
+            let revents = fds[0].revents().unwrap_or(nix::poll::PollFlags::empty());
             let mut byte = [0u8; 1];
-            assert!(
-                self.master.read(&mut byte).unwrap() != 0,
-                "channel closed before a reply to {json}"
-            );
-            if byte[0] == b'\n' {
-                return String::from_utf8(line).unwrap();
+            match self.master.read(&mut byte) {
+                Ok(0) => panic!(
+                    "PTY EOF in phase {phase:?} on {} for {json} (revents={revents:?}); partial={:?}\njournal:\n{}",
+                    self.slave_path,
+                    String::from_utf8_lossy(&line),
+                    dump_journal()
+                ),
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        return String::from_utf8(line).unwrap();
+                    }
+                    line.push(byte[0]);
+                }
+                Err(err) => panic!(
+                    "PTY read error in phase {phase:?} on {} for {json} (revents={revents:?}): {err}; partial={:?}\njournal:\n{}",
+                    self.slave_path,
+                    String::from_utf8_lossy(&line),
+                    dump_journal()
+                ),
             }
-            line.push(byte[0]);
         }
     }
 }
@@ -2186,18 +2233,91 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
     )
     .unwrap();
 
+    let wait_for_parser_holding_pty = |phase: &str,
+                                       exec_pid: &str,
+                                       expected_slave: &str,
+                                       timeout: std::time::Duration|
+     -> u32 {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let mut children = Vec::new();
+            if let Ok(tasks) = std::fs::read_dir(format!("/proc/{exec_pid}/task")) {
+                for task in tasks.flatten() {
+                    if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+                        for tok in text.split_whitespace() {
+                            if let Ok(cpid) = tok.parse::<u32>()
+                                && !children.contains(&cpid)
+                            {
+                                children.push(cpid);
+                            }
+                        }
+                    }
+                }
+            }
+            if children.len() == 1 {
+                let cpid = children[0];
+                let has_slave = std::fs::read_dir(format!("/proc/{cpid}/fd"))
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|e| std::fs::read_link(e.path()).ok())
+                    .any(|t| t.to_string_lossy() == expected_slave);
+                let status =
+                    std::fs::read_to_string(format!("/proc/{cpid}/status")).unwrap_or_default();
+                let ready = has_slave
+                    && status.contains("Name:\tqeminga-parser")
+                    && status.contains("Uid:\t601\t601")
+                    && (!cfg!(feature = "seccomp") || status.contains("Seccomp:\t2"));
+                if ready {
+                    return cpid;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                let (_, journal) = sh(
+                    "journalctl",
+                    &["-u", "qeminga.service", "-b", "--no-pager", "-n", "40"],
+                );
+                panic!(
+                    "timed out in phase {phase:?} waiting for parser child of {exec_pid} to own {expected_slave} (children={children:?})\njournal:\n{journal}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
     let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
     assert!(ok, "systemctl start (CVM): {text}");
+
+    let pid = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let (_, pid_raw) = sh(
+                "systemctl",
+                &["show", "-p", "MainPID", "--value", "qeminga.service"],
+            );
+            let p = pid_raw.trim();
+            if !p.is_empty() && p != "0" && Path::new(&format!("/proc/{p}/status")).exists() {
+                break p.to_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "qeminga.service MainPID did not appear"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+    let parser_pid = wait_for_parser_holding_pty(
+        "initial-start",
+        &pid,
+        &pty1.slave_path,
+        std::time::Duration::from_secs(15),
+    );
     assert_eq!(
-        pty1.request(r#"{"execute":"guest-ping"}"#),
+        pty1.request_in_phase("initial-ping", r#"{"execute":"guest-ping"}"#),
         r#"{"return":{}}"#
     );
 
-    let (_, pid_raw) = sh(
-        "systemctl",
-        &["show", "-p", "MainPID", "--value", "qeminga.service"],
-    );
-    let pid = pid_raw.trim().to_owned();
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
     let field = |name: &str| -> String {
         status
@@ -2218,31 +2338,6 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
     assert_eq!(field("Seccomp:"), "2");
     assert!(field("Uid:").starts_with("600\t600"), "{}", field("Uid:"));
 
-    let find_parser_child = |exec_pid: &str| -> u32 {
-        let mut children = Vec::new();
-        for task in std::fs::read_dir(format!("/proc/{exec_pid}/task"))
-            .unwrap()
-            .flatten()
-        {
-            if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
-                for tok in text.split_whitespace() {
-                    if let Ok(cpid) = tok.parse::<u32>()
-                        && !children.contains(&cpid)
-                    {
-                        children.push(cpid);
-                    }
-                }
-            }
-        }
-        assert_eq!(
-            children.len(),
-            1,
-            "expected one parser child of {exec_pid}, found {children:?}"
-        );
-        children[0]
-    };
-
-    let parser_pid = find_parser_child(&pid);
     let parser_threads = e2e::thread_statuses(parser_pid);
     assert_eq!(parser_threads.len(), 1);
     let pt = &parser_threads[0];
@@ -2272,7 +2367,7 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
 
     // Disabled CVM commands are denied independently by the executor.
     for method in ["guest-get-osinfo", "guest-shutdown", "guest-fstrim"] {
-        let reply = pty1.request(&format!(r#"{{"execute":"{method}"}}"#));
+        let reply = pty1.request_in_phase("cvm-disabled", &format!(r#"{{"execute":"{method}"}}"#));
         assert!(
             reply.contains("disabled"),
             "CVM profile must deny {method}: {reply}"
@@ -2284,8 +2379,15 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
     let mut pty2 = PtyChannel::open_for_qeminga();
     repoint_symlink(channel_link, &pty2.slave_path);
     drop(pty1);
+    let reopened_parser_pid = wait_for_parser_holding_pty(
+        "post-reopen",
+        &pid,
+        &pty2.slave_path,
+        std::time::Duration::from_secs(15),
+    );
+    assert_eq!(reopened_parser_pid, parser_pid);
     assert_eq!(
-        pty2.request(r#"{"execute":"guest-ping"}"#),
+        pty2.request_in_phase("post-reopen-ping", r#"{"execute":"guest-ping"}"#),
         r#"{"return":{}}"#,
         "CVM executor must complete SCM_RIGHTS channel reopen over IPC_FD"
     );
@@ -2299,7 +2401,10 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
         "arguments": { "mountpoints": [ext4.clone()] },
     })
     .to_string();
-    assert_eq!(pty2.request(&freeze_req), r#"{"return":1}"#);
+    assert_eq!(
+        pty2.request_in_phase("freeze-before-parser-kill", &freeze_req),
+        r#"{"return":1}"#
+    );
     assert!(Path::new("/run/qeminga/frozen").exists());
 
     nix::sys::signal::kill(
@@ -2309,7 +2414,7 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
     .unwrap();
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    loop {
+    let restarted_pid = loop {
         let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
         let (_, new_pid) = sh(
             "systemctl",
@@ -2322,7 +2427,7 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
             && new_pid != pid
             && !Path::new("/run/qeminga/frozen").exists()
         {
-            break;
+            break new_pid.to_owned();
         }
         assert!(
             std::time::Instant::now() < deadline,
@@ -2330,10 +2435,21 @@ fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
             Path::new("/run/qeminga/frozen").exists()
         );
         std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    };
+
+    // Wait for the replacement parser child to hold `pty2.slave_path` before
+    // writing to `pty2.master` (under `Type=simple`, `active` and `MainPID`
+    // advance before the replacement parser opens the PTY slave).
+    let restarted_parser_pid = wait_for_parser_holding_pty(
+        "post-restart",
+        &restarted_pid,
+        &pty2.slave_path,
+        std::time::Duration::from_secs(15),
+    );
+    assert_ne!(restarted_parser_pid, parser_pid);
 
     assert_eq!(
-        pty2.request(r#"{"execute":"guest-ping"}"#),
+        pty2.request_in_phase("post-restart-ping", r#"{"execute":"guest-ping"}"#),
         r#"{"return":{}}"#,
         "restarted CVM unit must serve requests"
     );

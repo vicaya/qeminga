@@ -81,6 +81,65 @@ pub fn seqpacket_pair(nonblocking: bool) -> Result<(OwnedFd, OwnedFd), Errno> {
     socketpair(AddressFamily::Unix, SockType::SeqPacket, None, flags)
 }
 
+/// Duplicates `fd` onto the lowest unused descriptor `>= min_fd` with
+/// `FD_CLOEXEC` set and closes the original descriptor.
+pub fn dup_above_cloexec(fd: OwnedFd, min_fd: RawFd) -> Result<OwnedFd, Errno> {
+    if min_fd < 0 {
+        return Err(Errno::EINVAL);
+    }
+    // SAFETY: `fd` is a valid owned descriptor; `F_DUPFD_CLOEXEC` returns a
+    // brand-new descriptor `>= min_fd` with `FD_CLOEXEC` set or `-1` on error.
+    let new_raw = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, min_fd) };
+    if new_raw < 0 {
+        return Err(Errno::last());
+    }
+    // SAFETY: `new_raw` was freshly allocated by `fcntl(F_DUPFD_CLOEXEC)` and
+    // is uniquely owned by this function.
+    let new_fd = unsafe { OwnedFd::from_raw_fd(new_raw) };
+    drop(fd);
+    Ok(new_fd)
+}
+
+/// Moves `fd` onto exact descriptor number `target_fd` with `FD_CLOEXEC` set
+/// and closes the original descriptor (if distinct).
+///
+/// Fails with [`Errno::EBUSY`] if `target_fd` is already open by another
+/// descriptor, so a live [`OwnedFd`] in the same process is never clobbered.
+pub fn pin_unused_fd_cloexec(fd: OwnedFd, target_fd: RawFd) -> Result<OwnedFd, Errno> {
+    if target_fd < 0 {
+        return Err(Errno::EINVAL);
+    }
+    if fd.as_raw_fd() == target_fd {
+        // SAFETY: `fd` is a valid owned descriptor; setting `FD_CLOEXEC` is
+        // side-effect free on descriptor ownership.
+        let rc = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) };
+        if rc < 0 {
+            return Err(Errno::last());
+        }
+        return Ok(fd);
+    }
+    // SAFETY: `F_GETFD` only probes whether `target_fd` currently exists in
+    // this process's descriptor table.
+    let probe = unsafe { libc::fcntl(target_fd, libc::F_GETFD) };
+    if probe >= 0 {
+        return Err(Errno::EBUSY);
+    }
+    let probe_err = Errno::last();
+    if probe_err != Errno::EBADF {
+        return Err(probe_err);
+    }
+    // SAFETY: `fd` is valid and `target_fd` was just verified unused (`EBADF`)
+    // before installing the duplicate atomically with `O_CLOEXEC`.
+    let rc = unsafe { libc::dup3(fd.as_raw_fd(), target_fd, libc::O_CLOEXEC) };
+    if rc < 0 {
+        return Err(Errno::last());
+    }
+    // SAFETY: `dup3` succeeded and created sole ownership of `target_fd`.
+    let pinned = unsafe { OwnedFd::from_raw_fd(target_fd) };
+    drop(fd);
+    Ok(pinned)
+}
+
 /// Sends a single `SOCK_SEQPACKET` message carrying `payload` and zero or one
 /// `SCM_RIGHTS` file descriptor (`MSG_NOSIGNAL`).
 pub fn send_packet(
@@ -442,5 +501,45 @@ mod tests {
         assert!(pkt.raw_controllen > 0);
         assert!(pkt.control_message_count >= 1);
         assert!(pkt.non_rights_cmsgs >= 1);
+    }
+
+    #[test]
+    fn dup_above_and_pin_unused_fd_set_cloexec_and_refuse_occupied_target() {
+        let (a, b) = seqpacket_pair(false).unwrap();
+        let occupied = b.as_raw_fd();
+        // Attempting to pin onto an already-open descriptor fails with EBUSY
+        // and leaves both descriptors intact.
+        let (c, d) = seqpacket_pair(false).unwrap();
+        assert_eq!(
+            pin_unused_fd_cloexec(c, occupied).unwrap_err(),
+            Errno::EBUSY
+        );
+        assert_eq!(dup_above_cloexec(d, -1).unwrap_err(), Errno::EINVAL);
+
+        let (e, f) = seqpacket_pair(false).unwrap();
+        let moved = dup_above_cloexec(e, 40).unwrap();
+        assert!(moved.as_raw_fd() >= 40);
+        // SAFETY: `F_GETFD` only reads flags on the live owned descriptor.
+        let flags = unsafe { libc::fcntl(moved.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+
+        // Pin onto itself succeeds and preserves FD_CLOEXEC.
+        let same_num = moved.as_raw_fd();
+        let same = pin_unused_fd_cloexec(moved, same_num).unwrap();
+        assert_eq!(same.as_raw_fd(), same_num);
+
+        // Find a guaranteed-free high fd slot, pin `same` onto it, and verify
+        // the socket pair still passes packets cleanly.
+        let target_fd = same_num + 25;
+        let pinned = pin_unused_fd_cloexec(same, target_fd).unwrap();
+        assert_eq!(pinned.as_raw_fd(), target_fd);
+        // SAFETY: `F_GETFD` only reads flags on the live owned descriptor.
+        let pinned_flags = unsafe { libc::fcntl(pinned.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(pinned_flags & libc::FD_CLOEXEC, 0);
+
+        send_packet(pinned.as_fd(), b"pinned", None).unwrap();
+        let pkt = recv_packet(f.as_fd(), 32).unwrap().unwrap();
+        assert_eq!(pkt.bytes, b"pinned");
+        drop((a, b));
     }
 }

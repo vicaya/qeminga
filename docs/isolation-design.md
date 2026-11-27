@@ -144,9 +144,18 @@ Chunk := version(u8 = 1)
 
 ### 4.2 Typed Operations (Explicitly Excluding General Proxies)
 
-Every operation is a closed enum variant authorized independently by the executor against its own `Config::authority()`, `RateLimiter`, `FreezeStateMachine`, and guest target policy:
+Every operation is a closed enum variant authorized independently by the executor against its own `Config::authority()`, `RateLimiter`, `FreezeStateMachine`, and guest target policy.
 
-| Opcode | Request payload (parser → executor) | Executor authorization & target binding | Response payload (executor → parser) |
+**Common command payload prefix (`host_id`):** Every QGA command opcode (`Ping` through `SuspendRam`, all 14 host-command opcodes) begins with an optional host-supplied QGA `id` prefix so the executor preserves the original request `id` in authoritative `command_received` audit records (`docs/design.md` §9):
+
+```text
+HostIdPrefix := has_host_id(u8: 0 = absent, 1 = present)
+              | [host_id(i64 LE) when has_host_id == 1]
+```
+
+Each command row below lists the command-specific fields *following* `HostIdPrefix` (so `empty` means zero command-specific bytes after `HostIdPrefix`, i.e. 1 byte when `id` is absent and 9 bytes when present). The two non-command opcodes do **not** carry `HostIdPrefix`: `ReportParseRejection` carries its own optional `id` inside its rejection payload, and `RequestChannelReopen` has a strictly 0-byte payload.
+
+| Opcode | Request payload (parser → executor; after `HostIdPrefix` for commands) | Executor authorization & target binding | Response payload (executor → parser) |
 |---|---|---|---|
 | `Ping` | empty | Rate limit (`PingSync`), audit | `OkEmpty` |
 | `Info` | empty | Rate limit (`PingSync`), audit | Static `Vec<(CommandId, enabled, success_response)>` derived from executor's `Config::authority()` |
@@ -154,7 +163,7 @@ Every operation is a closed enum variant authorized independently by the executo
 | `SyncDelimited { id: i64 }` | `i64` | Rate limit (`PingSync`), audit | `OkI64(id)` (parser prefixes `0xFF`) |
 | `FsfreezeStatus` | empty | Unlimited, watchdog heartbeat if `Frozen`, audit | `OkFreezeStatus(Thawed \| Frozen)` |
 | `FsfreezeFreeze` | empty | Freeze gate, rate limit (`FsfreezeFreeze`), guest mount policy (see #63 below), audit | `OkCount(u64)` or `Err(FixedErrorCode)` |
-| `FsfreezeFreezeList` | `has_list(u8: 0 = omitted, 1 = present)`, when `1`: `count(u16)` + `count` entries of `len(u16 <= 4096) + utf8 bytes` (total payload ≤ `64 KiB`, no separate count cap) | Freeze gate, rate limit (`FsfreezeFreeze`), explicit omitted/empty/list mount policy (see #63 below), `st_dev` verification on `O_RDONLY \| O_DIRECTORY`, audit | `OkCount(u64)` or `Err(FixedErrorCode)` |
+| `FsfreezeFreezeList` | `has_list(u8: 0 = omitted, 1 = present)`, when `1`: `count(u16)` + `count` entries of `len(u16 <= 4096) + utf8 bytes` (total payload ≤ `64 KiB` including `HostIdPrefix`, no separate count cap) | Freeze gate, rate limit (`FsfreezeFreeze`), explicit omitted/empty/list mount policy (see #63 below), `st_dev` verification on `O_RDONLY \| O_DIRECTORY`, audit | `OkCount(u64)` or `Err(FixedErrorCode)` |
 | `FsfreezeThaw` | empty | Unlimited, joins active `FreezeOp` or runs tracked/discovery drain covering every executor-owned freeze (see #63 & #69 below), audit | `OkCount(u64)` or `Err(FixedErrorCode)` |
 | `GetOsInfo` | empty | **Requires `authority.information`**, freeze gate, rate limit (`Get`), audit | Bounded `OsInfoDto` (≤ `128 KiB` chunked; covers ≤ `64 KiB` `os-release` + `uname`) or `Err(Disabled \| Frozen \| ...)` |
 | `NetworkGetInterfaces` | empty | **Requires `authority.information`**, freeze gate, rate limit (`Get`), audit | Bounded `Vec<InterfaceDto>` (≤ `256 KiB` chunked; loopback & link-local already stripped by executor) |
@@ -162,8 +171,8 @@ Every operation is a closed enum variant authorized independently by the executo
 | `Fstrim { minimum: u64 }` | `u64` | **Requires `authority.trim`**, freeze gate, rate limit (`Fstrim`), audit | Bounded `Vec<TrimPathDto>` (≤ `1 MiB` chunked; fixed open-failure reasons) or `Err(FstrimReplyTooLarge { trimmed_targets, failed_targets, limit_bytes })` |
 | `Shutdown { mode }` | `mode(u8: Powerdown \| Halt \| Reboot)` | **Requires `authority.reboot`**, freeze gate, rate limit (`Shutdown`), flush audit, `sync`+`reboot` | `OkSilent` (no reply on success) or `Err(...)` |
 | `SuspendRam` | empty | **Requires `authority.suspend`**, freeze gate, rate limit (`Shutdown`), writes `/sys/power/state`, audit | `OkSilent` or `Err(...)` |
-| `ReportParseRejection` | `kind(u8: Oversized \| ParseError \| UnknownMethod)`, bounded metadata | Rate-bounded executor audit entry logged explicitly as an **untrusted parser observation** (§3.4); no kernel work | `OkAck` |
-| `RequestChannelReopen` | empty | Executor enforces §5.7 reopen backoff (1 s → 30 s), opens `config.agent.channel_path`, checks `EBUSY` terminal rule (§8.4), verifies backing character-device identity (`fstat` + sysfs `virtio-ports` subsystem & port name, below), sends exact single fd via `SCM_RIGHTS` over `IPC_FD`, closes own copy | `OkChannelFd` (+ 1 `SCM_RIGHTS` fd) or `Err(RetryLater \| TerminalBusy)` |
+| `ReportParseRejection` | *(no `HostIdPrefix`)* `kind(u8: Oversized \| ParseError \| UnknownMethod)`, optional `id`, `frame_len`, bounded method metadata | Rate-bounded executor audit entry logged explicitly as an **untrusted parser observation** (§3.4); no kernel work | `OkAck` |
+| `RequestChannelReopen` | *(no `HostIdPrefix`)* strictly empty (0 bytes) | Executor enforces §5.7 reopen backoff (1 s → 30 s), opens `config.agent.channel_path`, checks `EBUSY` terminal rule (§8.4), verifies backing character-device identity (`fstat` + sysfs `virtio-ports` subsystem & port name, below), sends exact single fd via `SCM_RIGHTS` over `IPC_FD`, closes own copy | `OkChannelFd` (+ 1 `SCM_RIGHTS` fd) or `Err(RetryLater \| TerminalBusy)` |
 
 **Mount-policy semantics across every freeze/thaw form (open decision: [#63](https://github.com/vicaya/qeminga/issues/63); multi-freezer ownership: [#69](https://github.com/vicaya/qeminga/issues/69)):**
 The disclosure policy for unprovisioned mounts in the CVM profile is tracked in #63, and multi-freezer per-target ownership is tracked in #69 (OQ-11). Option B's IPC schema preserves every request distinction so the executor can enforce both cleanly:

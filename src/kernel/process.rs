@@ -442,8 +442,9 @@ const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
 ///
 /// Uses `close_range(min_fd, ~0U, CLOSE_RANGE_CLOEXEC)` on Linux 5.11+, falling
 /// back on Linux 5.4–5.10 to enumerating `/proc/self/fd` via raw `openat` +
-/// `getdents64`, and finally to bounded `getrlimit(RLIMIT_NOFILE)` iteration if
-/// `/proc` is unavailable.
+/// `getdents64`. Both paths cover the complete kernel descriptor table
+/// regardless of `RLIMIT_NOFILE`. If neither succeeds, returns the error so the
+/// child fails closed and declines to `execve(2)`.
 fn mark_fds_cloexec_from(min_fd: RawFd) -> Result<(), i32> {
     if min_fd < 0 {
         return Err(libc::EINVAL);
@@ -468,22 +469,27 @@ fn mark_fds_cloexec_from(min_fd: RawFd) -> Result<(), i32> {
     if err != libc::ENOSYS && err != libc::EINVAL {
         return Err(err);
     }
-    match mark_fds_cloexec_via_procfs(min_fd) {
-        Ok(()) => Ok(()),
-        Err(_) => mark_fds_cloexec_via_rlimit(min_fd),
-    }
+    mark_fds_cloexec_via_procfs(min_fd)
 }
 
 /// Async-signal-safe Linux 5.4 fallback: walks `/proc/self/fd` using raw
 /// `openat(2)` and `getdents64(2)` on a stack buffer, setting `FD_CLOEXEC` on
 /// every open descriptor `>= min_fd`.
 fn mark_fds_cloexec_via_procfs(min_fd: RawFd) -> Result<(), i32> {
-    // SAFETY: `c"/proc/self/fd"` is a static NUL-terminated path; `openat` is
+    mark_fds_cloexec_via_procfs_at(c"/proc/self/fd", min_fd)
+}
+
+/// Walks `fd_dir` (normally `/proc/self/fd`) using raw `openat(2)` and
+/// `getdents64(2)` and sets `FD_CLOEXEC` on every descriptor `>= min_fd`,
+/// propagating any open, directory-read, or `fcntl` error so callers fail
+/// closed.
+fn mark_fds_cloexec_via_procfs_at(fd_dir: &std::ffi::CStr, min_fd: RawFd) -> Result<(), i32> {
+    // SAFETY: `fd_dir` is a valid NUL-terminated path; `openat` is
     // async-signal-safe and `O_CLOEXEC` prevents `dirfd` itself from leaking.
     let dirfd = unsafe {
         libc::openat(
             libc::AT_FDCWD,
-            c"/proc/self/fd".as_ptr(),
+            fd_dir.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
@@ -547,33 +553,6 @@ fn mark_fds_cloexec_via_procfs(min_fd: RawFd) -> Result<(), i32> {
         libc::close(dirfd);
     }
     result
-}
-
-/// Async-signal-safe last-resort fallback when both `close_range` and
-/// `/proc/self/fd` are unavailable: iterates `min_fd..rlim_cur` setting
-/// `FD_CLOEXEC`.
-fn mark_fds_cloexec_via_rlimit(min_fd: RawFd) -> Result<(), i32> {
-    let mut lim = libc::rlimit {
-        rlim_cur: 0,
-        rlim_max: 0,
-    };
-    // SAFETY: `lim` is a valid writable `libc::rlimit` struct; `getrlimit` is
-    // async-signal-safe.
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return Err(io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(libc::EIO));
-    }
-    let upper = i32::try_from(lim.rlim_cur).unwrap_or(i32::MAX);
-    let mut fd = min_fd;
-    while fd < upper {
-        set_fd_cloexec_raw(fd)?;
-        fd = match fd.checked_add(1) {
-            Some(next) => next,
-            None => break,
-        };
-    }
-    Ok(())
 }
 
 /// Parses a non-negative base-10 ASCII descriptor number (returning `None` for
@@ -790,6 +769,11 @@ mod tests {
         );
         drop((p_r, p_w));
 
+        assert_eq!(
+            mark_fds_cloexec_via_procfs_at(c"/nonexistent/qeminga-proc-fd", 6),
+            Err(libc::ENOENT),
+            "descriptor scan must fail closed when procfs enumeration fails"
+        );
         assert_eq!(parse_ascii_fd(b""), None);
         assert_eq!(parse_ascii_fd(b"."), None);
         assert_eq!(parse_ascii_fd(b".."), None);

@@ -240,6 +240,19 @@ pub async fn execute_freeze_ipc(
     ctx: &Arc<Context>,
     restrict: Option<Vec<String>>,
 ) -> Result<u64, crate::ipc::IpcErrorCode> {
+    execute_freeze_ipc_with_published(ctx, restrict, || {}).await
+}
+
+/// Typed IPC freeze helper that invokes `on_published` synchronously as soon
+/// as `begin_freeze()` has moved the state machine to `Freezing` and
+/// `crate::freeze_op::start` has published the active [`crate::freeze_op::FreezeOp`]
+/// in `ctx` (before awaiting completion), so a later queued thaw can safely
+/// join the published operation without racing ahead of freeze startup.
+pub async fn execute_freeze_ipc_with_published(
+    ctx: &Arc<Context>,
+    restrict: Option<Vec<String>>,
+    on_published: impl FnOnce(),
+) -> Result<u64, crate::ipc::IpcErrorCode> {
     let effective =
         filter_freeze_selection(restrict.as_deref(), ctx.config.freeze_allowed_mountpoints());
     let token =
@@ -259,6 +272,7 @@ pub async fn execute_freeze_ipc(
     }
     ctx.hooks.on_freezing(ctx);
     let reply = crate::freeze_op::start(Arc::clone(ctx), token, effective);
+    on_published();
     match reply.await {
         Ok(Ok(frozen)) => Ok(frozen),
         Ok(Err(failure)) => Err(crate::ipc::IpcErrorCode::from_freeze_failure(&failure)),

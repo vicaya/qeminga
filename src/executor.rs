@@ -119,17 +119,60 @@ type ObservationLimiter = governor::RateLimiter<
     NoOpMiddleware<<DefaultClock as governor::clock::Clock>::Instant>,
 >;
 
+/// Lifecycle phase of the active freeze slot inside [`ExecutorLaneGate`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum FreezeStage {
+    /// No freeze command currently holds the freeze lane.
+    #[default]
+    Inactive,
+    /// A freeze command owns the freeze lane and is running its synchronous
+    /// admission / `begin_freeze()` / `freeze_op::start()` prefix; a later
+    /// `Thaw` must wait until it either publishes `FreezeOp` or finishes.
+    Starting,
+    /// The freeze command has published `Freezing` and its `FreezeOp` in `ctx`
+    /// and is now awaiting completion; a later `Thaw` may run concurrently to
+    /// join/abort it.
+    Published,
+}
+
 /// Executor-enforced §5.7 lane serialization so neither channel reconnects nor
-/// a compromised parser can start a freeze while an earlier serial operation
-/// (e.g. `guest-fstrim`) is still active, while still letting `Control` run
-/// concurrently and letting `Thaw` overtake queued serial work or join an
-/// active `Freeze`.
+/// a compromised parser can reorder serial side effects or let a later thaw
+/// race ahead of an earlier freeze's startup, while still letting `Control`
+/// run concurrently and letting `Thaw` overtake queued `Ordinary` work once an
+/// active `Freeze` has published its operation.
 #[derive(Default)]
 struct LaneState {
-    freeze_active: bool,
+    freeze_stage: FreezeStage,
     thaw_or_ordinary_active: bool,
     next_ticket: u64,
-    serial_waiters: VecDeque<u64>,
+    waiters: VecDeque<(u64, Kind)>,
+}
+
+impl LaneState {
+    fn can_acquire(&self, ticket: u64, kind: Kind) -> bool {
+        match kind {
+            Kind::Control => true,
+            Kind::Freeze | Kind::Ordinary => {
+                self.waiters.front() == Some(&(ticket, kind))
+                    && self.freeze_stage == FreezeStage::Inactive
+                    && !self.thaw_or_ordinary_active
+            }
+            Kind::Thaw => {
+                if self.thaw_or_ordinary_active {
+                    return false;
+                }
+                match self.freeze_stage {
+                    FreezeStage::Inactive => self.waiters.front() == Some(&(ticket, Kind::Thaw)),
+                    FreezeStage::Starting => false,
+                    FreezeStage::Published => !self
+                        .waiters
+                        .iter()
+                        .take_while(|&&(t, _)| t != ticket)
+                        .any(|&(_, k)| matches!(k, Kind::Freeze | Kind::Thaw)),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -139,79 +182,66 @@ struct ExecutorLaneGate {
 }
 
 impl ExecutorLaneGate {
-    async fn acquire(self: &Arc<Self>, kind: Kind) -> Option<ExecutorLaneGuard> {
-        match kind {
-            Kind::Control => None,
-            Kind::Thaw => loop {
-                let notified = self.notify.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    if !st.thaw_or_ordinary_active {
-                        st.thaw_or_ordinary_active = true;
-                        return Some(ExecutorLaneGuard {
-                            gate: Arc::clone(self),
-                            kind,
-                        });
+    /// Synchronously registers a request in IPC receive order BEFORE spawning
+    /// its handler task, returning `None` for `Kind::Control`.
+    fn register(self: &Arc<Self>, kind: Kind) -> Option<LaneTicket> {
+        if kind == Kind::Control {
+            return None;
+        }
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.next_ticket = st.next_ticket.wrapping_add(1);
+        let ticket = st.next_ticket;
+        st.waiters.push_back((ticket, kind));
+        Some(LaneTicket {
+            gate: Arc::clone(self),
+            ticket,
+            kind,
+            registered: true,
+        })
+    }
+}
+
+/// A receive-ordered reservation in [`ExecutorLaneGate`]; dropping it before
+/// [`LaneTicket::acquire`] removes the waiter and wakes successors.
+struct LaneTicket {
+    gate: Arc<ExecutorLaneGate>,
+    ticket: u64,
+    kind: Kind,
+    registered: bool,
+}
+
+impl LaneTicket {
+    async fn acquire(mut self) -> ExecutorLaneGuard {
+        loop {
+            let notified = self.gate.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.can_acquire(self.ticket, self.kind) {
+                    st.waiters.retain(|&(t, _)| t != self.ticket);
+                    self.registered = false;
+                    match self.kind {
+                        Kind::Freeze => st.freeze_stage = FreezeStage::Starting,
+                        Kind::Thaw | Kind::Ordinary => st.thaw_or_ordinary_active = true,
+                        Kind::Control => {}
                     }
-                }
-                notified.await;
-            },
-            Kind::Freeze | Kind::Ordinary => {
-                let ticket = {
-                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                    st.next_ticket = st.next_ticket.wrapping_add(1);
-                    let ticket = st.next_ticket;
-                    st.serial_waiters.push_back(ticket);
-                    ticket
-                };
-                let mut cleanup = SerialWaiterCleanup {
-                    gate: Arc::clone(self),
-                    ticket,
-                    active: true,
-                };
-                loop {
-                    let notified = self.notify.notified();
-                    tokio::pin!(notified);
-                    notified.as_mut().enable();
-                    {
-                        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                        if st.serial_waiters.front() == Some(&ticket)
-                            && !st.freeze_active
-                            && !st.thaw_or_ordinary_active
-                        {
-                            let _ = st.serial_waiters.pop_front();
-                            cleanup.active = false;
-                            if kind == Kind::Freeze {
-                                st.freeze_active = true;
-                            } else {
-                                st.thaw_or_ordinary_active = true;
-                            }
-                            return Some(ExecutorLaneGuard {
-                                gate: Arc::clone(self),
-                                kind,
-                            });
-                        }
-                    }
-                    notified.await;
+                    return ExecutorLaneGuard {
+                        gate: Arc::clone(&self.gate),
+                        kind: self.kind,
+                    };
                 }
             }
+            notified.await;
         }
     }
 }
 
-struct SerialWaiterCleanup {
-    gate: Arc<ExecutorLaneGate>,
-    ticket: u64,
-    active: bool,
-}
-
-impl Drop for SerialWaiterCleanup {
+impl Drop for LaneTicket {
     fn drop(&mut self) {
-        if self.active {
+        if self.registered {
             let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.serial_waiters.retain(|&t| t != self.ticket);
+            st.waiters.retain(|&(t, _)| t != self.ticket);
             drop(st);
             self.gate.notify.notify_waiters();
         }
@@ -223,11 +253,27 @@ struct ExecutorLaneGuard {
     kind: Kind,
 }
 
+impl ExecutorLaneGuard {
+    /// Marks an active `Kind::Freeze` guard as having published `Freezing` and
+    /// its `FreezeOp` in `ctx`, unblocking any waiting `Kind::Thaw` to join it.
+    fn mark_freeze_published(&self) {
+        if self.kind != Kind::Freeze {
+            return;
+        }
+        let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        if st.freeze_stage == FreezeStage::Starting {
+            st.freeze_stage = FreezeStage::Published;
+        }
+        drop(st);
+        self.gate.notify.notify_waiters();
+    }
+}
+
 impl Drop for ExecutorLaneGuard {
     fn drop(&mut self) {
         let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
         match self.kind {
-            Kind::Freeze => st.freeze_active = false,
+            Kind::Freeze => st.freeze_stage = FreezeStage::Inactive,
             Kind::Thaw | Kind::Ordinary => st.thaw_or_ordinary_active = false,
             Kind::Control => {}
         }
@@ -243,7 +289,7 @@ struct ExecutorState {
     observation_limiter: ObservationLimiter,
     channel_path: PathBuf,
     channel_opener: VerifiedOpenFn,
-    reopen_backoff: tokio::sync::Mutex<ReopenBackoff>,
+    reopen_backoff: StdMutex<ReopenBackoff>,
     reopen_gate: Arc<Semaphore>,
     op_slots: Semaphore,
     lanes: Arc<ExecutorLaneGate>,
@@ -430,7 +476,7 @@ where
         ctx: Arc::clone(&ctx),
         channel_path,
         channel_opener,
-        reopen_backoff: tokio::sync::Mutex::new(ReopenBackoff::new(
+        reopen_backoff: StdMutex::new(ReopenBackoff::new(
             had_initial_channel,
             initial_backoff,
             max_backoff,
@@ -459,9 +505,33 @@ where
         while tasks.try_join_next().is_some() {}
 
         // If a stop signal was received and the guest is now Thawed with no
-        // active tasks, stop cleanly.
+        // active tasks, drain any replies already produced by finished tasks
+        // and attempt one non-blocking flush, then abandon any undelivered
+        // replies the peer is not accepting so shutdown never depends on an
+        // untrusted parser (design §5.7).
         if stop_requested {
-            if ctx.state.current() == FreezeState::Thawed && tasks.is_empty() && outbox.is_empty() {
+            if ctx.state.current() == FreezeState::Thawed && tasks.is_empty() {
+                while let Ok(reply) = reply_rx.try_recv() {
+                    if reply.terminal_channel_err.is_none() {
+                        let _ = outbox.push_response(
+                            reply.session_gen,
+                            reply.req_id,
+                            &reply.response,
+                            reply.channel_fd,
+                        );
+                    }
+                }
+                if !outbox.is_empty() {
+                    let _ = outbox.flush(async_ipc.as_fd());
+                }
+                if !outbox.is_empty() {
+                    tracing::debug!(
+                        event = "stop_abandoned_ipc_replies",
+                        pending_packets = outbox.pending_packets(),
+                        pending_bytes = outbox.pending_bytes(),
+                        "abandoning undelivered IPC replies on graceful stop"
+                    );
+                }
                 break Ok(());
             }
             if ctx.state.current() != FreezeState::Thawed && !stop_warned {
@@ -529,7 +599,12 @@ where
                     let _ = outbox.flush(async_ipc.as_fd());
                     break Err(ExecutorExitError::ChannelTerminal(term_err));
                 }
-                if let Err(err) = push_checked_response(
+                if stop_requested
+                    && ctx.state.current() == FreezeState::Thawed
+                    && outbox_backpressured(&outbox)
+                {
+                    // Stop already accepted and parser is not draining; abandon reply.
+                } else if let Err(err) = push_checked_response(
                     &mut outbox,
                     reply.session_gen,
                     reply.req_id,
@@ -771,14 +846,22 @@ fn dispatch_ipc_request(
         return push_checked_response(outbox, session_gen, req_id, &response, None);
     };
 
+    // Register the §5.7 lane ticket synchronously in IPC receive order BEFORE
+    // spawning the task so Tokio scheduling can never reorder serial commands
+    // or let a later thaw race ahead of an earlier freeze's startup.
+    let lane_ticket = command_of_request(&request).and_then(|cmd| state.lanes.register(cmd.lane()));
+    {
+        let mut backoff = state
+            .reopen_backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        backoff.note_command();
+    }
+
     tasks.spawn(
         async move {
             let _permit = permit;
-            {
-                let mut backoff = state.reopen_backoff.lock().await;
-                backoff.note_command();
-            }
-            let response = execute_command_request(&state, host_id, request).await;
+            let response = execute_command_request(&state, host_id, request, lane_ticket).await;
             let _ = reply_tx
                 .send(OutboundReply {
                     session_gen,
@@ -1005,7 +1088,10 @@ async fn handle_channel_reopen(
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> OutboundReply {
     let (sleep_dur, was_open) = {
-        let mut backoff = state.reopen_backoff.lock().await;
+        let mut backoff = state
+            .reopen_backoff
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         backoff.next_sleep()
     };
     if was_open {
@@ -1036,7 +1122,10 @@ async fn handle_channel_reopen(
     match opened {
         Ok(Ok(fd)) => {
             {
-                let mut backoff = state.reopen_backoff.lock().await;
+                let mut backoff = state
+                    .reopen_backoff
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 backoff.note_open_succeeded();
             }
             tracing::info!(
@@ -1089,16 +1178,25 @@ async fn execute_command_request(
     state: &ExecutorState,
     host_id: Option<i64>,
     req: IpcRequest,
+    lane_ticket: Option<LaneTicket>,
 ) -> IpcResponse {
     let Some(cmd) = command_of_request(&req) else {
         return IpcResponse::OkAck;
     };
-    let _lane_guard = state.lanes.acquire(cmd.lane()).await;
+    let lane_guard = match lane_ticket {
+        Some(ticket) => Some(ticket.acquire().await),
+        None => None,
+    };
     if let Err(code) = admit_command(state, cmd, host_id) {
         return IpcResponse::Err(code);
     }
     state.ctx.record_handler_call();
     let ctx = &state.ctx;
+    let publish_freeze = || {
+        if let Some(ref guard) = lane_guard {
+            guard.mark_freeze_published();
+        }
+    };
     match req {
         IpcRequest::Ping => IpcResponse::OkEmpty,
         IpcRequest::Info => {
@@ -1117,16 +1215,18 @@ async fn execute_command_request(
         IpcRequest::FsfreezeStatus => {
             IpcResponse::OkFreezeStatus(fsfreeze::execute_status_ipc(ctx))
         }
-        IpcRequest::FsfreezeFreeze => match fsfreeze::execute_freeze_ipc(ctx, None).await {
-            Ok(n) => IpcResponse::OkCount(n),
-            Err(code) => IpcResponse::Err(code),
-        },
+        IpcRequest::FsfreezeFreeze => {
+            match fsfreeze::execute_freeze_ipc_with_published(ctx, None, publish_freeze).await {
+                Ok(n) => IpcResponse::OkCount(n),
+                Err(code) => IpcResponse::Err(code),
+            }
+        }
         IpcRequest::FsfreezeFreezeList(selection) => {
             let restrict = match selection {
                 FreezeListSelection::Omitted => None,
                 FreezeListSelection::Present(list) => Some(list),
             };
-            match fsfreeze::execute_freeze_ipc(ctx, restrict).await {
+            match fsfreeze::execute_freeze_ipc_with_published(ctx, restrict, publish_freeze).await {
                 Ok(n) => IpcResponse::OkCount(n),
                 Err(code) => IpcResponse::Err(code),
             }
@@ -1466,6 +1566,8 @@ mod tests {
             tracing::Level::INFO,
             router.clone(),
         ));
+        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
         let exec_task = tokio::spawn(
             serve_ipc_with_backoff(
                 Arc::clone(&ctx),
@@ -1480,7 +1582,7 @@ mod tests {
                 Duration::from_millis(10),
                 Duration::from_millis(50),
             )
-            .with_subscriber(dispatch),
+            .with_subscriber(dispatch.clone()),
         );
 
         // Drive parser end on a blocking thread so tokio workers stay free.
@@ -1921,7 +2023,10 @@ mod tests {
 
         let sink = SharedSink::default();
         let router = Router::new(Box::new(sink.clone()));
-        let subscriber = audit::subscriber(tracing::Level::DEBUG, router.clone());
+        let dispatch =
+            tracing::Dispatch::new(audit::subscriber(tracing::Level::DEBUG, router.clone()));
+        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let kernel = Arc::new(FakeKernel::new());
         kernel.script_open_error(format!("/nonexistent-trim-0-{long_seg}"), Errno::ENOENT);
@@ -1958,7 +2063,7 @@ mod tests {
                 async move { stop_rx.await.unwrap_or("SIGTERM") },
                 Duration::from_millis(10),
             )
-            .with_subscriber(subscriber),
+            .with_subscriber(dispatch.clone()),
         );
 
         let client = tokio::task::spawn_blocking(move || {
@@ -2289,6 +2394,8 @@ mod tests {
             tracing::Level::INFO,
             router.clone(),
         ));
+        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
+        tracing::callsite::rebuild_interest_cache();
 
         let exec_task = tokio::spawn(
             serve_ipc_with_backoff(
@@ -2304,7 +2411,7 @@ mod tests {
                 Duration::from_millis(10),
                 Duration::from_millis(50),
             )
-            .with_subscriber(dispatch),
+            .with_subscriber(dispatch.clone()),
         );
 
         let ctx_check = Arc::clone(&ctx);
@@ -2356,6 +2463,9 @@ mod tests {
             // 3. With all 8 `op_slots` saturated:
             //    - enabled `Ping(id=901)` is denied at capacity with RateLimited;
             //    - disabled `Shutdown(id=902)` is denied with Disabled (C-7 precedence).
+            // Ensure no concurrent no-subscriber unit test cached `Interest::never()`
+            // on the `Disposition::Denied` callsite during the sleep above.
+            tracing::callsite::rebuild_interest_cache();
             crate::ipc::send_request_with_id(
                 parser_sock.as_fd(),
                 1,
@@ -2493,5 +2603,260 @@ mod tests {
             "unexpected disabled capacity denial audit record: {}",
             cap_shutdown_lines[0]
         );
+    }
+
+    #[tokio::test]
+    async fn executor_abandons_undelivered_outbox_replies_on_stop_when_parser_stops_reading() {
+        // Codex P2: when a stop signal is honored in Thawed with all active
+        // tasks finished, undelivered replies in a stalled parser's outbox MUST
+        // be abandoned rather than blocking graceful exit until systemd kills
+        // the unit at TimeoutStopSec (design §5.7).
+        let mut cfg = Config::default();
+        cfg.rate_limits.ping_sync_per_min = 10_000;
+        let router = Router::new(Box::new(std::io::sink()));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::INFO,
+            router.clone(),
+        ));
+        let ctx = Arc::new(Context::new(
+            Arc::new(cfg),
+            Arc::new(FreezeStateMachine::new()),
+            router,
+            Marker::for_tests(),
+        ));
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+
+        let exec_task = tokio::spawn(
+            serve_ipc_with_backoff(
+                ctx,
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+                opener,
+                true,
+                None,
+                false,
+                async move { stop_rx.await.unwrap_or("SIGTERM") },
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+            )
+            .with_subscriber(dispatch),
+        );
+
+        // Flood requests without reading ANY response until the executor's
+        // outbox backpressures IPC reads (`EAGAIN`), keeping `parser_sock`
+        // open the entire time.
+        let (parser_sock, hit_eagain) = tokio::task::spawn_blocking(move || {
+            let mut saw_eagain = false;
+            for i in 1..=2000u64 {
+                let chunks = crate::ipc::encode_request_chunks(1, i, &IpcRequest::Ping).unwrap();
+                match crate::kernel::ipc::send_packet(parser_sock.as_fd(), &chunks[0], None) {
+                    Ok(()) => {}
+                    Err(Errno::EAGAIN) => {
+                        saw_eagain = true;
+                        break;
+                    }
+                    Err(err) => panic!("unexpected send error: {err}"),
+                }
+                if i % 32 == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            (parser_sock, saw_eagain)
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            hit_eagain,
+            "parser sends must fill executor outbox to backpressure before stop"
+        );
+
+        // Request graceful stop while the parser keeps `parser_sock` open and
+        // unread: executor MUST abandon undelivered replies and exit Ok(()).
+        let _ = stop_tx.send("SIGTERM");
+        let res = tokio::time::timeout(Duration::from_secs(2), exec_task)
+            .await
+            .expect("executor must abandon undelivered IPC replies on SIGTERM while Thawed")
+            .unwrap();
+        assert!(
+            res.is_ok(),
+            "expected clean Ok(()) stop while Thawed, got {res:?}"
+        );
+        drop(parser_sock);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn executor_freeze_followed_by_thaw_burst_never_leaves_guest_frozen() {
+        // Astra review: sending `FsfreezeFreeze` immediately followed by
+        // `FsfreezeThaw` in a single IPC burst MUST execute in IPC receive
+        // order so the thaw joins or follows the freeze instead of racing
+        // ahead as a Thawed recovery drain and leaving the guest Frozen.
+        let mut cfg = Config::default();
+        cfg.rate_limits.fsfreeze_freeze_per_min = 10_000;
+        let kernel = Arc::new(FakeKernel::new());
+        let table = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(cfg),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(SharedSink::default())),
+                Marker::for_tests(),
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(table.to_owned()))),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            Arc::clone(&ctx),
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            async move { stop_rx.await.unwrap_or("SIGTERM") },
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
+
+        let ctx_check = Arc::clone(&ctx);
+        let parser_sock = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            let mut next_req = 1u64;
+            for iter in 0..30u64 {
+                let freeze_req = next_req;
+                let thaw_req = next_req + 1;
+                next_req += 2;
+
+                // Queue freeze then thaw back-to-back before reading either reply.
+                send_request(parser_sock.as_fd(), 1, freeze_req, &IpcRequest::FsfreezeFreeze)
+                    .unwrap();
+                send_request(parser_sock.as_fd(), 1, thaw_req, &IpcRequest::FsfreezeThaw).unwrap();
+
+                let r1 = recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap();
+                let r2 = recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap();
+                let thaw_resp = if r1.req_id == thaw_req {
+                    &r1.response
+                } else {
+                    &r2.response
+                };
+                // If thaw aborted an in-flight freeze, wait briefly for the
+                // aborted freeze op to settle Thawed.
+                if matches!(
+                    thaw_resp,
+                    IpcResponse::Err(IpcErrorCode::ThawAbortPending { .. })
+                ) {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    while ctx_check.state.current() != FreezeState::Thawed
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                }
+                assert_eq!(
+                    ctx_check.state.current(),
+                    FreezeState::Thawed,
+                    "iteration {iter}: guest ended up frozen after freeze+thaw burst (r1={r1:?}, r2={r2:?})"
+                );
+            }
+            let _ = stop_tx.send("SIGTERM");
+            parser_sock
+        })
+        .await
+        .unwrap();
+
+        exec_task.await.unwrap().unwrap();
+        drop(parser_sock);
+    }
+
+    #[tokio::test]
+    async fn executor_lane_gate_preserves_receive_order_and_waits_for_freeze_publication() {
+        let gate = Arc::new(ExecutorLaneGate::default());
+        assert!(gate.register(Kind::Control).is_none());
+
+        // 1. Register Freeze then Thaw in receive order; poll Thaw FIRST.
+        //    Thaw must wait while Freeze is still unacquired AND while Freeze
+        //    is in `FreezeStage::Starting`, then unblock immediately once
+        //    `mark_freeze_published()` runs.
+        let freeze_t = gate.register(Kind::Freeze).unwrap();
+        let thaw_t = gate.register(Kind::Thaw).unwrap();
+        let mut thaw_fut = Box::pin(thaw_t.acquire());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut thaw_fut)
+                .await
+                .is_err(),
+            "Thaw must not acquire before earlier Freeze starts"
+        );
+        let freeze_guard = freeze_t.acquire().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut thaw_fut)
+                .await
+                .is_err(),
+            "Thaw must wait while earlier Freeze is still in FreezeStage::Starting"
+        );
+        freeze_guard.mark_freeze_published();
+        let thaw_guard = tokio::time::timeout(Duration::from_millis(200), thaw_fut)
+            .await
+            .expect("Thaw must acquire immediately once Freeze publishes its FreezeOp");
+        drop(thaw_guard);
+
+        // 2. While Freeze is still Published, queue Ordinary then Thaw:
+        //    Thaw must overtake Ordinary (design §5.7) while Ordinary waits for
+        //    both Freeze and Thaw to finish.
+        let ord_t = gate.register(Kind::Ordinary).unwrap();
+        let thaw2_t = gate.register(Kind::Thaw).unwrap();
+        let mut ord_fut = Box::pin(ord_t.acquire());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut ord_fut)
+                .await
+                .is_err(),
+            "Ordinary must wait while Freeze is active"
+        );
+        let thaw2_guard = tokio::time::timeout(Duration::from_millis(200), thaw2_t.acquire())
+            .await
+            .expect("Thaw must overtake queued Ordinary while Freeze is Published");
+        drop(freeze_guard);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut ord_fut)
+                .await
+                .is_err(),
+            "Ordinary must still wait while Thaw is active"
+        );
+        drop(thaw2_guard);
+        let ord_guard = tokio::time::timeout(Duration::from_millis(200), ord_fut)
+            .await
+            .expect("Ordinary must acquire once Freeze and Thaw finish");
+        drop(ord_guard);
+
+        // 3. Register Ordinary then Freeze while idle; polling Freeze FIRST must
+        //    still wait until Ordinary acquires and finishes (or drops).
+        let ord2_t = gate.register(Kind::Ordinary).unwrap();
+        let freeze2_t = gate.register(Kind::Freeze).unwrap();
+        let mut freeze2_fut = Box::pin(freeze2_t.acquire());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut freeze2_fut)
+                .await
+                .is_err(),
+            "Freeze must wait behind earlier Ordinary even when polled first"
+        );
+        // Dropping an unacquired ticket must unblock successors.
+        drop(ord2_t);
+        let freeze2_guard = tokio::time::timeout(Duration::from_millis(200), freeze2_fut)
+            .await
+            .expect("dropping unacquired Ordinary ticket must unblock waiting Freeze");
+        drop(freeze2_guard);
     }
 }

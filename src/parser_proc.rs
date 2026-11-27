@@ -2227,31 +2227,29 @@ mod tests {
 
     #[test]
     fn service_open_channel_revents_bounds_delimiter_free_read_turn() {
-        // Codex Security Review P2: continuous delimiter-free host bytes while
-        // `FrameDecoder` is discarding an oversized frame emit zero slots so
-        // `input_paused()` stays false. A single `ppoll` turn MUST cap channel
-        // reads/bytes and return to `ppoll` rather than draining unboundedly.
-        let (mut host, ch_fd) = unix_stream_pair();
-        // Send 128 KiB (> 64 KiB single-frame bound) of delimiter-free bytes
-        // from a feeder thread so a smaller socket buffer cannot deadlock.
-        let feeder = thread::spawn(move || {
-            let chunk = vec![b'A'; 4096];
-            for _ in 0..32 {
-                if host.write_all(&chunk).is_err() {
-                    break;
-                }
-            }
-            host
-        });
-        // Give the feeder a moment to fill the kernel socket buffer well past
-        // the per-turn byte cap (64 KiB).
-        thread::sleep(Duration::from_millis(50));
+        // Codex Security Review P2 + Astra review: start `FrameDecoder` already
+        // in discard mode (> MAX_FRAME_LEN delimiter-free bytes buffered, so
+        // zero slots are emitted and `input_paused()` stays false), then verify
+        // both the read-count cap and the byte cap synchronously with zero
+        // threads or sleeps: exact unread remainder stays on the socket and
+        // zero IPC requests are emitted.
 
+        // 1. Read-count cap (`MAX_CHANNEL_READS_PER_TURN`) using a 1-byte buffer.
+        let (mut host, ch_fd) = unix_stream_pair();
         let mut sess = OpenSession::new(ch_fd);
+        assert!(
+            sess.decoder
+                .push(&vec![b'X'; crate::framing::MAX_FRAME_LEN + 1])
+                .is_empty(),
+            "exceeding MAX_FRAME_LEN without newline enters discard mode without emitting a frame"
+        );
+        assert!(sess.decoder.is_discarding());
+        host.write_all(&[b'A'; MAX_CHANNEL_READS_PER_TURN + 1])
+            .unwrap();
+
         let mut next_req_id = 1u64;
         let mut ipc_outbox = IpcOutbox::new();
-        let mut read_buf = [0u8; CHANNEL_READ_CHUNK];
-
+        let mut one_byte_buf = [0u8; 1];
         let outcome = service_open_channel_revents(
             &mut sess,
             PollFlags::POLLIN,
@@ -2259,22 +2257,59 @@ mod tests {
             &mut next_req_id,
             &[],
             &mut ipc_outbox,
-            &mut read_buf,
+            &mut one_byte_buf,
         )
         .unwrap();
         assert_eq!(outcome, ChannelEventOutcome::Continue);
+        assert!(sess.decoder.is_discarding());
+        assert!(sess.slots.is_empty());
+        assert!(ipc_outbox.is_empty());
+        assert_eq!(next_req_id, 1);
 
-        // Unread bytes MUST still remain in the socket buffer because the read
-        // loop returned to `ppoll` after hitting its per-turn budget instead of
-        // draining the entire 128 KiB stream until `EAGAIN`.
-        let mut probe = [0u8; 64];
-        let remaining = nix::unistd::read(sess.fd.as_fd(), &mut probe);
-        assert!(
-            matches!(remaining, Ok(n) if n > 0),
-            "channel read turn must stop at its per-turn budget while bytes remain (got {remaining:?})"
+        let mut rem = [0u8; 8];
+        assert_eq!(
+            nix::unistd::read(sess.fd.as_fd(), &mut rem).unwrap(),
+            1,
+            "exactly 1 byte must remain unread after MAX_CHANNEL_READS_PER_TURN 1-byte reads"
+        );
+        assert_eq!(rem[0], b'A');
+        assert_eq!(
+            nix::unistd::read(sess.fd.as_fd(), &mut rem).unwrap_err(),
+            Errno::EAGAIN
         );
 
-        drop(sess);
-        let _ = feeder.join();
+        // 2. Byte cap (`MAX_CHANNEL_READ_BYTES_PER_TURN`) using a 32 KiB buffer
+        //    (hits the 64 KiB byte cap in 2 reads, well below the 16-read cap).
+        let extra = 17usize;
+        host.write_all(&vec![b'B'; MAX_CHANNEL_READ_BYTES_PER_TURN + extra])
+            .unwrap();
+        let mut big_buf = vec![0u8; MAX_CHANNEL_READ_BYTES_PER_TURN / 2];
+        let outcome = service_open_channel_revents(
+            &mut sess,
+            PollFlags::POLLIN,
+            1,
+            &mut next_req_id,
+            &[],
+            &mut ipc_outbox,
+            &mut big_buf,
+        )
+        .unwrap();
+        assert_eq!(outcome, ChannelEventOutcome::Continue);
+        assert!(sess.decoder.is_discarding());
+        assert!(sess.slots.is_empty());
+        assert!(ipc_outbox.is_empty());
+        assert_eq!(next_req_id, 1);
+
+        let mut tail = [0u8; 64];
+        assert_eq!(
+            nix::unistd::read(sess.fd.as_fd(), &mut tail).unwrap(),
+            extra,
+            "exactly {extra} bytes must remain unread after MAX_CHANNEL_READ_BYTES_PER_TURN"
+        );
+        assert!(tail[..extra].iter().all(|&b| b == b'B'));
+        assert_eq!(
+            nix::unistd::read(sess.fd.as_fd(), &mut tail).unwrap_err(),
+            Errno::EAGAIN
+        );
     }
 }

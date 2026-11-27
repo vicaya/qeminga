@@ -1574,7 +1574,7 @@ fn run_cvm_malicious_ipc_child(state_dir: &Path) {
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    println!("MOCK_PARSER_PID={child_pid}");
+    println!("\nMOCK_PARSER_PID={child_pid}");
     let _ = std::io::stdout().flush();
 
     chown(state_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
@@ -1837,8 +1837,8 @@ fn privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill
     );
     let mock_pid: u32 = mal_stdout
         .lines()
-        .find_map(|l| l.strip_prefix("MOCK_PARSER_PID="))
-        .expect("MOCK_PARSER_PID line")
+        .find_map(|l| l.split_once("MOCK_PARSER_PID=").map(|(_, v)| v))
+        .unwrap_or_else(|| panic!("MOCK_PARSER_PID line missing in:\n{mal_stdout}"))
         .trim()
         .parse()
         .unwrap();
@@ -2984,7 +2984,7 @@ fn run_cvm_violation_while_frozen_child(mount: &str, state_dir: &Path) {
     })
     .unwrap();
     let child_pid = child.pid().as_raw();
-    println!("VIOLATE_PARSER_PID={child_pid}");
+    println!("\nVIOLATE_PARSER_PID={child_pid}");
     let _ = std::io::stdout().flush();
 
     chown(state_dir, Some(uid600.uid), Some(uid600.gid)).unwrap();
@@ -3186,8 +3186,8 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     );
     let viol_parser_pid: u32 = viol_stdout
         .lines()
-        .find_map(|l| l.strip_prefix("VIOLATE_PARSER_PID="))
-        .expect("VIOLATE_PARSER_PID line")
+        .find_map(|l| l.split_once("VIOLATE_PARSER_PID=").map(|(_, v)| v))
+        .unwrap_or_else(|| panic!("VIOLATE_PARSER_PID line missing in:\n{viol_stdout}"))
         .trim()
         .parse()
         .unwrap();

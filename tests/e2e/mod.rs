@@ -150,6 +150,9 @@ pub struct SpawnOptions {
     /// its records) without any ioctl: the way to a frozen agent that
     /// works unprivileged and without fakes.
     pub recovery_marker: bool,
+    /// Optional binary path overriding `CARGO_BIN_EXE_qeminga` (for example,
+    /// `QEMINGA_RELEASE_BINARY` in CI's enforced privileged verification).
+    pub binary: Option<PathBuf>,
 }
 
 impl Default for SpawnOptions {
@@ -162,6 +165,7 @@ impl Default for SpawnOptions {
             stderr_pipe: false,
             enforce_hardening: false,
             recovery_marker: false,
+            binary: None,
         }
     }
 }
@@ -316,7 +320,10 @@ impl Agent {
                     .unwrap(),
             )
         };
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_qeminga"));
+        let binary = opts
+            .binary
+            .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_qeminga")));
+        let mut cmd = Command::new(&binary);
         cmd.arg("--config")
             .arg(&config_path)
             .stdin(Stdio::null())

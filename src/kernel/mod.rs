@@ -16,6 +16,7 @@ pub mod async_fd;
 pub mod caps;
 pub mod fake;
 pub mod ioctl;
+pub mod ipc;
 pub mod shutdown;
 pub mod statx;
 

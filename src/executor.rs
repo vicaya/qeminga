@@ -368,6 +368,23 @@ fn outbox_backpressured(outbox: &IpcOutbox) -> bool {
     outbox.pending_packets() >= MAX_OUTBOX_PACKETS || outbox.pending_bytes() >= MAX_OUTBOX_BYTES
 }
 
+/// Single executor outbox flush entry point: checks `stop_requested` +
+/// `FreezeState::Thawed` before sending every fd-bearing (`OkChannelFd`) packet
+/// so no flush path (loop top, `writable` arm, read-loop synchronous flush,
+/// `terminal_channel_err` flush, or final drain) can hand off a channel
+/// descriptor after shutdown reaches `Thawed`, while ordinary replies such as
+/// `ChannelTerminalBusy` continue to flush normally.
+fn flush_executor_outbox(
+    outbox: &mut IpcOutbox,
+    sock: std::os::fd::BorrowedFd<'_>,
+    ctx: &Context,
+    stop_requested: bool,
+) -> Result<FlushOutcome, Errno> {
+    outbox.flush_with_fd_gate(sock, || {
+        !(stop_requested && ctx.state.current() == FreezeState::Thawed)
+    })
+}
+
 /// Pushes one response onto `outbox` and enforces the hard defensive backlog
 /// ceiling so an unread compromised parser can never grow executor memory
 /// without bound (§5.10).
@@ -566,7 +583,8 @@ where
                 }
                 outbox.discard_channel_fd_packets();
                 if !outbox.is_empty() {
-                    let _ = outbox.flush(async_ipc.as_fd());
+                    let _ =
+                        flush_executor_outbox(&mut outbox, async_ipc.as_fd(), &ctx, stop_requested);
                 }
                 if let Some(err) = terminal_err {
                     break Err(ExecutorExitError::ChannelTerminal(err));
@@ -593,7 +611,7 @@ where
 
         // Flush any queued outbound packets non-blockingly before awaiting.
         if !outbox.is_empty() {
-            match outbox.flush(async_ipc.as_fd()) {
+            match flush_executor_outbox(&mut outbox, async_ipc.as_fd(), &ctx, stop_requested) {
                 Ok(FlushOutcome::Drained | FlushOutcome::WouldBlock) => {}
                 Err(err) => {
                     tracing::error!(
@@ -647,7 +665,7 @@ where
                         &IpcResponse::Err(IpcErrorCode::ChannelTerminalBusy),
                         None,
                     );
-                    let _ = outbox.flush(async_ipc.as_fd());
+                    let _ = flush_executor_outbox(&mut outbox, async_ipc.as_fd(), &ctx, stop_requested);
                     break Err(ExecutorExitError::ChannelTerminal(term_err));
                 }
                 if stop_requested
@@ -674,15 +692,9 @@ where
                 }
             }
             writable = async_ipc.writable(), if !outbox.is_empty() => {
-                if stop_requested && ctx.state.current() == FreezeState::Thawed {
-                    outbox.discard_channel_fd_packets();
-                }
-                if outbox.is_empty() {
-                    continue;
-                }
                 match writable {
                     Ok(mut guard) => {
-                        match outbox.flush(async_ipc.as_fd()) {
+                        match flush_executor_outbox(&mut outbox, async_ipc.as_fd(), &ctx, stop_requested) {
                             Ok(FlushOutcome::Drained) => {}
                             Ok(FlushOutcome::WouldBlock) => guard.clear_ready(),
                             Err(err) => {
@@ -737,7 +749,12 @@ where
                                         // so the socket stays drained and backpressure
                                         // triggers accurately when the peer stops reading.
                                         if !outbox.is_empty()
-                                            && let Err(err) = outbox.flush(async_ipc.as_fd())
+                                            && let Err(err) = flush_executor_outbox(
+                                                &mut outbox,
+                                                async_ipc.as_fd(),
+                                                &ctx,
+                                                stop_requested,
+                                            )
                                         {
                                             tracing::error!(
                                                 event = "parser_ipc_write_failed",
@@ -3747,6 +3764,144 @@ mod tests {
             nix::unistd::write(&pipe_w, b"x").unwrap_err(),
             Errno::EPIPE,
             "discarded channel OwnedFd must be closed rather than leaked"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_thaw_existing_ipc_on_settled_thawed_returns_zero_without_discovery_or_fithaw()
+    {
+        // Astra review: deterministic, scheduling-independent test proving
+        // `execute_thaw_existing_ipc` on a settled `Thawed` context returns
+        // `Ok(0)` with zero mountinfo discovery and zero `FITHAW` calls, both
+        // directly from `Thawed` and immediately after a real freeze+thaw.
+        struct CountingMounts {
+            table: String,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::mountinfo::MountSource for CountingMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, crate::proto::Error> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(self.table.as_bytes().to_vec())
+            }
+        }
+
+        let mount_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let state_dir = tempfile::Builder::new()
+            .prefix("qeminga-thaw-existing-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let marker = Marker::open(state_dir.path().join("frozen")).unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(Arc::clone(&kernel) as Arc<dyn crate::kernel::KernelOps>)
+            .with_mounts(Arc::new(CountingMounts {
+                table: "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned(),
+                reads: Arc::clone(&mount_reads),
+            })),
+        );
+
+        // 1. On an already-`Thawed` context, returns `Ok(0)` with zero I/O.
+        assert_eq!(fsfreeze::execute_thaw_existing_ipc(&ctx).await, Ok(0));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(mount_reads.load(Ordering::SeqCst), 0);
+        assert!(kernel.calls().is_empty());
+
+        // 2. Freeze (`1` mount read), thaw via `execute_thaw_existing_ipc`
+        //    (`Ok(1)`), then invoke `execute_thaw_existing_ipc` a second time
+        //    on the settled `Thawed` context: returns `Ok(0)` with ZERO extra
+        //    mountinfo reads and ZERO extra kernel calls.
+        assert_eq!(
+            fsfreeze::execute_freeze_ipc_with_published(&ctx, None, || {}).await,
+            Ok(1)
+        );
+        assert_eq!(fsfreeze::execute_thaw_existing_ipc(&ctx).await, Ok(1));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        let calls_after_first_thaw = kernel.calls().len();
+        let reads_after_first_thaw = mount_reads.load(Ordering::SeqCst);
+        assert_eq!(reads_after_first_thaw, 1);
+
+        assert_eq!(fsfreeze::execute_thaw_existing_ipc(&ctx).await, Ok(0));
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        assert_eq!(
+            mount_reads.load(Ordering::SeqCst),
+            reads_after_first_thaw,
+            "second execute_thaw_existing_ipc must not read mountinfo"
+        );
+        assert_eq!(
+            kernel.calls().len(),
+            calls_after_first_thaw,
+            "second execute_thaw_existing_ipc must not issue any kernel ioctl"
+        );
+    }
+
+    #[test]
+    fn flush_executor_outbox_drops_queued_fd_and_delivers_terminal_busy_after_thaw() {
+        // Astra review: start with a pending `OkChannelFd` queued during the
+        // frozen interval followed by `ChannelTerminalBusy`; once stop is
+        // requested and `ctx.state` is `Thawed`, `flush_executor_outbox` MUST
+        // drop the queued `OwnedFd` (never sending it over `SCM_RIGHTS`) while
+        // still delivering `ChannelTerminalBusy` intact.
+        let ctx = Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            Router::new(Box::new(std::io::sink())),
+            Marker::for_tests(),
+        );
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        let (pipe_r, pipe_w) = nix::unistd::pipe().unwrap();
+
+        let mut outbox = IpcOutbox::new();
+        outbox
+            .push_response(1, 10, &IpcResponse::OkChannelFd, Some(pipe_r))
+            .unwrap();
+        outbox
+            .push_response(
+                1,
+                11,
+                &IpcResponse::Err(IpcErrorCode::ChannelTerminalBusy),
+                None,
+            )
+            .unwrap();
+        assert_eq!(outbox.pending_packets(), 2);
+
+        // Stop requested and state is now `Thawed`: flush must discard the
+        // queued fd-bearing packet and deliver only `ChannelTerminalBusy`.
+        assert_eq!(
+            flush_executor_outbox(&mut outbox, exec_sock.as_fd(), &ctx, true).unwrap(),
+            FlushOutcome::Drained
+        );
+        assert!(outbox.is_empty());
+        assert_eq!(outbox.pending_bytes(), 0);
+        assert_eq!(
+            nix::unistd::write(&pipe_w, b"x").unwrap_err(),
+            Errno::EPIPE,
+            "queued OkChannelFd descriptor must be closed without transmission"
+        );
+
+        drop(exec_sock);
+        let mut asm = StreamAssembler::new(PeerRole::Parser);
+        let mut replies = Vec::new();
+        let mut received_fds = 0usize;
+        while let Some(pkt) = recv_packet(parser_sock.as_fd(), MAX_PACKET_BYTES).unwrap() {
+            received_fds += pkt.fds.len();
+            if let Some(AssembledMessage::Response(r)) = asm.push(pkt).unwrap() {
+                replies.push((r.req_id, r.response));
+            }
+        }
+        assert_eq!(
+            received_fds, 0,
+            "no SCM_RIGHTS fd may be sent after thaw+stop"
+        );
+        assert_eq!(
+            replies,
+            vec![(11, IpcResponse::Err(IpcErrorCode::ChannelTerminalBusy))]
         );
     }
 }

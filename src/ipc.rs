@@ -3295,9 +3295,25 @@ impl IpcOutbox {
     }
 
     /// Flushes queued chunks onto `sock` until the queue drains or the socket
-    /// reports `EAGAIN`/`EWOULDBLOCK`.
-    pub fn flush(&mut self, sock: BorrowedFd<'_>) -> Result<FlushOutcome, Errno> {
+    /// reports `EAGAIN`/`EWOULDBLOCK`, checking `allow_fd_handoff` before
+    /// transmitting each fd-bearing (`OkChannelFd`) packet.
+    ///
+    /// When `allow_fd_handoff()` returns `false`, any queued fd-bearing packet
+    /// is popped and dropped (closing its `OwnedFd`) without transmitting it,
+    /// while ordinary non-fd replies (such as `ChannelTerminalBusy`) continue
+    /// to flush normally.
+    pub fn flush_with_fd_gate(
+        &mut self,
+        sock: BorrowedFd<'_>,
+        mut allow_fd_handoff: impl FnMut() -> bool,
+    ) -> Result<FlushOutcome, Errno> {
         while let Some(front) = self.queue.front() {
+            if front.fd.is_some() && !allow_fd_handoff() {
+                if let Some(dropped) = self.queue.pop_front() {
+                    self.pending_bytes = self.pending_bytes.saturating_sub(dropped.bytes.len());
+                }
+                continue;
+            }
             match send_packet(sock, &front.bytes, front.fd.as_ref().map(AsFd::as_fd)) {
                 Ok(()) => {
                     if let Some(popped) = self.queue.pop_front() {
@@ -3309,6 +3325,12 @@ impl IpcOutbox {
             }
         }
         Ok(FlushOutcome::Drained)
+    }
+
+    /// Flushes queued chunks onto `sock` until the queue drains or the socket
+    /// reports `EAGAIN`/`EWOULDBLOCK`.
+    pub fn flush(&mut self, sock: BorrowedFd<'_>) -> Result<FlushOutcome, Errno> {
+        self.flush_with_fd_gate(sock, || true)
     }
 }
 

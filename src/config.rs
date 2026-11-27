@@ -79,6 +79,14 @@ pub struct AgentConfig {
     /// yield the guest-independent count `0`. An empty `Some(vec![])`
     /// authorizes freezing nothing.
     pub freeze_allowed_mountpoints: Option<Vec<String>>,
+    /// Optional runtime directory for cooperative per-superblock freeze
+    /// ownership records (§4.2, OQ-11, #69). When omitted (`None`, default),
+    /// qeminga runs in v1 sole-freezer mode and no independent in-guest
+    /// freezer is supported. When set, must be a canonical absolute directory
+    /// path distinct from `state_path` and its parent, residing on an
+    /// unfreezable runtime filesystem (checked at startup).
+    #[serde(default)]
+    pub freeze_ownership_dir: Option<PathBuf>,
 }
 
 /// The hardening profile (`[agent] hardening`, §8.1). The opt-out is
@@ -135,6 +143,7 @@ impl Default for AgentConfig {
             hardening: Hardening::Enforced,
             fsfreeze_operation_timeout_secs: None,
             freeze_allowed_mountpoints: None,
+            freeze_ownership_dir: None,
         }
     }
 }
@@ -418,6 +427,32 @@ impl Config {
                     agent.state_path.display()
                 ),
             ));
+        }
+        if let Some(dir) = &agent.freeze_ownership_dir {
+            let Some(raw) = dir.to_str() else {
+                return Err(invalid("agent.freeze_ownership_dir", "must be valid UTF-8"));
+            };
+            if raw.is_empty()
+                || raw.contains('\0')
+                || !raw.starts_with('/')
+                || raw == "/"
+                || raw.ends_with('/')
+                || raw.contains("//")
+                || raw.split('/').any(|seg| seg == "." || seg == "..")
+            {
+                return Err(invalid(
+                    "agent.freeze_ownership_dir",
+                    format!(
+                        "must be a canonical absolute directory path (not `/`, no `.`/`..`/`//`/trailing `/`), got {raw:?}"
+                    ),
+                ));
+            }
+            if dir == &agent.state_path || agent.state_path.parent() == Some(dir.as_path()) {
+                return Err(invalid(
+                    "agent.freeze_ownership_dir",
+                    "must be distinct from agent.state_path and its parent directory",
+                ));
+            }
         }
         if agent.hardening.is_enforced() && !self.features.seccomp {
             return Err(invalid(
@@ -1100,6 +1135,36 @@ mod tests {
                     }
                 ),
                 "{label}: unexpected error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn freeze_ownership_dir_validation() {
+        assert_eq!(Config::default().agent.freeze_ownership_dir, None);
+        let ok = Config::parse("[agent]\nfreeze_ownership_dir = \"/run/qeminga-freeze-owners\"\n")
+            .unwrap();
+        assert_eq!(
+            ok.agent.freeze_ownership_dir,
+            Some(PathBuf::from("/run/qeminga-freeze-owners"))
+        );
+
+        for bad in [
+            "",
+            "relative/path",
+            "/",
+            "/run/owners/",
+            "/run//owners",
+            "/run/./owners",
+            "/run/../owners",
+            "/run/qeminga",
+            "/run/qeminga/frozen",
+        ] {
+            let toml = format!("[agent]\nfreeze_ownership_dir = {bad:?}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("agent.freeze_ownership_dir"),
+                "bad={bad:?}: {err}"
             );
         }
     }

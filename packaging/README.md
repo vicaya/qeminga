@@ -325,9 +325,13 @@ device numbers, or marker paths).
   `/proc/self/mountinfo` cannot be read on a restricted recovery retry,
   retained descriptors are still drained for guest recovery while their
   wire credit and specific target error classes remain suppressed until
-  current visibility can be verified (per-target ownership in OQ-11 / #69
-  removes broad marker discovery once a second in-guest freezer is
-  supported).
+  current visibility can be verified (when `[agent] freeze_ownership_dir`
+  is also enabled under OQ-11 / #69 below, cooperative recovery drains and
+  releases only `qeminga`-owned superblocks — including any outside the
+  narrowed allowlist, with wire count `0` and `RecoveryIncomplete` error
+  collapsing — while leaving foreign-owned allowlisted superblocks frozen,
+  and idle cooperative thaws still require confirmed `ENOENT` marker
+  absence before fast-pathing `0`).
 - **Mount-binding assumption (v1).** Whether required mount paths come
   from provisioning (`config-data-protection.toml`) or from
   `guest-get-fsinfo`, the guest must keep each required path bound to
@@ -336,17 +340,98 @@ device numbers, or marker paths).
   Replacing a required path with another eligible filesystem before
   `guest-fsfreeze-freeze-list` still yields a matching freeze and thaw
   count because reply-local `fs-N` identifiers cannot detect remounts.
-- **Single-freezer assumption (v1).** Design §4.2 assumes qeminga is the
-  sole freezer in the guest. A host-requested `guest-fsfreeze-thaw`
-  while qeminga is already `Thawed` runs a discovery drain over all
-  eligible filesystems even with no qeminga operation or marker, and
-  `guest-fsfreeze-freeze` retains an already-frozen (`EBUSY`) superblock
-  for later thaw. Do **not** deploy v1 in a CVM that relies on an
-  independent in-guest freezer (such as an in-guest backup or integrity
-  check holding `FIFREEZE` outside qeminga), because the host could
-  release that freeze early; wait for guest-side coordination that
-  preserves freeze ownership across normal thaw and crash recovery
-  (OQ-11).
+- **Single-freezer assumption (default) and cooperative multi-freezer mode (OQ-11, #69).**
+  By default (`[agent] freeze_ownership_dir` unset), design §4.2 assumes
+  qeminga is the sole freezer in the guest: a host-requested
+  `guest-fsfreeze-thaw` while qeminga is already `Thawed` runs a
+  discovery drain over all eligible filesystems even with no qeminga
+  operation or marker, and `guest-fsfreeze-freeze` retains an
+  already-frozen (`EBUSY`) superblock for later thaw. Do **not** deploy
+  the default sole-freezer mode in a CVM that relies on an independent
+  in-guest freezer (such as an in-guest backup or integrity check
+  holding `FIFREEZE` outside qeminga), because the host could release
+  that freeze early.
+
+  To support a second cooperating in-guest freezer safely across normal
+  thaw, host-requested `Thawed` drain, automatic watchdog thaw,
+  rollback, crash/restart with a recovery marker, and ambiguous
+  ownership, configure `[agent] freeze_ownership_dir` (for example
+  `"/run/qeminga-freeze-owners"`) and satisfy **all** of these
+  deployment preconditions:
+
+  1. **Single shared guest-local `tmpfs` directory (`03770 root:<freezer-group>`):**
+     Provision the directory once for the guest boot on a guest-local
+     runtime `tmpfs` under trusted root-owned parent directories (such
+     as `/run/qeminga-freeze-owners`, distinct from `state_path` and its
+     parent directory `/run/qeminga`). All participating services must
+     share the **same** directory object for the lifetime of their
+     freezes and recovery: preserve it across individual service
+     restarts (never recreate or wipe it while any owner may hold a
+     claim, and never start a participating service in a separate mount
+     namespace with a private copy), and drain all outstanding claims
+     before relocating the directory or switching ownership modes.
+     Per-descriptor metadata checks cannot detect two distinct compliant
+     directories after a restart. Startup checks the pinned directory
+     descriptor before opening the channel: it refuses any freezable
+     filesystem and, under `hardening = "enforced"`, verifies via
+     `fstatfs(2)` that the directory resides on guest-local `tmpfs`
+     (rejecting network filesystems and host-provided shares outside the
+     freeze plan) and refuses any directory that is not owned by `root`,
+     belongs to group `0`, lacks the sticky bit (`01000`) or setgid bit
+     (`02000`), lacks group `rwx` (`0070`), or grants any permission to
+     other users (`0007`).
+  2. **Distinct OS UIDs, `SupplementaryGroups=`, `UMask=0027`, and `ReadWritePaths=`:** Run
+     each cooperating freezer under its own OS UID belonging to the
+     dedicated non-root `<freezer-group>` so the sticky bit prevents one
+     freezer from unlinking or renaming another owner's claim file, the
+     setgid bit gives created claim files `<freezer-group>` ownership,
+     and qeminga can verify `st_uid == geteuid()` on `"qeminga"` claims.
+     Add a systemd drop-in for `qeminga.service` granting
+     `SupplementaryGroups=<freezer-group>`, `UMask=0027` (overriding the
+     shipped unit's `UMask=0077` so `0640` claim files remain readable by
+     `<freezer-group>` while `0600` `/run/qeminga/frozen` stays private to
+     `qeminga`), and an appended
+     `ReadWritePaths=-/run/qeminga-freeze-owners` (without resetting
+     `ReadWritePaths=`, punching the ownership directory alongside
+     `-/run/qeminga` under the shipped unit's `ProtectSystem=strict` and
+     `ReadOnlyPaths=/run`). During privilege drop (`setgroups`),
+     qeminga preserves only that single authorized non-root group when
+     it is present in inherited supplementary groups, dropping every
+     other inherited group.
+  3. **All protected in-guest freezers participate in the shared claim
+     protocol:** Participation in this protocol is an explicit
+     prerequisite for protecting a guest-owned freeze, including across
+     crashes and restarts. Before `FIFREEZE` on `(major, minor)`,
+     atomically create `<major>-<minor>` with
+     `O_CREAT | O_EXCL | O_NOFOLLOW`, write `<owner-tag>\n` (`qeminga\n`
+     for qeminga; ASCII `[A-Za-z0-9._-]`, distinct per component), and
+     `fsync` both the file and the directory. Once acquired, the claim
+     must remain exclusively held by that owner until its thaw drain
+     reaches a terminal `FITHAW` (`EINVAL`/`EOPNOTSUPP`) and releases
+     `<major>-<minor>` (followed by `fsync` of the directory);
+     concurrent live handoff during an active drain is not part of the
+     protocol. With `freeze_ownership_dir` enabled, qeminga skips
+     foreign-claimed targets without opening or freezing them, verifies
+     current `qeminga` ownership once immediately before starting each
+     target's `FITHAW` drain (tracked thaw, rollback, abort, and
+     recovery; not between repeated `FITHAW` calls inside a single
+     drain), restricts recovery drains to `qeminga`-owned superblocks
+     (falling back to per-target direct claim verification on mounted
+     filesystems if directory enumeration fails), and fails closed
+     (draining reachable `qeminga` targets while establishing and
+     retaining `/run/qeminga/frozen` — or reporting `marker unavailable`
+     if the marker cannot be created while startup still re-checks the
+     ownership directory on restart — alongside uncertain handles and
+     `Frozen` state without touching foreign freezes) whenever any entry
+     is ambiguous or directory scanning fails. If an unannounced non-cooperating
+     freezer holds `FIFREEZE`, qeminga releases its fresh claim on
+     `EBUSY` only when the freeze worker survives to observe that
+     error; a crash between persisting the claim and handling `EBUSY`
+     leaves a `qeminga` claim that restart recovery
+     will drain, so operators running an integrity checker outside the
+     shared claim protocol cannot rely on cooperative mode to protect
+     its freezes. Omitting `freeze_ownership_dir` keeps the default
+     sole-freezer restriction above.
 
 ## Hardening profile and a failed upgrade or configuration
 

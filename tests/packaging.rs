@@ -772,6 +772,55 @@ fn cvm_docs_record_freeze_count_confidentiality_and_guest_allowlist() {
 }
 
 #[test]
+fn cooperative_freeze_ownership_preconditions_and_default_sole_freezer_are_documented() {
+    // OQ-11 (#69): cooperative multi-freezer mode is opt-in via
+    // `freeze_ownership_dir` with explicit deployment preconditions, while
+    // omitting it retains the documented sole-freezer restriction.
+    let readme = read("packaging/README.md");
+    let design = read("docs/design.md");
+    for needle in [
+        "freeze_ownership_dir",
+        "03770",
+        "sticky bit",
+        "setgid bit",
+        "fstatfs(2)",
+        "SupplementaryGroups=",
+        "UMask=0027",
+        "ReadWritePaths=-/run/qeminga-freeze-owners",
+        "O_CREAT | O_EXCL | O_NOFOLLOW",
+        "explicit\n     prerequisite",
+        "ambiguous",
+        "sole-freezer",
+    ] {
+        assert!(
+            readme.contains(needle),
+            "packaging/README.md missing cooperative ownership requirement {needle:?}"
+        );
+    }
+    assert!(
+        !readme.contains("(when unit write\n     confinement is active)"),
+        "packaging/README.md must not treat unit write confinement as optional after #66"
+    );
+    for needle in [
+        "freeze_ownership_dir",
+        "03770",
+        "TMPFS_MAGIC",
+        "UMask=0027",
+        "O_NONBLOCK",
+        "OwnedByOther",
+        "AlreadyOwnedBySelf",
+        "explicit prerequisite",
+        "ambiguous",
+        "sole-freezer",
+    ] {
+        assert!(
+            design.contains(needle),
+            "docs/design.md missing cooperative ownership specification {needle:?}"
+        );
+    }
+}
+
+#[test]
 fn tmpfiles_rule_hands_sys_power_state_to_the_service_account() {
     // OQ-6: after the drop the daemon cannot write the 0644 root:root
     // file; the (optional) rule gives group qeminga write access.

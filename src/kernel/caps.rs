@@ -85,8 +85,8 @@ impl From<SetKind> for CapSet {
 pub enum Step {
     /// `PR_SET_KEEPCAPS`.
     KeepCaps(bool),
-    /// `setgroups([gid])`.
-    SetGroups(Gid),
+    /// `setgroups(gids)`.
+    SetGroups(Vec<Gid>),
     /// `setresgid(gid, gid, gid)`.
     SetResGid(Gid),
     /// `setresuid(uid, uid, uid)`.
@@ -134,10 +134,12 @@ pub trait CapOps {
     fn is_root(&self) -> bool;
     /// Looks up the account in the passwd database.
     fn lookup(&self, user: &str) -> Result<Option<Account>, String>;
+    /// `getgroups`: currently inherited supplementary groups.
+    fn current_groups(&self) -> Result<Vec<Gid>, String>;
     /// `PR_SET_KEEPCAPS`.
     fn set_keepcaps(&self, keep: bool) -> Result<(), String>;
     /// `setgroups`.
-    fn setgroups(&self, gid: Gid) -> Result<(), String>;
+    fn setgroups(&self, gids: &[Gid]) -> Result<(), String>;
     /// `setresgid`.
     fn setresgid(&self, gid: Gid) -> Result<(), String>;
     /// `setresuid`.
@@ -174,12 +176,16 @@ impl CapOps for SystemCaps {
             .map_err(|e| e.to_string())
     }
 
+    fn current_groups(&self) -> Result<Vec<Gid>, String> {
+        nix::unistd::getgroups().map_err(|e| e.to_string())
+    }
+
     fn set_keepcaps(&self, keep: bool) -> Result<(), String> {
         caps::securebits::set_keepcaps(keep).map_err(|e| e.to_string())
     }
 
-    fn setgroups(&self, gid: Gid) -> Result<(), String> {
-        nix::unistd::setgroups(&[gid]).map_err(|e| e.to_string())
+    fn setgroups(&self, gids: &[Gid]) -> Result<(), String> {
+        nix::unistd::setgroups(gids).map_err(|e| e.to_string())
     }
 
     fn setresgid(&self, gid: Gid) -> Result<(), String> {
@@ -215,12 +221,68 @@ fn step(name: &'static str, result: Result<(), String>) -> Result<(), PrivilegeE
     result.map_err(|reason| PrivilegeError::Step { step: name, reason })
 }
 
+/// Computes the exact supplementary group list passed to `setgroups(2)`.
+///
+/// By default (`extra_gid == None`, or equal to the service account's primary
+/// GID), only `[account.gid]` is kept. When cooperative freeze ownership
+/// requests a shared `<freezer-group>`, it is preserved **only** if it is
+/// non-root (`gid != 0`) and already present in the process's inherited
+/// supplementary groups (as granted by systemd's `SupplementaryGroups=`),
+/// preventing a misconfigured directory from elevating the daemon into any
+/// arbitrary group; every other inherited group is still dropped.
+fn resolve_supplementary_groups(
+    account: Account,
+    ops: &dyn CapOps,
+    extra_gid: Option<Gid>,
+) -> Result<Vec<Gid>, PrivilegeError> {
+    let Some(gid) = extra_gid else {
+        return Ok(vec![account.gid]);
+    };
+    if gid == account.gid {
+        return Ok(vec![account.gid]);
+    }
+    if gid.as_raw() == 0 {
+        return Err(PrivilegeError::Step {
+            step: "supplementary group check",
+            reason: "refusing to preserve root group (gid 0)".to_owned(),
+        });
+    }
+    let inherited = ops
+        .current_groups()
+        .map_err(|reason| PrivilegeError::Step {
+            step: "getgroups",
+            reason,
+        })?;
+    if !inherited.contains(&gid) {
+        return Err(PrivilegeError::Step {
+            step: "supplementary group check",
+            reason: format!(
+                "requested freeze ownership group gid {} is not in inherited supplementary groups (configure SupplementaryGroups= on the service unit)",
+                gid.as_raw()
+            ),
+        });
+    }
+    Ok(vec![account.gid, gid])
+}
+
 /// Runs the §5.4 sequence for the named service account, or skips it
 /// with a warning when not root (C-18).
 pub fn drop_privileges(
     user: &str,
     ops: &dyn CapOps,
     authority: &Authority,
+) -> Result<Outcome, PrivilegeError> {
+    drop_privileges_with_group(user, ops, authority, None)
+}
+
+/// Runs the §5.4 sequence for the named service account, optionally preserving
+/// one explicitly inherited non-root supplementary group `extra_gid` for
+/// `[agent] freeze_ownership_dir` (OQ-11, #69).
+pub fn drop_privileges_with_group(
+    user: &str,
+    ops: &dyn CapOps,
+    authority: &Authority,
+    extra_gid: Option<Gid>,
 ) -> Result<Outcome, PrivilegeError> {
     if !ops.is_root() {
         tracing::warn!(
@@ -236,7 +298,7 @@ pub fn drop_privileges(
             reason,
         })?
         .ok_or_else(|| PrivilegeError::UnknownUser(user.to_owned()))?;
-    drop_privileges_to(account, ops, authority)?;
+    drop_privileges_to_with_group(account, ops, authority, extra_gid)?;
     Ok(Outcome::Dropped)
 }
 
@@ -248,6 +310,19 @@ pub fn drop_privileges_to(
     ops: &dyn CapOps,
     authority: &Authority,
 ) -> Result<(), PrivilegeError> {
+    drop_privileges_to_with_group(account, ops, authority, None)
+}
+
+/// Runs the §5.4 sequence for an already resolved account, optionally
+/// preserving one explicitly inherited non-root supplementary group
+/// `extra_gid` alongside `account.gid` (OQ-11, #69).
+pub fn drop_privileges_to_with_group(
+    account: Account,
+    ops: &dyn CapOps,
+    authority: &Authority,
+    extra_gid: Option<Gid>,
+) -> Result<(), PrivilegeError> {
+    let groups = resolve_supplementary_groups(account, ops, extra_gid)?;
     let finals = final_capability_set(authority);
     let mut with_setpcap = finals.clone();
     with_setpcap.insert(Capability::CAP_SETPCAP);
@@ -255,7 +330,7 @@ pub fn drop_privileges_to(
     // 2. Keep the permitted set across the uid change.
     step("PR_SET_KEEPCAPS", ops.set_keepcaps(true))?;
     // 3. Become the service account (groups first, while CAP_SETGID holds).
-    step("setgroups", ops.setgroups(account.gid))?;
+    step("setgroups", ops.setgroups(&groups))?;
     step("setresgid", ops.setresgid(account.gid))?;
     step("setresuid", ops.setresuid(account.uid))?;
     // 4. Re-raise the finals plus the CAP_SETPCAP needed to trim the
@@ -303,6 +378,7 @@ mod tests {
     struct FakeCaps {
         root: bool,
         users: Vec<(&'static str, Account)>,
+        groups: Vec<Gid>,
         bounding: CapsHashSet,
         steps: RefCell<Vec<Step>>,
         fail: Option<&'static str>,
@@ -319,6 +395,7 @@ mod tests {
                         gid: Gid::from_raw(600),
                     },
                 )],
+                groups: vec![Gid::from_raw(0)],
                 bounding: caps::all(),
                 steps: RefCell::new(Vec::new()),
                 fail: None,
@@ -356,11 +433,17 @@ mod tests {
         fn lookup(&self, user: &str) -> Result<Option<Account>, String> {
             Ok(self.users.iter().find(|(n, _)| *n == user).map(|(_, a)| *a))
         }
+        fn current_groups(&self) -> Result<Vec<Gid>, String> {
+            if self.fail == Some("getgroups") {
+                return Err("scripted failure".to_owned());
+            }
+            Ok(self.groups.clone())
+        }
         fn set_keepcaps(&self, keep: bool) -> Result<(), String> {
             self.record(Step::KeepCaps(keep))
         }
-        fn setgroups(&self, gid: Gid) -> Result<(), String> {
-            self.record(Step::SetGroups(gid))
+        fn setgroups(&self, gids: &[Gid]) -> Result<(), String> {
+            self.record(Step::SetGroups(gids.to_vec()))
         }
         fn setresgid(&self, gid: Gid) -> Result<(), String> {
             self.record(Step::SetResGid(gid))
@@ -452,7 +535,7 @@ mod tests {
             &steps[..6],
             &[
                 Step::KeepCaps(true),
-                Step::SetGroups(gid),
+                Step::SetGroups(vec![gid]),
                 Step::SetResGid(gid),
                 Step::SetResUid(uid),
                 Step::Set(SetKind::Permitted, with_setpcap.clone()),
@@ -618,11 +701,196 @@ mod tests {
         assert_eq!(field("uid"), "65534 gid=65534");
     }
 
+    #[test]
+    fn drop_preserves_single_authorized_supplementary_group_and_refuses_others() {
+        let primary = Gid::from_raw(600);
+        let freezer = Gid::from_raw(650);
+
+        // 1. Authorized non-root group present in inherited groups -> keeps ONLY
+        //    [primary, freezer], dropping root (0) and unrelated groups (999).
+        let mut ops = FakeCaps::root();
+        ops.groups = vec![Gid::from_raw(0), freezer, Gid::from_raw(999)];
+        assert_eq!(
+            drop_privileges_with_group(
+                "qeminga",
+                &ops,
+                &Authority::data_protection(),
+                Some(freezer),
+            ),
+            Ok(Outcome::Dropped)
+        );
+        assert_eq!(
+            ops.steps.borrow()[1],
+            Step::SetGroups(vec![primary, freezer]),
+            "must preserve only primary + authorized freezer group"
+        );
+
+        // 2. extra_gid matching primary gid -> keeps [primary] without duplicates
+        //    and does not require it in inherited supplementary groups.
+        let mut ops = FakeCaps::root();
+        ops.groups = vec![Gid::from_raw(0)];
+        assert_eq!(
+            drop_privileges_with_group(
+                "qeminga",
+                &ops,
+                &Authority::data_protection(),
+                Some(primary),
+            ),
+            Ok(Outcome::Dropped)
+        );
+        assert_eq!(ops.steps.borrow()[1], Step::SetGroups(vec![primary]));
+
+        // 3. Requested group NOT in inherited groups -> refused before any drop step.
+        let mut ops = FakeCaps::root();
+        ops.groups = vec![Gid::from_raw(0), Gid::from_raw(999)];
+        let err = drop_privileges_with_group(
+            "qeminga",
+            &ops,
+            &Authority::data_protection(),
+            Some(freezer),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("SupplementaryGroups="),
+            "error should guide operator to SupplementaryGroups=: {err}"
+        );
+        assert!(
+            ops.steps.borrow().is_empty(),
+            "must fail before changing process state"
+        );
+
+        // 4. Root group (gid 0) is ALWAYS refused even if inherited.
+        let mut ops = FakeCaps::root();
+        ops.groups = vec![Gid::from_raw(0), freezer];
+        let err = drop_privileges_with_group(
+            "qeminga",
+            &ops,
+            &Authority::data_protection(),
+            Some(Gid::from_raw(0)),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("gid 0"), "{err}");
+        assert!(ops.steps.borrow().is_empty());
+
+        // 5. getgroups failure is surfaced cleanly before any drop step.
+        let mut ops = FakeCaps::root();
+        ops.fail = Some("getgroups");
+        let err = drop_privileges_with_group(
+            "qeminga",
+            &ops,
+            &Authority::data_protection(),
+            Some(freezer),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            PrivilegeError::Step {
+                step: "getgroups",
+                reason: "scripted failure".to_owned(),
+            }
+        );
+        assert!(ops.steps.borrow().is_empty());
+    }
+
     /// `PR_GET_NO_NEW_PRIVS` after the drop; covered by the child report
     /// above and kept as its own named entry point.
     #[test]
     #[ignore = "needs root: see privileged_drop_leaves_exactly_final_caps"]
     fn privileged_no_new_privs_is_set() {
         privileged_drop_leaves_exactly_final_caps();
+    }
+
+    /// Verifies on a real root child that preserving one authorized
+    /// supplementary `<freezer-group>` drops all other inherited groups and
+    /// allows the dropped daemon to create, inspect, and release a group-
+    /// readable (`0640`) claim inside a `03770 root:<freezer-group>` tmpfs
+    /// directory under `UMask=0027` (OQ-11, #69).
+    #[test]
+    #[ignore = "needs root: performs a real privilege drop with SupplementaryGroups in a child"]
+    fn privileged_drop_preserves_authorized_supplementary_group() {
+        use std::os::unix::fs::MetadataExt;
+        const FREEZER_GID: u32 = 65001;
+        const EXTRA_GID: u32 = 65002;
+        if let Some(dir_path) = std::env::var_os("QEMINGA_CAPS_GROUP_DIR") {
+            let dir_path = std::path::PathBuf::from(dir_path);
+            let account = Account {
+                uid: Uid::from_raw(65534),
+                gid: Gid::from_raw(65534),
+            };
+            let freezer_gid = Gid::from_raw(FREEZER_GID);
+            nix::unistd::setgroups(&[Gid::from_raw(0), freezer_gid, Gid::from_raw(EXTRA_GID)])
+                .expect("seed inherited supplementary groups");
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o027));
+            let store = crate::ownership::LinuxOwnershipStore::open(&dir_path).expect("open dir");
+            assert!(store.is_tmpfs(), "test dir must be on tmpfs");
+            assert_eq!(store.gid(), FREEZER_GID);
+            drop_privileges_to_with_group(
+                account,
+                &SystemCaps,
+                &Authority::data_protection(),
+                Some(freezer_gid),
+            )
+            .expect("drop with authorized freezer group");
+            let mut groups: Vec<u32> = nix::unistd::getgroups()
+                .expect("getgroups")
+                .into_iter()
+                .map(Gid::as_raw)
+                .collect();
+            groups.sort_unstable();
+            assert_eq!(
+                groups,
+                vec![FREEZER_GID, 65534],
+                "must retain only primary and authorized freezer group"
+            );
+            use crate::ownership::{ClaimOutcome, OwnershipStore, TargetOwnership};
+            assert_eq!(store.try_claim((8, 1)).unwrap(), ClaimOutcome::Acquired);
+            assert_eq!(store.inspect((8, 1)).unwrap(), TargetOwnership::OwnedBySelf);
+            let claim_meta = std::fs::metadata(dir_path.join("8-1")).expect("stat claim");
+            assert_eq!(claim_meta.uid(), 65534);
+            assert_eq!(
+                claim_meta.gid(),
+                FREEZER_GID,
+                "setgid directory must assign freezer group to claim file"
+            );
+            assert_eq!(
+                claim_meta.mode() & 0o777,
+                0o640,
+                "UMask=0027 must keep claim file group-readable (0640)"
+            );
+            store.release((8, 1)).unwrap();
+            assert!(!dir_path.join("8-1").exists());
+            return;
+        }
+        assert!(Uid::effective().is_root(), "run as root");
+        let dir = tempfile::tempdir_in("/dev/shm").expect("tmpfs tempdir");
+        nix::unistd::chown(
+            dir.path(),
+            Some(Uid::from_raw(0)),
+            Some(Gid::from_raw(FREEZER_GID)),
+        )
+        .expect("chown 0:FREEZER_GID");
+        nix::sys::stat::fchmodat(
+            nix::fcntl::AT_FDCWD,
+            dir.path(),
+            nix::sys::stat::Mode::from_bits_truncate(0o3770),
+            nix::sys::stat::FchmodatFlags::FollowSymlink,
+        )
+        .expect("chmod 03770");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kernel::caps::tests::privileged_drop_preserves_authorized_supplementary_group",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("QEMINGA_CAPS_GROUP_DIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

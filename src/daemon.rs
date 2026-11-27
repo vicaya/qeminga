@@ -52,6 +52,7 @@ use crate::handlers::fsfreeze;
 use crate::kernel::caps::{Outcome, PrivilegeError};
 use crate::marker::{Marker, MarkerError};
 use crate::mountinfo::{MountEntry, MountSource};
+use crate::ownership::{LinuxOwnershipStore, OwnershipError, OwnershipStore};
 use crate::state::{FreezeState, FreezeStateMachine};
 
 /// The service account (§5.4, §8.3).
@@ -146,6 +147,9 @@ pub enum RunError {
     /// has no directory or file name.
     #[error("{0}")]
     Marker(#[from] MarkerError),
+    /// The configured `freeze_ownership_dir` could not be opened.
+    #[error("{0}")]
+    Ownership(#[from] OwnershipError),
     /// `state_path` is on a filesystem the freeze plan would freeze: its
     /// directory, opened and resolved as the kernel does, is on a planned
     /// device.
@@ -163,6 +167,45 @@ pub enum RunError {
         mount: PathBuf,
         /// That filesystem's `(major, minor)`.
         dev: (u32, u32),
+    },
+    /// `freeze_ownership_dir` is on a filesystem the freeze plan would freeze
+    /// (§8.2, OQ-11, #69).
+    #[error(
+        "freeze_ownership_dir {} is on {} ({}:{}), which the freeze plan would freeze; put it on tmpfs (e.g. /run)",
+        path.display(),
+        mount.display(),
+        dev.0,
+        dev.1
+    )]
+    OwnershipPath {
+        /// The configured path.
+        path: PathBuf,
+        /// A mount point of the planned filesystem the directory is on.
+        mount: PathBuf,
+        /// That filesystem's `(major, minor)`.
+        dev: (u32, u32),
+    },
+    /// `freeze_ownership_dir` is not on guest-local `tmpfs` under enforced
+    /// hardening (e.g. a network filesystem or host-provided share outside
+    /// the freeze plan; OQ-11, #69).
+    #[error(
+        "freeze_ownership_dir {} is not on guest-local tmpfs; put it on tmpfs (e.g. /run)",
+        path.display()
+    )]
+    OwnershipNotTmpfs {
+        /// The configured path.
+        path: PathBuf,
+    },
+    /// `freeze_ownership_dir` does not satisfy enforced-hardening ownership
+    /// and permission preconditions (`03770 root:<freezer-group>`, sticky +
+    /// setgid, non-root group with `rwx`, no permissions for other users;
+    /// OQ-11, #69).
+    #[error("freeze_ownership_dir {} has unsafe permissions: {detail}", path.display())]
+    OwnershipDirPermissions {
+        /// The configured path.
+        path: PathBuf,
+        /// Why the directory metadata was refused.
+        detail: String,
     },
     /// The mount table could not be read for the `state_path` check.
     #[error("cannot read the mount table: {0}")]
@@ -195,7 +238,11 @@ impl RunError {
         match self {
             RunError::Config(_)
             | RunError::Marker(_)
+            | RunError::Ownership(_)
             | RunError::StatePath { .. }
+            | RunError::OwnershipPath { .. }
+            | RunError::OwnershipNotTmpfs { .. }
+            | RunError::OwnershipDirPermissions { .. }
             | RunError::MountTable(_)
             | RunError::Hardening(_) => EX_CONFIG,
             RunError::Channel(_) => EX_UNAVAILABLE,
@@ -262,6 +309,110 @@ pub fn check_hardening(config: &Config, build: &BuildProfile) -> Result<(), RunE
     Ok(())
 }
 
+/// A pinned cooperative freeze ownership directory opened during startup along
+/// with the kernel metadata checked before privilege drop (OQ-11, #69).
+#[derive(Debug)]
+pub struct OpenedOwnershipDir {
+    /// The ownership store passed into [`Context`] after privilege drop.
+    pub store: Arc<dyn OwnershipStore>,
+    /// `(major, minor)` of the filesystem holding the directory.
+    pub dev: (u32, u32),
+    /// Owner UID of the directory at startup.
+    pub uid: u32,
+    /// Owner GID of the directory at startup (the shared `<freezer-group>`).
+    pub gid: u32,
+    /// Permission and special mode bits (`0o7777`) of the directory.
+    pub mode: u32,
+    /// Whether `fstatfs(2)` on the pinned directory descriptor reported
+    /// guest-local `tmpfs` (`TMPFS_MAGIC`).
+    pub is_tmpfs: bool,
+}
+
+/// Validates that an opened `freeze_ownership_dir` resides on an unfreezable
+/// filesystem and, under `hardening = "enforced"`, resides on guest-local
+/// `tmpfs` and satisfies the `03770 root:<freezer-group>` precondition
+/// (root-owned, dedicated non-root group with `rwx`, sticky + setgid bits,
+/// and no permissions for other users).
+pub fn validate_ownership_dir(
+    path: &Path,
+    opened: &OpenedOwnershipDir,
+    config: &Config,
+    mounts: &[MountEntry],
+    plan: &FreezePlan,
+) -> Result<(), RunError> {
+    if plan.covers_device(opened.dev) {
+        let mount = mounts
+            .iter()
+            .find(|entry| entry.dev() == opened.dev)
+            .map(|entry| entry.mount_point.clone())
+            .unwrap_or_default();
+        return Err(RunError::OwnershipPath {
+            path: path.to_path_buf(),
+            mount,
+            dev: opened.dev,
+        });
+    }
+    if config.agent.hardening.is_enforced() {
+        if !opened.is_tmpfs {
+            return Err(RunError::OwnershipNotTmpfs {
+                path: path.to_path_buf(),
+            });
+        }
+        if opened.uid != 0 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "must be owned by root (uid 0) under enforced hardening, found uid {}",
+                    opened.uid
+                ),
+            });
+        }
+        if opened.gid == 0 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: "must belong to a dedicated non-root freezer group (gid != 0) under enforced hardening".to_owned(),
+            });
+        }
+        if (opened.mode & 0o1000) == 0 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "must have the sticky bit set (expected 03770) under enforced hardening, found {:04o}",
+                    opened.mode
+                ),
+            });
+        }
+        if (opened.mode & 0o2000) == 0 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "must have the setgid bit set (expected 03770) so claim files inherit the freezer group under enforced hardening, found {:04o}",
+                    opened.mode
+                ),
+            });
+        }
+        if (opened.mode & 0o070) != 0o070 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "must grant rwx to the freezer group (expected 03770) under enforced hardening, found {:04o}",
+                    opened.mode
+                ),
+            });
+        }
+        if (opened.mode & 0o007) != 0 {
+            return Err(RunError::OwnershipDirPermissions {
+                path: path.to_path_buf(),
+                detail: format!(
+                    "must not grant permissions to other users (expected 03770) under enforced hardening, found {:04o}",
+                    opened.mode
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// The steps of the startup sequence, in the order [`run_with`] calls
 /// them. Production is [`SystemStartup`]; tests record the calls.
 pub trait Startup {
@@ -278,14 +429,38 @@ pub trait Startup {
     /// Step 3: the mount table for the `state_path` check (the device of
     /// the opened marker directory against the freeze plan, §8.2).
     fn mount_table(&self) -> Result<Vec<MountEntry>, String>;
+    /// Step 3b: open and pin the optional cooperative freeze ownership
+    /// directory (`[agent] freeze_ownership_dir`, OQ-11, #69).
+    fn open_ownership_dir(&self, path: &Path) -> Result<OpenedOwnershipDir, RunError> {
+        let store = LinuxOwnershipStore::open(path)?;
+        let dev = store.dev();
+        let uid = store.uid();
+        let gid = store.gid();
+        let mode = store.mode();
+        let is_tmpfs = store.is_tmpfs();
+        Ok(OpenedOwnershipDir {
+            store: Arc::new(store),
+            dev,
+            uid,
+            gid,
+            mode,
+            is_tmpfs,
+        })
+    }
     /// Step 4: one attempt to open the channel while still privileged.
     /// `EBUSY` is terminal; any other failure yields `Ok(None)` and the
     /// runtime's reopen loop (§5.7) retries after the drop, so a missing
     /// device never delays the privilege drop, the seccomp filter or the
     /// recovery watchdog (C-14, OQ-7).
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
-    /// Step 5: keep the final set of `authority` (§5.4, §5.9).
-    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError>;
+    /// Step 5: keep the final set of `authority` (§5.4, §5.9) and, when
+    /// cooperative freeze ownership is enabled, at most one explicitly
+    /// inherited non-root supplementary group `extra_gid` (OQ-11, #69).
+    fn drop_privileges(
+        &self,
+        authority: &Authority,
+        extra_gid: Option<nix::unistd::Gid>,
+    ) -> Result<Outcome, PrivilegeError>;
     /// Step 5b: start the audit writer thread, after the drop so that it
     /// is created under the dropped ceiling (§5.4).
     fn start_audit_writer(&self, router: &Router) -> Result<(), RunError> {
@@ -297,7 +472,8 @@ pub trait Startup {
     fn install_seccomp(&self, config: &Config) -> Result<bool, RunError>;
     /// Step 7: run until a signal; `recovery` selects the `Frozen` start;
     /// `channel` is the descriptor step 4 opened, if it did; `marker` is
-    /// the handle step 2 opened.
+    /// the handle step 2 opened; `ownership` is the optional cooperative
+    /// ownership store opened in step 3b.
     fn serve(
         &self,
         config: Arc<Config>,
@@ -305,6 +481,7 @@ pub trait Startup {
         recovery: bool,
         channel: Option<OwnedFd>,
         marker: Marker,
+        ownership: Option<Arc<dyn OwnershipStore>>,
     ) -> Result<(), RunError>;
 }
 
@@ -407,6 +584,17 @@ fn serve_after_logging(
             dev,
         });
     }
+    let (ownership, ownership_gid) = if let Some(dir) = config.agent.freeze_ownership_dir.as_deref()
+    {
+        let opened = startup.open_ownership_dir(dir)?;
+        validate_ownership_dir(dir, &opened, &config, &mounts, &plan)?;
+        (
+            Some(opened.store),
+            Some(nix::unistd::Gid::from_raw(opened.gid)),
+        )
+    } else {
+        (None, None)
+    };
     let channel = startup.open_channel(&config.agent.channel_path)?;
     if channel.is_none() {
         tracing::warn!(
@@ -424,7 +612,7 @@ fn serve_after_logging(
         suspend = authority.suspend,
         "authority derived from the configuration"
     );
-    match startup.drop_privileges(&authority)? {
+    match startup.drop_privileges(&authority, ownership_gid)? {
         Outcome::Dropped => tracing::info!(
             event = "privileges_dropped",
             user = SERVICE_USER,
@@ -437,6 +625,40 @@ fn serve_after_logging(
         }
         Outcome::SkippedUnprivileged => {}
     }
+    // Post-drop cooperative ownership check (running as `SERVICE_USER` so
+    // UID verification on `"qeminga"` claim files matches post-drop euid,
+    // and before starting the audit writer so escalation enters ring mode
+    // before any stderr flush): outstanding `qeminga` claims, ambiguous
+    // entries, or an unreadable ownership store escalate to `Frozen`
+    // recovery mode even if the recovery marker was absent.
+    let recovery = if !recovery && let Some(store) = ownership.as_deref() {
+        match store.inspect_all() {
+            Ok(snapshot) if snapshot.owned_by_self.is_empty() && snapshot.ambiguous.is_empty() => {
+                false
+            }
+            Ok(snapshot) => {
+                router.enter_ring();
+                tracing::warn!(
+                    event = "ownership_recovery_mode",
+                    owned_by_self = snapshot.owned_by_self.len(),
+                    ambiguous = snapshot.ambiguous.len(),
+                    "cooperative ownership store has outstanding or ambiguous entries; starting frozen"
+                );
+                true
+            }
+            Err(err) => {
+                router.enter_ring();
+                tracing::warn!(
+                    event = "ownership_recovery_mode",
+                    error = %err,
+                    "cannot inspect cooperative ownership store at startup; starting frozen"
+                );
+                true
+            }
+        }
+    } else {
+        recovery
+    };
     // Only now a second thread: created by the dropped thread, it inherits
     // the dropped ceiling (uid, capability sets, bounding set).
     startup.start_audit_writer(&router)?;
@@ -479,7 +701,14 @@ fn serve_after_logging(
             "compatibility build: unlisted syscalls are logged, not killed (never for a release)"
         );
     }
-    startup.serve(Arc::new(config), router, recovery, channel, marker)
+    startup.serve(
+        Arc::new(config),
+        router,
+        recovery,
+        channel,
+        marker,
+        ownership,
+    )
 }
 
 /// Production entry point: parse, run, map errors to exit codes.
@@ -566,11 +795,16 @@ impl Startup for SystemStartup {
         }
     }
 
-    fn drop_privileges(&self, authority: &Authority) -> Result<Outcome, PrivilegeError> {
-        crate::kernel::caps::drop_privileges(
+    fn drop_privileges(
+        &self,
+        authority: &Authority,
+        extra_gid: Option<nix::unistd::Gid>,
+    ) -> Result<Outcome, PrivilegeError> {
+        crate::kernel::caps::drop_privileges_with_group(
             SERVICE_USER,
             &crate::kernel::caps::SystemCaps,
             authority,
+            extra_gid,
         )
     }
 
@@ -599,10 +833,11 @@ impl Startup for SystemStartup {
         recovery: bool,
         channel: Option<OwnedFd>,
         marker: Marker,
+        ownership: Option<Arc<dyn OwnershipStore>>,
     ) -> Result<(), RunError> {
         let runtime = build_runtime().map_err(|err| RunError::Runtime(err.to_string()))?;
         let path = config.agent.channel_path.clone();
-        let ctx = production_context(config, router, recovery, marker);
+        let ctx = production_context(config, router, recovery, marker, ownership);
         let served = runtime.block_on(async move {
             // Register the handlers before serving anything: a SIGTERM that
             // arrives after the first reply must be deferred, not fatal.
@@ -663,7 +898,8 @@ pub fn build_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 pub const FAKE_KERNEL_ENV: &str = "QEMINGA_TEST_FAKE_KERNEL";
 
 /// The production context: real sources, state chosen by `recovery`, the
-/// marker handle opened at startup.
+/// marker handle opened at startup, and the optional cooperative ownership
+/// store.
 ///
 /// With the `test-fakes` Cargo feature **and** [`FAKE_KERNEL_ENV`] set
 /// **and** development hardening, the kernel shim is the fake: no ioctl,
@@ -675,13 +911,17 @@ pub fn production_context(
     router: Router,
     recovery: bool,
     marker: Marker,
+    ownership: Option<Arc<dyn OwnershipStore>>,
 ) -> Arc<Context> {
     let state = if recovery {
         FreezeStateMachine::starting_frozen()
     } else {
         FreezeStateMachine::new()
     };
-    let ctx = Context::new(config, Arc::new(state), router, marker);
+    let mut ctx = Context::new(config, Arc::new(state), router, marker);
+    if let Some(store) = ownership {
+        ctx = ctx.with_ownership(store);
+    }
     // Never under enforced hardening (`check_hardening` refused the start
     // already; this keeps the swap itself conditional on the profile).
     #[cfg(feature = "test-fakes")]
@@ -861,6 +1101,27 @@ mod tests {
         assert_eq!(RunError::Runtime("x".into()).exit_code(), EX_OSERR);
         assert_eq!(
             RunError::Marker(MarkerError::InvalidPath { path: "/".into() }).exit_code(),
+            EX_CONFIG
+        );
+        assert_eq!(
+            RunError::Ownership(OwnershipError::TooManyEntries { limit: 4096 }).exit_code(),
+            EX_CONFIG
+        );
+        assert_eq!(
+            RunError::OwnershipPath {
+                path: "/var/lib/own".into(),
+                mount: "/".into(),
+                dev: (8, 1),
+            }
+            .exit_code(),
+            EX_CONFIG
+        );
+        assert_eq!(
+            RunError::OwnershipDirPermissions {
+                path: "/run/qeminga-freeze-owners".into(),
+                detail: "missing sticky bit".into(),
+            }
+            .exit_code(),
             EX_CONFIG
         );
         assert_eq!(RunError::MountTable("x".into()).exit_code(), EX_CONFIG);

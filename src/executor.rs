@@ -2902,13 +2902,12 @@ mod tests {
         ));
         let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
-        let opener_entered = Arc::new(std::sync::Barrier::new(2));
-        let opener_release = Arc::new(std::sync::Barrier::new(2));
-        let entered_clone = Arc::clone(&opener_entered);
-        let release_clone = Arc::clone(&opener_release);
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let release_rx = Arc::new(std::sync::Mutex::new(release_rx));
         let opener: VerifiedOpenFn = Arc::new(move |p| {
-            entered_clone.wait();
-            release_clone.wait();
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().unwrap().recv();
             Err(OpenError::AlreadyOpen { path: p.to_owned() })
         });
 
@@ -2934,10 +2933,14 @@ mod tests {
         // Wait until the reopen worker is past its cancelable sleep and inside
         // the blocking opener, send SIGTERM, and wait for the executor's signal
         // audit record so `stop_requested` is guaranteed latched before the
-        // reopen worker completes with terminal EBUSY.
+        // reopen worker completes with terminal EBUSY. Dropping `release_tx` on
+        // unwind guarantees the blocking opener never hangs Tokio shutdown.
         let sink_check = sink.clone();
         tokio::task::spawn_blocking(move || {
-            opener_entered.wait();
+            let release_tx = release_tx;
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reopen worker did not enter blocking opener");
             let _ = stop_tx.send("SIGTERM");
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -2951,7 +2954,7 @@ mod tests {
                 );
                 std::thread::sleep(Duration::from_millis(2));
             }
-            opener_release.wait();
+            let _ = release_tx.send(());
         })
         .await
         .unwrap();

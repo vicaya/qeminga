@@ -229,6 +229,7 @@ fn write_all_single_byte(fd: std::os::fd::BorrowedFd<'_>, byte: u8) -> io::Resul
 #[derive(Debug, Clone)]
 struct PreparedRequest {
     lane: Kind,
+    frame_len: u32,
     ipc_request: IpcRequest,
     meta: ReplyMeta,
 }
@@ -252,16 +253,20 @@ enum ReplyMeta {
 /// [`PreparedRequest`] while preserving `C-7` exact evaluation precedence.
 fn prepare_frame(event: DecodeEvent) -> PreparedRequest {
     match event {
-        DecodeEvent::Oversized { discarded } => PreparedRequest {
-            lane: Kind::Control,
-            ipc_request: IpcRequest::ReportParseRejection(ParseRejection {
-                kind: ParseRejectionKind::Oversized,
-                frame_len: u32::try_from(discarded).unwrap_or(u32::MAX),
-                id: None,
-                method: None,
-            }),
-            meta: ReplyMeta::LocalRejection { reply: None },
-        },
+        DecodeEvent::Oversized { discarded } => {
+            let frame_len = u32::try_from(discarded).unwrap_or(u32::MAX);
+            PreparedRequest {
+                lane: Kind::Control,
+                frame_len,
+                ipc_request: IpcRequest::ReportParseRejection(ParseRejection {
+                    kind: ParseRejectionKind::Oversized,
+                    frame_len,
+                    id: None,
+                    method: None,
+                }),
+                meta: ReplyMeta::LocalRejection { reply: None },
+            }
+        }
         DecodeEvent::Frame { bytes, .. } => {
             let frame_len = u32::try_from(bytes.len()).unwrap_or(u32::MAX);
             let req = match parse_request(&bytes) {
@@ -270,6 +275,7 @@ fn prepare_frame(event: DecodeEvent) -> PreparedRequest {
                     let wire = encode(&Response::error(None, &err).to_json(), false);
                     return PreparedRequest {
                         lane: Kind::Control,
+                        frame_len,
                         ipc_request: IpcRequest::ReportParseRejection(ParseRejection {
                             kind: ParseRejectionKind::ParseError,
                             frame_len,
@@ -288,6 +294,7 @@ fn prepare_frame(event: DecodeEvent) -> PreparedRequest {
                 );
                 return PreparedRequest {
                     lane: Kind::Ordinary,
+                    frame_len,
                     ipc_request: IpcRequest::ReportParseRejection(ParseRejection {
                         kind: ParseRejectionKind::UnknownMethod,
                         frame_len,
@@ -346,6 +353,7 @@ fn prepare_allowlisted(cmd: Command, req: &Request, frame_len: u32) -> PreparedR
     match typed {
         Ok(ipc_request) => PreparedRequest {
             lane,
+            frame_len,
             ipc_request,
             meta: ReplyMeta::Command {
                 cmd,
@@ -355,6 +363,7 @@ fn prepare_allowlisted(cmd: Command, req: &Request, frame_len: u32) -> PreparedR
         },
         Err(_) => PreparedRequest {
             lane,
+            frame_len,
             ipc_request: IpcRequest::ReportParseRejection(ParseRejection {
                 kind: ParseRejectionKind::ParseError,
                 frame_len,
@@ -647,24 +656,24 @@ impl OpenSession {
                     .push_request_with_id(session_gen, req_id, host_id, &prep.ipc_request)
                     .is_err()
                 {
-                    // Request encoding failed its own bound (e.g., an absurdly
-                    // long entry past protocol cap): emit a local error rather
-                    // than stalling the slot.
-                    let fallback = match &prep.meta {
-                        ReplyMeta::Command { id, sentinel, .. } => Some(encode(
-                            &Response::error(
-                                *id,
-                                &ProtoError::InvalidArguments(
-                                    "request exceeds IPC payload bound".to_owned(),
-                                ),
-                            )
-                            .to_json(),
-                            *sentinel,
-                        )),
-                        ReplyMeta::LocalRejection { reply } => reply.clone(),
+                    // Defense in depth: if an allowlisted command ever exceeds
+                    // an IPC encoding bound, route it through the allowlisted
+                    // `ReportParseRejection` path so the executor records the
+                    // rejection and enforces C-7 gate precedence before
+                    // returning `InvalidArguments`. Never reply locally without
+                    // executor observation.
+                    let ReplyMeta::Command { cmd, id, .. } = &prep.meta else {
+                        return Err(());
                     };
-                    *slot = ParserSlot::Done(fallback);
-                    continue;
+                    let rej = IpcRequest::ReportParseRejection(ParseRejection {
+                        kind: ParseRejectionKind::ParseError,
+                        frame_len: prep.frame_len,
+                        id: *id,
+                        method: Some(ProjectedMethod::Full(cmd.name().to_owned())),
+                    });
+                    ipc_outbox
+                        .push_request_with_id(session_gen, req_id, None, &rej)
+                        .map_err(|_| ())?;
                 }
                 *slot = ParserSlot::Pending {
                     lane: kind,
@@ -2018,6 +2027,185 @@ mod tests {
         // never Session 1's retired fstrim reply!
         assert_eq!(read_line(&mut host2), "{\"return\":2,\"id\":202}\n");
         assert_eq!(read_line(&mut host2), "{\"return\":{},\"id\":203}\n");
+
+        drop(exec_sock);
+        assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);
+    }
+
+    #[test]
+    fn open_session_admit_routes_ipc_encode_failure_through_report_parse_rejection() {
+        // Codex P1: if an allowlisted command ever fails IPC encoding (e.g., an
+        // entry exceeding MAX_FREEZE_LIST_ENTRY_BYTES), `OpenSession::admit`
+        // must NOT answer locally without auditing; it must route the frame
+        // through `ReportParseRejection(ParseError, Full(cmd.name()))` so the
+        // executor audits it and evaluates C-7 gates (Disabled -> RateLimited
+        // -> Frozen -> InvalidArguments) before replying.
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        let (_host, ch_fd) = unix_stream_pair();
+        let mut sess = OpenSession::new(ch_fd);
+        let mut ipc_outbox = IpcOutbox::default();
+        let mut next_req_id = 1u64;
+
+        let oversized_entry = format!("/{}", "a".repeat(crate::ipc::MAX_FREEZE_LIST_ENTRY_BYTES));
+        sess.slots.push_back(ParserSlot::Waiting(PreparedRequest {
+            lane: Kind::Freeze,
+            frame_len: 4200,
+            ipc_request: IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(vec![
+                oversized_entry.clone(),
+            ])),
+            meta: ReplyMeta::Command {
+                cmd: Command::FsfreezeFreezeList,
+                id: Some(77),
+                sentinel: false,
+            },
+        }));
+        sess.slots.push_back(ParserSlot::Waiting(PreparedRequest {
+            lane: Kind::Freeze,
+            frame_len: 42,
+            ipc_request: IpcRequest::FsfreezeFreeze,
+            meta: ReplyMeta::Command {
+                cmd: Command::FsfreezeFreeze,
+                id: Some(78),
+                sentinel: false,
+            },
+        }));
+
+        assert!(
+            sess.admit(1, &mut next_req_id, &[], &mut ipc_outbox)
+                .is_ok(),
+            "allowlisted IPC encode failure must route to ReportParseRejection, not error"
+        );
+        assert!(
+            !ipc_outbox.is_empty(),
+            "admit must enqueue ReportParseRejection instead of answering locally"
+        );
+        assert!(
+            matches!(
+                sess.slots.front(),
+                Some(ParserSlot::Pending {
+                    lane: Kind::Freeze,
+                    req_id: 1,
+                    ..
+                })
+            ),
+            "slot must remain Pending awaiting executor gate decision"
+        );
+        assert!(
+            matches!(sess.slots.get(1), Some(ParserSlot::Waiting(_))),
+            "trailing exclusive slot must remain Waiting while fallback rejection holds the lane"
+        );
+
+        assert_eq!(
+            ipc_outbox.flush(parser_sock.as_fd()).unwrap(),
+            FlushOutcome::Drained
+        );
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+        let req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.session_gen, 1);
+        assert_eq!(req.req_id, 1);
+        assert_eq!(req.host_id, Some(77));
+        assert_eq!(
+            req.request,
+            IpcRequest::ReportParseRejection(ParseRejection {
+                kind: ParseRejectionKind::ParseError,
+                frame_len: 4200,
+                id: Some(77),
+                method: Some(ProjectedMethod::Full(
+                    "guest-fsfreeze-freeze-list".to_owned()
+                )),
+            })
+        );
+
+        // Drop the trailing Waiting slot before testing LocalRejection fail-closed.
+        let _ = sess.slots.pop_back();
+
+        // Executor applies C-7 precedence (e.g., RateLimited before
+        // InvalidArguments) and parser formats that authoritative error.
+        sess.complete_response(ReceivedResponse {
+            session_gen: 1,
+            req_id: 1,
+            response: IpcResponse::Err(IpcErrorCode::RateLimited {
+                class: crate::dispatch::ratelimit::CommandClass::FsfreezeFreeze,
+            }),
+            channel_fd: None,
+        })
+        .unwrap();
+        sess.promote_done();
+        assert_eq!(sess.wire_outbox.count(), 1);
+        let reply = String::from_utf8(sess.wire_outbox.replies.pop_front().unwrap()).unwrap();
+        assert!(
+            reply.contains("\"id\":77") && reply.contains("rate limit"),
+            "expected executor rate-limit reply, got: {reply}"
+        );
+
+        // A LocalRejection whose IPC encoding itself fails must fail closed
+        // (`Err(())`) rather than silently emitting an un-audited local reply.
+        sess.slots.push_back(ParserSlot::Waiting(PreparedRequest {
+            lane: Kind::Control,
+            frame_len: 4200,
+            ipc_request: IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(vec![
+                oversized_entry,
+            ])),
+            meta: ReplyMeta::LocalRejection {
+                reply: Some(b"{\"error\":{}}\n".to_vec()),
+            },
+        }));
+        assert!(
+            sess.admit(1, &mut next_req_id, &[], &mut ipc_outbox)
+                .is_err(),
+            "unencodable LocalRejection must fail closed rather than replying un-audited"
+        );
+    }
+
+    #[test]
+    fn parser_routes_overlong_freeze_list_frame_through_report_parse_rejection() {
+        // End-to-end check: a 4,097-byte mountpoint in guest-fsfreeze-freeze-list
+        // never produces an un-audited local reply in `run_parser_loop` (caught
+        // by JSON string bounds and reported to executor via ReportParseRejection).
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        set_nonblocking(parser_sock.as_fd()).unwrap();
+        let (mut host, ch_fd) = unix_stream_pair();
+        let parser_thread = thread::spawn(move || run_parser_loop(parser_sock, Some(ch_fd)));
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+
+        let long_entry = format!("/{}", "a".repeat(crate::ipc::MAX_FREEZE_LIST_ENTRY_BYTES));
+        let frame = format!(
+            "{{\"execute\":\"guest-fsfreeze-freeze-list\",\"arguments\":{{\"mountpoints\":[\"{long_entry}\"]}},\"id\":77}}\n"
+        );
+        host.write_all(frame.as_bytes()).unwrap();
+
+        let mut pfd = [PollFd::new(exec_sock.as_fd(), PollFlags::POLLIN)];
+        assert!(
+            ppoll(&mut pfd, Some(TimeSpec::new(2, 0)), None).unwrap() > 0,
+            "parser must report rejected frame to executor"
+        );
+        let req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            req.request,
+            IpcRequest::ReportParseRejection(ParseRejection {
+                kind: ParseRejectionKind::ParseError,
+                frame_len: u32::try_from(frame.len() - 1).unwrap(),
+                id: None,
+                method: None,
+            })
+        );
+        send_response(
+            exec_sock.as_fd(),
+            req.session_gen,
+            req.req_id,
+            &IpcResponse::OkAck,
+            None,
+        )
+        .unwrap();
+        let reply = read_line(&mut host);
+        assert!(
+            reply.contains("GenericError"),
+            "expected parse error reply after executor ack, got: {reply}"
+        );
 
         drop(exec_sock);
         assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);

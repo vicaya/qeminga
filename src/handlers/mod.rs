@@ -265,7 +265,10 @@ pub(crate) fn serialized_reply_line_bytes<T: serde::Serialize>(
     let mut counter = Counting(0);
     serde_json::to_writer(&mut counter, value)
         .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))?;
-    Ok((counter.0, counter.0 + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES))
+    Ok((
+        counter.0,
+        counter.0 + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES,
+    ))
 }
 
 /// Serialises an information reply and refuses one whose line on the

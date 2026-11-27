@@ -27,6 +27,7 @@ pub mod framing;
 pub mod freeze_op;
 pub mod freeze_plan;
 pub mod handlers;
+pub mod ipc;
 #[cfg(target_os = "linux")]
 pub mod kernel;
 pub mod marker;

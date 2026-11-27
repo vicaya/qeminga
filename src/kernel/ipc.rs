@@ -205,8 +205,8 @@ pub fn recv_packet(sock: BorrowedFd<'_>, max_bytes: usize) -> Result<Option<RawP
         iov_len: bytes.len(),
     };
 
-    let cmsg_fd_bytes = u32::try_from(RECV_CMSG_FD_SLOTS * size_of::<RawFd>())
-        .map_err(|_| Errno::EINVAL)?;
+    let cmsg_fd_bytes =
+        u32::try_from(RECV_CMSG_FD_SLOTS * size_of::<RawFd>()).map_err(|_| Errno::EINVAL)?;
     // SAFETY: `CMSG_SPACE` is a pure integer alignment calculation.
     let recv_cmsg_space = unsafe { libc::CMSG_SPACE(cmsg_fd_bytes) } as usize;
     const RECV_CMSG_BUF_LEN: usize = 64;

@@ -175,7 +175,9 @@ pub fn trim_plan(kernel: &dyn KernelOps, plan: &FreezePlan, minimum: u64) -> Tri
 /// wire without allocating a serialized buffer. Returns the wire line length
 /// on success, or [`FstrimOversize`] carrying exact `trimmed_targets`
 /// (successful `FITRIM` ioctls only) and `failed_targets` counts.
-pub fn check_fstrim_reply_bounds(response: &TrimResponse) -> Result<usize, Result<FstrimOversize, Error>> {
+pub fn check_fstrim_reply_bounds(
+    response: &TrimResponse,
+) -> Result<usize, Result<FstrimOversize, Error>> {
     let (_, line) = match crate::handlers::serialized_reply_line_bytes("fstrim", response) {
         Ok(measured) => measured,
         Err(err) => return Err(Err(err)),
@@ -606,7 +608,7 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_fstrim_reply_reports_exact_mixed_counts_logs_bounded_summary_and_keeps_dispatcher_usable()
-    {
+     {
         use tracing::instrument::WithSubscriber;
 
         #[derive(Clone, Default)]
@@ -635,9 +637,7 @@ mod tests {
         let long_seg = "a".repeat(3100);
         for i in 2u32..365 {
             let path = format!("/m/{long_seg}_{i}");
-            table.push_str(&format!(
-                "{i} 1 8:{i} / {path} rw - ext4 /dev/sd{i} rw\n"
-            ));
+            table.push_str(&format!("{i} 1 8:{i} / {path} rw - ext4 /dev/sd{i} rw\n"));
             if i % 5 == 0 {
                 kernel.script_open_error(&path, Errno::ENOENT);
                 expected_failed += 1;

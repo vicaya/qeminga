@@ -344,13 +344,19 @@ device numbers, or marker paths).
   By default (`[agent] freeze_ownership_dir` unset), design §4.2 assumes
   qeminga is the sole freezer in the guest: a host-requested
   `guest-fsfreeze-thaw` while qeminga is already `Thawed` runs a
-  discovery drain over all eligible filesystems even with no qeminga
-  operation or marker, and `guest-fsfreeze-freeze` retains an
-  already-frozen (`EBUSY`) superblock for later thaw. Do **not** deploy
-  the default sole-freezer mode in a CVM that relies on an independent
-  in-guest freezer (such as an in-guest backup or integrity check
-  holding `FIFREEZE` outside qeminga), because the host could release
-  that freeze early.
+  discovery drain even with no qeminga operation or marker — visiting all
+  eligible filesystems when `[agent] freeze_allowed_mountpoints` is
+  omitted, narrowing to currently visible allowlisted devices when
+  `freeze_allowed_mountpoints` is set and marker absence is confirmed via
+  `ENOENT`, and still running broad recovery over all eligible
+  filesystems whenever the recovery marker is present or indeterminate —
+  and `guest-fsfreeze-freeze` retains an already-frozen (`EBUSY`)
+  superblock for later thaw. Because an allowlist conveys no ownership of
+  a freeze, do **not** deploy the default sole-freezer mode (with or
+  without `freeze_allowed_mountpoints`) in a CVM that relies on an
+  independent in-guest freezer (such as an in-guest backup or integrity
+  check holding `FIFREEZE` outside qeminga), because the host could
+  release that freeze early.
 
   To support a second cooperating in-guest freezer safely across normal
   thaw, host-requested `Thawed` drain, automatic watchdog thaw,

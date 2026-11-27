@@ -1780,22 +1780,16 @@ fn thaw_blocking_cooperative(
                 minor = dev.1,
                 "qeminga-owned superblock is missing from mountinfo; retaining claim and marker"
             );
-            let countable = !restricted;
-            let kind = if countable {
-                RecoveryReason::TargetUnreachable
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             state.record_failure(
                 ThawFailure::Incomplete {
                     mountpoint: dev_label.clone(),
-                    kind,
+                    kind: RecoveryReason::TargetUnreachable,
                     reason: format!(
                         "qeminga-owned superblock {dev_label} not present in mount table; no FITHAW issued"
                     ),
                     thawed: 0,
                 },
-                countable,
+                !restricted,
             );
         }
     }
@@ -1807,11 +1801,6 @@ fn thaw_blocking_cooperative(
                 .is_some_and(|devs| devs.contains(&dev)),
             Some(_) | None => true,
         };
-        let kind = if countable {
-            RecoveryReason::OwnershipAmbiguous
-        } else {
-            RecoveryReason::RecoveryIncomplete
-        };
         let mountpoint = match entry.dev {
             Some((maj, min)) => format!("{maj}:{min}"),
             None => "(ownership)".to_owned(),
@@ -1819,7 +1808,7 @@ fn thaw_blocking_cooperative(
         state.record_failure(
             ThawFailure::Incomplete {
                 mountpoint,
-                kind,
+                kind: RecoveryReason::OwnershipAmbiguous,
                 reason: entry.reason.clone(),
                 thawed: 0,
             },
@@ -1858,14 +1847,10 @@ fn record_unreachable(
     err: OpenTargetError,
     countable: bool,
 ) {
-    let kind = if countable {
-        if err.permission_denied {
-            RecoveryReason::TargetOpenPermissionDenied
-        } else {
-            RecoveryReason::TargetUnreachable
-        }
+    let kind = if err.permission_denied {
+        RecoveryReason::TargetOpenPermissionDenied
     } else {
-        RecoveryReason::RecoveryIncomplete
+        RecoveryReason::TargetUnreachable
     };
     let failure = ThawFailure::Incomplete {
         mountpoint: lossy(&target.mountpoint),
@@ -1931,10 +1916,17 @@ struct ThawState {
 }
 
 impl ThawState {
-    /// Records an unrecoverable target failure. A failure on a policy-authorized
-    /// (`countable`) target upgrades an earlier excluded-only placeholder so
-    /// authorized failure classes are never masked by an excluded target (#63).
-    fn record_failure(&mut self, failure: ThawFailure, countable: bool) {
+    /// Records an unrecoverable target failure. Excluded or unverified
+    /// (`!countable`) target failures are masked centrally to
+    /// [`RecoveryReason::RecoveryIncomplete`] so no caller can accidentally
+    /// leak a target-specific wire failure class (#63, #81). A failure on a
+    /// policy-authorized (`countable`) target upgrades an earlier excluded-only
+    /// placeholder so authorized failure classes are never masked by an
+    /// excluded target.
+    fn record_failure(&mut self, mut failure: ThawFailure, countable: bool) {
+        if !countable && let ThawFailure::Incomplete { kind, .. } = &mut failure {
+            *kind = RecoveryReason::RecoveryIncomplete;
+        }
         match &self.unrecoverable {
             None => self.unrecoverable = Some(failure),
             Some(ThawFailure::Incomplete {
@@ -1963,15 +1955,10 @@ impl ThawState {
             keep_handle,
         } = verify_ownership_before_thaw(ownership, &mount)
         {
-            let wire_kind = if countable {
-                kind
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             self.record_failure(
                 ThawFailure::Incomplete {
                     mountpoint: lossy(mount.mountpoint()),
-                    kind: wire_kind,
+                    kind,
                     reason: detail,
                     thawed: 0,
                 },
@@ -1988,14 +1975,9 @@ impl ThawState {
             self.thawed += 1;
         }
         if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
-            let wire_kind = if countable {
-                kind
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             let failure = ThawFailure::Incomplete {
                 mountpoint: lossy(mount.mountpoint()),
-                kind: wire_kind,
+                kind,
                 reason: detail,
                 thawed: 0,
             };
@@ -2010,14 +1992,9 @@ impl ThawState {
         } else if let Some(store) = ownership
             && let Err(err) = store.release(mount.dev())
         {
-            let wire_kind = if countable {
-                recovery_reason_for_ownership_error(&err)
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             let failure = ThawFailure::Incomplete {
                 mountpoint: lossy(mount.mountpoint()),
-                kind: wire_kind,
+                kind: recovery_reason_for_ownership_error(&err),
                 reason: err.to_string(),
                 thawed: 0,
             };
@@ -9857,18 +9834,6 @@ mod tests {
         use crate::ownership::{InMemoryOwnershipStore, OwnershipStore, TargetOwnership};
         use tracing::instrument::WithSubscriber;
 
-        #[derive(Clone, Default)]
-        struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for LogSink {
-            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
         let table = concat!(
             "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
             "2 1 8:2 / /integrity rw - ext4 /dev/sdb1 rw\n",
@@ -9924,7 +9889,7 @@ mod tests {
         kernel1.fifreeze(&m_data).unwrap();
         kernel1.clear_calls();
         let hooks1 = Arc::new(Recorder::default());
-        let sink1 = LogSink::default();
+        let sink1 = SharedSink::default();
         let router1 = Router::new(Box::new(sink1.clone()));
         let (ctx1, _dir1) = make_ctx(
             FreezeState::Frozen,

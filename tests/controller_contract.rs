@@ -1860,6 +1860,10 @@ async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverifie
     );
     assert!(guest.dir.path().join("frozen").exists());
     assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(
+        guest.ctx().watchdog_slot().is_some(),
+        "failed cooperative recovery must re-arm the watchdog"
+    );
     assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
     assert!(
         !guest.kernel.calls().iter().any(
@@ -1881,6 +1885,7 @@ async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverifie
     );
     assert_eq!(guest.state(), FreezeState::Frozen);
     assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
 
     // 2. Adding a corrupt claim on currently authorized `/data` (`8-3`)
     //    alongside excluded `8-4` upgrades the wire reason to `OwnershipAmbiguous`
@@ -1898,6 +1903,7 @@ async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverifie
     assert!(own_dir.path().join("8-4").exists());
     assert_eq!(guest.state(), FreezeState::Frozen);
     assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
 
     // 3. Clearing `8-3` and `8-4`, then adding an unmounted/unverified device
     //    claim `8-99` collapses to generic `RecoveryIncomplete`.
@@ -1915,6 +1921,7 @@ async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverifie
     assert!(own_dir.path().join("8-99").exists());
     assert_eq!(guest.state(), FreezeState::Frozen);
     assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
 
     // 4. Operator removes `8-99`: retry settles cleanly to Thawed with count 0
     //    while foreign `/integrity` (`8-2`) stays frozen.
@@ -1926,6 +1933,7 @@ async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverifie
     assert_eq!(cleared["return"], json!(0));
     assert_eq!(guest.state(), FreezeState::Thawed);
     assert!(!guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_none());
     assert_eq!(
         std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
         "guest-integrity\n"

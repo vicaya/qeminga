@@ -801,6 +801,25 @@ fn cooperative_freeze_ownership_preconditions_and_default_sole_freezer_are_docum
         !readme.contains("(when unit write\n     confinement is active)"),
         "packaging/README.md must not treat unit write confinement as optional after #66"
     );
+    // #82: the writable-object inventory must qualify `/run/qeminga` as the
+    // default writable ordinary-file directory on pre-start mounts and link to
+    // the opt-in cooperative ownership drop-in recipe without duplicating it.
+    let inv_start = readme
+        .find("### Writable object inventory (packaged CVM service)")
+        .expect("writable-object inventory heading");
+    let inv_end = readme[inv_start..]
+        .find("### Why `PrivateTmp=no`")
+        .map(|off| inv_start + off)
+        .expect("end of writable-object inventory");
+    let inventory = &readme[inv_start..inv_end];
+    let inventory_lower = inventory.to_ascii_lowercase();
+    assert!(
+        inventory_lower.contains("by default")
+            && inventory.contains("freeze_ownership_dir")
+            && inventory.contains("#data-protection-profile-and-cvm-deployment-guidance")
+            && inventory_lower.contains("drop-in"),
+        "writable-object inventory must qualify /run/qeminga as default and link the opt-in cooperative ownership drop-in:\n{inventory}"
+    );
     for needle in [
         "freeze_ownership_dir",
         "03770",

@@ -132,6 +132,18 @@ pub enum ClaimOutcome {
     },
 }
 
+/// An entry in the cooperative ownership directory whose ownership could not
+/// be verified safely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmbiguousEntry {
+    /// Superblock `(major, minor)` parsed from a canonical `<major>-<minor>`
+    /// filename, or `None` for directory-level entries whose names do not
+    /// identify a superblock (non-UTF-8 or unrecognised filenames).
+    pub dev: Option<(u32, u32)>,
+    /// Guest-local diagnostic detail (never sent on the wire).
+    pub reason: String,
+}
+
 /// Point-in-time inventory of the cooperative ownership directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnershipSnapshot {
@@ -140,9 +152,10 @@ pub struct OwnershipSnapshot {
     /// Superblocks verified as owned by another cooperating freezer (guest-local
     /// diagnostics only; never thawed by qeminga).
     pub owned_by_other: Vec<(u32, u32)>,
-    /// Guest-local diagnostics for entries whose ownership is ambiguous. When
-    /// non-empty, recovery must fail closed and retain the marker.
-    pub ambiguous: Vec<String>,
+    /// Guest-local diagnostics (with parsed device identity when available) for
+    /// entries whose ownership is ambiguous. When non-empty, recovery must fail
+    /// closed and retain the marker.
+    pub ambiguous: Vec<AmbiguousEntry>,
 }
 
 /// Errors interacting with the cooperative ownership store.
@@ -577,11 +590,17 @@ impl OwnershipStore for LinuxOwnershipStore {
                 });
             }
             let Ok(name) = std::str::from_utf8(raw_name) else {
-                ambiguous.push("non-UTF-8 entry in freeze ownership directory".to_owned());
+                ambiguous.push(AmbiguousEntry {
+                    dev: None,
+                    reason: "non-UTF-8 entry in freeze ownership directory".to_owned(),
+                });
                 continue;
             };
             let Some(dev) = parse_dev_filename(name) else {
-                ambiguous.push(format!("unrecognised ownership entry name {name:?}"));
+                ambiguous.push(AmbiguousEntry {
+                    dev: None,
+                    reason: format!("unrecognised ownership entry name {name:?}"),
+                });
                 continue;
             };
             match inspect_entry_fd(&self.dir, name, Some(own_uid)) {
@@ -593,7 +612,10 @@ impl OwnershipStore for LinuxOwnershipStore {
                     other_devs.insert(dev);
                 }
                 EntryClass::Ambiguous(reason) => {
-                    ambiguous.push(format!("{name}: {reason}"));
+                    ambiguous.push(AmbiguousEntry {
+                        dev: Some(dev),
+                        reason: format!("{name}: {reason}"),
+                    });
                 }
             }
         }
@@ -799,13 +821,21 @@ impl OwnershipStore for InMemoryOwnershipStore {
         }
         let mut owned_by_self = Vec::new();
         let mut owned_by_other = Vec::new();
-        let mut ambiguous = s.extra_ambiguous.clone();
+        let mut ambiguous: Vec<AmbiguousEntry> = s
+            .extra_ambiguous
+            .iter()
+            .cloned()
+            .map(|reason| AmbiguousEntry { dev: None, reason })
+            .collect();
         for (&dev, entry) in &s.entries {
             match entry {
                 FakeEntry::Owner(o) if o == QEMINGA_OWNER => owned_by_self.push(dev),
                 FakeEntry::Owner(_) => owned_by_other.push(dev),
                 FakeEntry::Ambiguous(reason) => {
-                    ambiguous.push(format!("{}: {reason}", format_dev_filename(dev)));
+                    ambiguous.push(AmbiguousEntry {
+                        dev: Some(dev),
+                        reason: format!("{}: {reason}", format_dev_filename(dev)),
+                    });
                 }
             }
         }
@@ -958,6 +988,13 @@ mod tests {
         assert_eq!(snap.owned_by_self, vec![(8, 1)]);
         assert_eq!(snap.owned_by_other, vec![(8, 2)]);
         assert_eq!(snap.ambiguous.len(), 3, "{:?}", snap.ambiguous);
+        let amb_devs: BTreeSet<Option<(u32, u32)>> = snap.ambiguous.iter().map(|e| e.dev).collect();
+        assert_eq!(
+            amb_devs,
+            BTreeSet::from([None, Some((8, 3)), Some((8, 4))]),
+            "{:?}",
+            snap.ambiguous
+        );
 
         // 5. Release removes only qeminga's claim and is idempotent.
         store.release((8, 1)).unwrap();
@@ -1044,6 +1081,12 @@ mod tests {
         assert!(snap.owned_by_self.is_empty(), "{snap:?}");
         assert!(snap.owned_by_other.is_empty(), "{snap:?}");
         assert_eq!(snap.ambiguous.len(), 3, "{snap:?}");
+        let amb_devs: BTreeSet<Option<(u32, u32)>> = snap.ambiguous.iter().map(|e| e.dev).collect();
+        assert_eq!(
+            amb_devs,
+            BTreeSet::from([Some((8, 5)), Some((8, 6)), Some((8, 7))]),
+            "{snap:?}"
+        );
     }
 
     #[test]

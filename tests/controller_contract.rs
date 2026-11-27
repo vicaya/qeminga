@@ -1782,3 +1782,161 @@ async fn cvm_allowlist_and_cooperative_ownership_compose_across_foreign_freezes_
         guest.kernel.calls()
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn cvm_allowlist_and_cooperative_ownership_suppress_excluded_and_unverified_ambiguous_claims()
+{
+    // #81: under the combined opt-in profile (`freeze_allowed_mountpoints` +
+    // `freeze_ownership_dir` on real tmpfs), ambiguous per-device claim files
+    // for excluded or unverified devices collapse to generic `RecoveryIncomplete`
+    // while verified currently-authorized ambiguous claims retain
+    // `OwnershipAmbiguous`, always preserving recovery state, marker, watchdog,
+    // foreign freezes, and ambiguous claim files.
+    let own_dir = tempfile::Builder::new()
+        .prefix("qeminga-owners-amb-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let table = concat!(
+        "27 1 8:1 / / rw,relatime - ext4 /dev/sda1 rw\n",
+        "28 27 8:2 / /integrity rw,relatime - ext4 /dev/sdb1 rw\n",
+        "29 27 8:3 / /data rw,relatime - ext4 /dev/sdc1 rw\n",
+        "30 27 8:4 / /secret rw,relatime - ext4 /dev/sdd1 rw\n",
+    )
+    .to_owned();
+    let guest = Guest::with_policy_and_cooperative_ownership(
+        table,
+        Some(vec!["/integrity".to_owned(), "/data".to_owned()]),
+        own_dir.path().to_path_buf(),
+    );
+    let foreign_store = LinuxOwnershipStore::open(own_dir.path()).unwrap();
+
+    // Independent guest service claims and freezes allowlisted `/integrity` (8:2).
+    assert!(foreign_store.claim_as("guest-integrity", (8, 2)).unwrap());
+    let integrity_mount = guest
+        .kernel
+        .open_mount(Path::new("/integrity"), (8, 2))
+        .unwrap();
+    guest.kernel.fifreeze(&integrity_mount).unwrap();
+    guest
+        .kernel
+        .script_freeze_error("/integrity", nix::errno::Errno::EBUSY);
+
+    // 1. qeminga freezes allowlisted `/data` (8:3), crashes, and an excluded
+    //    device claim `8-4` (`/secret`) is corrupt (empty) on restart.
+    let frozen = guest
+        .request(
+            r#"{"execute":"guest-fsfreeze-freeze-list","arguments":{"mountpoints":["/data"]}}"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(frozen["return"], json!(1));
+    guest.crash_agent();
+    std::fs::write(own_dir.path().join("8-4"), b"").unwrap();
+    guest.start_agent();
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    guest.kernel.clear_calls();
+
+    // Recovery drains `/data` (authorized count 1), releases `8-3`, leaves
+    // foreign `/integrity` frozen and `8-4` intact, retains marker + Frozen,
+    // and collapses the excluded ambiguity to generic `RecoveryIncomplete`.
+    let excl_reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    let desc = excl_reply["error"]["desc"].as_str().unwrap();
+    assert_eq!(
+        desc,
+        "thaw incomplete: recovery did not complete; filesystem may still be frozen (1 target(s) thawed); state frozen, marker retained"
+    );
+    assert!(
+        !desc.contains("ambiguous") && !desc.contains("8-4") && !desc.contains("/secret"),
+        "{excl_reply}"
+    );
+    assert!(!own_dir.path().join("8-3").exists());
+    assert!(own_dir.path().join("8-4").exists());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert!(guest.dir.path().join("frozen").exists());
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(
+        guest.ctx().watchdog_slot().is_some(),
+        "failed cooperative recovery must re-arm the watchdog"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+    assert!(
+        !guest.kernel.calls().iter().any(
+            |c| matches!(c, Call::Open(p, _) | Call::Fithaw(p) if p == Path::new("/integrity"))
+        ),
+        "must never touch foreign /integrity: {:?}",
+        guest.kernel.calls()
+    );
+
+    // Zero-count retry with only excluded `8-4` remaining still reports generic
+    // `RecoveryIncomplete` with `0 target(s) thawed`.
+    let excl_zero = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        excl_zero["error"]["desc"].as_str().unwrap(),
+        "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+    );
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
+
+    // 2. Adding a corrupt claim on currently authorized `/data` (`8-3`)
+    //    alongside excluded `8-4` upgrades the wire reason to `OwnershipAmbiguous`
+    //    while preserving both claims, marker, Frozen, and foreign `/integrity`.
+    std::fs::write(own_dir.path().join("8-3"), b"corrupt-no-newline").unwrap();
+    let auth_reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        auth_reply["error"]["desc"].as_str().unwrap(),
+        "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+    );
+    assert!(own_dir.path().join("8-3").exists());
+    assert!(own_dir.path().join("8-4").exists());
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
+
+    // 3. Clearing `8-3` and `8-4`, then adding an unmounted/unverified device
+    //    claim `8-99` collapses to generic `RecoveryIncomplete`.
+    std::fs::remove_file(own_dir.path().join("8-3")).unwrap();
+    std::fs::remove_file(own_dir.path().join("8-4")).unwrap();
+    std::fs::write(own_dir.path().join("8-99"), b"").unwrap();
+    let unverified_reply = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(
+        unverified_reply["error"]["desc"].as_str().unwrap(),
+        "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+    );
+    assert!(own_dir.path().join("8-99").exists());
+    assert_eq!(guest.state(), FreezeState::Frozen);
+    assert!(guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_some());
+
+    // 4. Operator removes `8-99`: retry settles cleanly to Thawed with count 0
+    //    while foreign `/integrity` (`8-2`) stays frozen.
+    std::fs::remove_file(own_dir.path().join("8-99")).unwrap();
+    let cleared = guest
+        .request(r#"{"execute":"guest-fsfreeze-thaw"}"#)
+        .await
+        .unwrap();
+    assert_eq!(cleared["return"], json!(0));
+    assert_eq!(guest.state(), FreezeState::Thawed);
+    assert!(!guest.dir.path().join("frozen").exists());
+    assert!(guest.ctx().watchdog_slot().is_none());
+    assert_eq!(
+        std::fs::read_to_string(own_dir.path().join("8-2")).unwrap(),
+        "guest-integrity\n"
+    );
+    assert_eq!(guest.kernel.tracked_frozen_superblocks(), 1);
+}

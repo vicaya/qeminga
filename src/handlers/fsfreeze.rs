@@ -1696,53 +1696,68 @@ fn thaw_blocking_cooperative(
         }
     };
 
-    for reason in &snapshot.ambiguous {
-        tracing::error!(
-            event = "fsfreeze_ownership_ambiguous",
-            reason = %reason,
-            "ambiguous freeze ownership entry; draining reachable qeminga targets and retaining marker"
-        );
+    for entry in &snapshot.ambiguous {
+        match entry.dev {
+            Some((major, minor)) => {
+                tracing::error!(
+                    event = "fsfreeze_ownership_ambiguous",
+                    major,
+                    minor,
+                    reason = %entry.reason,
+                    "ambiguous freeze ownership entry; draining reachable qeminga targets and retaining marker"
+                );
+            }
+            None => {
+                tracing::error!(
+                    event = "fsfreeze_ownership_ambiguous",
+                    reason = %entry.reason,
+                    "ambiguous freeze ownership entry; draining reachable qeminga targets and retaining marker"
+                );
+            }
+        }
     }
 
+    let has_device_ambiguous = snapshot.ambiguous.iter().any(|entry| entry.dev.is_some());
     let mut pending_self: BTreeSet<(u32, u32)> = snapshot.owned_by_self.iter().copied().collect();
-    let (discovery, verified_countable) =
-        if !pending_self.is_empty() || (restricted && !retained.is_empty()) {
-            match build_recovery_plan(mounts, allowed, false) {
-                Ok(RecoveryPlan {
-                    plan,
-                    countable_devs,
-                }) => {
-                    for target in plan.thaw_order() {
-                        if !pending_self.remove(&target.dev) {
-                            continue;
-                        }
-                        let countable = countable_devs
-                            .as_ref()
-                            .is_none_or(|devs| devs.contains(&target.dev));
-                        drain_planned_target(
-                            kernel,
-                            store,
-                            &mut state,
-                            &mut retained,
-                            target,
-                            countable,
-                        );
+    let (discovery, verified_countable) = if !pending_self.is_empty()
+        || (restricted && (!retained.is_empty() || has_device_ambiguous))
+    {
+        match build_recovery_plan(mounts, allowed, false) {
+            Ok(RecoveryPlan {
+                plan,
+                countable_devs,
+            }) => {
+                for target in plan.thaw_order() {
+                    if !pending_self.remove(&target.dev) {
+                        continue;
                     }
-                    (None, countable_devs)
-                }
-                Err(failure) => {
-                    tracing::error!(
-                        event = "fsfreeze_thaw_plan_failed",
-                        error = %failure,
-                        held = retained.len(),
-                        "cannot read the mount table; draining the handles this process holds"
+                    let countable = countable_devs
+                        .as_ref()
+                        .is_none_or(|devs| devs.contains(&target.dev));
+                    drain_planned_target(
+                        kernel,
+                        store,
+                        &mut state,
+                        &mut retained,
+                        target,
+                        countable,
                     );
-                    (Some(failure), None)
                 }
+                (None, countable_devs)
             }
-        } else {
-            (None, None)
-        };
+            Err(failure) => {
+                tracing::error!(
+                    event = "fsfreeze_thaw_plan_failed",
+                    error = %failure,
+                    held = retained.len(),
+                    "cannot read the mount table; draining the handles this process holds"
+                );
+                (Some(failure), None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     for entry in retained.into_iter().rev() {
         pending_self.remove(&entry.mount.dev());
@@ -1765,35 +1780,39 @@ fn thaw_blocking_cooperative(
                 minor = dev.1,
                 "qeminga-owned superblock is missing from mountinfo; retaining claim and marker"
             );
-            let countable = !restricted;
-            let kind = if countable {
-                RecoveryReason::TargetUnreachable
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             state.record_failure(
                 ThawFailure::Incomplete {
                     mountpoint: dev_label.clone(),
-                    kind,
+                    kind: RecoveryReason::TargetUnreachable,
                     reason: format!(
                         "qeminga-owned superblock {dev_label} not present in mount table; no FITHAW issued"
                     ),
                     thawed: 0,
                 },
-                countable,
+                !restricted,
             );
         }
     }
 
-    if !snapshot.ambiguous.is_empty() {
+    for entry in &snapshot.ambiguous {
+        let countable = match entry.dev {
+            Some(dev) if restricted => verified_countable
+                .as_ref()
+                .is_some_and(|devs| devs.contains(&dev)),
+            Some(_) | None => true,
+        };
+        let mountpoint = match entry.dev {
+            Some((maj, min)) => format!("{maj}:{min}"),
+            None => "(ownership)".to_owned(),
+        };
         state.record_failure(
             ThawFailure::Incomplete {
-                mountpoint: "(ownership)".to_owned(),
+                mountpoint,
                 kind: RecoveryReason::OwnershipAmbiguous,
-                reason: snapshot.ambiguous.join("; "),
+                reason: entry.reason.clone(),
                 thawed: 0,
             },
-            true,
+            countable,
         );
     }
 
@@ -1828,14 +1847,10 @@ fn record_unreachable(
     err: OpenTargetError,
     countable: bool,
 ) {
-    let kind = if countable {
-        if err.permission_denied {
-            RecoveryReason::TargetOpenPermissionDenied
-        } else {
-            RecoveryReason::TargetUnreachable
-        }
+    let kind = if err.permission_denied {
+        RecoveryReason::TargetOpenPermissionDenied
     } else {
-        RecoveryReason::RecoveryIncomplete
+        RecoveryReason::TargetUnreachable
     };
     let failure = ThawFailure::Incomplete {
         mountpoint: lossy(&target.mountpoint),
@@ -1901,10 +1916,17 @@ struct ThawState {
 }
 
 impl ThawState {
-    /// Records an unrecoverable target failure. A failure on a policy-authorized
-    /// (`countable`) target upgrades an earlier excluded-only placeholder so
-    /// authorized failure classes are never masked by an excluded target (#63).
-    fn record_failure(&mut self, failure: ThawFailure, countable: bool) {
+    /// Records an unrecoverable target failure. Excluded or unverified
+    /// (`!countable`) target failures are masked centrally to
+    /// [`RecoveryReason::RecoveryIncomplete`] so no caller can accidentally
+    /// leak a target-specific wire failure class (#63, #81). A failure on a
+    /// policy-authorized (`countable`) target upgrades an earlier excluded-only
+    /// placeholder so authorized failure classes are never masked by an
+    /// excluded target.
+    fn record_failure(&mut self, mut failure: ThawFailure, countable: bool) {
+        if !countable && let ThawFailure::Incomplete { kind, .. } = &mut failure {
+            *kind = RecoveryReason::RecoveryIncomplete;
+        }
         match &self.unrecoverable {
             None => self.unrecoverable = Some(failure),
             Some(ThawFailure::Incomplete {
@@ -1933,15 +1955,10 @@ impl ThawState {
             keep_handle,
         } = verify_ownership_before_thaw(ownership, &mount)
         {
-            let wire_kind = if countable {
-                kind
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             self.record_failure(
                 ThawFailure::Incomplete {
                     mountpoint: lossy(mount.mountpoint()),
-                    kind: wire_kind,
+                    kind,
                     reason: detail,
                     thawed: 0,
                 },
@@ -1958,14 +1975,9 @@ impl ThawState {
             self.thawed += 1;
         }
         if let Some(DrainIncomplete { kind, detail }) = drained.incomplete() {
-            let wire_kind = if countable {
-                kind
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             let failure = ThawFailure::Incomplete {
                 mountpoint: lossy(mount.mountpoint()),
-                kind: wire_kind,
+                kind,
                 reason: detail,
                 thawed: 0,
             };
@@ -1980,14 +1992,9 @@ impl ThawState {
         } else if let Some(store) = ownership
             && let Err(err) = store.release(mount.dev())
         {
-            let wire_kind = if countable {
-                recovery_reason_for_ownership_error(&err)
-            } else {
-                RecoveryReason::RecoveryIncomplete
-            };
             let failure = ThawFailure::Incomplete {
                 mountpoint: lossy(mount.mountpoint()),
-                kind: wire_kind,
+                kind: recovery_reason_for_ownership_error(&err),
                 reason: err.to_string(),
                 thawed: 0,
             };
@@ -2194,6 +2201,7 @@ mod tests {
     struct SwitchableMounts {
         table: std::sync::Mutex<String>,
         fail: std::sync::atomic::AtomicBool,
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     impl SwitchableMounts {
@@ -2201,6 +2209,7 @@ mod tests {
             SwitchableMounts {
                 table: std::sync::Mutex::new(table.into()),
                 fail: std::sync::atomic::AtomicBool::new(false),
+                reads: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -2211,10 +2220,15 @@ mod tests {
         fn fail_reads(&self, fail: bool) {
             self.fail.store(fail, std::sync::atomic::Ordering::SeqCst);
         }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     impl MountSource for SwitchableMounts {
         fn read_mountinfo(&self) -> Result<Vec<u8>, Error> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(Error::Internal(
                     "cannot read /proc/self/mountinfo: Too many open files (os error 24)".into(),
@@ -9812,5 +9826,424 @@ mod tests {
         );
         assert_eq!(ctx3.state.current(), FreezeState::Frozen);
         assert_eq!(kernel3.tracked_frozen_superblocks(), 1);
+    }
+
+    #[tokio::test]
+    async fn cooperative_restricted_recovery_applies_disclosure_policy_to_ambiguous_device_claims()
+    {
+        use crate::ownership::{InMemoryOwnershipStore, OwnershipStore, TargetOwnership};
+        use tracing::instrument::WithSubscriber;
+
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /integrity rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /data rw - ext4 /dev/sdc1 rw\n",
+            "4 1 8:4 / /secret rw - ext4 /dev/sdd1 rw\n",
+        );
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        let make_ctx = |state: FreezeState,
+                        allowed: Option<Vec<String>>,
+                        mounts: Arc<dyn MountSource>,
+                        kernel: Arc<FakeKernel>,
+                        store: Arc<InMemoryOwnershipStore>,
+                        hooks: Arc<Recorder>,
+                        router: Router| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.agent.freeze_allowed_mountpoints = allowed;
+            let ctx = Arc::new(
+                Context::new(
+                    Arc::new(cfg),
+                    Arc::new(FreezeStateMachine::starting_in(state)),
+                    router,
+                    Marker::open(dir.path().join("frozen")).unwrap(),
+                )
+                .with_kernel(kernel)
+                .with_mounts(mounts)
+                .with_hooks(hooks)
+                .with_ownership(store),
+            );
+            (ctx, dir)
+        };
+
+        // 1. Excluded per-device ambiguous claim (`8-4` for `/secret`) alongside
+        //    `qeminga`-owned allowlisted `/data` (`8:3`) and foreign-owned
+        //    allowlisted `/integrity` (`8:2`):
+        //    - drains `/data` and releases `8-3` (authorized wire count 1),
+        //    - never touches foreign `/integrity` (`8-2` intact),
+        //    - collapses wire error to generic `RecoveryIncomplete` (NOT `OwnershipAmbiguous`),
+        //    - preserves full guest-local diagnostic for `8:4` in tracing logs,
+        //    - retains marker, `8-4`, `Frozen`, and arms watchdog;
+        //    - second retry with `8-3` already drained returns generic `RecoveryIncomplete`
+        //      with `0 target(s) thawed`.
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        store1.claim_foreign((8, 2), "guest-integrity");
+        store1.seed_self_claim((8, 3));
+        store1.inject_ambiguous_entry((8, 4), "corrupt-secret-claim-detail");
+        let kernel1 = Arc::new(FakeKernel::new());
+        kernel1.track_freeze_depth();
+        let m_int = kernel1.open_mount(Path::new("/integrity"), (8, 2)).unwrap();
+        let m_data = kernel1.open_mount(Path::new("/data"), (8, 3)).unwrap();
+        kernel1.fifreeze(&m_int).unwrap();
+        kernel1.fifreeze(&m_data).unwrap();
+        kernel1.clear_calls();
+        let hooks1 = Arc::new(Recorder::default());
+        let sink1 = SharedSink::default();
+        let router1 = Router::new(Box::new(sink1.clone()));
+        let (ctx1, _dir1) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/integrity".into(), "/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            kernel1.clone(),
+            store1.clone(),
+            hooks1.clone(),
+            router1.clone(),
+        );
+        ctx1.marker.create().unwrap();
+        let subscriber1 = crate::audit::subscriber(tracing::Level::ERROR, router1.clone());
+        let err1 = thaw(&ctx1, &thaw_req)
+            .with_subscriber(subscriber1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(router1.settle(Duration::from_secs(1)));
+        let logs1 = String::from_utf8(sink1.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            err1,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (1 target(s) thawed); state frozen, marker retained"
+        );
+        assert!(
+            logs1.contains("fsfreeze_ownership_ambiguous")
+                && logs1.contains("corrupt-secret-claim-detail")
+                && logs1.contains("\"major\":8")
+                && logs1.contains("\"minor\":4"),
+            "guest-local diagnostic must preserve device and detail: {logs1}"
+        );
+        assert_eq!(store1.owner_of((8, 3)), None);
+        assert_eq!(store1.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert!(matches!(
+            store1.inspect((8, 4)).unwrap(),
+            TargetOwnership::Ambiguous { .. }
+        ));
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        assert!(ctx1.marker.exists());
+        assert_eq!(hooks1.states_at("frozen"), vec![FreezeState::Frozen]);
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 1);
+        assert!(
+            !kernel1.calls().iter().any(
+                |c| matches!(c, Call::Open(p, _) | Call::Fithaw(p) if p == Path::new("/integrity"))
+            ),
+            "must never touch foreign /integrity: {:?}",
+            kernel1.calls()
+        );
+
+        let err1_retry = thaw(&ctx1, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err1_retry,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx1.state.current(), FreezeState::Frozen);
+        assert!(ctx1.marker.exists());
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 1);
+
+        // 2. Currently authorized per-device ambiguous claim (`8-3` for `/data`)
+        //    with empty `owned_by_self` and empty `retained` verifies current
+        //    visibility from mountinfo and retains `OwnershipAmbiguous`.
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        store2.claim_foreign((8, 2), "guest-integrity");
+        store2.inject_ambiguous_entry((8, 3), "empty-authorized-claim");
+        let mounts2 = Arc::new(SwitchableMounts::new(table));
+        let kernel2 = Arc::new(FakeKernel::new());
+        kernel2.track_freeze_depth();
+        let m_int2 = kernel2.open_mount(Path::new("/integrity"), (8, 2)).unwrap();
+        kernel2.fifreeze(&m_int2).unwrap();
+        kernel2.clear_calls();
+        let hooks2 = Arc::new(Recorder::default());
+        let (ctx2, _dir2) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/integrity".into(), "/data".into()]),
+            mounts2.clone(),
+            kernel2.clone(),
+            store2.clone(),
+            hooks2.clone(),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx2.marker.create().unwrap();
+        let err2 = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err2,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx2.state.current(), FreezeState::Frozen);
+        assert!(ctx2.marker.exists());
+        assert_eq!(hooks2.states_at("frozen"), vec![FreezeState::Frozen]);
+        assert!(matches!(
+            store2.inspect((8, 3)).unwrap(),
+            TargetOwnership::Ambiguous { .. }
+        ));
+        assert_eq!(store2.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert!(kernel2.calls().is_empty());
+
+        // 3a. Unverified per-device ambiguous claim due to unreadable mountinfo:
+        //     even though `8:3` is `/data`, failing mountinfo reads prevent
+        //     visibility verification -> collapses to generic `RecoveryIncomplete`.
+        //     Once mountinfo recovers, retry restores `OwnershipAmbiguous`.
+        mounts2.fail_reads(true);
+        let err3a = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3a,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx2.state.current(), FreezeState::Frozen);
+        assert!(ctx2.marker.exists());
+        mounts2.fail_reads(false);
+        let err3a_restored = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3a_restored,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+
+        // 3b. Overmounted allowlisted path (`/data` now resolves to `8:5` instead
+        //     of `8:3`) makes `8:3` no longer currently visible at `/data` ->
+        //     collapses to generic `RecoveryIncomplete`.
+        mounts2.set_table(concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /integrity rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /data rw - ext4 /dev/sdc1 rw\n",
+            "5 3 8:5 / /data rw - ext4 /dev/sde1 rw\n",
+        ));
+        let err3b = thaw(&ctx2, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3b,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+
+        // 3c. Absent/unmounted per-device ambiguous claim (`8-99` not in mountinfo)
+        //     collapses to generic `RecoveryIncomplete`.
+        let store3c = Arc::new(InMemoryOwnershipStore::new());
+        store3c.inject_ambiguous_entry((8, 99), "unmounted-corrupt");
+        let (ctx3c, _dir3c) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            Arc::new(FakeKernel::new()),
+            store3c.clone(),
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx3c.marker.create().unwrap();
+        let err3c = thaw(&ctx3c, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3c,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert!(matches!(
+            store3c.inspect((8, 99)).unwrap(),
+            TargetOwnership::Ambiguous { .. }
+        ));
+
+        // 4a. Excluded ambiguous `8-1` (sorts BEFORE `8-3`) alongside authorized
+        //     ambiguous `8-3`: the authorized claim upgrades `RecoveryIncomplete`
+        //     to `OwnershipAmbiguous`.
+        let store4a = Arc::new(InMemoryOwnershipStore::new());
+        store4a.inject_ambiguous_entry((8, 1), "excluded-root-corrupt");
+        store4a.inject_ambiguous_entry((8, 3), "authorized-data-corrupt");
+        let (ctx4a, _dir4a) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            Arc::new(FakeKernel::new()),
+            store4a,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx4a.marker.create().unwrap();
+        let err4a = thaw(&ctx4a, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err4a,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+
+        // 4b. Excluded ambiguous `8-4` alongside authorized `FITHAW` failure
+        //     (`EACCES`) on `qeminga`-owned `/data` (`8:3`): preserves
+        //     `FithawPermissionDenied` rather than overwriting with `RecoveryIncomplete`
+        //     or disclosing `OwnershipAmbiguous` for `8-4`.
+        let store4b = Arc::new(InMemoryOwnershipStore::new());
+        store4b.seed_self_claim((8, 3));
+        store4b.inject_ambiguous_entry((8, 4), "excluded-secret-corrupt");
+        let kernel4b = Arc::new(FakeKernel::new());
+        kernel4b.track_freeze_depth();
+        let m_data4b = kernel4b.open_mount(Path::new("/data"), (8, 3)).unwrap();
+        kernel4b.fifreeze(&m_data4b).unwrap();
+        kernel4b.script_thaw_error("/data", Errno::EACCES);
+        let (ctx4b, _dir4b) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            kernel4b,
+            store4b,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx4b.marker.create().unwrap();
+        let err4b = thaw(&ctx4b, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err4b,
+            "thaw incomplete: FITHAW permission denied (0 target(s) thawed); state frozen, marker retained"
+        );
+
+        // 4c. Excluded `qeminga`-owned `/secret` (`8:4`) fails `FITHAW` with
+        //     `EACCES` (recording `RecoveryIncomplete` during `drain_planned_target`)
+        //     alongside authorized ambiguous `8-3`: authorized `OwnershipAmbiguous`
+        //     upgrades the earlier excluded `RecoveryIncomplete`.
+        let store4c = Arc::new(InMemoryOwnershipStore::new());
+        store4c.seed_self_claim((8, 4));
+        store4c.inject_ambiguous_entry((8, 3), "authorized-data-corrupt");
+        let kernel4c = Arc::new(FakeKernel::new());
+        kernel4c.track_freeze_depth();
+        let m_sec4c = kernel4c.open_mount(Path::new("/secret"), (8, 4)).unwrap();
+        kernel4c.fifreeze(&m_sec4c).unwrap();
+        kernel4c.script_thaw_error("/secret", Errno::EACCES);
+        let (ctx4c, _dir4c) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            kernel4c,
+            store4c,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx4c.marker.create().unwrap();
+        let err4c = thaw(&ctx4c, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err4c,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+
+        // 5. Directory-level stray entry (`dev: None`) under restricted mode is
+        //    not target-attributable: reports `OwnershipAmbiguous` without reading
+        //    `/proc/self/mountinfo`.
+        let store5 = Arc::new(InMemoryOwnershipStore::new());
+        store5.inject_stray_ambiguous("unrecognised ownership entry name \"stray\"");
+        let mounts5 = Arc::new(SwitchableMounts::new(table));
+        let (ctx5, _dir5) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            mounts5.clone(),
+            Arc::new(FakeKernel::new()),
+            store5,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx5.marker.create().unwrap();
+        let err5 = thaw(&ctx5, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err5,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(
+            mounts5.read_count(),
+            0,
+            "stray-only restricted discovery must not read mountinfo"
+        );
+
+        // 6. Unrestricted mode (`freeze_allowed_mountpoints = None`) with only
+        //    a per-device ambiguous claim (`8-4`) still reports `OwnershipAmbiguous`
+        //    without needing `/proc/self/mountinfo`.
+        let store6 = Arc::new(InMemoryOwnershipStore::new());
+        store6.inject_ambiguous_entry((8, 4), "unrestricted-corrupt");
+        let mounts6 = Arc::new(SwitchableMounts::new(table));
+        mounts6.fail_reads(true);
+        let (ctx6, _dir6) = make_ctx(
+            FreezeState::Frozen,
+            None,
+            mounts6.clone(),
+            Arc::new(FakeKernel::new()),
+            store6,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx6.marker.create().unwrap();
+        let err6 = thaw(&ctx6, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err6,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(mounts6.read_count(), 0);
+
+        // 7. Held descriptor whose own claim became ambiguous while excluded
+        //    (`8:4` `/secret` held from before narrowing): neither `state.drain`
+        //    nor `snapshot.ambiguous` may upgrade `RecoveryIncomplete` to
+        //    `OwnershipAmbiguous`, and `FITHAW` is skipped with handle retained.
+        let store7 = Arc::new(InMemoryOwnershipStore::new());
+        store7.inject_ambiguous_entry((8, 4), "held-excluded-corrupt");
+        let kernel7 = Arc::new(FakeKernel::new());
+        kernel7.track_freeze_depth();
+        let m_sec7 = kernel7.open_mount(Path::new("/secret"), (8, 4)).unwrap();
+        kernel7.fifreeze(&m_sec7).unwrap();
+        kernel7.clear_calls();
+        let (ctx7, _dir7) = make_ctx(
+            FreezeState::Frozen,
+            Some(vec!["/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            kernel7.clone(),
+            store7,
+            Arc::new(Recorder::default()),
+            Router::new(Box::new(std::io::sink())),
+        );
+        ctx7.marker.create().unwrap();
+        ctx7.hold_frozen_mounts(vec![HeldMount {
+            mount: m_sec7,
+            countable: true,
+        }]);
+        let err7 = thaw(&ctx7, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err7,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx7.frozen_mount_count(), 1);
+        assert_eq!(kernel7.tracked_frozen_superblocks(), 1);
+        assert!(kernel7.calls().is_empty());
+
+        // 8. Idle cooperative thaw from `Thawed` (marker absent) encountering an
+        //    excluded per-device ambiguous claim (`8-4`) escalates to recovery,
+        //    establishes the marker, transitions to `Frozen` with watchdog armed,
+        //    preserves foreign `/integrity` (`8:2`), and collapses to generic
+        //    `RecoveryIncomplete` with `0 target(s) thawed`.
+        let store8 = Arc::new(InMemoryOwnershipStore::new());
+        store8.claim_foreign((8, 2), "guest-integrity");
+        store8.inject_ambiguous_entry((8, 4), "idle-excluded-corrupt");
+        let kernel8 = Arc::new(FakeKernel::new());
+        kernel8.track_freeze_depth();
+        let m_int8 = kernel8.open_mount(Path::new("/integrity"), (8, 2)).unwrap();
+        kernel8.fifreeze(&m_int8).unwrap();
+        kernel8.clear_calls();
+        let hooks8 = Arc::new(Recorder::default());
+        let (ctx8, _dir8) = make_ctx(
+            FreezeState::Thawed,
+            Some(vec!["/integrity".into(), "/data".into()]),
+            Arc::new(StaticMounts(table.to_owned())),
+            kernel8.clone(),
+            store8.clone(),
+            hooks8.clone(),
+            Router::new(Box::new(std::io::sink())),
+        );
+        assert!(!ctx8.marker.exists());
+        let err8 = thaw(&ctx8, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err8,
+            "thaw incomplete: recovery did not complete; filesystem may still be frozen (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx8.state.current(), FreezeState::Frozen);
+        assert!(ctx8.marker.exists());
+        assert_eq!(hooks8.states_at("frozen"), vec![FreezeState::Frozen]);
+        assert_eq!(store8.owner_of((8, 2)).as_deref(), Some("guest-integrity"));
+        assert!(matches!(
+            store8.inspect((8, 4)).unwrap(),
+            TargetOwnership::Ambiguous { .. }
+        ));
+        assert_eq!(kernel8.tracked_frozen_superblocks(), 1);
+        assert!(kernel8.calls().is_empty());
     }
 }

@@ -12,6 +12,8 @@ on:
       - "src/mountinfo.rs"
       - "src/freeze_plan.rs"
       - "src/handlers/osinfo.rs"
+      - "src/ipc.rs"
+      - "src/kernel/ipc.rs"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
   schedule:
@@ -28,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [frame_decoder, bounds_checker, mountinfo, os_release]
+        target: [frame_decoder, bounds_checker, mountinfo, os_release, ipc_codec]
     # cargo-fuzz needs -Z flags, so every cargo invocation in this job must
     # use nightly. rust-toolchain.toml pins stable and overrides `rustup
     # default`, hence the environment variable rather than a default.

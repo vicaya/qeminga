@@ -1539,4 +1539,203 @@ mod tests {
         assert!(text.contains("524288"), "{text}");
         assert!(text.contains("\"id\":77"), "{text}");
     }
+
+    #[test]
+    fn format_wire_reply_covers_inventory_fstrim_and_error_variants() {
+        use crate::handlers::fstrim::TrimPathOutcome;
+        use crate::ipc::{IpAddressDto, IpAddressKind, WireFreezeStatus};
+
+        let info_meta = ReplyMeta::Command {
+            cmd: Command::Info,
+            id: Some(1),
+            sentinel: false,
+        };
+        let info_wire = format_wire_reply(
+            &info_meta,
+            IpcResponse::OkInfo(vec![CommandCapability {
+                command: Command::Ping,
+                enabled: true,
+                success_response: true,
+            }]),
+        )
+        .unwrap()
+        .unwrap();
+        let info_str = String::from_utf8(info_wire).unwrap();
+        assert!(info_str.contains("\"guest-ping\""), "{info_str}");
+
+        let ifaces_meta = ReplyMeta::Command {
+            cmd: Command::NetworkGetInterfaces,
+            id: Some(2),
+            sentinel: false,
+        };
+        let ifaces_wire = format_wire_reply(
+            &ifaces_meta,
+            IpcResponse::OkInterfaces(vec![InterfaceDto {
+                name: "eth0".to_owned(),
+                hardware_address: Some("52:54:00:12:34:56".to_owned()),
+                ip_addresses: vec![IpAddressDto {
+                    ip_address: "10.0.0.2".to_owned(),
+                    kind: IpAddressKind::Ipv4,
+                    prefix: 24,
+                }],
+            }]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            String::from_utf8(ifaces_wire).unwrap().contains("\"eth0\""),
+            "expected interface name"
+        );
+
+        let fsinfo_meta = ReplyMeta::Command {
+            cmd: Command::GetFsInfo,
+            id: Some(3),
+            sentinel: false,
+        };
+        let fsinfo_wire = format_wire_reply(
+            &fsinfo_meta,
+            IpcResponse::OkFsInfo(vec![FsInfoDto {
+                name: "fs-1".to_owned(),
+                mountpoint: "/".to_owned(),
+                fs_type: "ext4".to_owned(),
+                total_bytes: Some(1024),
+                used_bytes: Some(512),
+            }]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            String::from_utf8(fsinfo_wire).unwrap().contains("\"fs-1\""),
+            "expected fsinfo id"
+        );
+
+        let trim_meta = ReplyMeta::Command {
+            cmd: Command::Fstrim,
+            id: Some(4),
+            sentinel: false,
+        };
+        let trim_wire = format_wire_reply(
+            &trim_meta,
+            IpcResponse::OkFstrim(vec![TrimPathDto {
+                path: "/data".to_owned(),
+                outcome: TrimPathOutcome::Trimmed {
+                    trimmed: 4096,
+                    minimum: 0,
+                },
+            }]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            String::from_utf8(trim_wire).unwrap().contains("4096"),
+            "expected trimmed bytes"
+        );
+
+        // Mixed-outcome FstrimReplyTooLarge produces fixed non-fatal GenericError.
+        let oversize_wire = format_wire_reply(
+            &trim_meta,
+            IpcResponse::Err(IpcErrorCode::FstrimReplyTooLarge {
+                trimmed_targets: 5,
+                failed_targets: 2,
+                limit_bytes: 1_048_576,
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let oversize_str = String::from_utf8(oversize_wire).unwrap();
+        assert!(
+            oversize_str.contains("trimmed 5 target(s) (2 failed)")
+                && oversize_str.contains("1 MiB"),
+            "{oversize_str}"
+        );
+
+        // Mismatched response variant fails closed as Err(()).
+        assert!(format_wire_reply(&info_meta, IpcResponse::OkEmpty).is_err());
+        assert!(
+            format_wire_reply(
+                &info_meta,
+                IpcResponse::OkFreezeStatus(WireFreezeStatus::Thawed)
+            )
+            .is_err()
+        );
+        assert!(format_wire_reply(&info_meta, IpcResponse::OkSilent).is_err());
+    }
+
+    #[test]
+    fn parser_handles_virtio_disconnect_drain_and_terminal_busy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::ipc::{recv_request, send_response};
+        use crate::kernel::ipc::seqpacket_pair;
+
+        // 1. VirtioHostDisconnected drains stale bytes without closing fd, then
+        //    serves fresh commands once HostState::Ready returns.
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        set_nonblocking(parser_sock.as_fd()).unwrap();
+        let (mut host, guest_fd) = unix_stream_pair();
+        // Write stale bytes from a "departed host" before parser starts.
+        host.write_all(b"{\"execute\":\"guest-shutdown\"}\n")
+            .unwrap();
+
+        let probe_calls = Arc::new(AtomicUsize::new(0));
+        let probe_clone = Arc::clone(&probe_calls);
+        let parser_thread = std::thread::spawn(move || {
+            run_parser_loop_with_probe(parser_sock, Some(guest_fd), move |_| {
+                let n = probe_clone.fetch_add(1, Ordering::SeqCst);
+                // First 3 probes report disconnected (initial check + drain read +
+                // wait-loop check), then Ready!
+                if n < 3 {
+                    HostState::VirtioHostDisconnected
+                } else {
+                    HostState::Ready
+                }
+            })
+        });
+
+        // Give the parser loop time to drain stale bytes and enter Ready.
+        std::thread::sleep(Duration::from_millis(80));
+        host.write_all(b"{\"execute\":\"guest-ping\",\"id\":55}\n")
+            .unwrap();
+
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+        let req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        // Stale guest-shutdown was discarded; only the fresh guest-ping arrived!
+        assert_eq!(req.request, IpcRequest::Ping);
+        send_response(
+            exec_sock.as_fd(),
+            req.session_gen,
+            req.req_id,
+            &IpcResponse::OkEmpty,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_line(&mut host), "{\"return\":{},\"id\":55}\n");
+        drop(exec_sock);
+        assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);
+
+        // 2. No initial channel -> RequestChannelReopen -> ChannelTerminalBusy exits cleanly.
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        set_nonblocking(parser_sock.as_fd()).unwrap();
+        let parser_thread = std::thread::spawn(move || run_parser_loop(parser_sock, None));
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+        let req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(req.request, IpcRequest::RequestChannelReopen);
+        send_response(
+            exec_sock.as_fd(),
+            req.session_gen,
+            req.req_id,
+            &IpcResponse::Err(IpcErrorCode::ChannelTerminalBusy),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            parser_thread.join().unwrap(),
+            ParserExit::ChannelTerminalBusy
+        );
+    }
 }

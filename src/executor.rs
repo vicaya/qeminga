@@ -69,7 +69,7 @@ const MAX_IN_FLIGHT_OPS: usize = MAX_CONCURRENT_STREAMS;
 
 /// Per-second rate cap on untrusted `parser_rejection_observed` audit records
 /// so a compromised parser cannot flood journald (§3.4).
-const PARSER_OBSERVATION_PER_SEC: u32 = 30;
+const PARSER_OBSERVATION_PER_SEC: u32 = 64;
 
 /// Why [`serve_ipc`] exited.
 #[derive(Debug, thiserror::Error)]
@@ -123,6 +123,7 @@ struct ExecutorState {
 struct ReopenBackoff {
     delay: Duration,
     saw_command_since_open: bool,
+    has_open_channel: bool,
     initial_backoff: Duration,
     max_backoff: Duration,
 }
@@ -139,6 +140,7 @@ impl ReopenBackoff {
                 initial_backoff
             },
             saw_command_since_open: had_initial_channel,
+            has_open_channel: had_initial_channel,
             initial_backoff,
             max_backoff,
         }
@@ -148,8 +150,9 @@ impl ReopenBackoff {
         self.saw_command_since_open = true;
     }
 
-    fn next_sleep(&mut self) -> Duration {
-        if self.saw_command_since_open {
+    fn next_sleep(&mut self) -> (Duration, bool) {
+        let was_open = std::mem::replace(&mut self.has_open_channel, false);
+        let sleep = if self.saw_command_since_open {
             self.saw_command_since_open = false;
             self.delay = self.initial_backoff;
             self.initial_backoff
@@ -157,10 +160,12 @@ impl ReopenBackoff {
             let sleep = self.delay.clamp(self.initial_backoff, self.max_backoff);
             self.delay = (sleep * 2).min(self.max_backoff);
             sleep
-        }
+        };
+        (sleep, was_open)
     }
 
     fn note_open_succeeded(&mut self) {
+        self.has_open_channel = true;
         self.delay = self.initial_backoff;
     }
 }
@@ -227,6 +232,13 @@ where
 {
     if recovery && let Err(err) = fsfreeze::start_recovery(&ctx) {
         tracing::error!(event = "recovery_failed", error = %err, "recovery startup failed");
+    }
+    if had_initial_channel {
+        tracing::info!(
+            event = "channel_open",
+            path = %channel_path.display(),
+            "channel opened"
+        );
     }
 
     let async_ipc = OwnedAsyncFd::register(ipc_fd)
@@ -314,11 +326,9 @@ where
             _ = stop_ticker.tick(), if stop_requested => {
                 if ctx.state.current() == FreezeState::Thawed {
                     let _ = reopen_cancel_tx.send(true);
-                    if tasks.is_empty() && outbox.is_empty() {
-                        break Ok(());
-                    }
                 }
             }
+            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
             maybe_reply = reply_rx.recv() => {
                 let Some(reply) = maybe_reply else {
                     break Ok(());
@@ -761,10 +771,17 @@ async fn handle_channel_reopen(
         };
     };
 
-    let sleep_dur = {
+    let (sleep_dur, was_open) = {
         let mut backoff = state.reopen_backoff.lock().await;
         backoff.next_sleep()
     };
+    if was_open {
+        tracing::warn!(
+            event = "channel_closed",
+            reopen_in_ms = u64::try_from(sleep_dur.as_millis()).unwrap_or(u64::MAX),
+            "channel closed; reopening"
+        );
+    }
     if !sleep_dur.is_zero() {
         tokio::select! {
             () = tokio::time::sleep(sleep_dur) => {}
@@ -1229,7 +1246,7 @@ mod tests {
         );
 
         // Drive parser end on a blocking thread so tokio workers stay free.
-        tokio::task::spawn_blocking(move || {
+        let client = tokio::task::spawn_blocking(move || {
             let mut asm = StreamAssembler::new(PeerRole::Parser);
 
             // 1. Disabled CVM command (`GetOsInfo`) rejected with `Disabled` and zero handler calls.
@@ -1353,12 +1370,20 @@ mod tests {
             assert_eq!(r.response, IpcResponse::OkCount(1));
 
             let _ = stop_tx.send("SIGTERM");
-            drop(parser_sock);
+            (parser_sock, asm)
         })
         .await
         .unwrap();
 
         exec_task.await.unwrap().unwrap();
+        // Executor closed IPC_FD on clean SIGTERM shutdown; parser sees EOF.
+        let (parser_sock, mut asm) = client;
+        assert!(
+            recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .is_none()
+        );
+        drop(parser_sock);
         assert!(router.settle(Duration::from_secs(2)));
         let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         assert!(
@@ -1530,6 +1555,227 @@ mod tests {
                 ExecutorExitError::ChannelTerminal(OpenError::AlreadyOpen { .. })
             ),
             "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_handles_inventory_fstrim_oversize_and_power_commands() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        use crate::audit;
+        use crate::handlers::interfaces::{InterfaceSource, RawAddr};
+        use crate::handlers::osinfo::{OsInfoSource, Uname};
+        use crate::proto::Error as ProtoError;
+
+        struct FakeOsInfo;
+        impl OsInfoSource for FakeOsInfo {
+            fn uname(&self) -> Result<Uname, ProtoError> {
+                Ok(Uname {
+                    release: "6.8.0".to_owned(),
+                    version: "#1 SMP".to_owned(),
+                    machine: "x86_64".to_owned(),
+                })
+            }
+            fn os_release(&self) -> Option<String> {
+                Some("ID=ubuntu\nNAME=\"Ubuntu\"\n".to_owned())
+            }
+        }
+        struct FakeIfaces;
+        impl InterfaceSource for FakeIfaces {
+            fn addresses(&self) -> Result<Vec<RawAddr>, ProtoError> {
+                Ok(vec![RawAddr {
+                    ifname: "eth0".to_owned(),
+                    loopback: false,
+                    mac: None,
+                    addr: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
+                    netmask: Some(IpAddr::V4(Ipv4Addr::new(255, 255, 255, 0))),
+                }])
+            }
+        }
+
+        let mut cfg = Config::default();
+        cfg.features.shutdown = true;
+        cfg.features.information = true;
+        cfg.features.fstrim = true;
+        cfg.features.suspend_ram = true;
+
+        // Build mountinfo text with 1 real temp mountpoint plus 5000 distinct
+        // synthetic mounts to push fstrim's assembled reply over 1 MiB.
+        let mount_dir = tempfile::tempdir().unwrap();
+        let mut mountinfo = format!(
+            "1 0 8:1 / {} rw - ext4 /dev/vda1 rw\n",
+            mount_dir.path().display()
+        );
+        let long_seg = "x".repeat(220);
+        for i in 0..5000u32 {
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                mountinfo,
+                "{} 1 253:{i} / /nonexistent-trim-{i}-{long_seg} rw - ext4 /dev/vdb{i} rw",
+                10 + i
+            );
+        }
+
+        let sink = SharedSink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        let subscriber = audit::subscriber(tracing::Level::DEBUG, router.clone());
+
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.script_open_error(format!("/nonexistent-trim-0-{long_seg}"), Errno::ENOENT);
+        kernel.script_trim(
+            format!("/nonexistent-trim-1-{long_seg}"),
+            Err(Errno::EOPNOTSUPP),
+        );
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(cfg),
+                Arc::new(FreezeStateMachine::new()),
+                router.clone(),
+                Marker::for_tests(),
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(mountinfo)))
+            .with_osinfo(Arc::new(FakeOsInfo))
+            .with_interfaces(Arc::new(FakeIfaces)),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+        let exec_task = tokio::spawn(
+            serve_ipc(
+                Arc::clone(&ctx),
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/test"),
+                opener,
+                true,
+                None,
+                false,
+                async move { stop_rx.await.unwrap_or("SIGTERM") },
+                Duration::from_millis(10),
+            )
+            .with_subscriber(subscriber),
+        );
+
+        let client = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+
+            // 1. Info returns all 14 commands.
+            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::Info).unwrap();
+            let r = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(r.response, IpcResponse::OkInfo(ref v) if v.len() == 14));
+
+            // 2. Sync & SyncDelimited echo id.
+            send_request(parser_sock.as_fd(), 1, 2, &IpcRequest::Sync { id: 99 }).unwrap();
+            assert_eq!(
+                recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap()
+                    .response,
+                IpcResponse::OkI64(99)
+            );
+            send_request(
+                parser_sock.as_fd(),
+                1,
+                3,
+                &IpcRequest::SyncDelimited { id: 100 },
+            )
+            .unwrap();
+            assert_eq!(
+                recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap()
+                    .response,
+                IpcResponse::OkI64(100)
+            );
+
+            // 3. GetOsInfo & NetworkGetInterfaces succeed.
+            send_request(parser_sock.as_fd(), 1, 4, &IpcRequest::GetOsInfo).unwrap();
+            let r = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert!(
+                matches!(r.response, IpcResponse::OkOsInfo(ref o) if o.id.as_deref() == Some("ubuntu"))
+            );
+
+            send_request(parser_sock.as_fd(), 1, 5, &IpcRequest::NetworkGetInterfaces).unwrap();
+            let r = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert!(matches!(r.response, IpcResponse::OkInterfaces(ref v) if v.len() == 1));
+
+            // 4. Fstrim over 1 MiB returns mixed-outcome FstrimReplyTooLarge
+            //    (4999 trimmed + 1 pre-ioctl open error + 1 FITRIM error)
+            //    WITHOUT dropping the IPC session!
+            send_request(
+                parser_sock.as_fd(),
+                1,
+                6,
+                &IpcRequest::Fstrim { minimum: 0 },
+            )
+            .unwrap();
+            let r = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                r.response,
+                IpcResponse::Err(IpcErrorCode::FstrimReplyTooLarge {
+                    trimmed_targets: 4999,
+                    failed_targets: 2,
+                    limit_bytes: crate::handlers::fstrim::MAX_FSTRIM_REPLY_BYTES as u64,
+                })
+            );
+
+            // 5. Session stays intact after oversize fstrim: Ping succeeds!
+            send_request(parser_sock.as_fd(), 1, 7, &IpcRequest::Ping).unwrap();
+            assert_eq!(
+                recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap()
+                    .response,
+                IpcResponse::OkEmpty
+            );
+
+            // 6. Shutdown returns OkSilent with FakeKernel.
+            send_request(
+                parser_sock.as_fd(),
+                1,
+                8,
+                &IpcRequest::Shutdown {
+                    mode: crate::handlers::shutdown::ShutdownMode::Powerdown,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap()
+                    .response,
+                IpcResponse::OkSilent
+            );
+
+            let _ = stop_tx.send("SIGTERM");
+            (parser_sock, asm)
+        })
+        .await
+        .unwrap();
+
+        exec_task.await.unwrap().unwrap();
+        let (parser_sock, mut asm) = client;
+        assert!(
+            recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .is_none()
+        );
+        drop(parser_sock);
+        assert!(router.settle(Duration::from_secs(2)));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("\"event\":\"fstrim_reply_too_large\""),
+            "expected bounded fstrim_reply_too_large audit record: {logs}"
         );
     }
 }

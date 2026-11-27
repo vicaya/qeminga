@@ -1026,10 +1026,15 @@ fn install_unit_with(channel_path: &str, production: bool) -> Option<InstalledUn
     } else {
         "hardening = \"unenforced-development-only\"\n"
     };
+    let transport = if channel_path.starts_with("/dev/virtio-ports/") {
+        ""
+    } else {
+        "channel_transport = \"pty-test-only\"\n"
+    };
     std::fs::write(
         InstalledUnit::CONFIG,
         format!(
-            "[agent]\nchannel_path = \"{channel_path}\"\nfsfreeze_idle_timeout_secs = 1\n{hardening}"
+            "[agent]\nchannel_path = \"{channel_path}\"\n{transport}fsfreeze_idle_timeout_secs = 1\n{hardening}"
         ),
     )
     .unwrap();
@@ -1535,7 +1540,7 @@ fn privileged_installed_unit_custom_marker_path_from_absent_dir() {
     std::fs::write(
         InstalledUnit::CONFIG,
         format!(
-            "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nfsfreeze_idle_timeout_secs = 1\nhardening = \"unenforced-development-only\"\n",
+            "[agent]\nchannel_path = \"{}\"\nchannel_transport = \"pty-test-only\"\nstate_path = \"{}\"\nfsfreeze_idle_timeout_secs = 1\nhardening = \"unenforced-development-only\"\n",
             pty.slave_path,
             custom_marker.display()
         ),
@@ -1984,6 +1989,76 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
         );
     }
 
+    // #78 (OQ-10): verify the isolated host-facing parser child process under
+    // `qeminga.service`: UID/GID 601, zero capabilities across all five sets,
+    // NoNewPrivs=1, Seccomp=2, single thread, and /dev/null on fds 0/1/2
+    // distinct from the executor's stderr journald sink.
+    let mut parser_children = Vec::new();
+    for task in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .unwrap()
+        .flatten()
+    {
+        if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+            for tok in text.split_whitespace() {
+                if let Ok(cpid) = tok.parse::<u32>()
+                    && !parser_children.contains(&cpid)
+                {
+                    parser_children.push(cpid);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        parser_children.len(),
+        1,
+        "expected exactly one isolated parser child of MainPID {pid}, found {parser_children:?}"
+    );
+    let parser_pid = parser_children[0];
+    let parser_threads = e2e::thread_statuses(parser_pid);
+    assert_eq!(
+        parser_threads.len(),
+        1,
+        "parser child must run a single-threaded ppoll loop: {parser_threads:?}"
+    );
+    let pt = &parser_threads[0];
+    for set in ["CapEff:", "CapPrm:", "CapBnd:", "CapInh:", "CapAmb:"] {
+        assert_eq!(pt.field(set), "0000000000000000", "parser {set} (OQ-10)");
+    }
+    assert_eq!(pt.field("NoNewPrivs:"), "1", "parser NoNewPrivs");
+    assert_eq!(pt.field("Seccomp:"), "2", "parser SECCOMP_MODE_FILTER");
+    assert!(
+        pt.field("Uid:").starts_with("601\t601"),
+        "parser Uid: {}",
+        pt.field("Uid:")
+    );
+    assert!(
+        pt.field("Gid:").starts_with("601\t601"),
+        "parser Gid: {}",
+        pt.field("Gid:")
+    );
+    let exec_stderr = std::fs::metadata(format!("/proc/{pid}/fd/2")).unwrap();
+    for fd_num in [0, 1, 2] {
+        use std::os::unix::fs::FileTypeExt;
+        let meta = std::fs::metadata(format!("/proc/{parser_pid}/fd/{fd_num}")).unwrap();
+        assert!(
+            meta.file_type().is_char_device(),
+            "parser fd {fd_num} must be char device"
+        );
+        assert_eq!(
+            (
+                nix::sys::stat::major(meta.rdev()),
+                nix::sys::stat::minor(meta.rdev())
+            ),
+            (1, 3),
+            "parser fd {fd_num} must be /dev/null (1, 3)"
+        );
+        assert_ne!(
+            (meta.dev(), meta.ino()),
+            (exec_stderr.dev(), exec_stderr.ino()),
+            "parser fd {fd_num} must not alias executor stderr audit sink"
+        );
+    }
+
     // #66: crash recovery under the confined unit (SIGKILL while frozen ->
     // Restart=always -> marker recovery drains real ext4/xfs superblocks
     // and removes the marker under ProtectSystem=strict).
@@ -2043,5 +2118,208 @@ fn privileged_installed_unit_matches_the_advertised_profile() {
     let (ok, text) = sh("systemctl", &["daemon-reload"]);
     assert!(ok, "{text}");
     refused("test-kernel request under enforced hardening");
+    drop(installed);
+}
+
+/// Verifies the packaged CVM/data-protection profile (`shutdown = false`,
+/// `information = false`, `fstrim = false`) and no-`CAP_KILL` parser
+/// supervision under the real installed `qeminga.service` unit (#78, OQ-10):
+/// - executor drops `CAP_SYS_BOOT` (`CapEff = CapPrm = CapBnd = 0000000000200004`)
+///   and runs under the enforcing CVM `executor_profile` (`sendmsg`/`recvmsg`
+///   restricted strictly to `arg0 == IPC_FD` = 3, `wait4` allowed, `kill` absent);
+/// - isolated `qeminga-parser` child runs single-threaded as UID/GID 601 with
+///   zero capabilities across all five sets, `NoNewPrivs = 1`, `Seccomp = 2`,
+///   and `/dev/null` on fds `0`/`1`/`2`;
+/// - `RequestChannelReopen` (`SCM_RIGHTS` over `IPC_FD`) succeeds post-seccomp;
+/// - killing the parser child while `Frozen` preserves `FreezeState`, marker,
+///   and watchdog until autonomous thaw completes, after which the executor
+///   exits non-zero and systemd `Restart=always` brings up a fresh pair.
+#[test]
+#[ignore = "needs root, a running systemd and a loop-mounted ext4 (scripts/ci/mk-loop-fs.sh)"]
+fn privileged_installed_unit_cvm_profile_and_parser_supervision() {
+    use std::io::Write;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    if qeminga::daemon::seccomp_mode() != "enforce" {
+        return;
+    }
+    let ext4 = std::env::var("QEMINGA_TEST_EXT4_MOUNT")
+        .expect("QEMINGA_TEST_EXT4_MOUNT: run scripts/ci/mk-loop-fs.sh setup");
+    let _thaw = e2e::ThawGuard::new(std::slice::from_ref(&ext4));
+
+    let channel_link = Path::new("/run/qeminga-cvm-test-channel");
+    let _channel_guard = PathGuard(channel_link.to_path_buf());
+    let mut pty1 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty1.slave_path);
+    let Some(installed) = install_unit_with(channel_link.to_str().unwrap(), true) else {
+        return;
+    };
+    let _ = std::fs::remove_file("/run/qeminga/frozen");
+    std::fs::write(
+        InstalledUnit::CONFIG,
+        format!(
+            "[agent]\nchannel_path = \"{}\"\nchannel_transport = \"pty-test-only\"\nfsfreeze_idle_timeout_secs = 1\n[features]\nshutdown = false\ninformation = false\nfstrim = false\n",
+            channel_link.display()
+        ),
+    )
+    .unwrap();
+
+    let (ok, text) = sh("systemctl", &["start", "qeminga.service"]);
+    assert!(ok, "systemctl start (CVM): {text}");
+    assert_eq!(
+        pty1.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#
+    );
+
+    let (_, pid_raw) = sh(
+        "systemctl",
+        &["show", "-p", "MainPID", "--value", "qeminga.service"],
+    );
+    let pid = pid_raw.trim().to_owned();
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let field = |name: &str| -> String {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .unwrap_or_else(|| panic!("{name} missing in {status}"))
+            .trim()
+            .to_owned()
+    };
+    // CVM profile: CAP_DAC_READ_SEARCH (2) + CAP_SYS_ADMIN (21), NO CAP_SYS_BOOT, NO CAP_KILL.
+    const CVM_CAPS: &str = "0000000000200004";
+    assert_eq!(field("CapEff:"), CVM_CAPS, "CVM effective caps");
+    assert_eq!(field("CapPrm:"), CVM_CAPS, "CVM permitted caps");
+    assert_eq!(field("CapBnd:"), CVM_CAPS, "CVM bounding caps");
+    assert_eq!(field("CapInh:"), "0000000000000000");
+    assert_eq!(field("CapAmb:"), "0000000000000000");
+    assert_eq!(field("NoNewPrivs:"), "1");
+    assert_eq!(field("Seccomp:"), "2");
+    assert!(field("Uid:").starts_with("600\t600"), "{}", field("Uid:"));
+
+    let find_parser_child = |exec_pid: &str| -> u32 {
+        let mut children = Vec::new();
+        for task in std::fs::read_dir(format!("/proc/{exec_pid}/task"))
+            .unwrap()
+            .flatten()
+        {
+            if let Ok(text) = std::fs::read_to_string(task.path().join("children")) {
+                for tok in text.split_whitespace() {
+                    if let Ok(cpid) = tok.parse::<u32>()
+                        && !children.contains(&cpid)
+                    {
+                        children.push(cpid);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            children.len(),
+            1,
+            "expected one parser child of {exec_pid}, found {children:?}"
+        );
+        children[0]
+    };
+
+    let parser_pid = find_parser_child(&pid);
+    let parser_threads = e2e::thread_statuses(parser_pid);
+    assert_eq!(parser_threads.len(), 1);
+    let pt = &parser_threads[0];
+    for set in ["CapEff:", "CapPrm:", "CapBnd:", "CapInh:", "CapAmb:"] {
+        assert_eq!(pt.field(set), "0000000000000000", "CVM parser {set}");
+    }
+    assert_eq!(pt.field("NoNewPrivs:"), "1");
+    assert_eq!(pt.field("Seccomp:"), "2");
+    assert!(pt.field("Uid:").starts_with("601\t601"));
+    assert!(pt.field("Gid:").starts_with("601\t601"));
+    let exec_stderr = std::fs::metadata(format!("/proc/{pid}/fd/2")).unwrap();
+    for fd_num in [0, 1, 2] {
+        let meta = std::fs::metadata(format!("/proc/{parser_pid}/fd/{fd_num}")).unwrap();
+        assert!(meta.file_type().is_char_device());
+        assert_eq!(
+            (
+                nix::sys::stat::major(meta.rdev()),
+                nix::sys::stat::minor(meta.rdev())
+            ),
+            (1, 3)
+        );
+        assert_ne!(
+            (meta.dev(), meta.ino()),
+            (exec_stderr.dev(), exec_stderr.ino())
+        );
+    }
+
+    // Disabled CVM commands are denied independently by the executor.
+    for method in ["guest-get-osinfo", "guest-shutdown", "guest-fstrim"] {
+        let reply = pty1.request(&format!(r#"{{"execute":"{method}"}}"#));
+        assert!(
+            reply.contains("disabled"),
+            "CVM profile must deny {method}: {reply}"
+        );
+    }
+
+    // Post-seccomp `RequestChannelReopen` + `SCM_RIGHTS` over `IPC_FD = 3`
+    // under the enforcing CVM executor filter.
+    let mut pty2 = PtyChannel::open_for_qeminga();
+    repoint_symlink(channel_link, &pty2.slave_path);
+    drop(pty1);
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#,
+        "CVM executor must complete SCM_RIGHTS channel reopen over IPC_FD"
+    );
+
+    // Freeze ext4, then kill the parser child with SIGKILL while Frozen:
+    // executor keeps freeze + marker + watchdog alive, thaws autonomously at
+    // idle expiry, removes the marker, exits non-zero, and systemd restarts
+    // a fresh executor+parser pair.
+    let freeze_req = serde_json::json!({
+        "execute": "guest-fsfreeze-freeze-list",
+        "arguments": { "mountpoints": [ext4.clone()] },
+    })
+    .to_string();
+    assert_eq!(pty2.request(&freeze_req), r#"{"return":1}"#);
+    assert!(Path::new("/run/qeminga/frozen").exists());
+
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(parser_pid as i32),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let (_, active) = sh("systemctl", &["is-active", "qeminga.service"]);
+        let (_, new_pid) = sh(
+            "systemctl",
+            &["show", "-p", "MainPID", "--value", "qeminga.service"],
+        );
+        let new_pid = new_pid.trim();
+        if active.trim() == "active"
+            && !new_pid.is_empty()
+            && new_pid != "0"
+            && new_pid != pid
+            && !Path::new("/run/qeminga/frozen").exists()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "CVM unit did not thaw and restart cleanly after parser SIGKILL (active={active:?}, new_pid={new_pid:?}, marker={})",
+            Path::new("/run/qeminga/frozen").exists()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    assert_eq!(
+        pty2.request(r#"{"execute":"guest-ping"}"#),
+        r#"{"return":{}}"#,
+        "restarted CVM unit must serve requests"
+    );
+    std::fs::File::create(format!("{ext4}/cvm-supervision-probe"))
+        .and_then(|mut f| f.write_all(b"thawed"))
+        .expect("ext4 must be thawed after parser crash supervision");
+
+    let (ok, text) = sh("systemctl", &["stop", "qeminga.service"]);
+    assert!(ok, "systemctl stop: {text}");
     drop(installed);
 }

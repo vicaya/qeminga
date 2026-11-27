@@ -396,10 +396,17 @@ fn child_exec_parser(
     if let Err(e) = dup_target(parser_ipc_raw, IPC_FD) {
         fail_and_exit(e);
     }
-    if initial_ch_raw >= 0
-        && let Err(e) = dup_target(initial_ch_raw, INITIAL_CHANNEL_FD)
-    {
-        fail_and_exit(e);
+    if initial_ch_raw >= 0 {
+        if let Err(e) = dup_target(initial_ch_raw, INITIAL_CHANNEL_FD) {
+            fail_and_exit(e);
+        }
+    } else {
+        // Close slot 4 defensively in case an external caller inherited a
+        // non-CLOEXEC descriptor onto `INITIAL_CHANNEL_FD`.
+        // SAFETY: `close` is async-signal-safe; `EBADF` is ignored.
+        unsafe {
+            libc::close(INITIAL_CHANNEL_FD);
+        }
     }
     if let Err(e) = dup_target(ready_w_raw, PARSER_READY_FD) {
         fail_and_exit(e);
@@ -446,10 +453,12 @@ pub fn arm_pdeathsig_and_verify_parent(expected_ppid: u32) -> Result<bool, Errno
     Ok(u32::try_from(getppid().as_raw()).ok() == Some(expected_ppid))
 }
 
-/// Applies the parser's filesystem-independent working directory (`chdir("/")`)
-/// and descriptor ceiling (`RLIMIT_NOFILE <= PARSER_NOFILE_LIMIT`) before
-/// installing seccomp (OQ-10 §3.2).
+/// Applies the parser's process name (`qeminga-parser`), filesystem-independent
+/// working directory (`chdir("/")`), and descriptor ceiling
+/// (`RLIMIT_NOFILE <= PARSER_NOFILE_LIMIT`) before installing seccomp
+/// (OQ-10 §3.2).
 pub fn apply_parser_rlimit_and_chdir() -> io::Result<()> {
+    let _ = nix::sys::prctl::set_name(c"qeminga-parser");
     std::env::set_current_dir("/")?;
     let mut cur = libc::rlimit {
         rlim_cur: 0,

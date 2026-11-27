@@ -365,6 +365,7 @@ fn startup_order_is_config_marker_channel_caps_seccomp_runtime() {
     let opts = Options {
         config_path: PathBuf::from("/etc/qeminga/config.toml"),
         version: false,
+        internal_parser: None,
     };
     daemon::run_with(&opts, &startup).unwrap();
     assert_eq!(
@@ -697,12 +698,12 @@ fn feature_warnings_are_logged_once_at_startup() {
     // deterministic; scoped test subscribers race with each other under
     // parallel tests.
     let expected = Config::parse(
-        "[agent]\nhardening = \"unenforced-development-only\"\n[features]\nseccomp = true\nsuspend_ram = true\n",
+        "[agent]\nhardening = \"unenforced-development-only\"\nchannel_transport = \"pty-test-only\"\n[features]\nseccomp = true\nsuspend_ram = true\n",
     )
     .unwrap()
     .warnings()
     .len();
-    assert!(expected >= 1, "the opt-out itself is warned about");
+    assert!(expected >= 2, "both opt-outs are warned about");
     let (stderr, status) = run_binary_over_pty("seccomp = true\nsuspend_ram = true\n");
     assert!(status.success(), "{status}: {stderr}");
     assert_eq!(
@@ -1274,10 +1275,15 @@ fn run_binary_over_pty_with(
         nix::unistd::chown(dir.path(), Some(user.uid), Some(user.gid)).unwrap();
     }
     let config_path = dir.path().join("config.toml");
+    let transport = if agent_toml.contains("channel_transport") {
+        ""
+    } else {
+        "channel_transport = \"pty-test-only\"\n"
+    };
     std::fs::write(
         &config_path,
         format!(
-            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{agent_toml}[features]\n{features_toml}\n",
+            "[agent]\nchannel_path = \"{slave_path}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{transport}{agent_toml}[features]\n{features_toml}\n",
             dir.path().join("frozen").display()
         ),
     )

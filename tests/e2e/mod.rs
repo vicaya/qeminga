@@ -24,6 +24,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout};
 use serde_json::Value;
 
 /// One thread of a process, as `/proc/<pid>/task/<tid>/status` shows it.
+#[derive(Debug)]
 pub struct ThreadStatus {
     pub tid: u32,
     pub name: String,
@@ -261,12 +262,18 @@ impl Agent {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&pty.slave_path, &link).unwrap();
         let config_path = dir.path().join("config.toml");
+        let transport = if opts.agent_extra.contains("channel_transport") {
+            ""
+        } else {
+            "channel_transport = \"pty-test-only\"\n"
+        };
         std::fs::write(
             &config_path,
             format!(
-                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}\n[features]\nseccomp = true\n{}\n",
+                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}{}\n[features]\nseccomp = true\n{}\n",
                 link.display(),
                 dir.path().join("frozen").display(),
+                transport,
                 if opts.enforce_hardening {
                     ""
                 } else {
@@ -605,6 +612,20 @@ impl Agent {
     /// `true` while the daemon is alive.
     pub fn is_running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Waits up to `timeout` for the daemon process to exit on its own.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// SIGTERM and wait.

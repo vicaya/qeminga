@@ -3327,9 +3327,16 @@ mod tests {
     #[test]
     fn ipc_outbox_resumes_multi_chunk_streams_across_nonblocking_backpressure() {
         let (parser_sock, exec_sock) = seqpacket_pair(true).unwrap();
+        // Bound the sender socket buffer explicitly so the test does not depend
+        // on the runner's `net.core.wmem_default`: Linux doubles `SO_SNDBUF`
+        // for skb accounting, so 64 KiB admits complete 32 KiB protocol chunks
+        // while deterministically forcing the ~800 KiB multi-chunk stream to
+        // pause mid-stream with `EAGAIN`.
+        nix::sys::socket::setsockopt(&exec_sock, nix::sys::socket::sockopt::SndBuf, &(64 * 1024))
+            .unwrap();
 
         // Build a large (~800 KiB, ~25 chunks) OkFsInfo response that exceeds
-        // Linux's default AF_UNIX socket buffer so a non-blocking sender MUST
+        // the bounded AF_UNIX send buffer so a non-blocking sender MUST
         // encounter EAGAIN mid-stream before the slow reader drains.
         let big_fs: Vec<FsInfoDto> = (0..6_500)
             .map(|i| FsInfoDto {

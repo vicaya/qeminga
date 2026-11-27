@@ -12,7 +12,7 @@
 //!    writable files and `/run/qeminga/frozen`), descriptor-level virtio-serial
 //!    channel verification (including simulated hotplug minor renumbering) under
 //!    the enforcing CVM executor filter, and malicious IPC / `MSG_CTRUNC` /
-//!    parser-side cmsg rejections / no-`CAP_KILL` `PR_SET_PDEATHSIG(SIGKILL)`
+//!    parser-side cmsg rejections / no-`CAP_KILL` systemd `KillMode=control-group`
 //!    supervision under the enforcing CVM executor filter.
 //! 4. Audit-sink isolation probe proving a compromised parser cannot forge
 //!    `command_received` records through fds `1`/`2` or any non-IPC descriptor.
@@ -41,7 +41,7 @@ use std::fmt::Write as _;
 use std::fs::{File, Permissions};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -53,10 +53,9 @@ use nix::errno::Errno;
 use nix::fcntl::{AT_FDCWD, AtFlags, FcntlArg, OFlag, fcntl, open, openat};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use nix::sys::signal::{Signal, kill};
-use nix::sys::stat::{Mode, fchmod, fstat, fstatat, major, minor};
+use nix::sys::stat::{Mode, SFlag, fchmod, fstat, fstatat, major, minor};
 use nix::unistd::{Gid, Pid, Uid, UnlinkatFlags, chown, fchown, mkdir, pipe, unlinkat};
 use serde_json::{Value, json};
-use tracing::instrument::WithSubscriber;
 
 use qeminga::audit::Router;
 use qeminga::channel::OpenError;
@@ -100,6 +99,7 @@ const WORLD_FILE_BYTES: &[u8] = b"untouched-world";
 const RETURNED_WITHOUT_SIGSYS: i32 = 99;
 const ENV_PROBE: &str = "QEMINGA_OQ10_PROBE";
 const ENV_AUX: &str = "QEMINGA_OQ10_AUX";
+const ENV_AUX2: &str = "QEMINGA_OQ10_AUX2";
 
 // ---- Shared helpers --------------------------------------------------------
 
@@ -173,53 +173,20 @@ fn qeminga_account(name: &str, expected_id: u32) -> Account {
     }
 }
 
-/// Snapshot of a boundary fixture file used to assert identical bytes, device,
-/// inode, and modification timestamp across the full boundary run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileSnapshot {
-    path: PathBuf,
-    bytes: Vec<u8>,
-    dev: u64,
-    ino: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-}
-
-impl FileSnapshot {
-    fn capture(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
-        let meta = std::fs::metadata(&path)
-            .unwrap_or_else(|e| panic!("stat fixture {}: {e}", path.display()));
-        let bytes =
-            std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
-        FileSnapshot {
-            path,
-            bytes,
-            dev: meta.dev(),
-            ino: meta.ino(),
-            mtime: meta.mtime(),
-            mtime_nsec: meta.mtime_nsec(),
-        }
-    }
-
-    fn assert_intact(&self) {
-        let now = Self::capture(&self.path);
-        assert_eq!(
-            now,
-            *self,
-            "boundary fixture {} was modified or replaced",
-            self.path.display()
-        );
-    }
-}
-
-/// An exclusively created boundary fixture file whose `(dev, ino)` is verified
-/// via `fstatat(..., AT_SYMLINK_NOFOLLOW)` before teardown unlinks it.
+/// An exclusively created boundary fixture file that retains a read-capable
+/// descriptor and recorded identity/metadata so both integrity checks and
+/// teardown verify the directory entry via `fstatat(..., AT_SYMLINK_NOFOLLOW)`
+/// before touching contents or unlinking.
 struct OwnedFixtureFile {
     parent_dir: PathBuf,
     name: String,
+    file: File,
+    expected_bytes: Vec<u8>,
     dev: u64,
     ino: u64,
+    size: i64,
+    mtime: i64,
+    mtime_nsec: i64,
 }
 
 impl OwnedFixtureFile {
@@ -239,7 +206,7 @@ impl OwnedFixtureFile {
         let fd = openat(
             &dirfd,
             name,
-            OFlag::O_WRONLY | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o600),
         )?;
         fchown(&fd, Some(uid), Some(gid))?;
@@ -251,9 +218,93 @@ impl OwnedFixtureFile {
         Ok(OwnedFixtureFile {
             parent_dir: parent_dir.to_path_buf(),
             name: name.to_owned(),
+            file,
+            expected_bytes: bytes.to_vec(),
             dev: st.st_dev,
             ino: st.st_ino,
+            size: st.st_size,
+            mtime: st.st_mtime,
+            mtime_nsec: st.st_mtime_nsec,
         })
+    }
+
+    /// Verifies that the directory entry still refers to the original regular
+    /// file inode without following symlinks, checks held-fd metadata, and
+    /// reads at most `expected_bytes.len() + 1` bytes from the held descriptor.
+    /// Diagnostics report only the path and differing field (never file bytes).
+    fn assert_intact(&self) {
+        let full = self.parent_dir.join(&self.name);
+        let dirfd = open(
+            &self.parent_dir,
+            OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap_or_else(|e| panic!("open parent dir {}: {e}", self.parent_dir.display()));
+        let dir_st = fstatat(&dirfd, self.name.as_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+            .unwrap_or_else(|e| panic!("fstatat {}: {e}", full.display()));
+        let dir_type = SFlag::from_bits_truncate(dir_st.st_mode) & SFlag::S_IFMT;
+        assert_eq!(
+            dir_type,
+            SFlag::S_IFREG,
+            "boundary fixture {} file type changed (mode={:#o})",
+            full.display(),
+            dir_st.st_mode
+        );
+        assert_eq!(
+            (dir_st.st_dev, dir_st.st_ino),
+            (self.dev, self.ino),
+            "boundary fixture {} directory entry identity changed (expected dev={}, ino={}, got dev={}, ino={})",
+            full.display(),
+            self.dev,
+            self.ino,
+            dir_st.st_dev,
+            dir_st.st_ino
+        );
+
+        let fd_st = fstat(&self.file)
+            .unwrap_or_else(|e| panic!("fstat held fd for {}: {e}", full.display()));
+        assert_eq!(
+            (fd_st.st_dev, fd_st.st_ino),
+            (self.dev, self.ino),
+            "boundary fixture {} held descriptor identity changed",
+            full.display()
+        );
+        assert_eq!(
+            fd_st.st_size,
+            self.size,
+            "boundary fixture {} size changed (expected {}, got {})",
+            full.display(),
+            self.size,
+            fd_st.st_size
+        );
+        assert_eq!(
+            (fd_st.st_mtime, fd_st.st_mtime_nsec),
+            (self.mtime, self.mtime_nsec),
+            "boundary fixture {} mtime changed (expected {}.{:09}, got {}.{:09})",
+            full.display(),
+            self.mtime,
+            self.mtime_nsec,
+            fd_st.st_mtime,
+            fd_st.st_mtime_nsec
+        );
+
+        let mut buf = vec![0u8; self.expected_bytes.len() + 1];
+        let mut total = 0usize;
+        while total < buf.len() {
+            match self.file.read_at(&mut buf[total..], total as u64) {
+                Ok(0) => break,
+                Ok(n) => total += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => panic!("read held fd for {}: {e}", full.display()),
+            }
+        }
+        assert!(
+            &buf[..total] == self.expected_bytes.as_slice(),
+            "boundary fixture {} content diverged (read {} bytes, expected {})",
+            full.display(),
+            total,
+            self.expected_bytes.len()
+        );
     }
 }
 
@@ -330,11 +381,12 @@ impl Drop for OwnedFixtureDir {
 
 /// The four synthetic guest secrets and unrelated writable files required
 /// simultaneously by `docs/isolation-design.md` §6, acquired exclusively with
-/// descriptor-pinned ownership/mode and identity-verified teardown.
+/// descriptor-pinned ownership/mode, held read-capable descriptors, and
+/// identity-verified teardown.
 struct BoundaryFixtures {
-    snapshots: Vec<FileSnapshot>,
     // Field drop order is declaration order: files unlink before dirs rmdir.
-    _owned_files: Vec<OwnedFixtureFile>,
+    boundary_files: Vec<OwnedFixtureFile>,
+    _owned_config: Option<OwnedFixtureFile>,
     _owned_dirs: Vec<OwnedFixtureDir>,
 }
 
@@ -345,7 +397,7 @@ impl BoundaryFixtures {
         let _uid601 = qeminga_account("qeminga-parser", 601);
 
         let mut owned_dirs = Vec::new();
-        let mut owned_files = Vec::new();
+        let mut boundary_files = Vec::new();
 
         if let Some(d) = OwnedFixtureDir::try_create_exclusive(
             Path::new("/var/lib"),
@@ -397,7 +449,7 @@ impl BoundaryFixtures {
                             parent.display()
                         )
                     });
-            owned_files.push(owned);
+            boundary_files.push(owned);
         }
 
         // Ensure `/etc/qeminga/config.toml` exists for Check 2's read probe,
@@ -406,7 +458,7 @@ impl BoundaryFixtures {
         {
             owned_dirs.push(d);
         }
-        match OwnedFixtureFile::try_create_exclusive(
+        let owned_config = match OwnedFixtureFile::try_create_exclusive(
             Path::new("/etc/qeminga"),
             "config.toml",
             Uid::from_raw(0),
@@ -414,31 +466,21 @@ impl BoundaryFixtures {
             0o644,
             b"[agent]\nlog_level = \"info\"\n",
         ) {
-            Ok(owned) => owned_files.push(owned),
-            Err(Errno::EEXIST) => {}
+            Ok(owned) => Some(owned),
+            Err(Errno::EEXIST) => None,
             Err(e) => panic!("create {CONFIG_PATH}: {e}"),
-        }
-
-        let snapshots = [
-            ROOT_SECRET_PATH,
-            WORLD_SECRET_PATH,
-            UID600_FILE_PATH,
-            WORLD_FILE_PATH,
-        ]
-        .into_iter()
-        .map(FileSnapshot::capture)
-        .collect();
+        };
 
         BoundaryFixtures {
-            snapshots,
-            _owned_files: owned_files,
+            boundary_files,
+            _owned_config: owned_config,
             _owned_dirs: owned_dirs,
         }
     }
 
     fn assert_all_intact(&self) {
-        for snap in &self.snapshots {
-            snap.assert_intact();
+        for f in &self.boundary_files {
+            f.assert_intact();
         }
     }
 }
@@ -533,6 +575,93 @@ fn run_self_probe(test_name: &str, probe: &str, aux: Option<&str>) -> std::proce
         cmd.env(ENV_AUX, aux);
     }
     cmd.output().unwrap()
+}
+
+/// Runs a self-probe inside a transient systemd service unit configured with
+/// `KillMode=control-group`, `TimeoutStopSec=2s`, and `SendSIGKILL=yes`,
+/// matching `qeminga.service`'s cgroup supervision path (without granting
+/// `CAP_KILL` to UID 600).
+fn run_self_probe_in_cgroup(
+    test_name: &str,
+    probe: &str,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    assert!(
+        Path::new("/run/systemd/system").is_dir(),
+        "cgroup supervision probe `{probe}` requires systemd PID 1 (/run/systemd/system)"
+    );
+    let exe = std::env::current_exe().unwrap();
+    let unit = format!("qeminga-oq10-{probe}-{}.service", std::process::id());
+    let mut cmd = ProcessCommand::new("systemd-run");
+    cmd.args([
+        "--wait",
+        "--pipe",
+        "--collect",
+        "--quiet",
+        "--service-type=exec",
+        &format!("--unit={unit}"),
+        "-p",
+        "KillMode=control-group",
+        "-p",
+        "TimeoutStopSec=2s",
+        "-p",
+        "SendSIGKILL=yes",
+        "-E",
+        &format!("{ENV_PROBE}={probe}"),
+    ]);
+    for (k, v) in extra_env {
+        assert!(
+            !v.contains('\n') && !v.contains('\0'),
+            "systemd-run -E value for {k} must not contain control characters"
+        );
+        cmd.args(["-E", &format!("{k}={v}")]);
+    }
+    if let Ok(bin) = std::env::var("QEMINGA_RELEASE_BINARY") {
+        cmd.args(["-E", &format!("QEMINGA_RELEASE_BINARY={bin}")]);
+    }
+    cmd.arg("--")
+        .arg(exe)
+        .args([
+            "--exact",
+            test_name,
+            "--include-ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap()
+}
+
+/// Asserts that `mount` accepts an exclusive temporary file write within
+/// `timeout`, without truncating any pre-existing file or leaving probe files
+/// behind. A still-frozen filesystem blocks the worker in D-state so the test
+/// thread times out and unwinds cleanly into `ThawGuard` instead of hanging.
+fn assert_writable_within(mount: &str, phase: &str, timeout: Duration) {
+    let dir = PathBuf::from(mount);
+    let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    std::thread::spawn(move || {
+        let res = (|| -> std::io::Result<()> {
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".qeminga-oq10-probe-")
+                .tempfile_in(&dir)?;
+            tmp.write_all(b"ok")?;
+            tmp.flush()?;
+            drop(tmp);
+            Ok(())
+        })()
+        .map_err(|e| e.to_string());
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => panic!("{phase}: write probe on {mount} failed: {err}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            panic!("{phase}: {mount} remained unwritable (likely still frozen) after {timeout:?}")
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("{phase}: write probe worker for {mount} exited unexpectedly")
+        }
+    }
 }
 
 fn assert_sigsys(out: &std::process::Output, label: &str) {
@@ -1810,18 +1939,19 @@ fn privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill
     );
 
     // 3c. StreamAssembler cmsg/MSG_CTRUNC/MSG_TRUNC fd closure on both peers,
-    // plus live enforcing CVM executor + uncooperative UID-601 mock parser
-    // proving PR_SET_PDEATHSIG(SIGKILL) terminates it without CAP_KILL.
+    // plus live enforcing CVM executor + uncooperative SIG_IGN UID-601 mock
+    // parser inside a `KillMode=control-group` systemd transient unit proving
+    // cgroup supervision terminates it without `CAP_KILL` on UID 600.
     verify_stream_assembler_cmsg_and_trunc_fd_closure();
 
     let mal_state_dir = tempfile::Builder::new()
         .prefix("qeminga-oq10-c3-mal-")
         .tempdir_in("/dev/shm")
         .unwrap();
-    let mal_out = run_self_probe(
+    let mal_out = run_self_probe_in_cgroup(
         "privileged_oq10_check3_integrity_channel_verify_malicious_ipc_and_no_cap_kill",
         "cvm-malicious-ipc",
-        Some(mal_state_dir.path().to_str().unwrap()),
+        &[(ENV_AUX, mal_state_dir.path().to_str().unwrap())],
     );
     let mal_stdout = String::from_utf8_lossy(&mal_out.stdout);
     let mal_stderr = String::from_utf8_lossy(&mal_out.stderr);
@@ -2098,8 +2228,7 @@ async fn run_check5_deterministic_reconnect() {
         tracing::Level::INFO,
         router.clone(),
     ));
-    let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
-    tracing::callsite::rebuild_interest_cache();
+    tracing::dispatcher::set_global_default(dispatch).unwrap();
 
     let state_dir = tempfile::Builder::new()
         .prefix("qeminga-oq10-c5-")
@@ -2154,22 +2283,19 @@ async fn run_check5_deterministic_reconnect() {
     let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
 
-    let exec_task = tokio::spawn(
-        serve_ipc_with_backoff(
-            Arc::clone(&ctx),
-            exec_sock,
-            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
-            opener,
-            true,
-            None,
-            false,
-            async move { stop_rx.await.unwrap_or("SIGTERM") },
-            Duration::from_millis(10),
-            Duration::from_millis(20),
-            Duration::from_millis(20),
-        )
-        .with_subscriber(dispatch.clone()),
-    );
+    let exec_task = tokio::spawn(serve_ipc_with_backoff(
+        Arc::clone(&ctx),
+        exec_sock,
+        PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+        opener,
+        true,
+        None,
+        false,
+        async move { stop_rx.await.unwrap_or("SIGTERM") },
+        Duration::from_millis(10),
+        Duration::from_millis(20),
+        Duration::from_millis(20),
+    ));
 
     let parser_thread = std::thread::spawn(move || run_parser_loop(parser_sock, Some(pty1_slave)));
 
@@ -2397,9 +2523,32 @@ async fn run_check5_deterministic_reconnect() {
     .unwrap();
 }
 
+fn run_check5_subprocess() {
+    let out = run_self_probe(
+        "oq10_check5_deterministic_reconnect_and_late_reply_isolation_unprivileged",
+        "check5-reconnect",
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("CHECK5_RECONNECT_OK"),
+        "check5 reconnect subprocess failed: {:?}\nstdout={stdout}\nstderr={stderr}",
+        out.status
+    );
+}
+
 #[tokio::test]
 async fn oq10_check5_deterministic_reconnect_and_late_reply_isolation_unprivileged() {
-    run_check5_deterministic_reconnect().await;
+    if let Ok(probe) = std::env::var(ENV_PROBE) {
+        assert_eq!(probe, "check5-reconnect", "unknown check5 probe: {probe}");
+        run_check5_deterministic_reconnect().await;
+        println!("\nCHECK5_RECONNECT_OK");
+        return;
+    }
+    tokio::task::spawn_blocking(run_check5_subprocess)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2407,7 +2556,9 @@ async fn oq10_check5_deterministic_reconnect_and_late_reply_isolation_unprivileg
 async fn privileged_oq10_check5_deterministic_reconnect_and_late_reply_isolation() {
     let fixtures = BoundaryFixtures::setup();
     // Layer 1: deterministic barrier-synchronized late-reply isolation (pending reused id=42).
-    run_check5_deterministic_reconnect().await;
+    tokio::task::spawn_blocking(run_check5_subprocess)
+        .await
+        .unwrap();
 
     // Layer 2: deployed process-pair (QEMINGA_RELEASE_BINARY in enforced CI) real
     // SCM_RIGHTS reconnect under UID 600/601 + enforcing seccomp filters.
@@ -2478,6 +2629,14 @@ impl OsInfoSource for LargeOsInfo {
 }
 
 async fn run_check6_large_payloads() {
+    let sink = SharedSink::default();
+    let router = Router::new(Box::new(sink.clone()));
+    let dispatch = tracing::Dispatch::new(qeminga::audit::subscriber(
+        tracing::Level::INFO,
+        router.clone(),
+    ));
+    tracing::dispatcher::set_global_default(dispatch).unwrap();
+
     // --- Sub-check 6a(i) + 6b + 6c:
     //   - `guest-get-fsinfo` > 256 KiB and <= 1 MiB across multi-chunk IPC
     //   - `guest-fsfreeze-freeze-list` with 300 short mount names (< 64 KiB) +
@@ -2526,7 +2685,7 @@ async fn run_check6_large_payloads() {
             Context::new(
                 Arc::new(cfg),
                 Arc::new(FreezeStateMachine::new()),
-                Router::new(Box::new(std::io::sink())),
+                router.clone(),
                 marker,
             )
             .with_kernel(kernel)
@@ -2679,14 +2838,8 @@ async fn run_check6_large_payloads() {
             );
         }
 
-        let sink = SharedSink::default();
-        let router = Router::new(Box::new(sink.clone()));
-        let dispatch = tracing::Dispatch::new(qeminga::audit::subscriber(
-            tracing::Level::INFO,
-            router.clone(),
-        ));
-        let _dispatch_guard = tracing::dispatcher::set_default(&dispatch);
-        tracing::callsite::rebuild_interest_cache();
+        assert!(router.settle(Duration::from_secs(2)));
+        sink.0.lock().unwrap().clear();
 
         let kernel = Arc::new(FakeKernel::new());
         // Root `/` + 4998 other mounts succeed (4999 trimmed);
@@ -2721,22 +2874,19 @@ async fn run_check6_large_payloads() {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
         let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
 
-        let exec_task = tokio::spawn(
-            serve_ipc_with_backoff(
-                Arc::clone(&ctx),
-                exec_sock,
-                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
-                opener,
-                true,
-                None,
-                false,
-                async move { stop_rx.await.unwrap_or("SIGTERM") },
-                Duration::from_millis(10),
-                Duration::from_millis(20),
-                Duration::from_millis(20),
-            )
-            .with_subscriber(dispatch.clone()),
-        );
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            Arc::clone(&ctx),
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            async move { stop_rx.await.unwrap_or("SIGTERM") },
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(20),
+        ));
         let parser_thread =
             std::thread::spawn(move || run_parser_loop(parser_sock, Some(pty_slave)));
 
@@ -2795,9 +2945,35 @@ async fn run_check6_large_payloads() {
     }
 }
 
+fn run_check6_subprocess() {
+    let out = run_self_probe(
+        "oq10_check6_large_payloads_osinfo_and_mixed_outcome_fstrim_unprivileged",
+        "check6-large-payloads",
+        None,
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stdout.contains("CHECK6_LARGE_PAYLOADS_OK"),
+        "check6 large-payload subprocess failed: {:?}\nstdout={stdout}\nstderr={stderr}",
+        out.status
+    );
+}
+
 #[tokio::test]
 async fn oq10_check6_large_payloads_osinfo_and_mixed_outcome_fstrim_unprivileged() {
-    run_check6_large_payloads().await;
+    if let Ok(probe) = std::env::var(ENV_PROBE) {
+        assert_eq!(
+            probe, "check6-large-payloads",
+            "unknown check6 probe: {probe}"
+        );
+        run_check6_large_payloads().await;
+        println!("\nCHECK6_LARGE_PAYLOADS_OK");
+        return;
+    }
+    tokio::task::spawn_blocking(run_check6_subprocess)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -2807,7 +2983,9 @@ async fn privileged_oq10_check6_large_payloads_osinfo_and_mixed_outcome_fstrim()
     // Layer 1: deterministic synthetic large-payload bounds (>256 KiB & >1 MiB
     // fsinfo, >256-entry freeze-list + #63, 48 KiB os-release > 32 KiB chunk,
     // 5001-target mixed-outcome >1 MiB fstrim).
-    run_check6_large_payloads().await;
+    tokio::task::spawn_blocking(run_check6_subprocess)
+        .await
+        .unwrap();
 
     // Layer 2: deployed process-pair (QEMINGA_RELEASE_BINARY in enforced CI)
     // exercising multi-chunk (>32 KiB, >256-entry) freeze-list + #63 allowlist
@@ -3074,11 +3252,9 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
 {
     if let Ok(probe) = std::env::var(ENV_PROBE) {
         if probe == "cvm-violation-while-frozen" {
-            let aux = std::env::var(ENV_AUX).unwrap();
-            let (mount, state_dir) = aux
-                .split_once('\n')
-                .expect("ENV_AUX must carry mount and state_dir separated by newline");
-            run_cvm_violation_while_frozen_child(mount, Path::new(state_dir));
+            let mount = std::env::var(ENV_AUX).expect("ENV_AUX must carry mount");
+            let state_dir = std::env::var(ENV_AUX2).expect("ENV_AUX2 must carry state_dir");
+            run_cvm_violation_while_frozen_child(&mount, Path::new(&state_dir));
             return;
         }
         panic!("unknown check7 probe: {probe}");
@@ -3108,6 +3284,7 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     let narrowed_cfg = format!(
         "fsfreeze_idle_timeout_secs = 2\nfsfreeze_max_timeout_secs = 5\nfreeze_allowed_mountpoints = [\"{protected_mount}\"]\n"
     );
+    const WRITE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
     // 1. Real SCM_RIGHTS channel handoff (initial + RequestChannelReopen) + ping.
     let mut agent = Agent::spawn_with(cvm_real_kernel(&both_cfg));
@@ -3153,24 +3330,36 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
         !agent.state_dir().join("frozen").exists(),
         "watchdog must remove recovery marker before executor exits"
     );
-    std::fs::write(format!("{protected_mount}/after-sigkill-watchdog"), b"ok").unwrap();
-    std::fs::write(format!("{second_mount}/after-sigkill-watchdog"), b"ok").unwrap();
+    assert_writable_within(
+        &protected_mount,
+        "after-sigkill-watchdog (protected)",
+        WRITE_PROBE_TIMEOUT,
+    );
+    assert_writable_within(
+        &second_mount,
+        "after-sigkill-watchdog (second)",
+        WRITE_PROBE_TIMEOUT,
+    );
     wait_for_pid_gone(parser_pid, Duration::from_secs(5));
     drop(agent);
 
-    // 3b. ipc_protocol_violation while Frozen under enforcing CVM executor filter ->
-    //     executor closes IPC_FD, keeps watchdog + marker alive until autonomous
-    //     thaw completes, makes real loop mount writable, exits non-zero, and
-    //     PR_SET_PDEATHSIG(SIGKILL) terminates the sleeping UID-601 mock parser.
+    // 3b. ipc_protocol_violation while Frozen under enforcing CVM executor filter
+    //     inside a `KillMode=control-group` systemd transient unit -> executor
+    //     closes IPC_FD, keeps watchdog + marker alive until autonomous thaw
+    //     completes, makes real loop mount writable, exits non-zero, and systemd
+    //     cgroup supervision terminates the sleeping SIG_IGN UID-601 mock parser
+    //     without CAP_KILL on UID 600.
     let viol_state_dir = tempfile::Builder::new()
         .prefix("qeminga-oq10-c7v-")
         .tempdir_in("/dev/shm")
         .unwrap();
-    let viol_aux = format!("{protected_mount}\n{}", viol_state_dir.path().display());
-    let viol = run_self_probe(
+    let viol = run_self_probe_in_cgroup(
         "privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_and_intact_fixtures",
         "cvm-violation-while-frozen",
-        Some(&viol_aux),
+        &[
+            (ENV_AUX, &protected_mount),
+            (ENV_AUX2, viol_state_dir.path().to_str().unwrap()),
+        ],
     );
     let viol_stdout = String::from_utf8_lossy(&viol.stdout);
     let viol_stderr = String::from_utf8_lossy(&viol.stderr);
@@ -3192,7 +3381,11 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
         .parse()
         .unwrap();
     wait_for_pid_gone(viol_parser_pid, Duration::from_secs(3));
-    std::fs::write(format!("{protected_mount}/after-violation-watchdog"), b"ok").unwrap();
+    assert_writable_within(
+        &protected_mount,
+        "after-violation-watchdog (protected)",
+        WRITE_PROBE_TIMEOUT,
+    );
 
     // 4. Policy narrowing across crash/restart:
     //    Freeze BOTH mounts, SIGKILL executor, restart with policy narrowed to
@@ -3218,8 +3411,16 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     );
     assert!(!agent.state_dir().join("frozen").exists());
     // Both superblocks must actually be thawed and writable!
-    std::fs::write(format!("{protected_mount}/after-narrowing"), b"ok").unwrap();
-    std::fs::write(format!("{second_mount}/after-narrowing"), b"ok").unwrap();
+    assert_writable_within(
+        &protected_mount,
+        "after-narrowing (protected)",
+        WRITE_PROBE_TIMEOUT,
+    );
+    assert_writable_within(
+        &second_mount,
+        "after-narrowing (second)",
+        WRITE_PROBE_TIMEOUT,
+    );
     assert!(agent.stop().success());
 
     // 5. Cooperative ownership (#69) preservation alongside a foreign-frozen fs:
@@ -3265,7 +3466,11 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
         "cooperative recovery thaw must drain only qeminga-owned superblock"
     );
     assert!(!agent.state_dir().join("frozen").exists());
-    std::fs::write(format!("{protected_mount}/after-coop"), b"ok").unwrap();
+    assert_writable_within(
+        &protected_mount,
+        "after-coop (protected)",
+        WRITE_PROBE_TIMEOUT,
+    );
     // Foreign-owned `second_mount` MUST still be frozen (EBUSY on FIFREEZE)
     // and retain its foreign owner claim!
     assert!(
@@ -3291,7 +3496,11 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
             .join(qeminga::ownership::format_dev_filename(second_dev)),
     )
     .unwrap();
-    std::fs::write(format!("{second_mount}/after-foreign-thaw"), b"ok").unwrap();
+    assert_writable_within(
+        &second_mount,
+        "after-foreign-thaw (second)",
+        WRITE_PROBE_TIMEOUT,
+    );
 
     // 6. Final normal freeze -> thaw cycle + intact-fixture byte/inode/mtime check.
     let mut agent = Agent::spawn_with(cvm_real_kernel(&both_cfg));
@@ -3302,10 +3511,86 @@ fn privileged_oq10_check7_authorized_freeze_thaw_cvm_recovery_policy_narrowing_a
     assert_eq!(agent.execute("guest-fsfreeze-status")["return"], "frozen");
     assert_eq!(agent.execute("guest-fsfreeze-thaw"), json!({"return": 2}));
     assert!(!agent.state_dir().join("frozen").exists());
-    std::fs::write(format!("{protected_mount}/after-final"), b"ok").unwrap();
-    std::fs::write(format!("{second_mount}/after-final"), b"ok").unwrap();
+    assert_writable_within(
+        &protected_mount,
+        "after-final (protected)",
+        WRITE_PROBE_TIMEOUT,
+    );
+    assert_writable_within(&second_mount, "after-final (second)", WRITE_PROBE_TIMEOUT);
     assert!(agent.stop().success());
 
     // 7. Assert all four boundary fixtures have identical bytes, dev, inode, mtime.
     fixtures.assert_all_intact();
+}
+
+#[test]
+fn oq10_fixture_and_writable_probe_helpers_unprivileged() {
+    let dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-helper-test-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    let uid = Uid::current();
+    let gid = Gid::current();
+
+    // 1. OwnedFixtureFile intact happy path + clean unlink on drop.
+    let fixture =
+        OwnedFixtureFile::try_create_exclusive(dir.path(), "fixture", uid, gid, 0o600, b"expected")
+            .unwrap();
+    fixture.assert_intact();
+
+    // 2. Mutating bytes through the held inode fails WITHOUT echoing file contents.
+    let secret_marker = b"TOP-SECRET-RUNNER-DATA";
+    std::fs::write(dir.path().join("fixture"), secret_marker).unwrap();
+    let mut_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.assert_intact();
+    }))
+    .unwrap_err();
+    let mut_msg = mut_err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| mut_err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        !mut_msg.contains("TOP-SECRET-RUNNER-DATA"),
+        "assert_intact must never disclose file contents in panic output: {mut_msg}"
+    );
+
+    // 3. Replacing the directory entry with a symlink to another file fails at
+    //    the AT_SYMLINK_NOFOLLOW identity check BEFORE reading anything.
+    let other = dir.path().join("other-secret");
+    std::fs::write(&other, b"OTHER-SENSITIVE-BYTES").unwrap();
+    std::fs::remove_file(dir.path().join("fixture")).unwrap();
+    symlink(&other, dir.path().join("fixture")).unwrap();
+    let link_err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fixture.assert_intact();
+    }))
+    .unwrap_err();
+    let link_msg = link_err
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| link_err.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        link_msg.contains("file type changed") && !link_msg.contains("OTHER-SENSITIVE-BYTES"),
+        "symlink replacement must fail on file type without reading target: {link_msg}"
+    );
+    drop(fixture);
+    // Drop must NOT unlink the replaced symlink (identity mismatch).
+    assert!(dir.path().join("fixture").symlink_metadata().is_ok());
+
+    // 4. assert_writable_within succeeds and leaves zero probe files behind.
+    let probe_dir = tempfile::Builder::new()
+        .prefix("qeminga-oq10-writable-test-")
+        .tempdir_in("/dev/shm")
+        .unwrap();
+    assert_writable_within(
+        probe_dir.path().to_str().unwrap(),
+        "unprivileged-self-test",
+        Duration::from_secs(2),
+    );
+    assert_eq!(
+        std::fs::read_dir(probe_dir.path()).unwrap().count(),
+        0,
+        "assert_writable_within must leave zero probe files behind"
+    );
 }

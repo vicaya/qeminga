@@ -280,18 +280,53 @@ pub async fn execute_freeze_ipc_with_published(
 /// requests the abort and reports the operation's outcome (§4.4). No target is
 /// ever drained by two owners.
 pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::IpcErrorCode> {
-    let token = match ctx.state.claim_thaw() {
+    execute_thaw_ipc_inner(ctx, true).await
+}
+
+/// Typed IPC thaw used once graceful stop (`SIGTERM`/`SIGINT`) is latched:
+/// completes any active `Frozen` or in-progress `Freezing` obligation (preserving
+/// C-21 and the join/abort path) without starting a fresh `Thawed → Thawing`
+/// recovery drain when an earlier thaw already settled `Thawed` (returning `Ok(0)`).
+pub async fn execute_thaw_existing_ipc(
+    ctx: &Arc<Context>,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    execute_thaw_ipc_inner(ctx, false).await
+}
+
+async fn execute_thaw_ipc_inner(
+    ctx: &Arc<Context>,
+    allow_recovery_from_thawed: bool,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    let claim = || {
+        if allow_recovery_from_thawed {
+            ctx.state.claim_thaw()
+        } else {
+            ctx.state.claim_thaw_from_frozen()
+        }
+    };
+    let token = match claim() {
         Ok(token) => token,
+        Err(err) if !allow_recovery_from_thawed && err.current == FreezeState::Thawed => {
+            return Ok(0);
+        }
         Err(err) => match ctx.freeze_op() {
-            Some(op) => return join_operation_typed(ctx, &op).await,
+            Some(op) => return join_operation_typed(ctx, &op, allow_recovery_from_thawed).await,
             // The operation may have settled between the claim and the
             // look-up: one more claim before refusing.
-            None => ctx.state.claim_thaw().map_err(|_| {
-                crate::ipc::IpcErrorCode::TransitionConflict {
-                    op: crate::ipc::TransitionOp::ClaimThaw,
-                    current: err.current,
+            None => match claim() {
+                Ok(token) => token,
+                Err(retry_err)
+                    if !allow_recovery_from_thawed && retry_err.current == FreezeState::Thawed =>
+                {
+                    return Ok(0);
                 }
-            })?,
+                Err(_) => {
+                    return Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                        op: crate::ipc::TransitionOp::ClaimThaw,
+                        current: err.current,
+                    });
+                }
+            },
         },
     };
     run_thaw_typed(ctx, token).await
@@ -315,16 +350,27 @@ pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::Ipc
 async fn join_operation_typed(
     ctx: &Arc<Context>,
     op: &crate::freeze_op::FreezeOp,
+    allow_recovery_from_thawed: bool,
 ) -> Result<u64, crate::ipc::IpcErrorCode> {
     if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
         op.wait_for_settlement().await;
-        let token =
-            ctx.state
-                .claim_thaw()
-                .map_err(|err| crate::ipc::IpcErrorCode::TransitionConflict {
+        let claim = if allow_recovery_from_thawed {
+            ctx.state.claim_thaw()
+        } else {
+            ctx.state.claim_thaw_from_frozen()
+        };
+        let token = match claim {
+            Ok(token) => token,
+            Err(err) if !allow_recovery_from_thawed && err.current == FreezeState::Thawed => {
+                return Ok(0);
+            }
+            Err(err) => {
+                return Err(crate::ipc::IpcErrorCode::TransitionConflict {
                     op: crate::ipc::TransitionOp::ClaimThaw,
                     current: err.current,
-                })?;
+                });
+            }
+        };
         return run_thaw_typed(ctx, token).await;
     }
     let progress = op.progress();
@@ -374,7 +420,7 @@ async fn join_operation(
     ctx: &Arc<Context>,
     op: &crate::freeze_op::FreezeOp,
 ) -> Result<Value, Error> {
-    let count = join_operation_typed(ctx, op)
+    let count = join_operation_typed(ctx, op, true)
         .await
         .map_err(crate::ipc::IpcErrorCode::to_proto_error)?;
     Ok(json!(count))

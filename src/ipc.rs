@@ -3271,6 +3271,29 @@ impl IpcOutbox {
         Ok(())
     }
 
+    /// Drops any queued `OkChannelFd` (`SCM_RIGHTS`) handoff packets and closes
+    /// their attached descriptors without transmitting them.
+    ///
+    /// Used when graceful shutdown has reached `Thawed` so a channel descriptor
+    /// queued concurrently with `SIGTERM`/`SIGINT` can never be transferred to
+    /// the parser right before closing `IPC_FD` (`OkChannelFd` is always a
+    /// single-chunk packet carrying `fd: Some(_)`).
+    pub fn discard_channel_fd_packets(&mut self) -> usize {
+        let mut dropped = 0usize;
+        let mut removed_bytes = 0usize;
+        self.queue.retain(|pkt| {
+            if pkt.fd.is_some() {
+                dropped += 1;
+                removed_bytes = removed_bytes.saturating_add(pkt.bytes.len());
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_bytes = self.pending_bytes.saturating_sub(removed_bytes);
+        dropped
+    }
+
     /// Flushes queued chunks onto `sock` until the queue drains or the socket
     /// reports `EAGAIN`/`EWOULDBLOCK`.
     pub fn flush(&mut self, sock: BorrowedFd<'_>) -> Result<FlushOutcome, Errno> {
@@ -4862,6 +4885,53 @@ mod tests {
             ))
         ));
         assert_eq!(parser_asm.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn outbox_discard_channel_fd_packets_closes_fds_and_preserves_other_replies() {
+        let (pipe_r, pipe_w) = nix::unistd::pipe().unwrap();
+        let mut outbox = IpcOutbox::new();
+        outbox
+            .push_response(1, 1, &IpcResponse::OkEmpty, None)
+            .unwrap();
+        let bytes_without_fd = outbox.pending_bytes();
+        outbox
+            .push_response(1, 2, &IpcResponse::OkChannelFd, Some(pipe_r))
+            .unwrap();
+        assert_eq!(outbox.pending_packets(), 2);
+        assert!(outbox.pending_bytes() > bytes_without_fd);
+
+        let dropped = outbox.discard_channel_fd_packets();
+        assert_eq!(dropped, 1);
+        assert_eq!(outbox.pending_packets(), 1);
+        assert_eq!(outbox.pending_bytes(), bytes_without_fd);
+        // Dropping the queued OkChannelFd closed `pipe_r` immediately.
+        assert_eq!(
+            nix::unistd::write(&pipe_w, b"x").unwrap_err(),
+            nix::errno::Errno::EPIPE
+        );
+
+        // Flushing the remaining outbox delivers ONLY OkEmpty and zero fds.
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        assert_eq!(
+            outbox.flush(exec_sock.as_fd()).unwrap(),
+            FlushOutcome::Drained
+        );
+        let pkt = crate::kernel::ipc::recv_packet(parser_sock.as_fd(), MAX_PACKET_BYTES)
+            .unwrap()
+            .unwrap();
+        assert!(pkt.fds.is_empty());
+        let mut asm = StreamAssembler::new(PeerRole::Parser);
+        let msg = asm.push(pkt).unwrap().unwrap();
+        assert!(matches!(
+            msg,
+            AssembledMessage::Response(ReceivedResponse {
+                req_id: 1,
+                response: IpcResponse::OkEmpty,
+                channel_fd: None,
+                ..
+            })
+        ));
     }
 
     proptest! {

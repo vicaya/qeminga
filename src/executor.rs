@@ -529,6 +529,7 @@ where
         if stop_requested {
             if ctx.state.current() == FreezeState::Thawed {
                 let _ = reopen_cancel_tx.send(true);
+                outbox.discard_channel_fd_packets();
             }
             if ctx.state.current() == FreezeState::Thawed && tasks.is_empty() {
                 let mut terminal_err: Option<OpenError> = None;
@@ -548,15 +549,22 @@ where
                         if terminal_err.is_none() {
                             terminal_err = Some(term_err);
                         }
+                    } else if reply.channel_fd.is_some()
+                        || matches!(reply.response, IpcResponse::OkChannelFd)
+                    {
+                        // Stop already accepted in `Thawed`: drop the reopened
+                        // descriptor instead of handing it off via SCM_RIGHTS.
+                        drop(reply.channel_fd);
                     } else {
                         let _ = outbox.push_response(
                             reply.session_gen,
                             reply.req_id,
                             &reply.response,
-                            reply.channel_fd,
+                            None,
                         );
                     }
                 }
+                outbox.discard_channel_fd_packets();
                 if !outbox.is_empty() {
                     let _ = outbox.flush(async_ipc.as_fd());
                 }
@@ -613,11 +621,13 @@ where
                 tracing::info!(event = "signal", signal = name, "stop requested");
                 if ctx.state.current() == FreezeState::Thawed {
                     let _ = reopen_cancel_tx.send(true);
+                    outbox.discard_channel_fd_packets();
                 }
             }
             _ = stop_ticker.tick(), if stop_requested => {
                 if ctx.state.current() == FreezeState::Thawed {
                     let _ = reopen_cancel_tx.send(true);
+                    outbox.discard_channel_fd_packets();
                 }
             }
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
@@ -642,6 +652,14 @@ where
                 }
                 if stop_requested
                     && ctx.state.current() == FreezeState::Thawed
+                    && (reply.channel_fd.is_some()
+                        || matches!(reply.response, IpcResponse::OkChannelFd))
+                {
+                    // Stop already accepted in `Thawed`: discard newly opened
+                    // descriptor rather than handing it off to the parser.
+                    drop(reply.channel_fd);
+                } else if stop_requested
+                    && ctx.state.current() == FreezeState::Thawed
                     && outbox_backpressured(&outbox)
                 {
                     // Stop already accepted and parser is not draining; abandon reply.
@@ -656,6 +674,12 @@ where
                 }
             }
             writable = async_ipc.writable(), if !outbox.is_empty() => {
+                if stop_requested && ctx.state.current() == FreezeState::Thawed {
+                    outbox.discard_channel_fd_packets();
+                }
+                if outbox.is_empty() {
+                    continue;
+                }
                 match writable {
                     Ok(mut guard) => {
                         match outbox.flush(async_ipc.as_fd()) {
@@ -1184,6 +1208,16 @@ async fn handle_channel_reopen(
     let opened = tokio::task::spawn_blocking(move || opener(&path)).await;
     match opened {
         Ok(Ok(fd)) => {
+            if *cancel.borrow() {
+                drop(fd);
+                return OutboundReply {
+                    session_gen,
+                    req_id,
+                    response: IpcResponse::Err(IpcErrorCode::ChannelRetryLater),
+                    channel_fd: None,
+                    terminal_channel_err: None,
+                };
+            }
             {
                 let mut backoff = state
                     .reopen_backoff
@@ -1299,10 +1333,17 @@ async fn execute_command_request(
                 Err(code) => IpcResponse::Err(code),
             }
         }
-        IpcRequest::FsfreezeThaw => match fsfreeze::execute_thaw_ipc(ctx).await {
-            Ok(n) => IpcResponse::OkCount(n),
-            Err(code) => IpcResponse::Err(code),
-        },
+        IpcRequest::FsfreezeThaw => {
+            let res = if state.stopping.load(Ordering::SeqCst) {
+                fsfreeze::execute_thaw_existing_ipc(ctx).await
+            } else {
+                fsfreeze::execute_thaw_ipc(ctx).await
+            };
+            match res {
+                Ok(n) => IpcResponse::OkCount(n),
+                Err(code) => IpcResponse::Err(code),
+            }
+        }
         IpcRequest::GetOsInfo => execute_osinfo(ctx).await,
         IpcRequest::NetworkGetInterfaces => execute_interfaces(ctx).await,
         IpcRequest::GetFsInfo => execute_fsinfo(ctx).await,
@@ -3437,5 +3478,275 @@ mod tests {
         parser_thread.await.unwrap();
         assert_eq!(ctx.state.current(), FreezeState::Thawed);
         assert!(!marker_path.exists());
+    }
+
+    #[tokio::test]
+    async fn executor_queued_duplicate_thaw_after_stop_does_not_start_recovery_drain() {
+        // Astra review: when SIGTERM is latched while Frozen and two
+        // `FsfreezeThaw` requests are pipelined together, the first thaw
+        // settles `Thawed`; the second already-queued thaw MUST return `0`
+        // without calling `claim_thaw` from `Thawed`, reading mountinfo, or
+        // issuing a fresh `FITHAW` recovery drain during shutdown.
+        struct CountingMounts {
+            table: String,
+            reads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl crate::mountinfo::MountSource for CountingMounts {
+            fn read_mountinfo(&self) -> Result<Vec<u8>, crate::proto::Error> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Ok(self.table.as_bytes().to_vec())
+            }
+        }
+
+        let mount_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kernel = Arc::new(FakeKernel::new());
+        kernel.track_freeze_depth();
+        let state_dir = tempfile::Builder::new()
+            .prefix("qeminga-exec-dup-thaw-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        let marker_path = state_dir.path().join("frozen");
+        let marker = Marker::open(&marker_path).unwrap();
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(Config::default()),
+                Arc::new(FreezeStateMachine::new()),
+                Router::new(Box::new(std::io::sink())),
+                marker,
+            )
+            .with_kernel(Arc::clone(&kernel) as Arc<dyn crate::kernel::KernelOps>)
+            .with_mounts(Arc::new(CountingMounts {
+                table: "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n".to_owned(),
+                reads: Arc::clone(&mount_reads),
+            })),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let stop_fired = Arc::new(AtomicBool::new(false));
+        let stop_fired_sig = Arc::clone(&stop_fired);
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            Arc::clone(&ctx),
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            async move {
+                let sig = stop_rx.await.unwrap_or("SIGTERM");
+                stop_fired_sig.store(true, Ordering::SeqCst);
+                sig
+            },
+            Duration::from_millis(10),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+
+        let reads_check = Arc::clone(&mount_reads);
+        let parser_sock = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            // 1. Freeze filesystem (1 mountinfo read).
+            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::FsfreezeFreeze).unwrap();
+            let fr = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(fr.response, IpcResponse::OkCount(1));
+            let reads_after_freeze = reads_check.load(Ordering::SeqCst);
+            assert_eq!(reads_after_freeze, 1);
+
+            // 2. Latch SIGTERM while Frozen and confirm C-21 status works.
+            let _ = stop_tx.send("SIGTERM");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !stop_fired.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            send_request(parser_sock.as_fd(), 1, 2, &IpcRequest::FsfreezeStatus).unwrap();
+            let st = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                st.response,
+                IpcResponse::OkFreezeStatus(crate::ipc::WireFreezeStatus::Frozen)
+            );
+
+            // 3. Pipeline TWO FsfreezeThaw requests in one burst so req 4 is
+            //    already dispatched with a lane ticket behind req 3.
+            send_request(parser_sock.as_fd(), 1, 3, &IpcRequest::FsfreezeThaw).unwrap();
+            send_request(parser_sock.as_fd(), 1, 4, &IpcRequest::FsfreezeThaw).unwrap();
+
+            let mut saw_first_thaw = false;
+            loop {
+                match recv_response(parser_sock.as_fd(), &mut asm) {
+                    Ok(Some(resp)) => match resp.req_id {
+                        3 => {
+                            assert_eq!(resp.response, IpcResponse::OkCount(1));
+                            saw_first_thaw = true;
+                        }
+                        4 => {
+                            assert_eq!(
+                                resp.response,
+                                IpcResponse::OkCount(0),
+                                "duplicate queued thaw after stop must return 0 without recovery drain"
+                            );
+                        }
+                        other => panic!("unexpected req_id {other}: {:?}", resp.response),
+                    },
+                    Ok(None) => break,
+                    Err(err) => panic!("unexpected IPC error: {err}"),
+                }
+            }
+            assert!(saw_first_thaw, "first thaw reply must arrive");
+            parser_sock
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), exec_task)
+            .await
+            .expect("executor must exit cleanly after thaw")
+            .unwrap()
+            .unwrap();
+        assert_eq!(ctx.state.current(), FreezeState::Thawed);
+        let fithaw_calls = kernel
+            .calls()
+            .into_iter()
+            .filter(|c| matches!(c, crate::kernel::fake::Call::Fithaw(_)))
+            .count();
+        // One depth-1 tracked thaw performs two `FITHAW` calls (drain -> 0,
+        // then terminating `EINVAL`); a fresh recovery drain from queued req 4
+        // would add a 3rd `FITHAW` and a 2nd `mountinfo` read.
+        assert_eq!(
+            fithaw_calls, 2,
+            "duplicate queued thaw after stop must NOT issue a fresh recovery FITHAW (saw {fithaw_calls})"
+        );
+        assert_eq!(
+            mount_reads.load(Ordering::SeqCst),
+            1,
+            "duplicate queued thaw after stop must NOT perform fresh mountinfo discovery"
+        );
+        drop(parser_sock);
+    }
+
+    #[tokio::test]
+    async fn executor_discards_successful_reopen_fd_when_stop_latched_in_thawed() {
+        // Astra review: if a blocking channel opener is already running when
+        // SIGTERM is latched in `Thawed` and subsequently succeeds with an
+        // `OwnedFd`, the executor MUST discard that descriptor (never hand it
+        // to the parser over `SCM_RIGHTS` in either the normal reply path or
+        // the final shutdown flush) and exit `Ok(())`.
+        let ctx = Arc::new(Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            Router::new(Box::new(std::io::sink())),
+            Marker::for_tests(),
+        ));
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let stop_fired = Arc::new(AtomicBool::new(false));
+        let stop_fired_sig = Arc::clone(&stop_fired);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let entered_tx = Arc::new(StdMutex::new(Some(entered_tx)));
+        let release_rx = Arc::new(StdMutex::new(release_rx));
+
+        let (pipe_r, pipe_w) = nix::unistd::pipe().unwrap();
+        let pipe_r_slot = Arc::new(StdMutex::new(Some(pipe_r)));
+        let opener: VerifiedOpenFn = Arc::new(move |_| {
+            if let Some(tx) = entered_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let _ = release_rx.lock().unwrap().recv();
+            Ok(pipe_r_slot
+                .lock()
+                .unwrap()
+                .take()
+                .expect("opener called once"))
+        });
+
+        send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::RequestChannelReopen).unwrap();
+
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            Arc::clone(&ctx),
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            false,
+            None,
+            false,
+            async move {
+                let sig = stop_rx.await.unwrap_or("SIGTERM");
+                stop_fired_sig.store(true, Ordering::SeqCst);
+                sig
+            },
+            Duration::from_millis(10),
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+
+        tokio::task::spawn_blocking(move || {
+            let release_tx = release_tx;
+            entered_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reopen worker did not enter blocking opener");
+            let _ = stop_tx.send("SIGTERM");
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !stop_fired.load(Ordering::SeqCst) {
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            let _ = release_tx.send(());
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), exec_task)
+            .await
+            .expect("executor must exit cleanly once blocked opener returns")
+            .unwrap();
+        assert!(res.is_ok(), "expected Ok(()), got {res:?}");
+
+        // Parser MUST NOT receive any SCM_RIGHTS descriptor or OkChannelFd.
+        let received = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+            let mut responses = Vec::new();
+            let mut received_fds = 0usize;
+            while let Some(pkt) = recv_packet(parser_sock.as_fd(), MAX_PACKET_BYTES).unwrap() {
+                received_fds += pkt.fds.len();
+                if let Some(AssembledMessage::Response(resp)) = asm.push(pkt).unwrap() {
+                    responses.push(resp.response);
+                }
+            }
+            (responses, received_fds)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            received.1, 0,
+            "executor must NOT hand off any channel fd after stop in Thawed (responses={:?})",
+            received.0
+        );
+        assert!(
+            !received
+                .0
+                .iter()
+                .any(|r| matches!(r, IpcResponse::OkChannelFd)),
+            "OkChannelFd must never be delivered after stop in Thawed: {:?}",
+            received.0
+        );
+        // The executor must have closed `pipe_r` itself: writing to `pipe_w`
+        // must fail with EPIPE (broken pipe).
+        assert_eq!(
+            nix::unistd::write(&pipe_w, b"x").unwrap_err(),
+            Errno::EPIPE,
+            "discarded channel OwnedFd must be closed rather than leaked"
+        );
     }
 }

@@ -935,12 +935,12 @@ mod tests {
 
     #[test]
     fn trim_plan_entries_retain_typed_outcomes_and_match_qga_formatting() {
-        let table = "\
-1 0 8:1 / / rw - ext4 /dev/sda1 rw
-2 1 8:2 / /a rw - ext4 /dev/sdb1 rw
-3 1 8:3 / /b rw - ext4 /dev/sdc1 rw
-4 1 8:4 / /c rw - ext4 /dev/sdd1 rw
-";
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /a rw - ext4 /dev/sdb1 rw\n",
+            "3 1 8:3 / /b rw - ext4 /dev/sdc1 rw\n",
+            "4 1 8:4 / /c rw - ext4 /dev/sdd1 rw\n",
+        );
         let plan = FreezePlan::build(&crate::mountinfo::parse_mountinfo(table));
         let kernel = FakeKernel::new();
         kernel.script_trim("/", Ok(4096));

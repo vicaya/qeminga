@@ -826,12 +826,9 @@ where
                                     guard.clear_ready();
                                     break;
                                 }
-                                Err(Errno::EINTR) => {
-                                    // Yield back to `select!` without clearing readiness
-                                    // so a newly delivered stop signal latches immediately.
-                                    hit_turn_cap = true;
-                                    break;
-                                }
+                                // `kernel::ipc::recv_packet` retries `EINTR` internally;
+                                // bounded turn draining is enforced by `MAX_IPC_READS_PER_TURN`
+                                // + `yield_now().await` + `biased;` stop-signal priority.
                                 Err(err) => {
                                     tracing::error!(
                                         event = "parser_ipc_read_failed",
@@ -3932,33 +3929,55 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn executor_latches_stop_signal_promptly_under_sustained_duplex_ipc_flood() {
-        // Codex Security Review P1: a compromised parser sustaining duplex IPC
-        // (replenishing requests and draining replies without backpressuring
-        // outbox) MUST NOT starve the outer `select!` from observing a ready
-        // `SIGTERM` and latching `ExecutorState::stopping`.
+        // Codex Security Review P1 + Astra review: a compromised parser
+        // sustaining duplex IPC (replenishing requests and draining replies
+        // without backpressuring outbox) MUST NOT starve the outer `select!`
+        // from observing a ready `SIGTERM` and latching `ExecutorState::stopping`.
         //
-        // Deterministic proof: pre-queue 32 synchronous `ReportParseRejection`
-        // packets followed by `FsfreezeFreeze` while a reader thread drains
-        // replies, and use a `signal` future that returns `Pending` on poll 1
-        // (forcing entry into the `readable` arm) and `Ready("SIGTERM")` on
-        // poll 2. With an unbounded `recv_packet` drain, poll 1 reads all 33
-        // packets and admits `FsfreezeFreeze`; with `MAX_IPC_READS_PER_TURN` +
-        // `biased;` signal priority, poll 1 stops after the turn cap and poll 2
-        // latches `SIGTERM` BEFORE the trailing `FsfreezeFreeze` is ever read.
-        struct ReadyOnSecondPoll {
-            polled_once: bool,
+        // Deterministic single-state-machine proof: pre-queue 32 synchronous
+        // `ReportParseRejection` packets followed by `FsfreezeFreeze` on a
+        // non-blocking `parser_sock`. `ReadyAfterFirstReply` drains any replies
+        // on `parser_sock` non-blockingly and becomes ready ONLY once at least
+        // one reply from Turn 1 has been received (so `SIGTERM` can never fire
+        // before Turn 1 runs, and replies are drained before `exec_sock` closes
+        // with unread tail packets). Asserting `replies == MAX_IPC_READS_PER_TURN`
+        // and `fifreeze_calls == 0` proves both that Turn 1 processed a
+        // non-empty bounded batch and that `SIGTERM` latched at the exact turn
+        // budget BEFORE packet 33 (`FsfreezeFreeze`) was ever read.
+        struct ReadyAfterFirstReply {
+            parser_sock: OwnedFd,
+            asm: StreamAssembler,
+            replies: Arc<std::sync::atomic::AtomicUsize>,
+            saw_freeze_ok: Arc<AtomicBool>,
         }
-        impl Future for ReadyOnSecondPoll {
+        impl Future for ReadyAfterFirstReply {
             type Output = &'static str;
             fn poll(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Self::Output> {
-                if self.polled_once {
+                let this = self.get_mut();
+                loop {
+                    match recv_packet(this.parser_sock.as_fd(), MAX_PACKET_BYTES) {
+                        Ok(Some(pkt)) => {
+                            if let Some(AssembledMessage::Response(resp)) =
+                                this.asm.push(pkt).unwrap()
+                            {
+                                this.replies.fetch_add(1, Ordering::SeqCst);
+                                if resp.req_id == 33
+                                    && matches!(resp.response, IpcResponse::OkCount(_))
+                                {
+                                    this.saw_freeze_ok.store(true, Ordering::SeqCst);
+                                }
+                            }
+                        }
+                        Ok(None) | Err(Errno::EAGAIN) => break,
+                        Err(err) => panic!("unexpected parser_sock recv error: {err}"),
+                    }
+                }
+                if this.replies.load(Ordering::SeqCst) > 0 {
                     std::task::Poll::Ready("SIGTERM")
                 } else {
-                    self.polled_once = true;
-                    cx.waker().wake_by_ref();
                     std::task::Poll::Pending
                 }
             }
@@ -3983,7 +4002,6 @@ mod tests {
             ))),
         );
         let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
-        set_blocking(parser_sock.as_fd());
 
         // Pre-queue 32 synchronous ReportParseRejection packets + trailing FsfreezeFreeze.
         let rej = IpcRequest::ReportParseRejection(ParseRejection {
@@ -3997,19 +4015,8 @@ mod tests {
         }
         send_request(parser_sock.as_fd(), 1, 33, &IpcRequest::FsfreezeFreeze).unwrap();
 
-        // Drain replies continuously so the executor's outbox never hits backpressure.
-        let reader = std::thread::spawn(move || {
-            let mut asm = StreamAssembler::new(PeerRole::Parser);
-            let mut saw_freeze_ok = false;
-            let mut count = 0usize;
-            while let Ok(Some(resp)) = recv_response(parser_sock.as_fd(), &mut asm) {
-                count += 1;
-                if resp.req_id == 33 && matches!(resp.response, IpcResponse::OkCount(_)) {
-                    saw_freeze_ok = true;
-                }
-            }
-            (count, saw_freeze_ok)
-        });
+        let replies = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let saw_freeze_ok = Arc::new(AtomicBool::new(false));
 
         tokio::time::timeout(
             Duration::from_secs(3),
@@ -4021,7 +4028,12 @@ mod tests {
                 true,
                 None,
                 false,
-                ReadyOnSecondPoll { polled_once: false },
+                ReadyAfterFirstReply {
+                    parser_sock,
+                    asm: StreamAssembler::new(PeerRole::Parser),
+                    replies: Arc::clone(&replies),
+                    saw_freeze_ok: Arc::clone(&saw_freeze_ok),
+                },
                 Duration::from_millis(10),
                 Duration::ZERO,
                 Duration::ZERO,
@@ -4031,7 +4043,8 @@ mod tests {
         .expect("executor must latch SIGTERM within bounded IPC read turns")
         .unwrap();
 
-        let (replies, saw_freeze_ok) = reader.join().unwrap();
+        let replies = replies.load(Ordering::SeqCst);
+        let saw_freeze_ok = saw_freeze_ok.load(Ordering::SeqCst);
         let fifreeze_calls = kernel
             .calls()
             .into_iter()
@@ -4041,9 +4054,9 @@ mod tests {
             !saw_freeze_ok && fifreeze_calls == 0,
             "SIGTERM must latch before trailing FsfreezeFreeze is read/admitted (replies={replies}, fifreeze_calls={fifreeze_calls})"
         );
-        assert!(
-            replies <= MAX_IN_FLIGHT_OPS,
-            "executor must bound per-turn IPC reads before polling ready stop signal (saw {replies} replies)"
+        assert_eq!(
+            replies, MAX_IPC_READS_PER_TURN,
+            "executor must process exactly one bounded turn ({MAX_IPC_READS_PER_TURN} packets) before latching ready stop signal (saw {replies} replies)"
         );
     }
 }

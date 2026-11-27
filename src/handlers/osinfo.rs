@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::dispatch::Context;
 use crate::handlers::NoArgs;
@@ -241,17 +241,25 @@ pub fn os_info(source: &dyn OsInfoSource) -> Result<OsInfo, Error> {
     })
 }
 
+/// Defensive bound on the serialized QGA `guest-get-osinfo` reply (512 KiB;
+/// OQ-10 §4.1, #77): covers any valid `<= 64 KiB` `os-release` file plus
+/// `uname` fields while rejecting extreme JSON character escaping with a
+/// non-fatal `GenericError` rather than emitting an unbounded line.
+pub const MAX_OSINFO_REPLY_BYTES: usize = 512 * 1024;
+
 /// `guest-get-osinfo` handler.
 pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     let NoArgs {} = arguments(req)?;
     let source: Arc<dyn OsInfoSource> = Arc::clone(&ctx.osinfo);
-    Ok(json!(os_info(source.as_ref())?))
+    let info = os_info(source.as_ref())?;
+    crate::handlers::bounded_reply("osinfo", &info, MAX_OSINFO_REPLY_BYTES)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use serde_json::json;
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(
@@ -487,5 +495,40 @@ mod tests {
             let _ = parse_os_release(&text);
             let _ = os_info(&Fake::new(Some(&text), None)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn osinfo_rejects_reply_over_defensive_wire_bound_without_truncating() {
+        use crate::audit::Router;
+        use crate::config::Config;
+        use crate::proto::parse_request;
+        use crate::state::FreezeStateMachine;
+
+        struct HugeEscapedOsInfo;
+        impl OsInfoSource for HugeEscapedOsInfo {
+            fn uname(&self) -> Result<Uname, Error> {
+                Ok(Uname {
+                    release: "\x01".repeat(40_000),
+                    version: "\x01".repeat(40_000),
+                    machine: "\x01".repeat(20_000),
+                })
+            }
+            fn os_release(&self) -> Option<String> {
+                Some(format!("PRETTY_NAME={}\n", "\x01".repeat(10_000)))
+            }
+        }
+        let ctx = Context::new(
+            Arc::new(Config::default()),
+            Arc::new(FreezeStateMachine::new()),
+            Router::new(Box::new(std::io::sink())),
+            crate::marker::Marker::for_tests(),
+        )
+        .with_osinfo(Arc::new(HugeEscapedOsInfo));
+        let req = parse_request(br#"{"execute":"guest-get-osinfo"}"#).unwrap();
+        let err = handle(&ctx, &req).await.unwrap_err().to_string();
+        assert!(
+            err.contains("over the 524288 byte bound") && err.contains("not truncated"),
+            "expected explicit 512 KiB wire bound error, got: {err}"
+        );
     }
 }

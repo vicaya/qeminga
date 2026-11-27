@@ -9704,4 +9704,113 @@ mod tests {
         assert_eq!(ctx3.state.current(), FreezeState::Frozen);
         assert!(ctx3.marker.exists());
     }
+
+    #[tokio::test]
+    async fn cooperative_tracked_thaw_and_empty_claim_discovery_respect_mountinfo_boundaries() {
+        use crate::ownership::InMemoryOwnershipStore;
+
+        let table = concat!(
+            "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n",
+            "2 1 8:2 / /data rw - ext4 /dev/sdb1 rw\n",
+        );
+        let freeze_req = parse_request(br#"{"execute":"guest-fsfreeze-freeze"}"#).unwrap();
+        let thaw_req = parse_request(br#"{"execute":"guest-fsfreeze-thaw"}"#).unwrap();
+
+        // 1. Tracked cooperative thaw (`ThawScope::Tracked`, `discover == false`)
+        //    must drain held descriptors via per-target `inspect()` + `release()`
+        //    without calling `inspect_all()` or reading `/proc/self/mountinfo`.
+        let dir1 = tempfile::tempdir().unwrap();
+        let store1 = Arc::new(InMemoryOwnershipStore::new());
+        let mounts1 = Arc::new(SwitchableMounts::new(table));
+        let kernel1 = Arc::new(FakeKernel::new());
+        kernel1.track_freeze_depth();
+        let mut cfg1 = Config::default();
+        cfg1.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx1 = Arc::new(
+            Context::new(
+                Arc::new(cfg1),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Thawed)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir1.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel1.clone())
+            .with_mounts(mounts1.clone())
+            .with_hooks(Arc::new(NoHooks))
+            .with_ownership(store1.clone()),
+        );
+        assert_eq!(freeze(&ctx1, &freeze_req).await.unwrap(), json!(1));
+        assert_eq!(ctx1.thaw_scope(), ThawScope::Tracked);
+        mounts1.fail_reads(true);
+        store1.script_inspect_error(Some(Errno::EIO));
+        assert_eq!(thaw(&ctx1, &thaw_req).await.unwrap(), json!(1));
+        assert_eq!(ctx1.state.current(), FreezeState::Thawed);
+        assert!(!ctx1.marker.exists());
+        assert_eq!(store1.owner_of((8, 2)), None);
+        assert_eq!(kernel1.tracked_frozen_superblocks(), 0);
+
+        // 2. Restricted cooperative discovery with empty `owned_by_self` and
+        //    empty `retained` must NOT read `/proc/self/mountinfo`: it removes
+        //    the stale marker and settles `Thawed` with count 0 even when
+        //    mountinfo reads fail.
+        let dir2 = tempfile::tempdir().unwrap();
+        let store2 = Arc::new(InMemoryOwnershipStore::new());
+        let mounts2 = Arc::new(SwitchableMounts::new(table));
+        mounts2.fail_reads(true);
+        let kernel2 = Arc::new(FakeKernel::new());
+        let mut cfg2 = Config::default();
+        cfg2.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx2 = Arc::new(
+            Context::new(
+                Arc::new(cfg2),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir2.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel2)
+            .with_mounts(mounts2)
+            .with_hooks(Arc::new(NoHooks))
+            .with_ownership(store2),
+        );
+        ctx2.marker.create().unwrap();
+        assert_eq!(thaw(&ctx2, &thaw_req).await.unwrap(), json!(0));
+        assert_eq!(ctx2.state.current(), FreezeState::Thawed);
+        assert!(!ctx2.marker.exists());
+
+        // 3. Restricted cooperative discovery with empty `owned_by_self` and a
+        //    non-empty allowlisted `retained` handle DOES read mountinfo so the
+        //    allowlisted target's lost-ownership error reports `OwnershipAmbiguous`
+        //    rather than collapsing to `RecoveryIncomplete`.
+        let dir3 = tempfile::tempdir().unwrap();
+        let store3 = Arc::new(InMemoryOwnershipStore::new());
+        let kernel3 = Arc::new(FakeKernel::new());
+        kernel3.track_freeze_depth();
+        let md3 = kernel3.open_mount(Path::new("/data"), (8, 2)).unwrap();
+        kernel3.fifreeze(&md3).unwrap();
+        let mut cfg3 = Config::default();
+        cfg3.agent.freeze_allowed_mountpoints = Some(vec!["/data".into()]);
+        let ctx3 = Arc::new(
+            Context::new(
+                Arc::new(cfg3),
+                Arc::new(FreezeStateMachine::starting_in(FreezeState::Frozen)),
+                Router::new(Box::new(std::io::sink())),
+                Marker::open(dir3.path().join("frozen")).unwrap(),
+            )
+            .with_kernel(kernel3.clone())
+            .with_mounts(Arc::new(StaticMounts(table.to_owned())))
+            .with_hooks(Arc::new(NoHooks))
+            .with_ownership(store3),
+        );
+        ctx3.marker.create().unwrap();
+        ctx3.hold_frozen_mounts(vec![HeldMount {
+            mount: md3,
+            countable: true,
+        }]);
+        let err3 = thaw(&ctx3, &thaw_req).await.unwrap_err().to_string();
+        assert_eq!(
+            err3,
+            "thaw incomplete: freeze ownership is ambiguous; cannot confirm complete recovery (0 target(s) thawed); state frozen, marker retained"
+        );
+        assert_eq!(ctx3.state.current(), FreezeState::Frozen);
+        assert_eq!(kernel3.tracked_frozen_superblocks(), 1);
+    }
 }

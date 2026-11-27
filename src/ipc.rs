@@ -262,8 +262,21 @@ impl RequestOpcode {
         }
     }
 
+    /// Whether this request opcode carries an optional host-supplied QGA `id`
+    /// (`Option<i64>`) prefix in its assembled payload (true for all 14 QGA
+    /// commands; `ReportParseRejection` already carries `id` in its body and
+    /// `RequestChannelReopen` has no host request).
+    pub const fn carries_host_id(self) -> bool {
+        !matches!(
+            self,
+            Self::ReportParseRejection | Self::RequestChannelReopen
+        )
+    }
+
     /// Maximum assembled payload bytes permitted for this request opcode.
     pub const fn max_payload_bytes(self) -> usize {
+        // 1-byte presence tag + optional 8-byte little-endian `i64` host id.
+        const MAX_HOST_ID_BYTES: usize = 9;
         match self {
             Self::Ping
             | Self::Info
@@ -273,10 +286,10 @@ impl RequestOpcode {
             | Self::GetOsInfo
             | Self::NetworkGetInterfaces
             | Self::GetFsInfo
-            | Self::SuspendRam
-            | Self::RequestChannelReopen => 0,
-            Self::Shutdown => 1,
-            Self::Sync | Self::SyncDelimited | Self::Fstrim => 8,
+            | Self::SuspendRam => MAX_HOST_ID_BYTES,
+            Self::Shutdown => MAX_HOST_ID_BYTES + 1,
+            Self::Sync | Self::SyncDelimited | Self::Fstrim => MAX_HOST_ID_BYTES + 8,
+            Self::RequestChannelReopen => 0,
             Self::ReportParseRejection => MAX_PARSE_REJECTION_PAYLOAD_BYTES,
             Self::FsfreezeFreezeList => MAX_REQUEST_PAYLOAD_BYTES,
         }
@@ -1475,6 +1488,9 @@ pub struct ReceivedRequest {
     pub session_gen: u64,
     /// Request identifier within `session_gen`.
     pub req_id: u64,
+    /// Optional host-supplied QGA `id` carried for executor audit correlation
+    /// (design §9).
+    pub host_id: Option<i64>,
     /// Decoded typed request.
     pub request: IpcRequest,
 }
@@ -1991,9 +2007,26 @@ fn write_freeze_stop_reason(out: &mut Vec<u8>, reason: FreezeStopReason) {
 // Payload encoding
 // ---------------------------------------------------------------------------
 
-fn encode_request_payload(req: &IpcRequest) -> Result<Vec<u8>, EncodeError> {
-    let limit = req.opcode().max_payload_bytes();
+fn encode_request_payload_with_id(
+    host_id: Option<i64>,
+    req: &IpcRequest,
+) -> Result<Vec<u8>, EncodeError> {
+    let opcode = req.opcode();
+    let limit = opcode.max_payload_bytes();
     let mut out = Vec::new();
+    if opcode.carries_host_id() {
+        match host_id {
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+            None => out.push(0),
+        }
+    } else if matches!(req, IpcRequest::RequestChannelReopen) && host_id.is_some() {
+        return Err(EncodeError::ValueOutOfRange(
+            "host_id not allowed on RequestChannelReopen",
+        ));
+    }
     match req {
         IpcRequest::Ping
         | IpcRequest::Info
@@ -2381,8 +2414,17 @@ fn encode_error_code(out: &mut Vec<u8>, code: IpcErrorCode) {
 fn decode_request_payload(
     opcode: RequestOpcode,
     payload: &[u8],
-) -> Result<IpcRequest, ProtocolViolation> {
+) -> Result<(Option<i64>, IpcRequest), ProtocolViolation> {
     let mut r = Reader::new(payload);
+    let mut host_id = if opcode.carries_host_id() {
+        if r.read_bool()? {
+            Some(r.read_i64()?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let req = match opcode {
         RequestOpcode::Ping => IpcRequest::Ping,
         RequestOpcode::Info => IpcRequest::Info,
@@ -2457,6 +2499,7 @@ fn decode_request_payload(
                     ));
                 }
             };
+            host_id = id;
             IpcRequest::ReportParseRejection(ParseRejection {
                 kind,
                 frame_len,
@@ -2467,7 +2510,7 @@ fn decode_request_payload(
         RequestOpcode::RequestChannelReopen => IpcRequest::RequestChannelReopen,
     };
     r.finish()?;
-    Ok(req)
+    Ok((host_id, req))
 }
 
 fn decode_response_payload(
@@ -2823,13 +2866,26 @@ fn split_into_chunks(
 }
 
 /// Encodes `req` into one or more bounded `<= 32 KiB` chunk packets tagged
-/// with `(session_gen, req_id)`.
+/// with `(session_gen, req_id)` and an optional host QGA `host_id` (`None`).
 pub fn encode_request_chunks(
     session_gen: u64,
     req_id: u64,
     req: &IpcRequest,
 ) -> Result<Vec<Vec<u8>>, EncodeError> {
-    let payload = encode_request_payload(req)?;
+    encode_request_chunks_with_id(session_gen, req_id, None, req)
+}
+
+/// Encodes `req` together with the optional host-supplied QGA `host_id` into
+/// one or more bounded `<= 32 KiB` chunk packets tagged with `(session_gen,
+/// req_id)` so the executor preserves protocol request IDs in authoritative
+/// audit records (design §9).
+pub fn encode_request_chunks_with_id(
+    session_gen: u64,
+    req_id: u64,
+    host_id: Option<i64>,
+    req: &IpcRequest,
+) -> Result<Vec<Vec<u8>>, EncodeError> {
+    let payload = encode_request_payload_with_id(host_id, req)?;
     split_into_chunks(session_gen, req_id, req.opcode() as u8, &payload)
 }
 
@@ -3084,10 +3140,11 @@ impl StreamAssembler {
             PeerRole::Executor => {
                 let op = RequestOpcode::from_u8(header.tag)
                     .ok_or(ProtocolViolation::UnknownTag(header.tag))?;
-                let request = decode_request_payload(op, &assembled)?;
+                let (host_id, request) = decode_request_payload(op, &assembled)?;
                 Ok(Some(AssembledMessage::Request(ReceivedRequest {
                     session_gen: header.session_gen,
                     req_id: header.req_id,
+                    host_id,
                     request,
                 })))
             }
@@ -3135,6 +3192,7 @@ struct PendingPacket {
 #[derive(Debug, Default)]
 pub struct IpcOutbox {
     queue: VecDeque<PendingPacket>,
+    pending_bytes: usize,
 }
 
 impl IpcOutbox {
@@ -3153,16 +3211,37 @@ impl IpcOutbox {
         self.queue.len()
     }
 
+    /// Total serialized bytes across all queued `SOCK_SEQPACKET` packets not
+    /// yet accepted by the kernel (used to enforce §5.10 outbound IPC memory
+    /// bounds).
+    pub fn pending_bytes(&self) -> usize {
+        self.pending_bytes
+    }
+
     /// Encodes and queues a complete typed request (`<= 64 KiB`, `1..=2` chunks,
-    /// zero attached descriptors).
+    /// zero attached descriptors, no host `id`).
     pub fn push_request(
         &mut self,
         session_gen: u64,
         req_id: u64,
         req: &IpcRequest,
     ) -> Result<(), EncodeError> {
-        let chunks = encode_request_chunks(session_gen, req_id, req)?;
+        self.push_request_with_id(session_gen, req_id, None, req)
+    }
+
+    /// Encodes and queues a complete typed request together with its optional
+    /// host-supplied QGA `host_id` (`<= 64 KiB`, `1..=2` chunks, zero attached
+    /// descriptors).
+    pub fn push_request_with_id(
+        &mut self,
+        session_gen: u64,
+        req_id: u64,
+        host_id: Option<i64>,
+        req: &IpcRequest,
+    ) -> Result<(), EncodeError> {
+        let chunks = encode_request_chunks_with_id(session_gen, req_id, host_id, req)?;
         for bytes in chunks {
+            self.pending_bytes = self.pending_bytes.saturating_add(bytes.len());
             self.queue.push_back(PendingPacket { bytes, fd: None });
         }
         Ok(())
@@ -3186,6 +3265,7 @@ impl IpcOutbox {
         let chunks = encode_response_chunks(session_gen, req_id, resp)?;
         for (idx, bytes) in chunks.into_iter().enumerate() {
             let fd = if idx == 0 { channel_fd.take() } else { None };
+            self.pending_bytes = self.pending_bytes.saturating_add(bytes.len());
             self.queue.push_back(PendingPacket { bytes, fd });
         }
         Ok(())
@@ -3197,7 +3277,9 @@ impl IpcOutbox {
         while let Some(front) = self.queue.front() {
             match send_packet(sock, &front.bytes, front.fd.as_ref().map(AsFd::as_fd)) {
                 Ok(()) => {
-                    let _ = self.queue.pop_front();
+                    if let Some(popped) = self.queue.pop_front() {
+                        self.pending_bytes = self.pending_bytes.saturating_sub(popped.bytes.len());
+                    }
                 }
                 Err(Errno::EAGAIN) => return Ok(FlushOutcome::WouldBlock),
                 Err(err) => return Err(err),
@@ -3208,7 +3290,8 @@ impl IpcOutbox {
 }
 
 /// Sends a complete typed request over a **blocking** `SOCK_SEQPACKET` socket
-/// as one or more `<= 32 KiB` chunks (never attaches file descriptors).
+/// as one or more `<= 32 KiB` chunks (never attaches file descriptors, no host
+/// `id`).
 ///
 /// Non-blocking callers must use [`IpcOutbox`] so `EAGAIN` mid-stream preserves
 /// the chunk cursor instead of restarting at `chunk_seq == 0`.
@@ -3218,7 +3301,19 @@ pub fn send_request(
     req_id: u64,
     req: &IpcRequest,
 ) -> Result<(), TransportError> {
-    let chunks = encode_request_chunks(session_gen, req_id, req)?;
+    send_request_with_id(sock, session_gen, req_id, None, req)
+}
+
+/// Sends a complete typed request together with its optional host-supplied QGA
+/// `host_id` over a **blocking** `SOCK_SEQPACKET` socket.
+pub fn send_request_with_id(
+    sock: BorrowedFd<'_>,
+    session_gen: u64,
+    req_id: u64,
+    host_id: Option<i64>,
+    req: &IpcRequest,
+) -> Result<(), TransportError> {
+    let chunks = encode_request_chunks_with_id(session_gen, req_id, host_id, req)?;
     for chunk in chunks {
         send_packet(sock, &chunk, None)?;
     }
@@ -3563,10 +3658,49 @@ mod tests {
             &IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(vec!["/data".into()])),
         )
         .unwrap();
-        assert_eq!(&omitted[0][HEADER_BYTES..], &[0]);
-        assert_eq!(&empty[0][HEADER_BYTES..], &[1, 0, 0]);
+        assert_eq!(&omitted[0][HEADER_BYTES..], &[0, 0]);
+        assert_eq!(&empty[0][HEADER_BYTES..], &[0, 1, 0, 0]);
         assert_ne!(omitted, empty);
         assert_ne!(empty, populated);
+
+        // Verify optional host_id (positive, negative, zero, omitted) round-trips
+        // cleanly across command opcodes and is rejected on RequestChannelReopen.
+        for (req_id, host_id) in [
+            (1001, Some(42)),
+            (1002, Some(-7)),
+            (1003, Some(0)),
+            (1004, None),
+        ] {
+            send_request_with_id(parser_sock.as_fd(), 12, req_id, host_id, &IpcRequest::Ping)
+                .unwrap();
+            let got = recv_request(exec_sock.as_fd(), &mut exec_asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(got.host_id, host_id);
+            assert_eq!(got.request, IpcRequest::Ping);
+        }
+        assert!(matches!(
+            encode_request_chunks_with_id(1, 1, Some(9), &IpcRequest::RequestChannelReopen),
+            Err(EncodeError::ValueOutOfRange(_))
+        ));
+
+        // Verify IpcOutbox::pending_bytes tracks queued bytes accurately to zero on drain.
+        let mut outbox = IpcOutbox::new();
+        assert_eq!(outbox.pending_bytes(), 0);
+        outbox
+            .push_request_with_id(1, 1, Some(77), &IpcRequest::Ping)
+            .unwrap();
+        assert_eq!(outbox.pending_bytes(), HEADER_BYTES + 9);
+        assert_eq!(
+            outbox.flush(parser_sock.as_fd()).unwrap(),
+            FlushOutcome::Drained
+        );
+        assert_eq!(outbox.pending_bytes(), 0);
+        let got = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.host_id, Some(77));
+        assert_eq!(got.request, IpcRequest::Ping);
     }
 
     #[test]
@@ -3895,8 +4029,8 @@ mod tests {
         assert_eq!(
             exec_asm.push(raw_pkt(bad_len)).unwrap_err(),
             ProtocolViolation::PayloadLengthMismatch {
-                header_len: 0,
-                actual_len: 1,
+                header_len: 1,
+                actual_len: 2,
             }
         );
 
@@ -4749,10 +4883,11 @@ mod tests {
         fn freeze_list_round_trip_property(
             session_gen in any::<u64>(),
             req_id in any::<u64>(),
+            host_id in prop::option::of(any::<i64>()),
             entries in prop::collection::vec("[^\0]{0,64}", 0..40)
         ) {
             let req = IpcRequest::FsfreezeFreezeList(FreezeListSelection::Present(entries));
-            let chunks = encode_request_chunks(session_gen, req_id, &req).unwrap();
+            let chunks = encode_request_chunks_with_id(session_gen, req_id, host_id, &req).unwrap();
             let mut asm = StreamAssembler::new(PeerRole::Executor);
             let mut decoded = None;
             for chunk in chunks {
@@ -4764,6 +4899,7 @@ mod tests {
                 Some(AssembledMessage::Request(got)) => {
                     prop_assert_eq!(got.session_gen, session_gen);
                     prop_assert_eq!(got.req_id, req_id);
+                    prop_assert_eq!(got.host_id, host_id);
                     prop_assert_eq!(got.request, req);
                 }
                 other => prop_assert!(false, "expected Request, got {other:?}"),

@@ -5,8 +5,8 @@ Files shipped with the daemon (design §8.2–§8.4, §5.7, §8.5, C-20):
 | File | Installs to | Purpose |
 |---|---|---|
 | `systemd/qeminga.service` | `/usr/lib/systemd/system/` | The unit: conflicts with `qemu-guest-agent.service`, deliberately does not bind to the virtio port device (a crash while frozen is recovered whether or not the port is there; the daemon retries the open), hands `/run/qeminga` to the service account before every start (privileged `ExecStartPre` lines; not `RuntimeDirectory=`, see below), `TimeoutStopSec=330s` for the default 300 s freeze cap. |
-| `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` account, mode 0600 (§8.3). |
-| `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates user and group `qeminga`, uid/gid 600, no login shell. |
+| `udev/99-qeminga.rules` | `/etc/udev/rules.d/` or `/usr/lib/udev/rules.d/` | Hands the single-open port `org.qemu.guest_agent.0` to the `qeminga` executor account, mode 0600 (§8.3); the executor verifies the opened descriptor (`virtio-ports` subsystem + port name) and hands it to `qeminga-parser` over `SCM_RIGHTS`. |
+| `sysusers.d/qeminga.conf` | `/usr/lib/sysusers.d/` | Creates both service accounts without login shells: `qeminga` (uid/gid `600:600`, privileged policy/kernel executor) and `qeminga-parser` (uid/gid `601:601`, unprivileged zero-capability host-facing parser). |
 | `config-data-protection.toml` | `/etc/qeminga/config.toml` (**CVM installation default**) | The data-protection profile (§5.9): freeze, thaw, status and the controls only; explicitly sets `shutdown = false`, `information = false`, and `fstrim = false` so `CAP_SYS_BOOT`, `reboot(2)`, `uname`, `statfs`, netlink and `FITRIM` are given up. |
 | `config.toml` | `/etc/qeminga/config.toml` (general-VM / TOML schema default) | General-VM / libvirt lifecycle defaults (§8.2): enables `guest-shutdown`, `guest-fstrim`, and the information commands (`guest-get-osinfo`, `guest-network-get-interfaces`, `guest-get-fsinfo`); every key is optional and omitted `[features]` switches default to `true`. |
 | `tmpfiles.d/qeminga.conf` | `/usr/lib/tmpfiles.d/` | Creates `/run/qeminga` (0700, owned by `qeminga`) at boot for the recovery marker (C-20). Always install it and run `systemd-tmpfiles --create`. |
@@ -37,7 +37,7 @@ package-level conflict too. To migrate by hand:
 sudo systemctl disable --now qemu-guest-agent.service
 sudo install -m 0755 target/release/qeminga /usr/bin/qeminga
 sudo install -m 0644 packaging/sysusers.d/qeminga.conf /usr/lib/sysusers.d/
-sudo systemd-sysusers                      # creates qeminga (600:600)
+sudo systemd-sysusers                      # creates qeminga (600:600) and qeminga-parser (601:601)
 sudo install -m 0644 packaging/udev/99-qeminga.rules /etc/udev/rules.d/
 sudo udevadm control --reload && sudo udevadm trigger --subsystem-match=virtio-ports
 sudo install -m 0644 packaging/tmpfiles.d/qeminga.conf /usr/lib/tmpfiles.d/
@@ -54,7 +54,11 @@ CVM installation default: snapshot coordination only). For a general-VM
 deployment that needs `guest-shutdown`, `guest-fstrim`, or the
 information commands (for example `virsh domifaddr`, `virsh domfsinfo`,
 or `virsh shutdown --mode agent`), install `packaging/config.toml` as
-`/etc/qeminga/config.toml` instead.
+`/etc/qeminga/config.toml` instead. If `channel_path` points to a device
+node or symlink whose basename differs from the virtio-serial port name
+(for example `/dev/vport0p1`), set
+`channel_port_name = "org.qemu.guest_agent.0"` under `[agent]` so
+descriptor verification matches the port's sysfs `name` attribute.
 
 Verify with `systemctl status qeminga` and, from the host,
 `virsh qemu-agent-command <domain> '{"execute":"guest-ping"}'`.
@@ -107,13 +111,13 @@ even while `CAP_SYS_ADMIN` is held.
 
 - **During privileged startup (before privilege drop and seccomp):**
   - `ExecStartPre=+` runs as root without the unit's read-only sandboxing solely to ensure `/run/qeminga` exists (`mkdir -p`), is owned by `qeminga:qeminga` (`chown`), and is mode `0700` (`chmod`) — preserving any pre-existing recovery marker across restarts — before `ExecStart` enters its confined mount namespace. The leading `-` on `ReadWritePaths=-/run/qeminga` is required because systemd still evaluates `ReadWritePaths=` for `ExecStartPre=+`; without `-`, a missing `/run/qeminga` fails `ExecStartPre=+` with `226/NAMESPACE` before `mkdir -p` runs.
-  - `ExecStart=/usr/bin/qeminga` starts inside the confined mount namespace (`ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`, `SystemCallFilter=~@mount`) as UID `0` with `CapabilityBoundingSet` (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`) to read `/etc/qeminga/config.toml`, pin `/run/qeminga`, open the channel device (`O_RDWR`), drop to UID/GID `600`, drop excess capabilities, set `NoNewPrivs`, and install the seccomp filter — before reading any host input.
+  - `ExecStart=/usr/bin/qeminga` starts inside the confined mount namespace (`ProtectSystem=strict`, `ProtectHome=read-only`, `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`, `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`, `SystemCallFilter=~@mount`) as UID `0` with `CapabilityBoundingSet` (`CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, `CAP_DAC_READ_SEARCH`, `CAP_DAC_OVERRIDE`, `CAP_SETUID`, `CAP_SETGID`, `CAP_SETPCAP`) to read `/etc/qeminga/config.toml`, pin `/run/qeminga`, open and verify the channel device (`O_RDWR`, `fstat(S_ISCHR)` + sysfs `virtio-ports` + `name`), spawn the isolated `qeminga-parser` child (`601:601`, zero capabilities, `/dev/null` on fds `0`/`1`/`2`, `parser_profile` seccomp) over `IPC_FD = 3`, close the executor's copy of the channel fd, drop the executor to UID/GID `600`, drop excess capabilities, set `NoNewPrivs`, and install `executor_profile` seccomp — before reading any host input.
 - **After privilege drop (serving host input):**
-  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`): the default ordinary-file directory writable to the service for mounts present at service start (by default, the only such directory when `[agent] freeze_ownership_dir` is unset), holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
-  - Shared cooperative freeze-ownership claim directory (`[agent] freeze_ownership_dir`) **only** when the guest operator opts into cooperative multi-freezer mode and grants write access through a guest systemd drop-in; see [Single-freezer assumption (default) and cooperative multi-freezer mode](#cooperative-freeze-ownership) below for the directory ownership, permission, and drop-in requirements.
-  - `/dev/virtio-ports/org.qemu.guest_agent.0` (`0600 qeminga:qeminga`, symlink to `/dev/vport*`): the read-write virtio-serial character device opened at startup and reopened after disconnect/hot-unplug.
-  - Inherited `stderr` journald stream (`StandardError=journal`): structured audit records.
-  - `/sys/power/state` **only** when the guest operator opts into `suspend_ram` (both guest-installed `tmpfiles.d/qeminga-suspend.conf` and a guest `ReadWritePaths=/sys/power/state` drop-in).
+  - `/run/qeminga` (`0700 qeminga:qeminga`, explicit `ReadWritePaths=-/run/qeminga`, executor only): the default ordinary-file directory writable to the executor for mounts present at service start (by default, the only such directory when `[agent] freeze_ownership_dir` is unset), holding `/run/qeminga/frozen` (mode `0600`, reinforced by `UMask=0077`).
+  - Shared cooperative freeze-ownership claim directory (`[agent] freeze_ownership_dir`, executor only) **only** when the guest operator opts into cooperative multi-freezer mode and grants write access through a guest systemd drop-in; see [Single-freezer assumption (default) and cooperative multi-freezer mode](#cooperative-freeze-ownership) below for the directory ownership, permission, and drop-in requirements.
+  - `/dev/virtio-ports/org.qemu.guest_agent.0` (`0600 qeminga:qeminga`, symlink to `/dev/vport*`): opened and verified by the `qeminga` executor at startup and on `RequestChannelReopen`, transferred via `SCM_RIGHTS` over `IPC_FD` to `qeminga-parser` (`601:601`), and immediately closed in the executor so only the zero-capability parser performs channel I/O.
+  - Inherited `stderr` journald stream (`StandardError=journal`, executor only): authoritative structured audit records (`qeminga-parser` receives `/dev/null` on fds `0`/`1`/`2`).
+  - `/sys/power/state` (executor only) **only** when the guest operator opts into `suspend_ram` (both guest-installed `tmpfiles.d/qeminga-suspend.conf` and a guest `ReadWritePaths=/sys/power/state` drop-in).
 - **Residual writable locations:**
   - World-writable character devices under `/dev` (`/dev/null`, `/dev/zero`, `/dev/full`, `/dev/tty`, `/dev/ptmx`), because `PrivateDevices=yes` cannot be enabled without hiding `/dev/virtio-ports/org.qemu.guest_agent.0` (and PTY slaves used in installed-unit tests). Ordinary files on `/dev` itself and on every filesystem already mounted beneath `/dev` (such as `/dev/shm`, `/dev/mqueue`, and `/dev/hugepages`) are recursively locked read-only (`MNT_READONLY`) by `BindReadOnlyPaths=/sys /dev`, which blocks ordinary-file writes and unlinks (`EROFS`) while allowing `O_RDWR` open and I/O on existing character devices (including virtio-serial reopen after disconnect/hotplug).
   - Per-process procfs attribute files under `/proc/self/` (such as `/proc/self/comm` and `/proc/self/oom_score_adj`), which are kernel process interfaces rather than ordinary files.
@@ -195,22 +199,28 @@ post-compromise authority (design §5.9):
   Accepts only `guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, and
   `guest-info`; explicitly disables `guest-shutdown`, `guest-get-osinfo`,
   `guest-network-get-interfaces`, `guest-get-fsinfo`, `guest-fstrim`, and
-  `guest-suspend-ram`. After dropping to `qeminga` (UID/GID 600),
-  `CapEff`, `CapPrm`, and `CapBnd` retain **only** `CAP_SYS_ADMIN` and
-  `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty (`CAP_SYS_BOOT`
-  absent from all five sets). The seccomp filter omits `reboot`, `sync`,
-  `uname`, `statfs`, `fstatfs`, the netlink syscalls, `socket`, the
-  inventory `sendto` rule, and `FITRIM` (see *Sockets and IPC* below for
-  the narrowed runtime signal rules).
+  `guest-suspend-ram`. After dropping privileges, the executor (`qeminga`,
+  UID/GID `600`) retains **only** `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`
+  in `CapEff`, `CapPrm`, and `CapBnd`, with `CapInh` and `CapAmb` empty
+  (`CAP_SYS_BOOT` absent from all five sets), while the separate host-facing
+  parser (`qeminga-parser`, UID/GID `601`) runs with all five capability sets
+  empty and zero filesystem syscalls. The executor seccomp filter omits
+  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `socket`, `bind`,
+  `getsockname`, `setsockopt`, the inventory `sendto` rule, and `FITRIM`,
+  while restricting `sendmsg`/`recvmsg` to `IPC_FD` (`3`) and keeping
+  `readlinkat` (sysfs channel verification) and `wait4` (parser reaping)
+  (see *Sockets and IPC* below for the narrowed runtime signal rules).
 - **General-VM / lifecycle profile (`config.toml`, TOML schema default):**
   Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`,
-  `guest-network-get-interfaces`, and `guest-get-fsinfo`. `CapEff`,
-  `CapPrm`, and `CapBnd` retain `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and
-  `CAP_DAC_READ_SEARCH`, with `CapInh` and `CapAmb` empty; seccomp keeps
-  `reboot`, `sync`, `uname`, `statfs`, `fstatfs`, `FITRIM`, `socket`
-  restricted to `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`,
-  the inventory `sendto` rule (`flags == 0`, `addrlen == 12`), and the
-  netlink syscalls.
+  `guest-network-get-interfaces`, and `guest-get-fsinfo`. The executor
+  (`qeminga`, UID/GID `600`) retains `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and
+  `CAP_DAC_READ_SEARCH` in `CapEff`, `CapPrm`, and `CapBnd`, with `CapInh`
+  and `CapAmb` empty; its seccomp filter keeps `reboot`, `sync`, `uname`,
+  `statfs`, `fstatfs`, `FITRIM`, `socket` restricted to
+  `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`, the inventory
+  `sendto` rule (`flags == 0`, `addrlen == 12`), and the netlink syscalls.
+  The separate parser (`qeminga-parser`, UID/GID `601`) runs under the
+  identical zero-capability, zero-filesystem sandbox as the CVM profile.
 - **Custom CVM configs must disable features explicitly:** The CVM
   installation default comes from installing `config-data-protection.toml`.
   An empty or partial `config.toml` is valid even under
@@ -228,19 +238,31 @@ freeze/thaw error replies emit only `GenericError`, a fixed reason,
 recovery state, and counts (never guest mount names, alternate paths,
 device numbers, or marker paths).
 
-- **Authority of a compromised parser process (both profiles):**
-  - *Broad file reads + host channel:* Retaining `CAP_DAC_READ_SEARCH`
-    and `openat`/`read`/`getdents64` in the same process that writes to
-    the virtio host channel means seccomp is **not** a confidentiality
-    boundary for guest-readable or root-owned file contents after a
-    parser-process compromise (design §5.9, OQ-10).
-  - *Ordinary file writes:* Seccomp keeps `openat`, `write`, `writev`,
-    `pwrite64`, `fsync`, and `unlinkat` (for the channel, stderr, marker,
-    and optional `/sys/power/state`). Ordinary writes are limited by
-    guest Unix permissions (UID/GID 600, with `CAP_DAC_OVERRIDE` dropped)
-    and the shipped unit's read-only mount namespace (see *Filesystem
-    write confinement* above: `ProtectSystem=strict`,
-    `ProtectHome=read-only`, `PrivateTmp=no`,
+- **Two-process parser/executor authority and residual authority (both profiles):**
+  - *Separated host channel and guest-file reads:* In production startup,
+    the host-facing parser (`qeminga-parser`, UID/GID `601`, zero
+    capabilities, `/dev/null` on fds `0`/`1`/`2`, zero filesystem/ioctl/socket
+    syscalls under `parser_profile`) owns the verified virtio-serial host
+    channel and speaks only closed typed binary opcodes over `IPC_FD` (`3`).
+    The privileged executor (`qeminga`, UID/GID `600`) retains
+    `CAP_DAC_READ_SEARCH` and `openat`/`read`/`getdents64`, verifies the
+    channel descriptor (`fstat(S_ISCHR)` + sysfs `subsystem == "virtio-ports"`
+    + exact `name`, using `[agent] channel_port_name` when `channel_path`
+    has a different basename such as `/dev/vport0p1`), transfers the verified
+    fd to `qeminga-parser` via `SCM_RIGHTS`, and immediately closes its own
+    copy so it never parses host JSON or performs host-channel I/O. Full
+    installed-service boundary verification of this split on both `x86_64`
+    and `aarch64` (`docs/isolation-design.md` §6) is tracked in **#79**;
+    parser-compromise file-content confidentiality is not claimed in a
+    release until #79 passes on both architectures (design §5.9, OQ-10).
+  - *Ordinary file writes:* The parser has no filesystem syscalls. Inside
+    the executor, seccomp keeps `openat`, `write`, `writev`, `pwrite64`,
+    `fsync`, and `unlinkat` (for stderr, the recovery marker, optional
+    cooperative freeze-ownership claims, and optional `/sys/power/state`).
+    Ordinary writes are limited by guest Unix permissions (UID/GID 600,
+    with `CAP_DAC_OVERRIDE` dropped) and the shipped unit's read-only mount
+    namespace (see *Filesystem write confinement* above:
+    `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp=no`,
     `ReadWritePaths=-/run/qeminga`, `ProtectKernelTunables=yes`,
     `BindReadOnlyPaths=/sys /dev`, `ReadOnlyPaths=/run`,
     `SystemCallFilter=~@mount`, and `UMask=0077`), which confines
@@ -249,26 +271,28 @@ device numbers, or marker paths).
     `[agent] freeze_ownership_dir` only with the [cooperative-ownership
     drop-in](#cooperative-freeze-ownership) below, and `/sys/power/state`
     only with guest-installed `tmpfiles.d/qeminga-suspend.conf` and a
-    guest suspend drop-in) while
-    leaving the residual writable objects inventoried above (character
-    devices under `/dev`, `/proc/self/*`, and filesystems mounted in the
-    guest's system-manager mount namespace after service start).
-  - *Sockets and IPC:* Under an installed, enforcing seccomp filter
-    (required by `hardening = "enforced"`; the filter may be absent or
+    guest suspend drop-in) while leaving the residual writable objects
+    inventoried above (character devices under `/dev`, `/proc/self/*`, and
+    filesystems mounted in the guest's system-manager mount namespace after
+    service start).
+  - *Sockets and IPC:* Under installed, enforcing seccomp filters
+    (required by `hardening = "enforced"`; the filters may be absent or
     logging-only under the development-only opt-out
     `hardening = "unenforced-development-only"`),
     IP socket creation (`AF_INET`/`AF_INET6`), `connect`/`accept`/`listen`,
-    and `execve`/`execveat` are denied in every profile. With
-    `information = false`, `socket`, `bind`, `sendmsg`, `recvmsg`,
-    `setsockopt`, `getsockname`, and peer-addressed `sendto` are absent
-    from the filter; with `information = true`, `socket` is restricted to
-    `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)` alongside an
-    additional inventory `sendto` rule restricted to `flags == 0` and
-    `addrlen == 12` (`sizeof(struct sockaddr_nl)`). In every profile,
-    `socketpair` is restricted to
+    and `execve`/`execveat` are denied in both processes. Both the parser
+    and the CVM (`information = false`) executor restrict `sendmsg`/`recvmsg`
+    strictly to `arg0 == IPC_FD` (`3`) (with `socket`, `bind`, `setsockopt`,
+    `getsockname`, and peer-addressed `sendto` absent); with
+    `information = true`, the executor adds `socket` restricted to
+    `(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE)`, an additional
+    inventory `sendto` rule restricted to `flags == 0` and `addrlen == 12`
+    (`sizeof(struct sockaddr_nl)`), and netlink `bind`/`getsockname`/
+    `sendmsg`/`recvmsg`/`setsockopt`. In every profile, the executor keeps
+    `socketpair` restricted to
     `(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0)`,
-    `recvfrom` is restricted to peerless calls (`src_addr == NULL`,
-    `addrlen == NULL`), and `sendto` keeps the peerless form
+    `recvfrom` restricted to peerless calls (`src_addr == NULL`,
+    `addrlen == NULL`), and `sendto` restricted to the peerless form
     (`dest_addr == NULL`, `addrlen == 0`) for the Tokio/mio runtime
     signal driver; seccomp-BPF cannot dereference pointers or inspect
     already-open descriptors such as the signal socketpair or inherited

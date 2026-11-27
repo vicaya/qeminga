@@ -1018,7 +1018,10 @@ mod tests {
                 gid: Gid::from_raw(65534),
             };
             drop_parser_privileges_to(account, &SystemCaps).expect("drop parser caps");
-            let status = std::fs::read_to_string("/proc/self/status").expect("status");
+            // CapBnd and NoNewPrivs are per-thread on Linux, so inspect
+            // `/proc/thread-self/status` (the exact thread that performed the
+            // drop) alongside direct per-thread `caps::read` / `prctl` queries.
+            let status = std::fs::read_to_string("/proc/thread-self/status").expect("status");
             for field in ["CapEff:", "CapPrm:", "CapBnd:", "CapInh:", "CapAmb:"] {
                 let val = status
                     .lines()
@@ -1027,12 +1030,25 @@ mod tests {
                     .trim();
                 assert_eq!(val, "0000000000000000", "{field} must be all zero");
             }
+            for cset in [
+                CapSet::Effective,
+                CapSet::Permitted,
+                CapSet::Bounding,
+                CapSet::Inheritable,
+                CapSet::Ambient,
+            ] {
+                assert!(
+                    caps::read(None, cset).unwrap().is_empty(),
+                    "{cset:?} must be empty"
+                );
+            }
             let nnp = status
                 .lines()
                 .find_map(|l| l.strip_prefix("NoNewPrivs:"))
                 .unwrap()
                 .trim();
             assert_eq!(nnp, "1");
+            assert!(nix::sys::prctl::get_no_new_privs().unwrap());
             assert_eq!(Uid::effective().as_raw(), 65534);
             assert_eq!(Gid::effective().as_raw(), 65534);
             return;
@@ -1043,6 +1059,7 @@ mod tests {
                 "--exact",
                 "kernel::caps::tests::privileged_drop_parser_privileges_leaves_zero_caps",
                 "--ignored",
+                "--test-threads=1",
                 "--nocapture",
             ])
             .env("QEMINGA_CAPS_PARSER_CHILD", "1")

@@ -24,11 +24,12 @@
 //!    any uncooperative parser and restart the unit cleanly.
 #![forbid(unsafe_code)]
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::num::NonZeroU32;
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use governor::Quota;
@@ -36,11 +37,11 @@ use governor::clock::DefaultClock;
 use governor::middleware::NoOpMiddleware;
 use governor::state::{InMemoryState, NotKeyed};
 use nix::errno::Errno;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio::task::JoinSet;
 
 use crate::audit::{AuditRecord, Disposition, MethodField};
-use crate::channel::{INITIAL_BACKOFF, MAX_BACKOFF, OpenError};
+use crate::channel::{INITIAL_BACKOFF, Kind, MAX_BACKOFF, OpenError};
 use crate::dispatch::ratelimit::RateLimiter;
 use crate::dispatch::{Context, reason};
 use crate::freeze_plan::FreezePlan;
@@ -66,6 +67,19 @@ pub type VerifiedOpenFn = Arc<dyn Fn(&Path) -> Result<OwnedFd, OpenError> + Send
 /// Maximum concurrent in-flight executor operations admitted from the parser
 /// (matches `MAX_CONCURRENT_STREAMS` / `MAX_QUEUED = 8`).
 const MAX_IN_FLIGHT_OPS: usize = MAX_CONCURRENT_STREAMS;
+
+/// Soft backpressure watermarks on the executor's outbound IPC queue (§5.10):
+/// once reached, the executor stops reading new requests from `IPC_FD` until
+/// the parser drains responses so an unread compromised parser cannot grow
+/// privileged-process memory indefinitely.
+const MAX_OUTBOX_PACKETS: usize = 64;
+const MAX_OUTBOX_BYTES: usize = 2 * 1024 * 1024;
+
+/// Hard defensive ceilings on the executor's outbound IPC queue (sufficient to
+/// absorb replies from every already-in-flight operation once backpressure
+/// pauses reading, while terminating a misbehaving IPC peer if ever exceeded).
+const HARD_MAX_OUTBOX_PACKETS: usize = 256;
+const HARD_MAX_OUTBOX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Per-second rate cap on untrusted `parser_rejection_observed` audit records
 /// so a compromised parser cannot flood journald (§3.4).
@@ -105,6 +119,123 @@ type ObservationLimiter = governor::RateLimiter<
     NoOpMiddleware<<DefaultClock as governor::clock::Clock>::Instant>,
 >;
 
+/// Executor-enforced §5.7 lane serialization so neither channel reconnects nor
+/// a compromised parser can start a freeze while an earlier serial operation
+/// (e.g. `guest-fstrim`) is still active, while still letting `Control` run
+/// concurrently and letting `Thaw` overtake queued serial work or join an
+/// active `Freeze`.
+#[derive(Default)]
+struct LaneState {
+    freeze_active: bool,
+    thaw_or_ordinary_active: bool,
+    next_ticket: u64,
+    serial_waiters: VecDeque<u64>,
+}
+
+#[derive(Default)]
+struct ExecutorLaneGate {
+    state: StdMutex<LaneState>,
+    notify: Notify,
+}
+
+impl ExecutorLaneGate {
+    async fn acquire(self: &Arc<Self>, kind: Kind) -> Option<ExecutorLaneGuard> {
+        match kind {
+            Kind::Control => None,
+            Kind::Thaw => loop {
+                let notified = self.notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if !st.thaw_or_ordinary_active {
+                        st.thaw_or_ordinary_active = true;
+                        return Some(ExecutorLaneGuard {
+                            gate: Arc::clone(self),
+                            kind,
+                        });
+                    }
+                }
+                notified.await;
+            },
+            Kind::Freeze | Kind::Ordinary => {
+                let ticket = {
+                    let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                    st.next_ticket = st.next_ticket.wrapping_add(1);
+                    let ticket = st.next_ticket;
+                    st.serial_waiters.push_back(ticket);
+                    ticket
+                };
+                let mut cleanup = SerialWaiterCleanup {
+                    gate: Arc::clone(self),
+                    ticket,
+                    active: true,
+                };
+                loop {
+                    let notified = self.notify.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    {
+                        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                        if st.serial_waiters.front() == Some(&ticket)
+                            && !st.freeze_active
+                            && !st.thaw_or_ordinary_active
+                        {
+                            let _ = st.serial_waiters.pop_front();
+                            cleanup.active = false;
+                            if kind == Kind::Freeze {
+                                st.freeze_active = true;
+                            } else {
+                                st.thaw_or_ordinary_active = true;
+                            }
+                            return Some(ExecutorLaneGuard {
+                                gate: Arc::clone(self),
+                                kind,
+                            });
+                        }
+                    }
+                    notified.await;
+                }
+            }
+        }
+    }
+}
+
+struct SerialWaiterCleanup {
+    gate: Arc<ExecutorLaneGate>,
+    ticket: u64,
+    active: bool,
+}
+
+impl Drop for SerialWaiterCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.serial_waiters.retain(|&t| t != self.ticket);
+            drop(st);
+            self.gate.notify.notify_waiters();
+        }
+    }
+}
+
+struct ExecutorLaneGuard {
+    gate: Arc<ExecutorLaneGate>,
+    kind: Kind,
+}
+
+impl Drop for ExecutorLaneGuard {
+    fn drop(&mut self) {
+        let mut st = self.gate.state.lock().unwrap_or_else(|e| e.into_inner());
+        match self.kind {
+            Kind::Freeze => st.freeze_active = false,
+            Kind::Thaw | Kind::Ordinary => st.thaw_or_ordinary_active = false,
+            Kind::Control => {}
+        }
+        drop(st);
+        self.gate.notify.notify_waiters();
+    }
+}
+
 /// State shared across the executor's spawned request tasks.
 struct ExecutorState {
     ctx: Arc<Context>,
@@ -113,8 +244,9 @@ struct ExecutorState {
     channel_path: PathBuf,
     channel_opener: VerifiedOpenFn,
     reopen_backoff: tokio::sync::Mutex<ReopenBackoff>,
-    reopen_gate: Semaphore,
+    reopen_gate: Arc<Semaphore>,
     op_slots: Semaphore,
+    lanes: Arc<ExecutorLaneGate>,
 }
 
 /// Executor-owned channel reopen backoff (§5.7) immune to parser spoofing:
@@ -168,6 +300,52 @@ impl ReopenBackoff {
         self.has_open_channel = true;
         self.delay = self.initial_backoff;
     }
+}
+
+fn outbox_backpressured(outbox: &IpcOutbox) -> bool {
+    outbox.pending_packets() >= MAX_OUTBOX_PACKETS || outbox.pending_bytes() >= MAX_OUTBOX_BYTES
+}
+
+/// Pushes one response onto `outbox` and enforces the hard defensive backlog
+/// ceiling so an unread compromised parser can never grow executor memory
+/// without bound (§5.10).
+fn push_checked_response(
+    outbox: &mut IpcOutbox,
+    session_gen: u64,
+    req_id: u64,
+    response: &IpcResponse,
+    channel_fd: Option<OwnedFd>,
+) -> Result<(), ExecutorExitError> {
+    if let Err(err) = outbox.push_response(session_gen, req_id, response, channel_fd) {
+        tracing::error!(
+            event = "ipc_response_encode_failed",
+            error = %err,
+            "failed to encode executor IPC response"
+        );
+        let _ = outbox.push_response(
+            session_gen,
+            req_id,
+            &IpcResponse::Err(IpcErrorCode::HandlerFailed {
+                command: Command::Ping,
+            }),
+            None,
+        );
+    }
+    if outbox.pending_packets() > HARD_MAX_OUTBOX_PACKETS
+        || outbox.pending_bytes() > HARD_MAX_OUTBOX_BYTES
+    {
+        tracing::error!(
+            event = "ipc_protocol_violation",
+            pending_packets = outbox.pending_packets(),
+            pending_bytes = outbox.pending_bytes(),
+            error = "executor outbound IPC backlog exceeded bound",
+            "closing IPC and terminating parser"
+        );
+        return Err(ExecutorExitError::ProtocolViolation(
+            "executor outbound IPC backlog exceeded bound".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Runs the privileged executor loop over `ipc_fd` until graceful shutdown
@@ -257,8 +435,9 @@ where
             initial_backoff,
             max_backoff,
         )),
-        reopen_gate: Semaphore::new(1),
+        reopen_gate: Arc::new(Semaphore::new(1)),
         op_slots: Semaphore::new(MAX_IN_FLIGHT_OPS),
+        lanes: Arc::new(ExecutorLaneGate::default()),
     });
 
     let (reply_tx, mut reply_rx) = mpsc::channel::<OutboundReply>(MAX_IN_FLIGHT_OPS * 2);
@@ -314,6 +493,8 @@ where
             }
         }
 
+        let can_read_ipc = !outbox_backpressured(&outbox);
+
         tokio::select! {
             name = &mut signal, if signal_pending => {
                 signal_pending = false;
@@ -348,25 +529,14 @@ where
                     let _ = outbox.flush(async_ipc.as_fd());
                     break Err(ExecutorExitError::ChannelTerminal(term_err));
                 }
-                if let Err(err) = outbox.push_response(
+                if let Err(err) = push_checked_response(
+                    &mut outbox,
                     reply.session_gen,
                     reply.req_id,
                     &reply.response,
                     reply.channel_fd,
                 ) {
-                    tracing::error!(
-                        event = "ipc_response_encode_failed",
-                        error = %err,
-                        "failed to encode executor IPC response"
-                    );
-                    let _ = outbox.push_response(
-                        reply.session_gen,
-                        reply.req_id,
-                        &IpcResponse::Err(IpcErrorCode::HandlerFailed {
-                            command: Command::Ping,
-                        }),
-                        None,
-                    );
+                    break Err(err);
                 }
             }
             writable = async_ipc.writable(), if !outbox.is_empty() => {
@@ -394,11 +564,14 @@ where
                     }
                 }
             }
-            readable = async_ipc.readable() => {
+            readable = async_ipc.readable(), if can_read_ipc => {
                 match readable {
                     Ok(mut guard) => {
                         let mut read_exit: Option<Result<(), ExecutorExitError>> = None;
                         loop {
+                            if outbox_backpressured(&outbox) {
+                                break;
+                            }
                             match recv_packet(async_ipc.as_fd(), MAX_PACKET_BYTES) {
                                 Ok(Some(pkt)) => match assembler.push(pkt) {
                                     Ok(Some(AssembledMessage::Request(req))) => {
@@ -406,13 +579,36 @@ where
                                             // Stop already accepted while Thawed: do not start new work.
                                             continue;
                                         }
-                                        dispatch_ipc_request(
+                                        if let Err(err) = dispatch_ipc_request(
                                             Arc::clone(&state),
                                             req,
                                             reply_tx.clone(),
                                             reopen_cancel_rx.clone(),
+                                            &mut outbox,
                                             &mut tasks,
-                                        );
+                                        ) {
+                                            read_exit = Some(Err(err));
+                                            break;
+                                        }
+                                        // Flush synchronously generated replies (e.g.
+                                        // ReportParseRejection or capacity denial)
+                                        // so the socket stays drained and backpressure
+                                        // triggers accurately when the peer stops reading.
+                                        if !outbox.is_empty()
+                                            && let Err(err) = outbox.flush(async_ipc.as_fd())
+                                        {
+                                            tracing::error!(
+                                                event = "parser_ipc_write_failed",
+                                                errno = %err,
+                                                "IPC write failed; closing IPC"
+                                            );
+                                            read_exit = Some(if stop_requested {
+                                                Ok(())
+                                            } else {
+                                                Err(ExecutorExitError::ParserLost)
+                                            });
+                                            break;
+                                        }
                                     }
                                     Ok(Some(AssembledMessage::Response(_))) => {
                                         tracing::error!(
@@ -479,9 +675,11 @@ where
         }
     };
 
-    // Cancel any in-flight reopen backoff sleep and immediately close `IPC_FD`,
-    // severing every authority path from the parser (OQ-10 §5.3).
+    // Cancel any in-flight reopen backoff sleep, close `reply_rx` so no
+    // finishing task can block on `reply_tx.send().await`, and immediately
+    // close `IPC_FD`, severing every authority path from the parser (§5.3, §5.7).
     let _ = reopen_cancel_tx.send(true);
+    drop(reply_rx);
     drop(outbox);
     drop(async_ipc);
 
@@ -504,69 +702,73 @@ where
     exit_result
 }
 
-/// Dispatches one validated [`ReceivedRequest`] onto the executor's task set.
+/// Dispatches one validated [`ReceivedRequest`] onto the executor's task set
+/// (or answers synchronously for non-blocking observations / capacity denials).
 fn dispatch_ipc_request(
     state: Arc<ExecutorState>,
     req: ReceivedRequest,
     reply_tx: mpsc::Sender<OutboundReply>,
     reopen_cancel: tokio::sync::watch::Receiver<bool>,
+    outbox: &mut IpcOutbox,
     tasks: &mut JoinSet<()>,
-) {
+) -> Result<(), ExecutorExitError> {
     use tracing::instrument::WithSubscriber;
 
     let ReceivedRequest {
         session_gen,
         req_id,
+        host_id,
         request,
     } = req;
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
 
-    // Special non-command operations: RequestChannelReopen & ReportParseRejection.
+    // Special non-command operation: RequestChannelReopen (at most 1 spawned task).
     if matches!(request, IpcRequest::RequestChannelReopen) {
+        let Ok(reopen_permit) = Arc::clone(&state.reopen_gate).try_acquire_owned() else {
+            return push_checked_response(
+                outbox,
+                session_gen,
+                req_id,
+                &IpcResponse::Err(IpcErrorCode::ChannelRetryLater),
+                None,
+            );
+        };
         tasks.spawn(
             async move {
-                let reply = handle_channel_reopen(&state, session_gen, req_id, reopen_cancel).await;
+                let reply = handle_channel_reopen(
+                    &state,
+                    session_gen,
+                    req_id,
+                    reopen_permit,
+                    reopen_cancel,
+                )
+                .await;
                 let _ = reply_tx.send(reply).await;
             }
             .with_subscriber(dispatch),
         );
-        return;
+        return Ok(());
     }
 
+    // Special non-command operation: ReportParseRejection runs synchronously
+    // (zero spawned tasks, rate-bounded observation log only, never emits
+    // `command_received`).
     if let IpcRequest::ReportParseRejection(rej) = request {
-        tasks.spawn(
-            async move {
-                let response = handle_parse_rejection(&state, rej).await;
-                let _ = reply_tx
-                    .send(OutboundReply {
-                        session_gen,
-                        req_id,
-                        response,
-                        channel_fd: None,
-                        terminal_channel_err: None,
-                    })
-                    .await;
-            }
-            .with_subscriber(dispatch),
-        );
-        return;
+        let response = handle_parse_rejection(&state, rej);
+        return push_checked_response(outbox, session_gen, req_id, &response, None);
     }
 
     // Bound concurrent spawned operations so a compromised parser cannot
-    // exhaust executor task capacity.
+    // exhaust executor task capacity. Denials at capacity still emit one
+    // authoritative `command_received` audit record (preserving disabled
+    // precedence, C-7).
     let Ok(permit) = Arc::clone(&state).try_acquire_op_slot() else {
-        let class = command_of_request(&request).map_or(
-            crate::dispatch::ratelimit::CommandClass::PingSync,
-            Command::rate_class,
-        );
-        let _ = reply_tx.try_send(OutboundReply {
-            session_gen,
-            req_id,
-            response: IpcResponse::Err(IpcErrorCode::RateLimited { class }),
-            channel_fd: None,
-            terminal_channel_err: None,
-        });
-        return;
+        let response = if let Some(cmd) = command_of_request(&request) {
+            deny_at_capacity(&state, cmd, host_id)
+        } else {
+            IpcResponse::OkAck
+        };
+        return push_checked_response(outbox, session_gen, req_id, &response, None);
     };
 
     tasks.spawn(
@@ -576,7 +778,7 @@ fn dispatch_ipc_request(
                 let mut backoff = state.reopen_backoff.lock().await;
                 backoff.note_command();
             }
-            let response = execute_command_request(&state, request).await;
+            let response = execute_command_request(&state, host_id, request).await;
             let _ = reply_tx
                 .send(OutboundReply {
                     session_gen,
@@ -589,6 +791,7 @@ fn dispatch_ipc_request(
         }
         .with_subscriber(dispatch),
     );
+    Ok(())
 }
 
 impl ExecutorState {
@@ -633,13 +836,14 @@ fn command_of_request(req: &IpcRequest) -> Option<Command> {
 }
 
 /// Evaluates the executor's independent authorization gates for `cmd`
-/// (`is_enabled -> rate_limit -> freeze_gate`, C-7) and emits the single
-/// authoritative `command_received` audit record (§9).
-fn admit_command(state: &ExecutorState, cmd: Command, id: Option<i64>) -> Result<(), IpcErrorCode> {
-    let freeze_state_before = state.ctx.state.current().as_str();
+/// (`is_enabled -> rate_limit -> freeze_gate`, C-7) without emitting an audit
+/// record.
+fn evaluate_command_gates(
+    state: &ExecutorState,
+    cmd: Command,
+) -> Result<(), (&'static str, IpcErrorCode)> {
     let authority = state.ctx.config.authority();
-
-    let gate = if !cmd.is_enabled(&authority) {
+    if !cmd.is_enabled(&authority) {
         Err((reason::DISABLED, IpcErrorCode::Disabled { command: cmd }))
     } else if let Err(rl) = state.limiter.check(cmd.rate_class()) {
         Err((
@@ -650,9 +854,15 @@ fn admit_command(state: &ExecutorState, cmd: Command, id: Option<i64>) -> Result
         Err((reason::FROZEN, IpcErrorCode::Frozen))
     } else {
         Ok(())
-    };
+    }
+}
 
-    match gate {
+/// Evaluates the executor's independent authorization gates for `cmd`
+/// (`is_enabled -> rate_limit -> freeze_gate`, C-7) and emits the single
+/// authoritative `command_received` audit record (§9).
+fn admit_command(state: &ExecutorState, cmd: Command, id: Option<i64>) -> Result<(), IpcErrorCode> {
+    let freeze_state_before = state.ctx.state.current().as_str();
+    match evaluate_command_gates(state, cmd) {
         Ok(()) => {
             AuditRecord {
                 method: MethodField::Full(cmd.name().to_owned()),
@@ -678,32 +888,64 @@ fn admit_command(state: &ExecutorState, cmd: Command, id: Option<i64>) -> Result
     }
 }
 
-/// Handles `IpcRequest::ReportParseRejection`:
+/// Emits one authoritative `command_received` denial record when a typed
+/// command hits the executor's concurrent operation cap, preserving C-7
+/// disabled-command precedence.
+fn deny_at_capacity(state: &ExecutorState, cmd: Command, id: Option<i64>) -> IpcResponse {
+    let freeze_state_before = state.ctx.state.current().as_str();
+    let authority = state.ctx.config.authority();
+    let (denial_reason, code) = if !cmd.is_enabled(&authority) {
+        (reason::DISABLED, IpcErrorCode::Disabled { command: cmd })
+    } else {
+        (
+            reason::RATE_LIMITED,
+            IpcErrorCode::RateLimited {
+                class: cmd.rate_class(),
+            },
+        )
+    };
+    AuditRecord {
+        method: MethodField::Full(cmd.name().to_owned()),
+        id,
+        disposition: Disposition::Denied,
+        reason: Some(denial_reason),
+        freeze_state_before,
+    }
+    .emit();
+    IpcResponse::Err(code)
+}
+
+/// Handles `IpcRequest::ReportParseRejection` synchronously:
 /// - For an allowlisted command with invalid arguments (`ParseError` +
-///   `method: Some(Full(cmd_name))`), runs authoritative gates first (`C-7`)
-///   so disabled/rate-limited/frozen status takes precedence over
-///   `InvalidArguments`.
-/// - For raw parse errors, oversized frames, and unknown methods, emits a
-///   rate-bounded `parser_rejection_observed` record explicitly marked
-///   `source = "untrusted_parser"` (never forging `command_received`, §3.4).
-async fn handle_parse_rejection(state: &ExecutorState, rej: ParseRejection) -> IpcResponse {
-    if rej.kind == ParseRejectionKind::ParseError
+///   `method: Some(Full(cmd_name))`), evaluates the executor's gates
+///   (`is_enabled -> rate_limit -> freeze_gate`) so the wire reply preserves
+///   `C-7` precedence over `InvalidArguments`, while NEVER emitting an
+///   authoritative `command_received` record (no command ran).
+/// - Emits a rate-bounded `parser_rejection_observed` record explicitly marked
+///   `source = "untrusted_parser"` for all rejection kinds (§3.4).
+fn handle_parse_rejection(state: &ExecutorState, rej: ParseRejection) -> IpcResponse {
+    let freeze_state_before = state.ctx.state.current().as_str();
+    let (reason_str, response) = if rej.kind == ParseRejectionKind::ParseError
         && let Some(ProjectedMethod::Full(ref name)) = rej.method
         && let Some(cmd) = Command::from_method(name)
     {
-        return match admit_command(state, cmd, rej.id) {
-            Ok(()) => IpcResponse::Err(IpcErrorCode::InvalidArguments { command: cmd }),
-            Err(code) => IpcResponse::Err(code),
-        };
-    }
-
-    if state.observation_limiter.check().is_ok() {
+        match evaluate_command_gates(state, cmd) {
+            Ok(()) => (
+                reason::INVALID_ARGUMENTS,
+                IpcResponse::Err(IpcErrorCode::InvalidArguments { command: cmd }),
+            ),
+            Err((denial_reason, code)) => (denial_reason, IpcResponse::Err(code)),
+        }
+    } else {
         let reason_str = match rej.kind {
             ParseRejectionKind::Oversized => reason::OVERSIZED_FRAME,
             ParseRejectionKind::ParseError => reason::PARSE_ERROR,
             ParseRejectionKind::UnknownMethod => reason::COMMAND_NOT_FOUND,
         };
-        let freeze_state_before = state.ctx.state.current().as_str();
+        (reason_str, IpcResponse::OkAck)
+    };
+
+    if state.observation_limiter.check().is_ok() {
         match rej.method.as_ref().map(ProjectedMethod::to_method_field) {
             Some(MethodField::Full(m)) => {
                 tracing::warn!(
@@ -748,7 +990,7 @@ async fn handle_parse_rejection(state: &ExecutorState, rej: ParseRejection) -> I
             }
         }
     }
-    IpcResponse::OkAck
+    response
 }
 
 /// Handles `IpcRequest::RequestChannelReopen`: serializes reopens, enforces
@@ -759,18 +1001,9 @@ async fn handle_channel_reopen(
     state: &ExecutorState,
     session_gen: u64,
     req_id: u64,
+    _reopen_permit: OwnedSemaphorePermit,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> OutboundReply {
-    let Ok(_guard) = state.reopen_gate.try_acquire() else {
-        return OutboundReply {
-            session_gen,
-            req_id,
-            response: IpcResponse::Err(IpcErrorCode::ChannelRetryLater),
-            channel_fd: None,
-            terminal_channel_err: None,
-        };
-    };
-
     let (sleep_dur, was_open) = {
         let mut backoff = state.reopen_backoff.lock().await;
         backoff.next_sleep()
@@ -851,12 +1084,17 @@ async fn handle_channel_reopen(
 }
 
 /// Exhaustive static `match` executing one allowlisted typed command in the
-/// privileged executor (design §5.1, OQ-10 §4.2).
-async fn execute_command_request(state: &ExecutorState, req: IpcRequest) -> IpcResponse {
+/// privileged executor (design §5.1, §5.7, §9, OQ-10 §4.2).
+async fn execute_command_request(
+    state: &ExecutorState,
+    host_id: Option<i64>,
+    req: IpcRequest,
+) -> IpcResponse {
     let Some(cmd) = command_of_request(&req) else {
         return IpcResponse::OkAck;
     };
-    if let Err(code) = admit_command(state, cmd, None) {
+    let _lane_guard = state.lanes.acquire(cmd.lane()).await;
+    if let Err(code) = admit_command(state, cmd, host_id) {
         return IpcResponse::Err(code);
     }
     state.ctx.record_handler_call();
@@ -1249,8 +1487,16 @@ mod tests {
         let client = tokio::task::spawn_blocking(move || {
             let mut asm = StreamAssembler::new(PeerRole::Parser);
 
-            // 1. Disabled CVM command (`GetOsInfo`) rejected with `Disabled` and zero handler calls.
-            send_request(parser_sock.as_fd(), 1, 1, &IpcRequest::GetOsInfo).unwrap();
+            // 1. Disabled CVM command (`GetOsInfo`) rejected with `Disabled` and zero handler calls,
+            //    preserving host QGA `id` (701) in authoritative audit.
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                1,
+                Some(701),
+                &IpcRequest::GetOsInfo,
+            )
+            .unwrap();
             let r = recv_response(parser_sock.as_fd(), &mut asm)
                 .unwrap()
                 .unwrap();
@@ -1262,7 +1508,7 @@ mod tests {
             );
 
             // 2. Disabled command with bad args (`ReportParseRejection(ParseError, Full("guest-fstrim"))`)
-            //    returns `Disabled`, NOT `InvalidArguments` (C-7 precedence).
+            //    returns `Disabled`, NOT `InvalidArguments` (C-7 precedence), and must NOT emit `command_received`.
             send_request(
                 parser_sock.as_fd(),
                 1,
@@ -1285,7 +1531,8 @@ mod tests {
                 })
             );
 
-            // 3. Enabled command (`guest-ping`) with bad args returns `InvalidArguments`.
+            // 3. Enabled command (`guest-ping`) with bad args returns `InvalidArguments`
+            //    and must NOT emit `command_received` (only `parser_rejection_observed`).
             send_request(
                 parser_sock.as_fd(),
                 1,
@@ -1354,7 +1601,14 @@ mod tests {
                 .unwrap();
             assert_eq!(r.response, IpcResponse::OkCount(1));
 
-            send_request(parser_sock.as_fd(), 1, 7, &IpcRequest::FsfreezeStatus).unwrap();
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                7,
+                Some(-702),
+                &IpcRequest::FsfreezeStatus,
+            )
+            .unwrap();
             let r = recv_response(parser_sock.as_fd(), &mut asm)
                 .unwrap()
                 .unwrap();
@@ -1386,17 +1640,66 @@ mod tests {
         drop(parser_sock);
         assert!(router.settle(Duration::from_secs(2)));
         let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs.lines().collect();
+        // Unknown method observation.
         assert!(
-            logs.contains("\"event\":\"parser_rejection_observed\"")
-                && logs.contains("\"source\":\"untrusted_parser\"")
-                && logs.contains("\"reason\":\"command_not_found\""),
-            "expected untrusted parser observation record: {logs}"
+            lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"parser_rejection_observed\"")
+                    && l.contains("\"source\":\"untrusted_parser\"")
+                    && l.contains("\"method\":\"guest-exec\"")
+                    && l.contains("\"reason\":\"command_not_found\"")),
+            "expected untrusted unknown-method observation record: {logs}"
+        );
+        // Known-method invalid-arguments observations (both disabled and enabled)
+        // must appear ONLY as `parser_rejection_observed`, NEVER as `command_received`.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"parser_rejection_observed\"")
+                    && l.contains("\"source\":\"untrusted_parser\"")
+                    && l.contains("\"method\":\"guest-fstrim\"")
+                    && l.contains("\"reason\":\"disabled\"")
+                    && l.contains("\"id\":9")),
+            "expected known-method disabled observation record: {logs}"
         );
         assert!(
-            logs.contains("\"event\":\"command_received\"")
-                && logs.contains("\"method\":\"guest-get-osinfo\"")
-                && logs.contains("\"reason\":\"disabled\""),
-            "expected authoritative disabled command_received record: {logs}"
+            lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"parser_rejection_observed\"")
+                    && l.contains("\"source\":\"untrusted_parser\"")
+                    && l.contains("\"method\":\"guest-ping\"")
+                    && l.contains("\"reason\":\"invalid_arguments\"")
+                    && l.contains("\"id\":10")),
+            "expected known-method invalid_arguments observation record: {logs}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"command_received\"")
+                    && (l.contains("\"method\":\"guest-fstrim\"")
+                        || l.contains("\"method\":\"guest-ping\""))),
+            "parser-reported argument errors must NEVER emit authoritative command_received records: {logs}"
+        );
+        // Real typed commands preserve host QGA `id` on both denied and allowed records.
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"command_received\"")
+                    && l.contains("\"method\":\"guest-get-osinfo\"")
+                    && l.contains("\"disposition\":\"denied\"")
+                    && l.contains("\"reason\":\"disabled\"")
+                    && l.contains("\"id\":701")),
+            "expected authoritative disabled command_received record with id=701: {logs}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("\"event\":\"command_received\"")
+                    && l.contains("\"method\":\"guest-fsfreeze-status\"")
+                    && l.contains("\"disposition\":\"allowed\"")
+                    && l.contains("\"id\":-702")),
+            "expected authoritative allowed command_received record with id=-702: {logs}"
         );
     }
 
@@ -1776,6 +2079,419 @@ mod tests {
         assert!(
             logs.contains("\"event\":\"fstrim_reply_too_large\""),
             "expected bounded fstrim_reply_too_large audit record: {logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_exits_promptly_after_rejection_flood_and_protocol_violation() {
+        // Codex P1 #2: sending > 16 `ReportParseRejection` requests without
+        // reading replies followed by a malformed IPC packet must NEVER hang
+        // waiting on `reply_tx.send()` during cleanup.
+        let cfg = Config::default();
+        let router = Router::new(Box::new(std::io::sink()));
+        let ctx = Arc::new(Context::new(
+            Arc::new(cfg),
+            Arc::new(FreezeStateMachine::new()),
+            router,
+            Marker::for_tests(),
+        ));
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            ctx,
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            std::future::pending(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
+
+        tokio::task::spawn_blocking(move || {
+            for i in 1..=32u64 {
+                send_request(
+                    parser_sock.as_fd(),
+                    1,
+                    i,
+                    &IpcRequest::ReportParseRejection(ParseRejection {
+                        kind: ParseRejectionKind::ParseError,
+                        frame_len: 16,
+                        id: Some(i as i64),
+                        method: None,
+                    }),
+                )
+                .unwrap();
+            }
+            // Follow immediately with a malformed IPC packet (wrong version).
+            let _ = send_packet(parser_sock.as_fd(), &[99u8; 23], None);
+            // Keep socket alive briefly; executor must close IPC_FD and exit
+            // promptly even while replies remain unread.
+            std::thread::sleep(Duration::from_millis(100));
+            drop(parser_sock);
+        })
+        .await
+        .unwrap();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), exec_task)
+            .await
+            .expect("executor must not deadlock in cleanup join_next")
+            .unwrap();
+        assert!(
+            matches!(res, Err(ExecutorExitError::ProtocolViolation(_))),
+            "expected ProtocolViolation, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_backpressures_unread_outbox_and_exits_cleanly_on_peer_close() {
+        // Codex P1 #1: flooding requests without reading responses must hit
+        // outbox backpressure (stopping IPC reads so memory stays bounded) and
+        // still detect peer close promptly via writable `EPIPE`.
+        let cfg = Config::default();
+        let router = Router::new(Box::new(std::io::sink()));
+        let ctx = Arc::new(Context::new(
+            Arc::new(cfg),
+            Arc::new(FreezeStateMachine::new()),
+            router,
+            Marker::for_tests(),
+        ));
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+
+        let exec_task = tokio::spawn(serve_ipc_with_backoff(
+            ctx,
+            exec_sock,
+            PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+            opener,
+            true,
+            None,
+            false,
+            std::future::pending(),
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(50),
+        ));
+
+        // Send non-blocking ReportParseRejection packets without ever reading
+        // responses until the kernel send buffer fills because the executor
+        // paused reading under outbox backpressure.
+        let hit_eagain = tokio::task::spawn_blocking(move || {
+            let mut saw_eagain = false;
+            for i in 1..=2000u64 {
+                let pkt = crate::ipc::encode_request_chunks(
+                    1,
+                    i,
+                    &IpcRequest::ReportParseRejection(ParseRejection {
+                        kind: ParseRejectionKind::ParseError,
+                        frame_len: 12,
+                        id: None,
+                        method: None,
+                    }),
+                )
+                .unwrap()
+                .remove(0);
+                match send_packet(parser_sock.as_fd(), &pkt, None) {
+                    Ok(()) => {}
+                    Err(Errno::EAGAIN) => {
+                        saw_eagain = true;
+                        break;
+                    }
+                    Err(err) => panic!("unexpected send error: {err}"),
+                }
+                if i % 32 == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            // Drop peer while executor outbox is backpressured: writable EPIPE
+            // must wake the executor immediately.
+            drop(parser_sock);
+            saw_eagain
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            hit_eagain,
+            "parser sends must eventually hit EAGAIN once executor outbox backpressures IPC reads"
+        );
+        let res = tokio::time::timeout(Duration::from_secs(3), exec_task)
+            .await
+            .expect("executor must exit promptly on peer close under backpressure")
+            .unwrap();
+        assert!(
+            matches!(res, Err(ExecutorExitError::ParserLost)),
+            "expected ParserLost, got {res:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_audits_capacity_denials_and_enforces_serial_lane_across_concurrent_ipc() {
+        // Covers BOTH:
+        // 1. Codex P1 #3 (executor-side defense in depth): sending `GetOsInfo`
+        //    (Ordinary serial lane) followed immediately by `FsfreezeFreeze`
+        //    over raw IPC without waiting MUST serialize the freeze behind the
+        //    active serial operation, while `Ping` (Control) runs concurrently.
+        // 2. Astra Thread 9: saturating all 8 `op_slots` audits every denied
+        //    typed command ONCE with method, host_id, reason, and freeze_state,
+        //    preserving disabled-command precedence over capacity rate limit.
+        struct GatedOsInfo {
+            entered: std::sync::Barrier,
+            release: std::sync::Barrier,
+        }
+        impl crate::handlers::osinfo::OsInfoSource for GatedOsInfo {
+            fn uname(&self) -> Result<crate::handlers::osinfo::Uname, crate::proto::Error> {
+                self.entered.wait();
+                self.release.wait();
+                Ok(crate::handlers::osinfo::Uname {
+                    release: "6.8.0".to_owned(),
+                    version: "#1".to_owned(),
+                    machine: "x86_64".to_owned(),
+                })
+            }
+            fn os_release(&self) -> Option<String> {
+                Some("ID=linux\n".to_owned())
+            }
+        }
+
+        let sink = SharedSink::default();
+        let router = Router::new(Box::new(sink.clone()));
+        let mut cfg = Config::default();
+        cfg.features.shutdown = false; // Disabled command for precedence check at capacity.
+        let kernel = Arc::new(FakeKernel::new());
+        let os_gate = Arc::new(GatedOsInfo {
+            entered: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        });
+        let table = "1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        let ctx = Arc::new(
+            Context::new(
+                Arc::new(cfg),
+                Arc::new(FreezeStateMachine::new()),
+                router.clone(),
+                Marker::for_tests(),
+            )
+            .with_kernel(kernel)
+            .with_mounts(Arc::new(StaticMounts(table.to_owned())))
+            .with_osinfo(Arc::clone(&os_gate) as Arc<dyn crate::handlers::osinfo::OsInfoSource>),
+        );
+
+        let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        set_blocking(parser_sock.as_fd());
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let opener: VerifiedOpenFn = Arc::new(|p| Err(OpenError::NotFound { path: p.to_owned() }));
+        let dispatch = tracing::Dispatch::new(crate::audit::subscriber(
+            tracing::Level::INFO,
+            router.clone(),
+        ));
+
+        let exec_task = tokio::spawn(
+            serve_ipc_with_backoff(
+                Arc::clone(&ctx),
+                exec_sock,
+                PathBuf::from("/dev/virtio-ports/org.qemu.guest_agent.0"),
+                opener,
+                true,
+                None,
+                false,
+                async move { stop_rx.await.unwrap_or("SIGTERM") },
+                Duration::from_millis(10),
+                Duration::from_millis(10),
+                Duration::from_millis(50),
+            )
+            .with_subscriber(dispatch),
+        );
+
+        let ctx_check = Arc::clone(&ctx);
+        let client = tokio::task::spawn_blocking(move || {
+            let mut asm = StreamAssembler::new(PeerRole::Parser);
+
+            // 1. Start `GetOsInfo` (Ordinary serial lane) and wait until it is
+            //    actively running inside the handler.
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                1,
+                Some(100),
+                &IpcRequest::GetOsInfo,
+            )
+            .unwrap();
+            os_gate.entered.wait();
+
+            // 2. Immediately send `FsfreezeFreeze` (Freeze) plus 6 more queued
+            //    `GetFsInfo` (Ordinary) so all 8 `op_slots` are occupied!
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                2,
+                Some(200),
+                &IpcRequest::FsfreezeFreeze,
+            )
+            .unwrap();
+            for req_id in 3..=8u64 {
+                crate::ipc::send_request_with_id(
+                    parser_sock.as_fd(),
+                    1,
+                    req_id,
+                    Some(200 + req_id as i64),
+                    &IpcRequest::GetFsInfo,
+                )
+                .unwrap();
+            }
+
+            // Give the executor a moment to spawn all 8 tasks and confirm that
+            // `FsfreezeFreeze` has NOT entered Frozen while `GetOsInfo` is active.
+            std::thread::sleep(Duration::from_millis(80));
+            assert_eq!(
+                ctx_check.state.current(),
+                FreezeState::Thawed,
+                "freeze must NOT begin while an earlier serial operation (GetOsInfo) is still active"
+            );
+
+            // 3. With all 8 `op_slots` saturated:
+            //    - enabled `Ping(id=901)` is denied at capacity with RateLimited;
+            //    - disabled `Shutdown(id=902)` is denied with Disabled (C-7 precedence).
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                9,
+                Some(901),
+                &IpcRequest::Ping,
+            )
+            .unwrap();
+            let r_cap = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(r_cap.req_id, 9);
+            assert_eq!(
+                r_cap.response,
+                IpcResponse::Err(IpcErrorCode::RateLimited {
+                    class: crate::dispatch::ratelimit::CommandClass::PingSync,
+                })
+            );
+
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                10,
+                Some(902),
+                &IpcRequest::Shutdown {
+                    mode: crate::handlers::shutdown::ShutdownMode::Powerdown,
+                },
+            )
+            .unwrap();
+            let r_dis = recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .unwrap();
+            assert_eq!(r_dis.req_id, 10);
+            assert_eq!(
+                r_dis.response,
+                IpcResponse::Err(IpcErrorCode::Disabled {
+                    command: Command::Shutdown,
+                })
+            );
+
+            // 4. Release the blocked `GetOsInfo`: now req 1 finishes first,
+            //    then req 2 (`FsfreezeFreeze`) runs and freezes the guest,
+            //    then reqs 3..=8 (`GetFsInfo`) are denied by the freeze gate.
+            os_gate.release.wait();
+
+            let mut replies = std::collections::BTreeMap::new();
+            for _ in 0..8 {
+                let r = recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap();
+                replies.insert(r.req_id, r.response);
+            }
+            assert!(matches!(replies.get(&1), Some(IpcResponse::OkOsInfo(_))));
+            assert_eq!(replies.get(&2), Some(&IpcResponse::OkCount(1)));
+            for req_id in 3..=8u64 {
+                assert_eq!(
+                    replies.get(&req_id),
+                    Some(&IpcResponse::Err(IpcErrorCode::Frozen))
+                );
+            }
+
+            // Thaw cleanly before SIGTERM.
+            crate::ipc::send_request_with_id(
+                parser_sock.as_fd(),
+                1,
+                11,
+                Some(903),
+                &IpcRequest::FsfreezeThaw,
+            )
+            .unwrap();
+            assert_eq!(
+                recv_response(parser_sock.as_fd(), &mut asm)
+                    .unwrap()
+                    .unwrap()
+                    .response,
+                IpcResponse::OkCount(1)
+            );
+
+            let _ = stop_tx.send("SIGTERM");
+            (parser_sock, asm)
+        })
+        .await
+        .unwrap();
+
+        exec_task.await.unwrap().unwrap();
+        let (parser_sock, mut asm) = client;
+        assert!(
+            recv_response(parser_sock.as_fd(), &mut asm)
+                .unwrap()
+                .is_none()
+        );
+        drop(parser_sock);
+        assert!(router.settle(Duration::from_secs(2)));
+        let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<&str> = logs.lines().collect();
+
+        let cap_ping_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("\"event\":\"command_received\"")
+                    && l.contains("\"method\":\"guest-ping\"")
+                    && l.contains("\"id\":901")
+            })
+            .collect();
+        assert_eq!(
+            cap_ping_lines.len(),
+            1,
+            "capacity-denied guest-ping must be audited exactly once: {logs}"
+        );
+        assert!(
+            cap_ping_lines[0].contains("\"disposition\":\"denied\"")
+                && cap_ping_lines[0].contains("\"reason\":\"rate_limited\"")
+                && cap_ping_lines[0].contains("\"freeze_state_before\":\"thawed\""),
+            "unexpected capacity denial audit record: {}",
+            cap_ping_lines[0]
+        );
+
+        let cap_shutdown_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("\"event\":\"command_received\"")
+                    && l.contains("\"method\":\"guest-shutdown\"")
+                    && l.contains("\"id\":902")
+            })
+            .collect();
+        assert_eq!(
+            cap_shutdown_lines.len(),
+            1,
+            "capacity-denied disabled guest-shutdown must be audited exactly once: {logs}"
+        );
+        assert!(
+            cap_shutdown_lines[0].contains("\"disposition\":\"denied\"")
+                && cap_shutdown_lines[0].contains("\"reason\":\"disabled\"")
+                && cap_shutdown_lines[0].contains("\"freeze_state_before\":\"thawed\""),
+            "unexpected disabled capacity denial audit record: {}",
+            cap_shutdown_lines[0]
         );
     }
 }

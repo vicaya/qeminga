@@ -465,13 +465,28 @@ struct Lanes {
     thaw_or_ordinary: bool,
 }
 
+/// Exclusive (non-control) in-flight IPC request from a departed host session
+/// that is still executing in the executor. Retained across `session_gen`
+/// boundaries until its late executor reply arrives so a replacement session
+/// cannot start a freeze while an earlier serial operation (e.g. `fstrim`) is
+/// still running (design §5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetiredLane {
+    session_gen: u64,
+    req_id: u64,
+    lane: Kind,
+}
+
 impl Lanes {
-    fn of(slots: &VecDeque<ParserSlot>) -> Self {
+    fn of(slots: &VecDeque<ParserSlot>, retired: &[RetiredLane]) -> Self {
         let mut lanes = Lanes::default();
         for slot in slots {
             if let ParserSlot::Pending { lane, .. } = slot {
                 lanes.take(*lane);
             }
+        }
+        for entry in retired {
+            lanes.take(entry.lane);
         }
         lanes
     }
@@ -513,6 +528,12 @@ impl WireOutbox {
     fn push(&mut self, reply: Vec<u8>) {
         self.pending += reply.len();
         self.replies.push_back(reply);
+    }
+
+    fn abandon(&mut self) {
+        self.replies.clear();
+        self.written = 0;
+        self.pending = 0;
     }
 
     /// Writes as many queued reply bytes as `fd` accepts without blocking.
@@ -590,13 +611,14 @@ impl OpenSession {
         &mut self,
         session_gen: u64,
         next_req_id: &mut u64,
+        retired: &[RetiredLane],
         ipc_outbox: &mut IpcOutbox,
     ) -> Result<(), ()> {
         if self.wire_outbox.pending_bytes() >= MAX_REPLY_BYTES {
             return Ok(());
         }
         let window = MAX_QUEUED.saturating_sub(self.wire_outbox.count());
-        let mut lanes = Lanes::of(&self.slots);
+        let mut lanes = Lanes::of(&self.slots, retired);
         let mut serial_waiting = false;
         for slot in self.slots.iter_mut().take(window) {
             let ParserSlot::Waiting(prep) = slot else {
@@ -617,8 +639,12 @@ impl OpenSession {
             if let ParserSlot::Waiting(prep) = std::mem::replace(slot, ParserSlot::Done(None)) {
                 let req_id = *next_req_id;
                 *next_req_id = next_req_id.wrapping_add(1).max(1);
+                let host_id = match &prep.meta {
+                    ReplyMeta::Command { id, .. } => *id,
+                    ReplyMeta::LocalRejection { .. } => None,
+                };
                 if ipc_outbox
-                    .push_request(session_gen, req_id, &prep.ipc_request)
+                    .push_request_with_id(session_gen, req_id, host_id, &prep.ipc_request)
                     .is_err()
                 {
                     // Request encoding failed its own bound (e.g., an absurdly
@@ -717,6 +743,7 @@ where
     let mut ipc_asm = StreamAssembler::new(PeerRole::Parser);
     let mut session_gen: u64 = 1;
     let mut next_req_id: u64 = 1;
+    let mut retired_pending: Vec<RetiredLane> = Vec::new();
     let mut read_buf = [0u8; CHANNEL_READ_CHUNK];
 
     let mut ch_state = match initial_channel {
@@ -732,7 +759,12 @@ where
             ChannelState::Open(sess) => {
                 sess.promote_done();
                 if sess
-                    .admit(session_gen, &mut next_req_id, &mut ipc_outbox)
+                    .admit(
+                        session_gen,
+                        &mut next_req_id,
+                        &retired_pending,
+                        &mut ipc_outbox,
+                    )
                     .is_err()
                 {
                     return ParserExit::ProtocolViolation;
@@ -819,9 +851,13 @@ where
                 match recv_packet(ipc_fd.as_fd(), MAX_PACKET_BYTES) {
                     Ok(Some(pkt)) => match ipc_asm.push(pkt) {
                         Ok(Some(AssembledMessage::Response(resp))) => {
-                            if let Some(exit) =
-                                handle_ipc_response(resp, &mut session_gen, &mut ch_state, &probe)
-                            {
+                            if let Some(exit) = handle_ipc_response(
+                                resp,
+                                &mut session_gen,
+                                &mut ch_state,
+                                &mut retired_pending,
+                                &probe,
+                            ) {
                                 return exit;
                             }
                         }
@@ -903,71 +939,28 @@ where
             continue;
         }
 
-        // 6. Service active channel I/O (flush replies first, then read frames).
+        // 6. Service active channel readiness: classify hangup/error FIRST
+        //    before any write or read (§5.7), then flush replies and read frames.
         if let (ChannelState::Open(sess), Some(revents)) = (&mut ch_state, ch_revents) {
-            let mut end_session = false;
-            let mut observed_disconnect = false;
+            let outcome = match service_open_channel_revents(
+                sess,
+                revents,
+                session_gen,
+                &mut next_req_id,
+                &retired_pending,
+                &mut ipc_outbox,
+                &mut read_buf,
+            ) {
+                Ok(outcome) => outcome,
+                Err(()) => return ParserExit::ProtocolViolation,
+            };
 
-            // 6a. Write queued replies while writable.
-            if !sess.wire_outbox.is_empty()
-                && !sess.write_failed
-                && revents.contains(PollFlags::POLLOUT)
-                && let Err(err) = sess.wire_outbox.flush(sess.fd.as_fd())
+            if let ChannelEventOutcome::EndSession {
+                observed_disconnect,
+            } = outcome
             {
-                sess.write_failed = true;
-                end_session = true;
-                if err.kind() == io::ErrorKind::BrokenPipe {
-                    observed_disconnect = true;
-                }
-            }
-
-            // 6b. Read host input when readable and not backpressure-paused.
-            if !end_session && revents.contains(PollFlags::POLLIN) && !sess.input_paused() {
-                loop {
-                    if sess.input_paused() {
-                        break;
-                    }
-                    match nix::unistd::read(sess.fd.as_fd(), &mut read_buf) {
-                        Ok(0) => {
-                            end_session = true;
-                            observed_disconnect = true;
-                            break;
-                        }
-                        Ok(n) => {
-                            for event in sess.decoder.push(&read_buf[..n]) {
-                                sess.slots
-                                    .push_back(ParserSlot::Waiting(prepare_frame(event)));
-                            }
-                            // Immediately admit decoded frames so a client that
-                            // writes a complete command (e.g. guest-shutdown)
-                            // and immediately closes the channel still delivers
-                            // its request to the executor before EOF teardown.
-                            if sess
-                                .admit(session_gen, &mut next_req_id, &mut ipc_outbox)
-                                .is_err()
-                            {
-                                return ParserExit::ProtocolViolation;
-                            }
-                        }
-                        Err(Errno::EAGAIN) => break,
-                        Err(Errno::EINTR) => continue,
-                        Err(_) => {
-                            end_session = true;
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // 6c. Detect peer hangup/error via revents even when input is paused.
-            if !end_session && classify_channel_revents(revents) != HostState::Ready {
-                end_session = true;
-                observed_disconnect = true;
-            }
-
-            if end_session {
-                // Flush any requests just submitted from the final read before
-                // retiring this session generation.
+                // Flush any requests already admitted before retiring this
+                // session generation.
                 match ipc_outbox.flush(ipc_fd.as_fd()) {
                     Ok(FlushOutcome::Drained | FlushOutcome::WouldBlock) => {}
                     Err(_) => return ParserExit::IpcClosed,
@@ -979,6 +972,20 @@ where
                     },
                 );
                 if let ChannelState::Open(old_sess) = prev {
+                    // Retain exclusive (non-control) in-flight lane ownership
+                    // across the generation bump until the executor finishes
+                    // and returns the stale-generation reply (design §5.7).
+                    for slot in &old_sess.slots {
+                        if let ParserSlot::Pending { lane, req_id, .. } = slot
+                            && *lane != Kind::Control
+                        {
+                            retired_pending.push(RetiredLane {
+                                session_gen,
+                                req_id: *req_id,
+                                lane: *lane,
+                            });
+                        }
+                    }
                     // Increment `session_gen` on EVERY disconnect/EOF/reopen
                     // boundary so any late executor reply for the departed
                     // peer is discarded without writing to a replacement peer.
@@ -988,6 +995,92 @@ where
             }
         }
     }
+}
+
+/// Outcome of handling one `ppoll` readiness event on an [`OpenSession`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelEventOutcome {
+    /// Session remains active.
+    Continue,
+    /// Peer hangup, EOF, or I/O error observed; tear down the active session
+    /// without performing any further channel reads or writes.
+    EndSession { observed_disconnect: bool },
+}
+
+/// Processes one `ppoll` readiness event on an active [`OpenSession`].
+///
+/// Closed/hangup readiness (`POLLHUP`, `POLLRDHUP`, `POLLERR`, `POLLNVAL`) is
+/// classified **before** any channel `write(2)` or `read(2)` (design §5.7), so
+/// undelivered replies are abandoned and driver-queued bytes from a departed
+/// host session are routed straight to `teardown_channel` /
+/// `drain_disconnected_input` instead of being executed as new commands.
+fn service_open_channel_revents(
+    sess: &mut OpenSession,
+    revents: PollFlags,
+    session_gen: u64,
+    next_req_id: &mut u64,
+    retired: &[RetiredLane],
+    ipc_outbox: &mut IpcOutbox,
+    read_buf: &mut [u8],
+) -> Result<ChannelEventOutcome, ()> {
+    // 6a. Classify closed/hangup readiness FIRST (§5.7).
+    let revents_state = classify_channel_revents(revents);
+    if revents_state != HostState::Ready {
+        sess.write_failed = true;
+        sess.wire_outbox.abandon();
+        return Ok(ChannelEventOutcome::EndSession {
+            observed_disconnect: revents_state == HostState::VirtioHostDisconnected,
+        });
+    }
+
+    // 6b. Write queued replies while writable (only when peer is still Ready).
+    if !sess.wire_outbox.is_empty()
+        && !sess.write_failed
+        && revents.contains(PollFlags::POLLOUT)
+        && let Err(err) = sess.wire_outbox.flush(sess.fd.as_fd())
+    {
+        sess.write_failed = true;
+        sess.wire_outbox.abandon();
+        return Ok(ChannelEventOutcome::EndSession {
+            observed_disconnect: err.kind() == io::ErrorKind::BrokenPipe,
+        });
+    }
+
+    // 6c. Read host input when readable and not backpressure-paused.
+    if revents.contains(PollFlags::POLLIN) && !sess.input_paused() {
+        loop {
+            if sess.input_paused() {
+                break;
+            }
+            match nix::unistd::read(sess.fd.as_fd(), read_buf) {
+                Ok(0) => {
+                    sess.write_failed = true;
+                    sess.wire_outbox.abandon();
+                    return Ok(ChannelEventOutcome::EndSession {
+                        observed_disconnect: true,
+                    });
+                }
+                Ok(n) => {
+                    for event in sess.decoder.push(&read_buf[..n]) {
+                        sess.slots
+                            .push_back(ParserSlot::Waiting(prepare_frame(event)));
+                    }
+                    sess.admit(session_gen, next_req_id, retired, ipc_outbox)?;
+                }
+                Err(Errno::EAGAIN) => break,
+                Err(Errno::EINTR) => continue,
+                Err(_) => {
+                    sess.write_failed = true;
+                    sess.wire_outbox.abandon();
+                    return Ok(ChannelEventOutcome::EndSession {
+                        observed_disconnect: false,
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(ChannelEventOutcome::Continue)
 }
 
 /// Classifies a newly opened or newly handed-off channel descriptor.
@@ -1063,11 +1156,16 @@ fn handle_ipc_response<P>(
     mut resp: ReceivedResponse,
     session_gen: &mut u64,
     ch_state: &mut ChannelState,
+    retired_pending: &mut Vec<RetiredLane>,
     probe: &P,
 ) -> Option<ParserExit>
 where
     P: Fn(std::os::fd::BorrowedFd<'_>) -> HostState + Send + Sync,
 {
+    // Release any retired exclusive lane owned by this completed request
+    // before discarding stale-generation replies.
+    retired_pending.retain(|r| !(r.session_gen == resp.session_gen && r.req_id == resp.req_id));
+
     // Stale response from an earlier session generation: drop any payload (and
     // reject any unexpected channel descriptor attached to a stale generation).
     if resp.session_gen != *session_gen {
@@ -1737,5 +1835,191 @@ mod tests {
             parser_thread.join().unwrap(),
             ParserExit::ChannelTerminalBusy
         );
+    }
+
+    #[test]
+    fn hangup_revents_aborts_before_reading_stale_input_or_writing_queued_replies() {
+        // 1. Observed virtio hangup (`POLLIN | POLLHUP`, `!POLLOUT`): stale
+        //    driver-queued input must NOT be read/submitted, and any queued
+        //    undelivered reply must be abandoned without writing.
+        let (mut host, guest_fd) = unix_stream_pair();
+        host.set_nonblocking(true).unwrap();
+        host.write_all(b"{\"execute\":\"guest-shutdown\",\"id\":1}\n")
+            .unwrap();
+
+        let mut sess = OpenSession::new(guest_fd);
+        sess.wire_outbox
+            .push(b"{\"return\":{},\"id\":0}\n".to_vec());
+        let mut next_req_id = 1;
+        let mut ipc_outbox = IpcOutbox::new();
+        let mut read_buf = [0u8; 256];
+
+        let outcome = service_open_channel_revents(
+            &mut sess,
+            PollFlags::POLLIN | PollFlags::POLLHUP,
+            1,
+            &mut next_req_id,
+            &[],
+            &mut ipc_outbox,
+            &mut read_buf,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ChannelEventOutcome::EndSession {
+                observed_disconnect: true
+            }
+        );
+        assert!(
+            ipc_outbox.is_empty(),
+            "stale input on POLLIN|POLLHUP must never be decoded or submitted over IPC"
+        );
+        assert!(
+            sess.wire_outbox.is_empty(),
+            "queued reply must be abandoned"
+        );
+        let mut probe_buf = [0u8; 64];
+        assert_eq!(
+            host.read(&mut probe_buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "zero bytes may be written to host once hangup is observed"
+        );
+
+        // 2. Observed writable hangup (`POLLOUT | POLLHUP`): queued reply must
+        //    NOT be flushed before terminating the session.
+        let (mut host2, guest_fd2) = unix_stream_pair();
+        host2.set_nonblocking(true).unwrap();
+        let mut sess2 = OpenSession::new(guest_fd2);
+        sess2
+            .wire_outbox
+            .push(b"{\"return\":{},\"id\":9}\n".to_vec());
+        let outcome2 = service_open_channel_revents(
+            &mut sess2,
+            PollFlags::POLLOUT | PollFlags::POLLHUP,
+            2,
+            &mut next_req_id,
+            &[],
+            &mut ipc_outbox,
+            &mut read_buf,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome2,
+            ChannelEventOutcome::EndSession {
+                observed_disconnect: false
+            }
+        );
+        assert!(sess2.wire_outbox.is_empty());
+        assert_eq!(
+            host2.read(&mut probe_buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "queued reply must not be written on POLLOUT|POLLHUP"
+        );
+    }
+
+    #[test]
+    fn serial_lane_ownership_survives_channel_reopen_and_preserves_host_id() {
+        let (exec_sock, parser_sock) = seqpacket_pair(false).unwrap();
+        set_nonblocking(parser_sock.as_fd()).unwrap();
+        let (mut host1, guest1) = unix_stream_pair();
+        let (mut host2, guest2) = unix_stream_pair();
+
+        let parser_thread = thread::spawn(move || run_parser_loop(parser_sock, Some(guest1)));
+        let mut exec_asm = StreamAssembler::new(PeerRole::Executor);
+
+        // Session 1 starts `guest-fstrim` (Ordinary serial lane) with host id 101.
+        host1
+            .write_all(b"{\"execute\":\"guest-fstrim\",\"id\":101}\n")
+            .unwrap();
+        let trim_req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(trim_req.request, IpcRequest::Fstrim { minimum: 0 });
+        assert_eq!(trim_req.host_id, Some(101));
+
+        // Session 1 disconnects while `guest-fstrim` is STILL executing in the executor!
+        drop(host1);
+        let reopen_req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopen_req.request, IpcRequest::RequestChannelReopen);
+        assert_eq!(reopen_req.host_id, None);
+        send_response(
+            exec_sock.as_fd(),
+            reopen_req.session_gen,
+            reopen_req.req_id,
+            &IpcResponse::OkChannelFd,
+            Some(guest2.as_fd()),
+        )
+        .unwrap();
+        drop(guest2);
+
+        // Session 2 sends `guest-fsfreeze-freeze` (Freeze) followed by `guest-ping`
+        // (Control). `guest-ping` must run immediately, while `guest-fsfreeze-freeze`
+        // MUST wait until Session 1's retired `fstrim` finishes (§5.7).
+        host2
+            .write_all(
+                b"{\"execute\":\"guest-fsfreeze-freeze\",\"id\":202}\n{\"execute\":\"guest-ping\",\"id\":203}\n",
+            )
+            .unwrap();
+
+        let next_req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next_req.request,
+            IpcRequest::Ping,
+            "control ping must overtake freeze while retired fstrim holds the serial lane"
+        );
+        assert_eq!(next_req.host_id, Some(203));
+        send_response(
+            exec_sock.as_fd(),
+            next_req.session_gen,
+            next_req.req_id,
+            &IpcResponse::OkEmpty,
+            None,
+        )
+        .unwrap();
+
+        // Confirm `guest-fsfreeze-freeze` has NOT been submitted yet.
+        let mut pfd = [PollFd::new(exec_sock.as_fd(), PollFlags::POLLIN)];
+        assert_eq!(
+            ppoll(&mut pfd, Some(TimeSpec::new(0, 80_000_000)), None).unwrap(),
+            0,
+            "freeze must not start before retired fstrim completes"
+        );
+
+        // Now complete Session 1's retired `fstrim`: its late reply is discarded
+        // (never written to host2) AND releases the serial lane so host2's freeze starts!
+        send_response(
+            exec_sock.as_fd(),
+            trim_req.session_gen,
+            trim_req.req_id,
+            &IpcResponse::OkFstrim(vec![]),
+            None,
+        )
+        .unwrap();
+
+        let freeze_req = recv_request(exec_sock.as_fd(), &mut exec_asm)
+            .unwrap()
+            .unwrap();
+        assert_eq!(freeze_req.request, IpcRequest::FsfreezeFreeze);
+        assert_eq!(freeze_req.host_id, Some(202));
+        send_response(
+            exec_sock.as_fd(),
+            freeze_req.session_gen,
+            freeze_req.req_id,
+            &IpcResponse::OkCount(2),
+            None,
+        )
+        .unwrap();
+
+        // Host 2 receives ONLY its own replies in request order (202, then 203),
+        // never Session 1's retired fstrim reply!
+        assert_eq!(read_line(&mut host2), "{\"return\":2,\"id\":202}\n");
+        assert_eq!(read_line(&mut host2), "{\"return\":{},\"id\":203}\n");
+
+        drop(exec_sock);
+        assert_eq!(parser_thread.join().unwrap(), ParserExit::IpcClosed);
     }
 }

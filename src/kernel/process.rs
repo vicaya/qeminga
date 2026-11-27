@@ -412,8 +412,17 @@ fn child_exec_parser(
         fail_and_exit(e);
     }
 
+    // Preserve the parser's exact descriptor allowlist (`0..=5`) across
+    // `execve(2)` even if an external service launcher passed an extra
+    // descriptor without `FD_CLOEXEC` (OQ-10 §3.2). Marking `>= 6` as
+    // `FD_CLOEXEC` keeps `exec_err_w_raw` (`>= 16`) open to report any
+    // `execve` error while closing every fd `>= 6` atomically on success.
+    if let Err(e) = mark_fds_cloexec_from(PARSER_READY_FD + 1) {
+        fail_and_exit(e);
+    }
+
     // SAFETY: `exe`, `argv`, and `envp` are NUL-terminated arrays allocated in
-    // the parent before `fork(2)`; every other descriptor in the child carries
+    // the parent before `fork(2)`; every descriptor `>= 6` now carries
     // `FD_CLOEXEC` and is closed atomically by `execve(2)`.
     unsafe {
         libc::execve(exe, argv, envp);
@@ -422,6 +431,179 @@ fn child_exec_parser(
         .raw_os_error()
         .unwrap_or(libc::EIO);
     fail_and_exit(err);
+}
+
+/// Linux `close_range(2)` flag requesting `FD_CLOEXEC` rather than immediate
+/// close (`<linux/close_range.h>`, Linux 5.11+).
+const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
+
+/// Async-signal-safe helper that marks every open file descriptor `>= min_fd`
+/// as `FD_CLOEXEC`.
+///
+/// Uses `close_range(min_fd, ~0U, CLOSE_RANGE_CLOEXEC)` on Linux 5.11+, falling
+/// back on Linux 5.4–5.10 to enumerating `/proc/self/fd` via raw `openat` +
+/// `getdents64`, and finally to bounded `getrlimit(RLIMIT_NOFILE)` iteration if
+/// `/proc` is unavailable.
+fn mark_fds_cloexec_from(min_fd: RawFd) -> Result<(), i32> {
+    if min_fd < 0 {
+        return Err(libc::EINVAL);
+    }
+    // SAFETY: `SYS_close_range` with `CLOSE_RANGE_CLOEXEC` only sets
+    // `FD_CLOEXEC` on descriptors `>= min_fd`, is async-signal-safe, and
+    // returns `-1` with `ENOSYS`/`EINVAL` on kernels older than Linux 5.11.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            min_fd as libc::c_uint,
+            libc::c_uint::MAX,
+            CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    if err != libc::ENOSYS && err != libc::EINVAL {
+        return Err(err);
+    }
+    match mark_fds_cloexec_via_procfs(min_fd) {
+        Ok(()) => Ok(()),
+        Err(_) => mark_fds_cloexec_via_rlimit(min_fd),
+    }
+}
+
+/// Async-signal-safe Linux 5.4 fallback: walks `/proc/self/fd` using raw
+/// `openat(2)` and `getdents64(2)` on a stack buffer, setting `FD_CLOEXEC` on
+/// every open descriptor `>= min_fd`.
+fn mark_fds_cloexec_via_procfs(min_fd: RawFd) -> Result<(), i32> {
+    // SAFETY: `c"/proc/self/fd"` is a static NUL-terminated path; `openat` is
+    // async-signal-safe and `O_CLOEXEC` prevents `dirfd` itself from leaking.
+    let dirfd = unsafe {
+        libc::openat(
+            libc::AT_FDCWD,
+            c"/proc/self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dirfd < 0 {
+        return Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+
+    let mut buf = [0u8; 4096];
+    let result = loop {
+        // SAFETY: `dirfd` is a valid open directory fd and `buf` is a valid
+        // writable stack buffer of length `buf.len()`; `getdents64` is
+        // async-signal-safe.
+        let nread =
+            unsafe { libc::syscall(libc::SYS_getdents64, dirfd, buf.as_mut_ptr(), buf.len()) };
+        if nread < 0 {
+            let err = io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO);
+            if err == libc::EINTR {
+                continue;
+            }
+            break Err(err);
+        }
+        if nread == 0 {
+            break Ok(());
+        }
+        let total = usize::try_from(nread).unwrap_or(0).min(buf.len());
+        let mut offset = 0usize;
+        let mut parse_err = None;
+        while offset + 19 <= total {
+            // `struct linux_dirent64`: d_ino(8), d_off(8), d_reclen(2), d_type(1), d_name[].
+            let reclen = usize::from(u16::from_ne_bytes([buf[offset + 16], buf[offset + 17]]));
+            if reclen < 20 || offset + reclen > total {
+                parse_err = Some(libc::EIO);
+                break;
+            }
+            let name_slice = &buf[offset + 19..offset + reclen];
+            let name_len = name_slice
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_slice.len());
+            if let Some(fd) = parse_ascii_fd(&name_slice[..name_len])
+                && fd >= min_fd
+                && fd != dirfd
+                && let Err(e) = set_fd_cloexec_raw(fd)
+            {
+                parse_err = Some(e);
+                break;
+            }
+            offset += reclen;
+        }
+        if let Some(e) = parse_err {
+            break Err(e);
+        }
+    };
+
+    // SAFETY: `dirfd` was opened above and is closed exactly once here.
+    unsafe {
+        libc::close(dirfd);
+    }
+    result
+}
+
+/// Async-signal-safe last-resort fallback when both `close_range` and
+/// `/proc/self/fd` are unavailable: iterates `min_fd..rlim_cur` setting
+/// `FD_CLOEXEC`.
+fn mark_fds_cloexec_via_rlimit(min_fd: RawFd) -> Result<(), i32> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid writable `libc::rlimit` struct; `getrlimit` is
+    // async-signal-safe.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return Err(io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    let upper = i32::try_from(lim.rlim_cur).unwrap_or(i32::MAX);
+    let mut fd = min_fd;
+    while fd < upper {
+        set_fd_cloexec_raw(fd)?;
+        fd = match fd.checked_add(1) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    Ok(())
+}
+
+/// Parses a non-negative base-10 ASCII descriptor number (returning `None` for
+/// `"."`, `".."`, empty strings, or overflowing values).
+fn parse_ascii_fd(bytes: &[u8]) -> Option<RawFd> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut acc: i32 = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(i32::from(b - b'0'))?;
+    }
+    Some(acc)
+}
+
+/// Sets `FD_CLOEXEC` on `fd` using raw `fcntl(2)`, ignoring `EBADF` for closed
+/// slots.
+fn set_fd_cloexec_raw(fd: RawFd) -> Result<(), i32> {
+    // SAFETY: `fcntl(F_SETFD, FD_CLOEXEC)` is async-signal-safe and safely
+    // returns `EBADF` on closed descriptor numbers.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EIO);
+    if err == libc::EBADF { Ok(()) } else { Err(err) }
 }
 
 /// Adopts an inherited descriptor (`IPC_FD`, `INITIAL_CHANNEL_FD`, or
@@ -490,20 +672,27 @@ mod tests {
     #[test]
     fn spawn_parser_binds_dev_null_empty_env_and_exact_inherited_fds() {
         // Spawn `/bin/sh -c ...` as a lightweight stand-in child to inspect its
-        // exact inherited environment, stdio backing device, fd table, and
-        // readiness handshake.
+        // exact inherited environment, stdio backing device, complete fd table
+        // (with an extra harmless non-CLOEXEC descriptor open in the parent),
+        // and readiness handshake.
+        let dir = tempfile::tempdir().unwrap();
+        let fds_out = dir.path().join("child-fds.txt");
         let (exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
         let (ch_r, ch_w) = pipe2(OFlag::O_CLOEXEC).unwrap();
+        // Extra harmless descriptor opened WITHOUT O_CLOEXEC (simulating a
+        // descriptor inherited from a service launcher): must NEVER cross exec.
+        let (leaked_r, leaked_w) = pipe2(OFlag::empty()).unwrap();
+        assert!(leaked_r.as_raw_fd() >= 6 || leaked_w.as_raw_fd() >= 6);
 
         let script = concat!(
             "set -e\n",
+            // Redirect inside a subshell so `$$` opens zero saved-fd slots.
+            "p=$$\n",
+            "(ls /proc/$p/fd > \"$1\")\n",
             "test -z \"$(/usr/bin/env | grep -v '^PWD=' | grep -v '^SHLVL=' | grep -v '^_=' || true)\"\n",
             "for d in 0 1 2; do\n",
             "    test \"$(readlink /proc/$$/fd/$d)\" = \"/dev/null\"\n",
             "done\n",
-            "test -e /proc/$$/fd/3\n",
-            "test -e /proc/$$/fd/4\n",
-            "test -e /proc/$$/fd/5\n",
             "printf 'R' >&5\n",
             "exec 5>&-\n",
         );
@@ -513,6 +702,8 @@ mod tests {
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
                 OsString::from(script),
+                OsString::from("_"),
+                fds_out.as_os_str().to_os_string(),
             ],
             parser_ipc: parser_sock,
             initial_channel: Some(ch_w),
@@ -524,9 +715,20 @@ mod tests {
         // shell exits, `ch_r` sees EOF.
         let status = child.wait().unwrap();
         assert_eq!(status, WaitStatus::Exited(child.pid(), 0));
+        let mut observed_fds: Vec<RawFd> = std::fs::read_to_string(&fds_out)
+            .unwrap()
+            .split_whitespace()
+            .map(|s| s.parse::<RawFd>().unwrap())
+            .collect();
+        observed_fds.sort_unstable();
+        assert_eq!(
+            observed_fds,
+            vec![0, 1, 2, 3, 4, 5],
+            "parser child must inherit ONLY slots 0..=5 (no leaked launcher fds)"
+        );
         let mut b = [0u8; 1];
         assert_eq!(nix::unistd::read(&ch_r, &mut b), Ok(0));
-        drop(exec_sock);
+        drop((leaked_r, leaked_w, exec_sock));
     }
 
     #[test]
@@ -565,5 +767,76 @@ mod tests {
         assert!(!arm_pdeathsig_and_verify_parent(ppid.wrapping_add(1)).unwrap());
         // Reset pdeathsig on test runner thread so it doesn't alter harness behavior.
         nix::sys::prctl::set_pdeathsig(None).unwrap();
+    }
+
+    #[test]
+    fn mark_fds_cloexec_procfs_fallback_and_no_initial_channel_strip_extra_fds() {
+        // Direct Linux 5.4 fallback test: a freshly opened non-CLOEXEC pipe
+        // above `min_fd` is marked `FD_CLOEXEC` by `mark_fds_cloexec_via_procfs`.
+        let (p_r, p_w) = pipe2(OFlag::empty()).unwrap();
+        let min_fd = p_r.as_raw_fd().min(p_w.as_raw_fd());
+        assert_eq!(
+            fcntl(p_r.as_fd(), FcntlArg::F_GETFD).unwrap() & FdFlag::FD_CLOEXEC.bits(),
+            0
+        );
+        mark_fds_cloexec_via_procfs(min_fd).unwrap();
+        assert_ne!(
+            fcntl(p_r.as_fd(), FcntlArg::F_GETFD).unwrap() & FdFlag::FD_CLOEXEC.bits(),
+            0
+        );
+        assert_ne!(
+            fcntl(p_w.as_fd(), FcntlArg::F_GETFD).unwrap() & FdFlag::FD_CLOEXEC.bits(),
+            0
+        );
+        drop((p_r, p_w));
+
+        assert_eq!(parse_ascii_fd(b""), None);
+        assert_eq!(parse_ascii_fd(b"."), None);
+        assert_eq!(parse_ascii_fd(b".."), None);
+        assert_eq!(parse_ascii_fd(b"12a"), None);
+        assert_eq!(parse_ascii_fd(b"999999999999999"), None);
+        assert_eq!(parse_ascii_fd(b"42"), Some(42));
+
+        // Without an initial channel, slot 4 is absent and extra non-CLOEXEC
+        // descriptors never survive execve.
+        let dir = tempfile::tempdir().unwrap();
+        let fds_out = dir.path().join("child-fds-no-ch.txt");
+        let (_exec_sock, parser_sock) = seqpacket_pair(true).unwrap();
+        let (extra_r, extra_w) = pipe2(OFlag::empty()).unwrap();
+        let script = concat!(
+            "set -e\n",
+            "p=$$\n",
+            "(ls /proc/$p/fd > \"$1\")\n",
+            "printf 'R' >&5\n",
+            "exec 5>&-\n",
+        );
+        let mut child = spawn_parser(ParserSpawnSpec {
+            exe: PathBuf::from("/bin/sh"),
+            args: vec![
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+                OsString::from("_"),
+                fds_out.as_os_str().to_os_string(),
+            ],
+            parser_ipc: parser_sock,
+            initial_channel: None,
+            ready_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(status, WaitStatus::Exited(child.pid(), 0));
+        let mut observed_fds: Vec<RawFd> = std::fs::read_to_string(&fds_out)
+            .unwrap()
+            .split_whitespace()
+            .map(|s| s.parse::<RawFd>().unwrap())
+            .collect();
+        observed_fds.sort_unstable();
+        assert_eq!(
+            observed_fds,
+            vec![0, 1, 2, 3, 5],
+            "without initial channel, parser child must inherit ONLY 0, 1, 2, 3, 5"
+        );
+        drop((extra_r, extra_w));
     }
 }

@@ -753,6 +753,28 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
             && readme.contains("peerless"),
         "docs/design.md, packaging/README.md, and README.md must align on debug_assertions, enforcing-filter scope, and #67 narrowed socket/IPC rules"
     );
+
+    // 7. #78: docs/design.md and packaging/README.md must describe both service
+    //    accounts (`qeminga` 600 and `qeminga-parser` 601), the executor/parser
+    //    split, explicit `channel_port_name` configuration, and link installed-
+    //    service boundary verification to #79.
+    for (name, text) in [
+        ("docs/design.md", &design),
+        ("packaging/README.md", &packaging),
+    ] {
+        for needle in [
+            "qeminga-parser",
+            "601",
+            "channel_port_name",
+            "SCM_RIGHTS",
+            "#79",
+        ] {
+            assert!(
+                text.contains(needle),
+                "{name} must document {needle:?} for the production parser/executor split"
+            );
+        }
+    }
 }
 
 #[test]

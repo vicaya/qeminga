@@ -63,6 +63,8 @@ pub mod reason {
     pub const OVERSIZED_FRAME: &str = "oversized_frame";
     /// The frame was not a valid request (bounds, JSON, or schema).
     pub const PARSE_ERROR: &str = "parse_error";
+    /// An allowlisted command carried invalid arguments.
+    pub const INVALID_ARGUMENTS: &str = "invalid_arguments";
     /// The method is not allowlisted (AC1).
     pub const COMMAND_NOT_FOUND: &str = "command_not_found";
     /// The method is allowlisted but disabled by configuration.

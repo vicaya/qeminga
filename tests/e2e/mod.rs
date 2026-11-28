@@ -24,6 +24,7 @@ use nix::poll::{PollFd, PollFlags, PollTimeout};
 use serde_json::Value;
 
 /// One thread of a process, as `/proc/<pid>/task/<tid>/status` shows it.
+#[derive(Debug)]
 pub struct ThreadStatus {
     pub tid: u32,
     pub name: String,
@@ -215,15 +216,17 @@ fn open_pty() -> Pty {
 /// *not* root), so every test would otherwise report the daemon's exit 77.
 /// Fail once, before spawning, with the fix.
 pub fn require_service_account_when_root() {
-    if nix::unistd::geteuid().is_root()
-        && nix::unistd::User::from_name("qeminga").unwrap().is_none()
-    {
-        panic!(
-            "running as root without the `qeminga` account: the daemon refuses to start (cannot drop privileges, exit 77). \
-             Create it with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` \
-             (or `groupadd -g 600 qeminga && useradd -r -u 600 -g 600 -M -s /usr/sbin/nologin qeminga`), \
-             or run the tests unprivileged."
-        );
+    if nix::unistd::geteuid().is_root() {
+        for account in ["qeminga", "qeminga-parser"] {
+            if nix::unistd::User::from_name(account).unwrap().is_none() {
+                panic!(
+                    "running as root without the `{account}` account: the daemon refuses to start (cannot drop privileges, exit 77). \
+                     Create both accounts with `sudo systemd-sysusers packaging/sysusers.d/qeminga.conf` \
+                     (or groupadd/useradd for `qeminga` 600:600 and `qeminga-parser` 601:601), \
+                     or run the tests unprivileged."
+                );
+            }
+        }
     }
 }
 
@@ -259,12 +262,18 @@ impl Agent {
         let _ = std::fs::remove_file(&link);
         std::os::unix::fs::symlink(&pty.slave_path, &link).unwrap();
         let config_path = dir.path().join("config.toml");
+        let transport = if opts.agent_extra.contains("channel_transport") {
+            ""
+        } else {
+            "channel_transport = \"pty-test-only\"\n"
+        };
         std::fs::write(
             &config_path,
             format!(
-                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}\n[features]\nseccomp = true\n{}\n",
+                "[agent]\nchannel_path = \"{}\"\nstate_path = \"{}\"\nlog_level = \"debug\"\n{}{}{}\n[features]\nseccomp = true\n{}\n",
                 link.display(),
                 dir.path().join("frozen").display(),
+                transport,
                 if opts.enforce_hardening {
                     ""
                 } else {
@@ -603,6 +612,20 @@ impl Agent {
     /// `true` while the daemon is alive.
     pub fn is_running(&mut self) -> bool {
         self.child.try_wait().unwrap().is_none()
+    }
+
+    /// Waits up to `timeout` for the daemon process to exit on its own.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// SIGTERM and wait.

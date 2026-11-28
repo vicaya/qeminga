@@ -54,13 +54,9 @@ pub fn supports_mem(states: &str) -> bool {
     states.split_ascii_whitespace().any(|s| s == MEM)
 }
 
-/// `guest-suspend-ram` handler (feature `suspend_ram` only).
+/// Executes `guest-suspend-ram` (feature `suspend_ram` only).
 #[cfg(feature = "suspend_ram")]
-pub async fn handle(
-    ctx: &crate::dispatch::Context,
-    req: &crate::proto::Request,
-) -> Result<serde_json::Value, Error> {
-    let crate::handlers::NoArgs {} = crate::proto::arguments(req)?;
+pub async fn execute_suspend(ctx: &crate::dispatch::Context) -> Result<(), Error> {
     let ops: std::sync::Arc<dyn SuspendOps> = std::sync::Arc::clone(&ctx.suspend);
     tokio::task::spawn_blocking(move || {
         let states = ops.supported_states()?;
@@ -73,6 +69,17 @@ pub async fn handle(
     })
     .await
     .map_err(|err| Error::Internal(format!("suspend task failed: {err}")))??;
+    Ok(())
+}
+
+/// `guest-suspend-ram` handler (feature `suspend_ram` only).
+#[cfg(feature = "suspend_ram")]
+pub async fn handle(
+    ctx: &crate::dispatch::Context,
+    req: &crate::proto::Request,
+) -> Result<serde_json::Value, Error> {
+    let crate::handlers::NoArgs {} = crate::proto::arguments(req)?;
+    execute_suspend(ctx).await?;
     Ok(serde_json::json!({}))
 }
 

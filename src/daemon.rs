@@ -58,6 +58,9 @@ use crate::state::{FreezeState, FreezeStateMachine};
 /// The service account (§5.4, §8.3).
 pub const SERVICE_USER: &str = "qeminga";
 
+/// The dedicated zero-capability parser account (OQ-10 §3.2, #78).
+pub const PARSER_USER: &str = "qeminga-parser";
+
 /// `EX_USAGE`.
 pub const EX_USAGE: u8 = 64;
 /// `EX_UNAVAILABLE`: the channel cannot be served (already open).
@@ -91,13 +94,24 @@ pub struct Options {
     pub config_path: PathBuf,
     /// `--version`/`-V` was given.
     pub version: bool,
+    /// Internal `--internal-parser` child mode spawned by the executor
+    /// (OQ-10 §3.2, #78).
+    pub internal_parser: Option<crate::parser_proc::ParserOptions>,
 }
 
 impl Default for Options {
     fn default() -> Self {
+        Self::default_config()
+    }
+}
+
+impl Options {
+    /// Default public-CLI options (`--config /etc/qeminga/config.toml`).
+    pub fn default_config() -> Self {
         Options {
             config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
             version: false,
+            internal_parser: None,
         }
     }
 }
@@ -108,10 +122,16 @@ impl Default for Options {
 pub struct UsageError(pub String);
 
 /// Hand-rolled argument parsing: `--config PATH`, `--config=PATH`,
-/// `--version`/`-V`. Anything else is a usage error.
+/// `--version`/`-V` (plus the internal `--internal-parser` mode used only when
+/// the executor re-execs the isolated parser child). Anything else is a usage
+/// error.
 pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, UsageError> {
-    let mut opts = Options::default();
-    let mut iter = args.into_iter();
+    let mut iter = args.into_iter().peekable();
+    if iter.peek().is_some_and(|arg| arg == "--internal-parser") {
+        let _ = iter.next();
+        return parse_internal_parser_args(iter);
+    }
+    let mut opts = Options::default_config();
     while let Some(arg) = iter.next() {
         if arg == "--version" || arg == "-V" {
             opts.version = true;
@@ -135,6 +155,86 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Options, U
         }
     }
     Ok(opts)
+}
+
+fn parse_internal_parser_args(
+    mut iter: impl Iterator<Item = OsString>,
+) -> Result<Options, UsageError> {
+    let mut parent_pid: Option<u32> = None;
+    let mut hardening: Option<crate::config::Hardening> = None;
+    let mut seccomp: Option<bool> = None;
+    let mut has_initial_channel = false;
+
+    while let Some(arg) = iter.next() {
+        if arg == "--parent-pid" {
+            let val = iter
+                .next()
+                .ok_or_else(|| UsageError("--parent-pid needs a PID".to_owned()))?;
+            let s = val
+                .to_str()
+                .ok_or_else(|| UsageError("invalid --parent-pid".to_owned()))?;
+            let pid: u32 = s
+                .parse()
+                .map_err(|_| UsageError(format!("invalid --parent-pid: {s}")))?;
+            if pid == 0 {
+                return Err(UsageError("--parent-pid must be nonzero".to_owned()));
+            }
+            parent_pid = Some(pid);
+        } else if arg == "--hardening" {
+            let val = iter
+                .next()
+                .ok_or_else(|| UsageError("--hardening needs a mode".to_owned()))?;
+            hardening = Some(if val == "enforced" {
+                crate::config::Hardening::Enforced
+            } else if val == "unenforced" {
+                crate::config::Hardening::Development
+            } else {
+                return Err(UsageError(format!(
+                    "invalid --hardening: {}",
+                    val.to_string_lossy()
+                )));
+            });
+        } else if arg == "--seccomp" {
+            let val = iter
+                .next()
+                .ok_or_else(|| UsageError("--seccomp needs on|off".to_owned()))?;
+            seccomp = Some(if val == "on" {
+                true
+            } else if val == "off" {
+                false
+            } else {
+                return Err(UsageError(format!(
+                    "invalid --seccomp: {}",
+                    val.to_string_lossy()
+                )));
+            });
+        } else if arg == "--has-initial-channel" {
+            has_initial_channel = true;
+        } else {
+            return Err(UsageError(format!(
+                "unrecognised internal parser argument: {}",
+                arg.to_string_lossy()
+            )));
+        }
+    }
+
+    let parent_pid = parent_pid
+        .ok_or_else(|| UsageError("--internal-parser requires --parent-pid".to_owned()))?;
+    let hardening =
+        hardening.ok_or_else(|| UsageError("--internal-parser requires --hardening".to_owned()))?;
+    let seccomp =
+        seccomp.ok_or_else(|| UsageError("--internal-parser requires --seccomp".to_owned()))?;
+
+    Ok(Options {
+        config_path: PathBuf::from(DEFAULT_CONFIG_PATH),
+        version: false,
+        internal_parser: Some(crate::parser_proc::ParserOptions {
+            parent_pid,
+            hardening,
+            seccomp,
+            has_initial_channel,
+        }),
+    })
 }
 
 /// Why startup or serving failed; maps to an exit code.
@@ -248,6 +348,15 @@ impl RunError {
             RunError::Channel(_) => EX_UNAVAILABLE,
             RunError::Privileges(_) => EX_NOPERM,
             RunError::Seccomp(_) | RunError::Runtime(_) => EX_OSERR,
+        }
+    }
+}
+
+impl From<crate::executor::ExecutorExitError> for RunError {
+    fn from(err: crate::executor::ExecutorExitError) -> Self {
+        match err {
+            crate::executor::ExecutorExitError::ChannelTerminal(open) => RunError::Channel(open),
+            other => RunError::Runtime(other.to_string()),
         }
     }
 }
@@ -453,6 +562,35 @@ pub trait Startup {
     /// device never delays the privilege drop, the seccomp filter or the
     /// recovery watchdog (C-14, OQ-7).
     fn open_channel(&self, path: &Path) -> Result<Option<OwnedFd>, OpenError>;
+    /// Step 4 (verified): opens `config.agent.channel_path` and verifies its
+    /// backing character-device identity against `policy` before any
+    /// descriptor can cross IPC into the parser (OQ-10 §4.2, #78).
+    ///
+    /// Default delegates to [`Startup::open_channel`] so recording fakes in
+    /// startup-order tests continue to exercise the single-process path.
+    fn open_verified_channel(
+        &self,
+        config: &Config,
+        policy: &crate::channel_verify::ChannelIdentityPolicy,
+    ) -> Result<Option<OwnedFd>, OpenError> {
+        let _ = policy;
+        self.open_channel(&config.agent.channel_path)
+    }
+    /// Step 4b: spawns the isolated `--internal-parser` child while the
+    /// executor is still single-threaded and before the executor drops its
+    /// own privileges (OQ-10 §3.2, #78).
+    ///
+    /// Takes `channel` via `.take()` when spawning the parser child so a `None`
+    /// default leaves `channel` untouched for [`Startup::serve`].
+    fn spawn_parser_process(
+        &self,
+        config: &Config,
+        policy: crate::channel_verify::ChannelIdentityPolicy,
+        channel: &mut Option<OwnedFd>,
+    ) -> Result<Option<SpawnedParser>, RunError> {
+        let _ = (config, policy, channel);
+        Ok(None)
+    }
     /// Step 5: keep the final set of `authority` (§5.4, §5.9) and, when
     /// cooperative freeze ownership is enabled, at most one explicitly
     /// inherited non-root supplementary group `extra_gid` (OQ-11, #69).
@@ -483,6 +621,42 @@ pub trait Startup {
         marker: Marker,
         ownership: Option<Arc<dyn OwnershipStore>>,
     ) -> Result<(), RunError>;
+    /// Step 7 (isolated two-process mode): serves the parser child over
+    /// `IPC_FD` until a stop signal while `Thawed`, terminal `EBUSY`, parser
+    /// exit, or `ipc_protocol_violation` (OQ-10 §4–§5, #78).
+    fn serve_isolated(
+        &self,
+        config: Arc<Config>,
+        router: Router,
+        recovery: bool,
+        spawned: SpawnedParser,
+        marker: Marker,
+        ownership: Option<Arc<dyn OwnershipStore>>,
+    ) -> Result<(), RunError> {
+        let _ = (config, router, recovery, spawned, marker, ownership);
+        Err(RunError::Runtime(
+            "isolated parser serving is not implemented by this Startup".to_owned(),
+        ))
+    }
+}
+
+/// Resources returned by [`Startup::spawn_parser_process`] for the isolated
+/// executor serving loop (OQ-10 §3.2, #78).
+#[derive(Debug)]
+pub struct SpawnedParser {
+    /// Executor's end of the `AF_UNIX` `SOCK_SEQPACKET` pair pinned to
+    /// [`crate::ipc::IPC_FD`] (`3`).
+    ///
+    /// Declared before `child` so dropping `SpawnedParser` on an early startup
+    /// failure closes `IPC_FD` first, immediately signalling EOF to the parser.
+    pub ipc_fd: OwnedFd,
+    /// Handle to the spawned `--internal-parser` child for `wait4` reaping
+    /// without `CAP_KILL` or `kill(2)`.
+    pub child: crate::kernel::process::ParserChild,
+    /// Channel descriptor identity policy captured before seccomp.
+    pub channel_policy: crate::channel_verify::ChannelIdentityPolicy,
+    /// Whether an initial verified channel descriptor was passed to the parser.
+    pub had_initial_channel: bool,
 }
 
 /// The seccomp mode this binary installs: `"enforce"`, `"log"` (the
@@ -595,7 +769,8 @@ fn serve_after_logging(
     } else {
         (None, None)
     };
-    let channel = startup.open_channel(&config.agent.channel_path)?;
+    let channel_policy = crate::channel_verify::ChannelIdentityPolicy::from_config(&config);
+    let mut channel = startup.open_verified_channel(&config, &channel_policy)?;
     if channel.is_none() {
         tracing::warn!(
             event = "channel_open_deferred",
@@ -603,6 +778,11 @@ fn serve_after_logging(
             "channel not open yet; the runtime retries after the privilege drop"
         );
     }
+    // Step 4b: spawn the isolated `--internal-parser` child while still
+    // single-threaded (before the audit writer thread or Tokio runtime) and
+    // before the executor drops its own privileges so the parser can transition
+    // to UID/GID 601 (`qeminga-parser`) with zero capabilities (OQ-10 §3.2).
+    let spawned_parser = startup.spawn_parser_process(&config, channel_policy, &mut channel)?;
     let authority = config.authority();
     tracing::info!(
         event = "authority",
@@ -662,6 +842,12 @@ fn serve_after_logging(
     // Only now a second thread: created by the dropped thread, it inherits
     // the dropped ceiling (uid, capability sets, bounding set).
     startup.start_audit_writer(&router)?;
+    // Before installing the descriptor-filtered executor seccomp policy,
+    // verify that descriptor `IPC_FD` (`3`) holds the intended AF_UNIX
+    // SOCK_SEQPACKET IPC socket (OQ-10 §3.2, #78).
+    if let Some(ref spawned) = spawned_parser {
+        verify_ipc_fd_pinned(&spawned.ipc_fd)?;
+    }
     // An installer that fails (a kernel or a container policy refusing
     // the filter) is a hardening outcome like a filter that is absent:
     // the refusal under the enforced profile, a warning under the
@@ -701,18 +887,32 @@ fn serve_after_logging(
             "compatibility build: unlisted syscalls are logged, not killed (never for a release)"
         );
     }
-    startup.serve(
-        Arc::new(config),
-        router,
-        recovery,
-        channel,
-        marker,
-        ownership,
-    )
+    if let Some(spawned) = spawned_parser {
+        startup.serve_isolated(
+            Arc::new(config),
+            router,
+            recovery,
+            spawned,
+            marker,
+            ownership,
+        )
+    } else {
+        startup.serve(
+            Arc::new(config),
+            router,
+            recovery,
+            channel,
+            marker,
+            ownership,
+        )
+    }
 }
 
 /// Production entry point: parse, run, map errors to exit codes.
 pub fn run(opts: Options) -> ExitCode {
+    if let Some(parser_opts) = opts.internal_parser {
+        return crate::parser_proc::run_parser_main(parser_opts);
+    }
     if opts.version {
         let mut out = std::io::stdout().lock();
         let _ = writeln!(out, "qeminga {}", crate::VERSION);
@@ -795,6 +995,105 @@ impl Startup for SystemStartup {
         }
     }
 
+    fn open_verified_channel(
+        &self,
+        config: &Config,
+        policy: &crate::channel_verify::ChannelIdentityPolicy,
+    ) -> Result<Option<OwnedFd>, OpenError> {
+        match crate::channel_verify::open_verified_channel(&config.agent.channel_path, policy, true)
+        {
+            Ok(fd) => Ok(Some(fd)),
+            Err(err) => {
+                if err.is_terminal() {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    event = "channel_open_failed",
+                    error = %err,
+                    "cannot open verified channel now"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn spawn_parser_process(
+        &self,
+        config: &Config,
+        policy: crate::channel_verify::ChannelIdentityPolicy,
+        channel: &mut Option<OwnedFd>,
+    ) -> Result<Option<SpawnedParser>, RunError> {
+        let (exec_sock, parser_sock) = crate::kernel::ipc::seqpacket_pair(true)
+            .map_err(|e| RunError::Runtime(format!("cannot create IPC socketpair: {e}")))?;
+        // Ensure `parser_sock` never occupies `IPC_FD` (`3`) before pinning
+        // `exec_sock` onto `IPC_FD` atomically (OQ-10 §3.2).
+        let parser_ipc = crate::kernel::ipc::dup_above_cloexec(parser_sock, crate::ipc::IPC_FD + 1)
+            .map_err(|e| RunError::Runtime(format!("cannot relocate parser IPC fd: {e}")))?;
+        let ipc_fd = crate::kernel::ipc::pin_unused_fd_cloexec(exec_sock, crate::ipc::IPC_FD)
+            .map_err(|e| {
+                RunError::Runtime(format!("cannot pin IPC_FD ({}): {e}", crate::ipc::IPC_FD))
+            })?;
+
+        // Re-exec `/proc/self/exe` directly so the parser always executes the
+        // exact binary inode of this running executor without pathname TOCTOU.
+        let exe = PathBuf::from("/proc/self/exe");
+        let had_initial_channel = channel.is_some();
+        let parent_pid = std::process::id();
+        let mut args = vec![
+            OsString::from("qeminga"),
+            OsString::from("--internal-parser"),
+            OsString::from("--parent-pid"),
+            OsString::from(parent_pid.to_string()),
+            OsString::from("--hardening"),
+            OsString::from(if config.agent.hardening.is_enforced() {
+                "enforced"
+            } else {
+                "unenforced"
+            }),
+            OsString::from("--seccomp"),
+            OsString::from(if config.seccomp_enabled() {
+                "on"
+            } else {
+                "off"
+            }),
+        ];
+        if had_initial_channel {
+            args.push(OsString::from("--has-initial-channel"));
+        }
+
+        let spec = crate::kernel::process::ParserSpawnSpec {
+            exe,
+            args,
+            parser_ipc,
+            initial_channel: channel.take(),
+            ready_timeout: Duration::from_secs(10),
+        };
+        let child = crate::kernel::process::spawn_parser(spec).map_err(|err| {
+            match err.child_exit_code() {
+                Some(code) if code == i32::from(EX_NOPERM) => {
+                    RunError::Privileges(PrivilegeError::UnknownUser(PARSER_USER.to_owned()))
+                }
+                Some(code) if code == i32::from(EX_CONFIG) => RunError::Hardening(
+                    "isolated parser refused to start under enforced hardening (not started as root or seccomp unavailable)"
+                        .to_owned(),
+                ),
+                _ => RunError::Runtime(format!("cannot spawn isolated parser: {err}")),
+            }
+        })?;
+        tracing::info!(
+            event = "parser_spawned",
+            parser_pid = child.pid().as_raw(),
+            had_initial_channel,
+            "isolated parser process ready"
+        );
+        Ok(Some(SpawnedParser {
+            ipc_fd,
+            child,
+            channel_policy: policy,
+            had_initial_channel,
+        }))
+    }
+
     fn drop_privileges(
         &self,
         authority: &Authority,
@@ -813,9 +1112,11 @@ impl Startup for SystemStartup {
         if !config.seccomp_enabled() {
             return Ok(false);
         }
-        let program =
-            crate::seccomp::profile(crate::seccomp::Target::current(), &config.authority())
-                .map_err(|err| RunError::Seccomp(err.to_string()))?;
+        let program = crate::seccomp::executor_profile(
+            crate::seccomp::Target::current(),
+            &config.authority(),
+        )
+        .map_err(|err| RunError::Seccomp(err.to_string()))?;
         crate::seccomp::install(&program).map_err(|err| RunError::Seccomp(err.to_string()))?;
         Ok(true)
     }
@@ -857,6 +1158,51 @@ impl Startup for SystemStartup {
                 &path,
                 Arc::new(channel::open_device),
                 channel,
+                recovery,
+                signal,
+                STOP_POLL,
+            )
+            .await
+            .map_err(RunError::from)
+        });
+        finish_runtime(runtime, RUNTIME_SHUTDOWN_GRACE);
+        served
+    }
+
+    fn serve_isolated(
+        &self,
+        config: Arc<Config>,
+        router: Router,
+        recovery: bool,
+        spawned: SpawnedParser,
+        marker: Marker,
+        ownership: Option<Arc<dyn OwnershipStore>>,
+    ) -> Result<(), RunError> {
+        let runtime = build_runtime().map_err(|err| RunError::Runtime(err.to_string()))?;
+        let path = config.agent.channel_path.clone();
+        let ctx = production_context(config, router, recovery, marker, ownership);
+        let policy = spawned.channel_policy;
+        let opener: crate::executor::VerifiedOpenFn =
+            Arc::new(move |p| crate::channel_verify::open_verified_channel(p, &policy, false));
+        let served = runtime.block_on(async move {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate())
+                .map_err(|err| RunError::Runtime(format!("cannot listen for SIGTERM: {err}")))?;
+            let mut int = signal(SignalKind::interrupt())
+                .map_err(|err| RunError::Runtime(format!("cannot listen for SIGINT: {err}")))?;
+            let signal = async move {
+                tokio::select! {
+                    _ = term.recv() => "SIGTERM",
+                    _ = int.recv() => "SIGINT",
+                }
+            };
+            crate::executor::serve_ipc(
+                ctx,
+                spawned.ipc_fd,
+                path,
+                opener,
+                spawned.had_initial_channel,
+                Some(spawned.child),
                 recovery,
                 signal,
                 STOP_POLL,
@@ -1021,6 +1367,37 @@ async fn wait_until_thawed(ctx: &Context, poll: Duration) {
     }
 }
 
+/// Verifies before installing the descriptor-filtered executor seccomp policy
+/// that `fd` occupies exact descriptor [`crate::ipc::IPC_FD`] (`3`) and is an
+/// `AF_UNIX` `SOCK_SEQPACKET` socket (OQ-10 §3.2, #78).
+pub fn verify_ipc_fd_pinned(fd: &OwnedFd) -> Result<(), RunError> {
+    verify_ipc_fd_at(fd, crate::ipc::IPC_FD)
+}
+
+fn verify_ipc_fd_at(fd: &OwnedFd, expected_fd: std::os::fd::RawFd) -> Result<(), RunError> {
+    use std::os::fd::AsRawFd;
+
+    use nix::sys::socket::{SockType, UnixAddr, getsockname, getsockopt, sockopt};
+
+    let raw = fd.as_raw_fd();
+    if raw != expected_fd {
+        return Err(RunError::Runtime(format!(
+            "executor IPC socket is on fd {raw}, expected IPC_FD ({expected_fd})"
+        )));
+    }
+    let sock_type = getsockopt(fd, sockopt::SockType)
+        .map_err(|err| RunError::Runtime(format!("IPC_FD ({raw}) is not a valid socket: {err}")))?;
+    if sock_type != SockType::SeqPacket {
+        return Err(RunError::Runtime(format!(
+            "IPC_FD ({raw}) has socket type {sock_type:?}, expected SOCK_SEQPACKET"
+        )));
+    }
+    getsockname::<UnixAddr>(raw).map_err(|err| {
+        RunError::Runtime(format!("IPC_FD ({raw}) is not an AF_UNIX socket: {err}"))
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1029,6 +1406,36 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn verify_ipc_fd_checks_slot_socket_type_and_domain() {
+        use std::os::fd::AsRawFd;
+
+        use nix::fcntl::OFlag;
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+
+        // Valid AF_UNIX SOCK_SEQPACKET at its own slot succeeds, wrong slot fails.
+        let (a, _b) = crate::kernel::ipc::seqpacket_pair(true).unwrap();
+        verify_ipc_fd_at(&a, a.as_raw_fd()).unwrap();
+        let err = verify_ipc_fd_at(&a, a.as_raw_fd() + 1).unwrap_err();
+        assert!(err.to_string().contains("expected IPC_FD"), "{err}");
+
+        // Non-socket fd (pipe) fails.
+        let (r, _w) = nix::unistd::pipe2(OFlag::O_CLOEXEC).unwrap();
+        let err = verify_ipc_fd_at(&r, r.as_raw_fd()).unwrap_err();
+        assert!(err.to_string().contains("not a valid socket"), "{err}");
+
+        // Wrong socket type (SOCK_STREAM instead of SOCK_SEQPACKET) fails.
+        let (s1, _s2) = socketpair(
+            AddressFamily::Unix,
+            SockType::Stream,
+            None,
+            SockFlag::SOCK_CLOEXEC,
+        )
+        .unwrap();
+        let err = verify_ipc_fd_at(&s1, s1.as_raw_fd()).unwrap_err();
+        assert!(err.to_string().contains("expected SOCK_SEQPACKET"), "{err}");
     }
 
     #[test]
@@ -1065,6 +1472,129 @@ mod tests {
             parse_args(args(&["--bogus"])).unwrap_err().to_string(),
             "unrecognised argument: --bogus"
         );
+    }
+
+    #[test]
+    fn parse_args_handles_internal_parser_mode() {
+        let parsed = parse_args(args(&[
+            "--internal-parser",
+            "--parent-pid",
+            "4242",
+            "--hardening",
+            "enforced",
+            "--seccomp",
+            "on",
+            "--has-initial-channel",
+        ]))
+        .unwrap();
+        assert_eq!(
+            parsed.internal_parser,
+            Some(crate::parser_proc::ParserOptions {
+                parent_pid: 4242,
+                hardening: crate::config::Hardening::Enforced,
+                seccomp: true,
+                has_initial_channel: true,
+            })
+        );
+
+        let dev = parse_args(args(&[
+            "--internal-parser",
+            "--parent-pid",
+            "7",
+            "--hardening",
+            "unenforced",
+            "--seccomp",
+            "off",
+        ]))
+        .unwrap();
+        assert_eq!(
+            dev.internal_parser,
+            Some(crate::parser_proc::ParserOptions {
+                parent_pid: 7,
+                hardening: crate::config::Hardening::Development,
+                seccomp: false,
+                has_initial_channel: false,
+            })
+        );
+
+        // Reject missing required flags, zero/invalid PID, unknown modes/flags.
+        for bad in [
+            &["--internal-parser"][..],
+            &["--internal-parser", "--parent-pid"][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "0",
+                "--hardening",
+                "enforced",
+                "--seccomp",
+                "on",
+            ][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "abc",
+                "--hardening",
+                "enforced",
+                "--seccomp",
+                "on",
+            ][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "10",
+                "--hardening",
+                "bogus",
+                "--seccomp",
+                "on",
+            ][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "10",
+                "--hardening",
+                "enforced",
+                "--seccomp",
+                "maybe",
+            ][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "10",
+                "--hardening",
+                "enforced",
+                "--seccomp",
+                "on",
+                "--extra",
+            ][..],
+            &[
+                "--internal-parser",
+                "--parent-pid",
+                "10",
+                "--hardening",
+                "enforced",
+            ][..],
+        ] {
+            assert!(parse_args(args(bad)).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn executor_exit_errors_map_to_run_errors() {
+        let busy = RunError::from(crate::executor::ExecutorExitError::ChannelTerminal(
+            OpenError::AlreadyOpen {
+                path: "/dev/virtio-ports/org.qemu.guest_agent.0".into(),
+            },
+        ));
+        assert_eq!(busy.exit_code(), EX_UNAVAILABLE);
+
+        for err in [
+            crate::executor::ExecutorExitError::ProtocolViolation("bad opcode".into()),
+            crate::executor::ExecutorExitError::ParserLost,
+            crate::executor::ExecutorExitError::IpcIo("epoll failed".into()),
+        ] {
+            assert_eq!(RunError::from(err).exit_code(), EX_OSERR);
+        }
     }
 
     #[test]

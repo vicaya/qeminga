@@ -31,6 +31,12 @@ ExecStartPre=+/usr/bin/chmod 0700 /run/qeminga
 ExecStart=/usr/bin/qeminga --config /etc/qeminga/config.toml
 Restart=always
 RestartSec=1s
+# CapabilityBoundingSet excludes CAP_KILL from startup, so Linux's
+# check_kill_permission() denies cross-UID PR_SET_PDEATHSIG once the parser
+# runs as UID 601. KillMode=control-group lets systemd clean up any
+# uncooperative UID-601 parser on MainPID exit (SIGTERM, then SIGKILL after
+# TimeoutStopSec) before Restart=always launches a replacement generation.
+KillMode=control-group
 TimeoutStopSec=330s
 StandardOutput=null
 StandardError=journal

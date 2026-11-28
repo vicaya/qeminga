@@ -117,6 +117,20 @@ impl OwnedAsyncFd {
         }
     }
 
+    /// Waits until the registered descriptor becomes readable and returns a
+    /// readiness guard whose `clear_ready()` resets edge-triggered readiness
+    /// after `EAGAIN`.
+    pub async fn readable(&self) -> io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>> {
+        self.inner.readable().await
+    }
+
+    /// Waits until the registered descriptor becomes writable and returns a
+    /// readiness guard whose `clear_ready()` resets edge-triggered readiness
+    /// after `EAGAIN`.
+    pub async fn writable(&self) -> io::Result<tokio::io::unix::AsyncFdReadyGuard<'_, OwnedFd>> {
+        self.inner.writable().await
+    }
+
     /// Writes from `data` once the descriptor is writable; `Pending` until
     /// then. If Tokio has already latched `WRITE_CLOSED` (`EPOLLHUP` /
     /// `EPOLLERR`), returns `BrokenPipe` **before** calling `write(2)` so an

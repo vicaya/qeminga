@@ -62,14 +62,15 @@ pub const fn reboot_command(mode: ShutdownMode) -> RebootCommand {
 /// How long a shutdown waits for its audit record to be delivered.
 pub const AUDIT_DELIVERY_GRACE: std::time::Duration = crate::audit::DELIVERY_GRACE;
 
-/// `guest-shutdown` handler.
-pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
-    let args: ShutdownArgs = arguments(req)?;
-    let cmd = reboot_command(args.mode.unwrap_or(ShutdownMode::Powerdown));
+/// Executes `guest-shutdown` with a pre-validated [`ShutdownMode`]: settles
+/// the audit writer for up to [`AUDIT_DELIVERY_GRACE`], then runs `sync` and
+/// `reboot` on the blocking pool.
+pub async fn execute_shutdown(ctx: &Context, mode: ShutdownMode) -> Result<(), Error> {
+    let cmd = reboot_command(mode);
     let kernel: Arc<dyn KernelOps> = Arc::clone(&ctx.kernel);
     // The audit record for this command was already emitted by the
-    // dispatcher; give the writer thread a bounded chance to deliver it
-    // before the kernel stops scheduling us. Bounded: a sink that is not
+    // dispatcher/executor; give the writer thread a bounded chance to deliver
+    // it before the kernel stops scheduling us. Bounded: a sink that is not
     // reading (§9.1) delays the shutdown by this much and no more.
     let audit = ctx.audit.clone();
     let _ = tokio::task::spawn_blocking(move || audit.settle(AUDIT_DELIVERY_GRACE)).await;
@@ -80,6 +81,13 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     .await
     .map_err(|err| Error::Internal(format!("shutdown task failed: {err}")))?
     .map_err(|err| Error::Internal(format!("shutdown failed: {err}")))?;
+    Ok(())
+}
+
+/// `guest-shutdown` handler.
+pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
+    let args: ShutdownArgs = arguments(req)?;
+    execute_shutdown(ctx, args.mode.unwrap_or(ShutdownMode::Powerdown)).await?;
     Ok(json!({}))
 }
 

@@ -20,9 +20,11 @@ compile_error!(
 
 pub mod audit;
 pub mod channel;
+pub mod channel_verify;
 pub mod config;
 pub mod daemon;
 pub mod dispatch;
+pub mod executor;
 pub mod framing;
 pub mod freeze_op;
 pub mod freeze_plan;
@@ -33,6 +35,7 @@ pub mod kernel;
 pub mod marker;
 pub mod mountinfo;
 pub mod ownership;
+pub mod parser_proc;
 pub mod proto;
 #[cfg(feature = "seccomp")]
 pub mod seccomp;

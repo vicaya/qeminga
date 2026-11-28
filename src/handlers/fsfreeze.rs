@@ -202,19 +202,22 @@ pub struct FreezeListArgs {
     pub mountpoints: Option<Vec<String>>,
 }
 
-/// `guest-fsfreeze-status`: `"frozen"` whenever the state is not `Thawed`
-/// (C-7); refreshes the watchdog only while `Frozen`.
-pub async fn status(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
-    let NoArgs {} = arguments(req)?;
+/// Typed IPC helper for `guest-fsfreeze-status`: returns `"frozen"` whenever
+/// the state is not `Thawed` (C-7) and refreshes the watchdog only while
+/// `Frozen`.
+pub fn execute_status_ipc(ctx: &Arc<Context>) -> crate::ipc::WireFreezeStatus {
     let state = ctx.state.current();
     if state == FreezeState::Frozen {
         ctx.hooks.on_heartbeat(ctx);
     }
-    Ok(json!(if state.is_frozen_for_gate() {
-        "frozen"
-    } else {
-        "thawed"
-    }))
+    crate::ipc::WireFreezeStatus::from_state(state)
+}
+
+/// `guest-fsfreeze-status`: `"frozen"` whenever the state is not `Thawed`
+/// (C-7); refreshes the watchdog only while `Frozen`.
+pub async fn status(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
+    let NoArgs {} = arguments(req)?;
+    Ok(json!(execute_status_ipc(ctx).as_str()))
 }
 
 /// `guest-fsfreeze-freeze`: freezes the whole plan.
@@ -230,95 +233,230 @@ pub async fn freeze_list(ctx: &Arc<Context>, req: &Request) -> Result<Value, Err
     run_freeze(ctx, args.mountpoints).await
 }
 
-/// `guest-fsfreeze-thaw`: drains every planned filesystem. While a freeze
-/// operation is unresolved (`Freezing`, or the recovery of an aborted one),
-/// the thaw joins it instead of starting a drain of its own: it requests
-/// the abort, waits for the recovery pass over the targets frozen so far,
-/// and reports the operation's outcome (§4.4). No target is ever drained
-/// by two owners.
-pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
-    let NoArgs {} = arguments(req)?;
-    let token = match ctx.state.claim_thaw() {
-        Ok(token) => token,
-        Err(err) => match ctx.freeze_op() {
-            Some(op) => return join_operation(ctx, &op).await,
+/// Typed IPC freeze helper that invokes `on_published` synchronously as soon
+/// as `begin_freeze()` has moved the state machine to `Freezing` and
+/// `crate::freeze_op::start` has published the active [`crate::freeze_op::FreezeOp`]
+/// in `ctx` (before awaiting completion), so a later queued thaw can safely
+/// join the published operation without racing ahead of freeze startup.
+pub async fn execute_freeze_ipc_with_published(
+    ctx: &Arc<Context>,
+    restrict: Option<Vec<String>>,
+    on_published: impl FnOnce(),
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    let effective =
+        filter_freeze_selection(restrict.as_deref(), ctx.config.freeze_allowed_mountpoints());
+    let token =
+        ctx.state
+            .begin_freeze()
+            .map_err(|err| crate::ipc::IpcErrorCode::TransitionConflict {
+                op: crate::ipc::TransitionOp::BeginFreeze,
+                current: err.current,
+            })?;
+    if effective.as_deref() == Some(&[]) {
+        ctx.state.freeze_failed(token);
+        tracing::info!(
+            event = "fsfreeze_empty_selection",
+            "freeze selection admitted zero targets; settled thawed without I/O"
+        );
+        return Ok(0);
+    }
+    ctx.hooks.on_freezing(ctx);
+    let reply = crate::freeze_op::start(Arc::clone(ctx), token, effective);
+    on_published();
+    match reply.await {
+        Ok(Ok(frozen)) => Ok(frozen),
+        Ok(Err(failure)) => Err(crate::ipc::IpcErrorCode::from_freeze_failure(&failure)),
+        Err(_) => Err(crate::ipc::IpcErrorCode::FreezeTaskFailed {
+            stage: FreezeTaskStage::Preparation,
+        }),
+    }
+}
+
+/// How a thaw claim handles an already-`Thawed` state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThawClaimPolicy {
+    /// Normal `guest-fsfreeze-thaw`: claims `Frozen → Thawing` or
+    /// `Thawed → Thawing` (recovery drain).
+    AllowRecoveryFromThawed,
+    /// Graceful-stop thaw (`SIGTERM`/`SIGINT` latched): claims
+    /// `Frozen → Thawing` and preserves `Freezing`/`Thawing` conflicts (so an
+    /// active freeze operation is still joined/aborted), while mapping
+    /// `Thawed` to [`ThawClaimOutcome::AlreadyThawed`] (`Ok(0)`).
+    ExistingFrozenOnly,
+}
+
+/// Result of attempting a thaw state transition under a [`ThawClaimPolicy`].
+#[derive(Debug)]
+enum ThawClaimOutcome {
+    /// Transitioned into `Thawing`; caller owns the drain token.
+    Claimed(ThawToken),
+    /// `ExistingFrozenOnly` observed `Thawed`; nothing to drain.
+    AlreadyThawed,
+    /// State machine is in a conflicting state (`Freezing` or `Thawing`).
+    Conflict(crate::state::TransitionError),
+}
+
+fn try_claim_thaw(
+    state: &crate::state::FreezeStateMachine,
+    policy: ThawClaimPolicy,
+) -> ThawClaimOutcome {
+    match policy {
+        ThawClaimPolicy::AllowRecoveryFromThawed => match state.claim_thaw() {
+            Ok(token) => ThawClaimOutcome::Claimed(token),
+            Err(err) => ThawClaimOutcome::Conflict(err),
+        },
+        ThawClaimPolicy::ExistingFrozenOnly => match state.claim_thaw_from_frozen() {
+            Ok(token) => ThawClaimOutcome::Claimed(token),
+            Err(err) => match err.current {
+                FreezeState::Thawed => ThawClaimOutcome::AlreadyThawed,
+                FreezeState::Freezing | FreezeState::Thawing | FreezeState::Frozen => {
+                    ThawClaimOutcome::Conflict(err)
+                }
+            },
+        },
+    }
+}
+
+/// Typed IPC helper for `guest-fsfreeze-thaw` returning closed
+/// [`crate::ipc::IpcErrorCode`] values with zero guest paths or device numbers.
+///
+/// While a freeze operation is unresolved (`Freezing`, or the recovery of an
+/// aborted one), the thaw joins it instead of starting a drain of its own: it
+/// requests the abort and reports the operation's outcome (§4.4). No target is
+/// ever drained by two owners.
+pub async fn execute_thaw_ipc(ctx: &Arc<Context>) -> Result<u64, crate::ipc::IpcErrorCode> {
+    execute_thaw_ipc_inner(ctx, ThawClaimPolicy::AllowRecoveryFromThawed).await
+}
+
+/// Typed IPC thaw used once graceful stop (`SIGTERM`/`SIGINT`) is latched:
+/// completes any active `Frozen` or in-progress `Freezing` obligation (preserving
+/// C-21 and the join/abort path) without starting a fresh `Thawed → Thawing`
+/// recovery drain when an earlier thaw already settled `Thawed` (returning `Ok(0)`).
+pub async fn execute_thaw_existing_ipc(
+    ctx: &Arc<Context>,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    execute_thaw_ipc_inner(ctx, ThawClaimPolicy::ExistingFrozenOnly).await
+}
+
+async fn execute_thaw_ipc_inner(
+    ctx: &Arc<Context>,
+    policy: ThawClaimPolicy,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    let token = match try_claim_thaw(&ctx.state, policy) {
+        ThawClaimOutcome::Claimed(token) => token,
+        ThawClaimOutcome::AlreadyThawed => return Ok(0),
+        ThawClaimOutcome::Conflict(err) => match ctx.freeze_op() {
+            Some(op) => return join_operation_typed(ctx, &op, policy).await,
             // The operation may have settled between the claim and the
             // look-up: one more claim before refusing.
-            None => ctx
-                .state
-                .claim_thaw()
-                .map_err(|_| Error::Internal(format!("cannot thaw: {err}")))?,
+            None => match try_claim_thaw(&ctx.state, policy) {
+                ThawClaimOutcome::Claimed(token) => token,
+                ThawClaimOutcome::AlreadyThawed => return Ok(0),
+                ThawClaimOutcome::Conflict(_) => {
+                    return Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                        op: crate::ipc::TransitionOp::ClaimThaw,
+                        current: err.current,
+                    });
+                }
+            },
         },
     };
-    let count = run_thaw(ctx, token).await?;
+    run_thaw_typed(ctx, token).await
+}
+
+/// A thaw that joins the freeze operation in progress: it requests the abort
+/// and is answered at once, conservatively, from the operation's current
+/// progress. It never waits for the recovery (a blocked `FITHAW` would hold
+/// the session with it) and never reports a complete thaw while the operation
+/// can still freeze a target: the host learns the outcome from
+/// `guest-fsfreeze-status`, which answers `frozen` until the operation has
+/// settled `Thawed`.
+///
+/// The request and the operation's own commit compete on one transition: when
+/// the operation had already committed (a freeze that succeeded a moment ago,
+/// or a settlement of its own), nothing is aborted, the operation's settlement
+/// is awaited (the driver is past every blocking call by then) and the thaw
+/// takes the ordinary path from the published state, so a thaw is never told
+/// "recovery pending" by an operation that then publishes a successful
+/// `Frozen`.
+async fn join_operation_typed(
+    ctx: &Arc<Context>,
+    op: &crate::freeze_op::FreezeOp,
+    policy: ThawClaimPolicy,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
+    if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
+        op.wait_for_settlement().await;
+        let token = match try_claim_thaw(&ctx.state, policy) {
+            ThawClaimOutcome::Claimed(token) => token,
+            ThawClaimOutcome::AlreadyThawed => return Ok(0),
+            ThawClaimOutcome::Conflict(err) => {
+                return Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                    op: crate::ipc::TransitionOp::ClaimThaw,
+                    current: err.current,
+                });
+            }
+        };
+        return run_thaw_typed(ctx, token).await;
+    }
+    let progress = op.progress();
+    match progress.settled {
+        Some(FreezeState::Thawed) => Ok(progress.recovered),
+        Some(state) => Err(crate::ipc::IpcErrorCode::ThawIncomplete {
+            kind: progress
+                .unrecoverable_reason
+                .unwrap_or(RecoveryReason::RecoveryIncomplete),
+            thawed: progress.recovered,
+            final_state: state,
+            marker_retained: true,
+        }),
+        None => Err(abort_pending_error(&progress)),
+    }
+}
+
+/// Maps an unsettled freeze operation's progress to its closed host-safe
+/// `ThawAbortPending` error code (design §4.4, §5.9, AC27).
+fn abort_pending_error(progress: &crate::freeze_op::Progress) -> crate::ipc::IpcErrorCode {
+    let activity = if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
+        crate::ipc::AbortActivity::Preparing
+    } else if progress.in_flight.is_some() {
+        crate::ipc::AbortActivity::InFlightFifreeze
+    } else {
+        crate::ipc::AbortActivity::Idle
+    };
+    crate::ipc::IpcErrorCode::ThawAbortPending {
+        activity,
+        thawed: progress.recovered,
+    }
+}
+
+/// `guest-fsfreeze-thaw`: drains every planned filesystem (delegating through
+/// [`execute_thaw_ipc`] so direct QGA and isolated IPC share one abort/join
+/// implementation).
+pub async fn thaw(ctx: &Arc<Context>, req: &Request) -> Result<Value, Error> {
+    let NoArgs {} = arguments(req)?;
+    let count = execute_thaw_ipc(ctx)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)?;
     Ok(json!(count))
 }
 
-/// A thaw that joins the freeze operation in progress: it requests the
-/// abort and is answered at once, conservatively, from the operation's
-/// current progress. It never waits for the recovery (a blocked `FITHAW`
-/// would hold the session with it) and never reports a complete thaw
-/// while the operation can still freeze a target: the host learns the
-/// outcome from `guest-fsfreeze-status`, which answers `frozen` until the
-/// operation has settled `Thawed`.
-///
-/// The request and the operation's own commit compete on one transition:
-/// when the operation had already committed (a freeze that succeeded a
-/// moment ago, or a settlement of its own), nothing is aborted, the
-/// operation's settlement is awaited (the driver is past every blocking
-/// call by then) and the thaw takes the ordinary path from the published
-/// state, so a thaw is never told "recovery pending" by an operation that
-/// then publishes a successful `Frozen`.
+#[cfg(test)]
 async fn join_operation(
     ctx: &Arc<Context>,
     op: &crate::freeze_op::FreezeOp,
 ) -> Result<Value, Error> {
-    if op.request_abort() == crate::freeze_op::AbortRequest::Committed {
-        op.wait_for_settlement().await;
-        let token = ctx
-            .state
-            .claim_thaw()
-            .map_err(|err| Error::Internal(format!("cannot thaw: {err}")))?;
-        let count = run_thaw(ctx, token).await?;
-        return Ok(json!(count));
-    }
-    let progress = op.progress();
-    match progress.settled {
-        Some(FreezeState::Thawed) => Ok(json!(progress.recovered)),
-        Some(state) => {
-            let reason = progress
-                .unrecoverable_reason
-                .map(RecoveryReason::host_reason)
-                .unwrap_or("recovery incomplete");
-            Err(Error::Internal(format!(
-                "thaw joined the aborted freeze: {} target(s) thawed; {reason}; state {state}, marker retained",
-                progress.recovered,
-            )))
-        }
-        None => Err(Error::Internal(format_joining_pending(&progress))),
-    }
+    let count = join_operation_typed(ctx, op, ThawClaimPolicy::AllowRecoveryFromThawed)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)?;
+    Ok(json!(count))
 }
 
-/// Host-facing reply for a `guest-fsfreeze-thaw` joining an unsettled
-/// freeze operation (design §4.4, §5.9, AC27). Across the unsettled window —
-/// preparation, transition in `commit_abort`, recovery draining, and
-/// finalisation after marker removal — the reply uses the fixed
-/// `"abort accepted, recovery pending"` wording together with the observed
-/// thawed count and in-flight activity, avoiding stale state or marker claims.
+#[cfg(test)]
 fn format_joining_pending(progress: &crate::freeze_op::Progress) -> String {
-    if progress.in_flight.as_deref() == Some(crate::freeze_op::PREPARING) {
-        return "thaw requested: abort accepted, recovery pending (preparation still in flight)"
-            .to_owned();
+    match abort_pending_error(progress).to_proto_error() {
+        Error::Internal(desc) => desc,
+        other => other.to_string(),
     }
-    let activity = if progress.in_flight.is_some() {
-        ", a FIFREEZE is still in flight"
-    } else {
-        ""
-    };
-    format!(
-        "thaw requested: abort accepted, recovery pending ({} target(s) thawed so far{activity})",
-        progress.recovered,
-    )
 }
 
 /// The freeze algorithm shared by `freeze` and `freeze-list`: claim
@@ -361,6 +499,17 @@ async fn run_freeze(ctx: &Arc<Context>, restrict: Option<Vec<String>>) -> Result
 /// The thaw drain shared by the handler and the watchdog: the caller has
 /// already won `claim_thaw` and passes the token.
 pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error> {
+    run_thaw_typed(ctx, token)
+        .await
+        .map_err(crate::ipc::IpcErrorCode::to_proto_error)
+}
+
+/// Typed variant of [`run_thaw`] returning closed [`crate::ipc::IpcErrorCode`]
+/// values shared between direct QGA handlers and the isolated IPC executor.
+pub async fn run_thaw_typed(
+    ctx: &Arc<Context>,
+    token: ThawToken,
+) -> Result<u64, crate::ipc::IpcErrorCode> {
     ctx.hooks.on_thaw_claimed(ctx);
     let kernel = Arc::clone(&ctx.kernel);
     let mounts = Arc::clone(&ctx.mounts);
@@ -534,8 +683,10 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             ctx.set_thaw_scope(ThawScope::Discovery);
             ctx.state.thaw_succeeded(token);
             tracing::warn!(event = "fsfreeze_recovery_drain_failed", error = %failure, "recovery drain failed; still thawed");
-            Err(Error::Internal(
-                failure.host_description(FreezeState::Thawed),
+            Err(crate::ipc::IpcErrorCode::from_thaw_failure(
+                &failure,
+                FreezeState::Thawed,
+                false,
             ))
         }
         Err(failure) => {
@@ -552,10 +703,11 @@ pub async fn run_thaw(ctx: &Arc<Context>, token: ThawToken) -> Result<u64, Error
             } else {
                 tracing::error!(event = "fsfreeze_thaw_failed", error = %failure, "thaw failed; recovery marker unavailable");
             }
-            Err(Error::Internal(failure.host_description_with_marker(
+            Err(crate::ipc::IpcErrorCode::from_thaw_failure(
+                &failure,
                 FreezeState::Frozen,
                 marker_retained,
-            )))
+            ))
         }
     }
 }
@@ -10245,5 +10397,235 @@ mod tests {
         ));
         assert_eq!(kernel8.tracked_frozen_superblocks(), 1);
         assert!(kernel8.calls().is_empty());
+    }
+
+    #[test]
+    fn try_claim_thaw_policy_matrix() {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Expected {
+            Claimed,
+            AlreadyThawed,
+            Conflict(FreezeState),
+        }
+
+        let cases = [
+            (
+                ThawClaimPolicy::AllowRecoveryFromThawed,
+                FreezeState::Thawed,
+                Expected::Claimed,
+                FreezeState::Thawing,
+            ),
+            (
+                ThawClaimPolicy::AllowRecoveryFromThawed,
+                FreezeState::Frozen,
+                Expected::Claimed,
+                FreezeState::Thawing,
+            ),
+            (
+                ThawClaimPolicy::AllowRecoveryFromThawed,
+                FreezeState::Freezing,
+                Expected::Conflict(FreezeState::Freezing),
+                FreezeState::Freezing,
+            ),
+            (
+                ThawClaimPolicy::AllowRecoveryFromThawed,
+                FreezeState::Thawing,
+                Expected::Conflict(FreezeState::Thawing),
+                FreezeState::Thawing,
+            ),
+            (
+                ThawClaimPolicy::ExistingFrozenOnly,
+                FreezeState::Thawed,
+                Expected::AlreadyThawed,
+                FreezeState::Thawed,
+            ),
+            (
+                ThawClaimPolicy::ExistingFrozenOnly,
+                FreezeState::Frozen,
+                Expected::Claimed,
+                FreezeState::Thawing,
+            ),
+            (
+                ThawClaimPolicy::ExistingFrozenOnly,
+                FreezeState::Freezing,
+                Expected::Conflict(FreezeState::Freezing),
+                FreezeState::Freezing,
+            ),
+            (
+                ThawClaimPolicy::ExistingFrozenOnly,
+                FreezeState::Thawing,
+                Expected::Conflict(FreezeState::Thawing),
+                FreezeState::Thawing,
+            ),
+        ];
+
+        for (policy, start, expected, expected_after) in cases {
+            let sm = FreezeStateMachine::starting_in(start);
+            let actual = match try_claim_thaw(&sm, policy) {
+                ThawClaimOutcome::Claimed(token) => {
+                    assert_eq!(sm.current(), expected_after, "{policy:?} from {start:?}");
+                    sm.thaw_succeeded(token);
+                    Expected::Claimed
+                }
+                ThawClaimOutcome::AlreadyThawed => {
+                    assert_eq!(sm.current(), expected_after, "{policy:?} from {start:?}");
+                    Expected::AlreadyThawed
+                }
+                ThawClaimOutcome::Conflict(err) => {
+                    assert_eq!(sm.current(), expected_after, "{policy:?} from {start:?}");
+                    Expected::Conflict(err.current)
+                }
+            };
+            assert_eq!(actual, expected, "{policy:?} from {start:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_thaw_existing_ipc_distinguishes_frozen_thawed_and_conflict() {
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts.clone());
+
+        // 1. Settled `Thawed`: returns `Ok(0)` without reading mountinfo or
+        //    issuing any ioctl.
+        assert_eq!(execute_thaw_existing_ipc(&rig.ctx).await, Ok(0));
+        assert_eq!(mounts.read_count(), 0);
+        assert!(rig.kernel.calls().is_empty());
+        assert_eq!(rig.state(), FreezeState::Thawed);
+
+        // 2. `Thawing` with no active `freeze_op`: surfaces `TransitionConflict`
+        //    after the retry claim instead of collapsing to `Ok(0)`.
+        let thaw_token = rig.ctx.state.claim_thaw().unwrap();
+        assert_eq!(
+            execute_thaw_existing_ipc(&rig.ctx).await,
+            Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                op: crate::ipc::TransitionOp::ClaimThaw,
+                current: FreezeState::Thawing,
+            })
+        );
+        assert_eq!(mounts.read_count(), 0);
+        assert!(rig.kernel.calls().is_empty());
+        rig.ctx.state.thaw_succeeded(thaw_token);
+
+        // 3. `Freezing` with no active `freeze_op`: also surfaces
+        //    `TransitionConflict` after the retry claim instead of `Ok(0)`.
+        let freeze_token = rig.ctx.state.begin_freeze().unwrap();
+        assert_eq!(
+            execute_thaw_existing_ipc(&rig.ctx).await,
+            Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                op: crate::ipc::TransitionOp::ClaimThaw,
+                current: FreezeState::Freezing,
+            })
+        );
+        assert_eq!(mounts.read_count(), 0);
+        assert!(rig.kernel.calls().is_empty());
+        rig.ctx.state.freeze_failed(freeze_token);
+
+        // 4. `Frozen`: drains all 4 frozen mounts and settles `Thawed`.
+        let frozen = freeze(&rig.ctx, &req(r#"{"execute":"guest-fsfreeze-freeze"}"#))
+            .await
+            .unwrap();
+        assert_eq!(frozen, json!(4));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(execute_thaw_existing_ipc(&rig.ctx).await, Ok(4));
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+
+        // 5. Active `Freezing` operation: joins and requests abort, returning
+        //    `ThawAbortPending` rather than `Ok(0)` or `TransitionConflict`.
+        let d = rig.kernel.script_freeze_gate(D);
+        let _release = d.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("D blocked", |_| d.waiting() == 1).await;
+        let err = execute_thaw_existing_ipc(&rig.ctx).await.unwrap_err();
+        assert!(
+            matches!(err, crate::ipc::IpcErrorCode::ThawAbortPending { .. }),
+            "expected ThawAbortPending when joining active freeze, got {err:?}"
+        );
+        d.release();
+        let _ = freezing.await.unwrap();
+        rig.wait_for("aborted freeze settled", |r| {
+            r.state() == FreezeState::Thawed
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn join_operation_typed_after_committed_settlement_respects_claim_policy() {
+        let mounts = Arc::new(SwitchableMounts::new(fixture("nested.txt")));
+        let rig = Rig::with_mounts(FreezeState::Thawed, mounts.clone());
+
+        // Capture a real `FreezeOp` while in-flight, then let it commit and
+        // settle `Frozen` so `request_abort()` returns `AbortRequest::Committed`
+        // and `wait_for_settlement()` completes immediately without timing races.
+        let d = rig.kernel.script_freeze_gate(D);
+        let _release = d.release_on_drop();
+        let freezing = rig.spawn_freeze();
+        rig.wait_for("D blocked", |_| d.waiting() == 1).await;
+        let op = rig.ctx.freeze_op().unwrap();
+        d.release();
+        assert_eq!(freezing.await.unwrap().unwrap(), json!(4));
+        assert_eq!(rig.state(), FreezeState::Frozen);
+        assert_eq!(
+            op.request_abort(),
+            crate::freeze_op::AbortRequest::Committed
+        );
+
+        // 1. Committed settlement followed by a genuine `Thawing` conflict:
+        //    both policies MUST report `TransitionConflict { Thawing }`, never
+        //    collapsing to `Ok(0)`.
+        let held_thaw = rig.ctx.state.claim_thaw().unwrap();
+        for policy in [
+            ThawClaimPolicy::ExistingFrozenOnly,
+            ThawClaimPolicy::AllowRecoveryFromThawed,
+        ] {
+            assert_eq!(
+                join_operation_typed(&rig.ctx, &op, policy).await,
+                Err(crate::ipc::IpcErrorCode::TransitionConflict {
+                    op: crate::ipc::TransitionOp::ClaimThaw,
+                    current: FreezeState::Thawing,
+                }),
+                "{policy:?} must preserve TransitionConflict after committed settlement"
+            );
+        }
+        rig.ctx.state.thaw_failed(held_thaw);
+        assert_eq!(rig.state(), FreezeState::Frozen);
+
+        // 2. Committed settlement while still `Frozen`: `ExistingFrozenOnly`
+        //    claims the thaw and drains all 4 targets to `Thawed`.
+        assert_eq!(
+            join_operation_typed(&rig.ctx, &op, ThawClaimPolicy::ExistingFrozenOnly).await,
+            Ok(4)
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
+        assert!(!rig.marker().exists());
+
+        // 3. Committed settlement once already `Thawed`: `ExistingFrozenOnly`
+        //    maps `Thawed` to `Ok(0)` with zero mount reads, zero kernel ioctls,
+        //    and no thaw-claim hook.
+        let reads_before = mounts.read_count();
+        let events_before = rig.hooks.events().len();
+        rig.kernel.clear_calls();
+        assert_eq!(
+            join_operation_typed(&rig.ctx, &op, ThawClaimPolicy::ExistingFrozenOnly).await,
+            Ok(0)
+        );
+        assert_eq!(mounts.read_count(), reads_before);
+        assert!(rig.kernel.calls().is_empty());
+        assert_eq!(rig.hooks.events().len(), events_before);
+        assert_eq!(rig.state(), FreezeState::Thawed);
+
+        // 4. Committed settlement once already `Thawed` under normal
+        //    `AllowRecoveryFromThawed`: claims and runs the recovery drain
+        //    (`thaw_claimed` -> `thawed`) instead of short-circuiting.
+        assert_eq!(
+            join_operation_typed(&rig.ctx, &op, ThawClaimPolicy::AllowRecoveryFromThawed).await,
+            Ok(0)
+        );
+        assert!(mounts.read_count() > reads_before);
+        assert_eq!(
+            &rig.hooks.events()[events_before..],
+            &["thaw_claimed", "thawed"]
+        );
+        assert_eq!(rig.state(), FreezeState::Thawed);
     }
 }

@@ -12,7 +12,7 @@
 use libfuzzer_sys::fuzz_target;
 use qeminga::ipc::{
     AssembledMessage, MAX_CONCURRENT_STREAMS, MAX_FSINFO_IPC_BYTES, MAX_PACKET_BYTES,
-    MAX_REQUEST_PAYLOAD_BYTES, PeerRole, StreamAssembler, encode_request_chunks,
+    MAX_REQUEST_PAYLOAD_BYTES, PeerRole, StreamAssembler, encode_request_chunks_with_id,
     encode_response_chunks,
 };
 use qeminga::kernel::ipc::RawPacket;
@@ -32,8 +32,13 @@ fn synthetic_packet(flags: u8, bytes: Vec<u8>) -> RawPacket {
 fn check_round_trip(msg: AssembledMessage) {
     match msg {
         AssembledMessage::Request(req) => {
-            let chunks = encode_request_chunks(req.session_gen, req.req_id, &req.request)
-                .expect("accepted request must re-encode within bounds");
+            let chunks = encode_request_chunks_with_id(
+                req.session_gen,
+                req.req_id,
+                req.host_id,
+                &req.request,
+            )
+            .expect("accepted request must re-encode within bounds");
             let mut verify = StreamAssembler::new(PeerRole::Executor);
             let mut decoded = None;
             for chunk in chunks {

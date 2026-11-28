@@ -369,6 +369,64 @@ pub fn drop_privileges_to_with_group(
     Ok(())
 }
 
+/// Drops the host-facing parser process to `user` (`qeminga-parser`, UID/GID
+/// `601`) with **zero** capabilities in every set (`CapEff`, `CapPrm`,
+/// `CapBnd`, `CapInh`, `CapAmb`), single supplementary group `[gid]`, and
+/// `PR_SET_NO_NEW_PRIVS` (OQ-10 §3.2, #78).
+///
+/// Skips with a warning when not root (matching C-18; enforced hardening
+/// refuses `Outcome::SkippedUnprivileged`).
+pub fn drop_parser_privileges(user: &str, ops: &dyn CapOps) -> Result<Outcome, PrivilegeError> {
+    if !ops.is_root() {
+        tracing::warn!(
+            event = "parser_privilege_drop_skipped",
+            "parser not running as root; capabilities are not dropped (a refusal under enforced hardening)"
+        );
+        return Ok(Outcome::SkippedUnprivileged);
+    }
+    let account = ops
+        .lookup(user)
+        .map_err(|reason| PrivilegeError::Step {
+            step: "user lookup",
+            reason,
+        })?
+        .ok_or_else(|| PrivilegeError::UnknownUser(user.to_owned()))?;
+    drop_parser_privileges_to(account, ops)?;
+    Ok(Outcome::Dropped)
+}
+
+/// Drops the host-facing parser process to an already-resolved `account` with
+/// zero capabilities in all five capability sets and `PR_SET_NO_NEW_PRIVS`.
+///
+/// Caller must arm `PR_SET_PDEATHSIG(SIGKILL)` and re-check `getppid()`
+/// **after** this returns because `setresuid` clears `pdeath_signal` on Linux.
+pub fn drop_parser_privileges_to(account: Account, ops: &dyn CapOps) -> Result<(), PrivilegeError> {
+    // 1. Empty the entire bounding set while still holding CAP_SETPCAP.
+    let bounding = ops.bounding().map_err(|reason| PrivilegeError::Step {
+        step: "read bounding set",
+        reason,
+    })?;
+    let mut to_drop: Vec<Capability> = bounding.into_iter().collect();
+    to_drop.sort_by_key(|cap| cap.index());
+    for cap in to_drop {
+        step("bounding set drop", ops.drop(SetKind::Bounding, cap))?;
+    }
+    // 2. Ensure KEEPCAPS is off so setresuid clears effective/permitted/ambient.
+    step("PR_SET_KEEPCAPS", ops.set_keepcaps(false))?;
+    // 3. Switch groups, GID, and UID to the dedicated parser account.
+    step("setgroups", ops.setgroups(&[account.gid]))?;
+    step("setresgid", ops.setresgid(account.gid))?;
+    step("setresuid", ops.setresuid(account.uid))?;
+    // 4. Explicitly clear all remaining sets (effective before permitted).
+    step("clear effective", ops.clear(SetKind::Effective))?;
+    step("clear permitted", ops.clear(SetKind::Permitted))?;
+    step("clear inheritable", ops.clear(SetKind::Inheritable))?;
+    step("clear ambient", ops.clear(SetKind::Ambient))?;
+    // 5. Lock out any privilege regain before seccomp installation.
+    step("PR_SET_NO_NEW_PRIVS", ops.set_no_new_privs())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +942,127 @@ mod tests {
                 "--nocapture",
             ])
             .env("QEMINGA_CAPS_GROUP_DIR", dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn drop_parser_privileges_empties_every_capability_set_and_switches_to_uid_601() {
+        let mut fake = FakeCaps::root();
+        fake.users.push((
+            "qeminga-parser",
+            Account {
+                uid: Uid::from_raw(601),
+                gid: Gid::from_raw(601),
+            },
+        ));
+        assert_eq!(
+            drop_parser_privileges("qeminga-parser", &fake).unwrap(),
+            Outcome::Dropped
+        );
+        let steps = fake.steps.borrow();
+        let bounding_drops: usize = steps
+            .iter()
+            .filter(|s| matches!(s, Step::Drop(SetKind::Bounding, _)))
+            .count();
+        assert_eq!(
+            bounding_drops,
+            caps::all().len(),
+            "must drop every capability from bounding set"
+        );
+        let tail = &steps[bounding_drops..];
+        assert_eq!(
+            tail,
+            &[
+                Step::KeepCaps(false),
+                Step::SetGroups(vec![Gid::from_raw(601)]),
+                Step::SetResGid(Gid::from_raw(601)),
+                Step::SetResUid(Uid::from_raw(601)),
+                Step::Clear(SetKind::Effective),
+                Step::Clear(SetKind::Permitted),
+                Step::Clear(SetKind::Inheritable),
+                Step::Clear(SetKind::Ambient),
+                Step::NoNewPrivs,
+            ]
+        );
+
+        // Missing user fails with UnknownUser.
+        assert_eq!(
+            drop_parser_privileges("missing-parser", &fake).unwrap_err(),
+            PrivilegeError::UnknownUser("missing-parser".to_owned())
+        );
+
+        // Non-root skips cleanly with SkippedUnprivileged.
+        drop(steps);
+        fake.root = false;
+        fake.steps.borrow_mut().clear();
+        assert_eq!(
+            drop_parser_privileges("qeminga-parser", &fake).unwrap(),
+            Outcome::SkippedUnprivileged
+        );
+        assert!(fake.steps.borrow().is_empty());
+    }
+
+    #[test]
+    #[ignore = "needs root (runs real zero-capability parser privilege drop in a child)"]
+    fn privileged_drop_parser_privileges_leaves_zero_caps() {
+        if std::env::var_os("QEMINGA_CAPS_PARSER_CHILD").is_some() {
+            let account = Account {
+                uid: Uid::from_raw(65534),
+                gid: Gid::from_raw(65534),
+            };
+            drop_parser_privileges_to(account, &SystemCaps).expect("drop parser caps");
+            // CapBnd and NoNewPrivs are per-thread on Linux, so inspect
+            // `/proc/thread-self/status` (the exact thread that performed the
+            // drop) alongside direct per-thread `caps::read` / `prctl` queries.
+            let status = std::fs::read_to_string("/proc/thread-self/status").expect("status");
+            for field in ["CapEff:", "CapPrm:", "CapBnd:", "CapInh:", "CapAmb:"] {
+                let val = status
+                    .lines()
+                    .find_map(|l| l.strip_prefix(field))
+                    .unwrap_or_else(|| panic!("{field} missing"))
+                    .trim();
+                assert_eq!(val, "0000000000000000", "{field} must be all zero");
+            }
+            for cset in [
+                CapSet::Effective,
+                CapSet::Permitted,
+                CapSet::Bounding,
+                CapSet::Inheritable,
+                CapSet::Ambient,
+            ] {
+                assert!(
+                    caps::read(None, cset).unwrap().is_empty(),
+                    "{cset:?} must be empty"
+                );
+            }
+            let nnp = status
+                .lines()
+                .find_map(|l| l.strip_prefix("NoNewPrivs:"))
+                .unwrap()
+                .trim();
+            assert_eq!(nnp, "1");
+            assert!(nix::sys::prctl::get_no_new_privs().unwrap());
+            assert_eq!(Uid::effective().as_raw(), 65534);
+            assert_eq!(Gid::effective().as_raw(), 65534);
+            return;
+        }
+        assert!(Uid::effective().is_root(), "run as root");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "kernel::caps::tests::privileged_drop_parser_privileges_leaves_zero_caps",
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("QEMINGA_CAPS_PARSER_CHILD", "1")
             .output()
             .unwrap();
         assert!(

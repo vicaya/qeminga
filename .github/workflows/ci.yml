@@ -445,6 +445,8 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq xfsprogs
           sudo groupadd -g 600 qeminga || true
           sudo useradd -u 600 -g 600 -M -r -s /usr/sbin/nologin qeminga || true
+          sudo groupadd -g 601 qeminga-parser || true
+          sudo useradd -u 601 -g 601 -M -r -s /usr/sbin/nologin qeminga-parser || true
       - name: The enforced feature set really enforces
         run: |
           cfg=$(cargo rustc --lib --locked --features "$ENFORCED_FEATURES" -- --print cfg)

@@ -305,8 +305,8 @@ pub const IPC_FD: u64 = crate::ipc::IPC_FD as u64;
 /// Both `clone` and `clone3` (as well as `fork`/`vfork`/`execve`/`execveat`)
 /// are omitted: the parser serves its pre-opened channel descriptor and
 /// `IPC_FD = 3` on a single `ppoll` loop after installing this filter, so a
-/// compromised parser cannot fork a detached child process that escapes
-/// `PR_SET_PDEATHSIG(SIGKILL)` supervision.
+/// compromised parser cannot spawn extra threads or detached child processes
+/// beyond the single supervised parser PID (OQ-10 §3.2, §5.3).
 pub const PARSER_COMMON: &[&str] = &[
     // Pre-opened descriptor I/O only (verified virtio channel fd, /dev/null on
     // fds 0/1/2, and IPC_FD = 3). Zero path-taking or filesystem-opening

@@ -87,6 +87,41 @@ pub struct AgentConfig {
     /// unfreezable runtime filesystem (checked at startup).
     #[serde(default)]
     pub freeze_ownership_dir: Option<PathBuf>,
+    /// Backing channel device verification mode (`[agent] channel_transport`,
+    /// OQ-10 §4.2, #78). Defaults to [`ChannelTransport::VirtioSerial`].
+    #[serde(default)]
+    pub channel_transport: ChannelTransport,
+    /// Optional explicit virtio-serial port name expected in sysfs
+    /// `/sys/dev/char/<maj>:<min>/name` (OQ-10 §4.2). When omitted, defaults
+    /// to the basename of `channel_path` (e.g. `org.qemu.guest_agent.0`).
+    #[serde(default)]
+    pub channel_port_name: Option<String>,
+}
+
+/// Backing channel device verification mode (`[agent] channel_transport`,
+/// OQ-10 §4.2, #78).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+pub enum ChannelTransport {
+    /// Production: require `fstat(S_ISCHR)` plus sysfs
+    /// `subsystem == "virtio-ports"` and exact `name == "<port>\n"`.
+    #[default]
+    #[serde(rename = "virtio-serial")]
+    VirtioSerial,
+    /// Test and development harnesses driving the daemon over a PTY slave:
+    /// require `fstat(S_ISCHR)` + `DEVPTS_SUPER_MAGIC` + Unix98 PTY slave /
+    /// `isatty(fd)`. Never accepts regular files or arbitrary character devices.
+    #[serde(rename = "pty-test-only")]
+    PtyTestOnly,
+}
+
+impl ChannelTransport {
+    /// The configuration spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ChannelTransport::VirtioSerial => "virtio-serial",
+            ChannelTransport::PtyTestOnly => "pty-test-only",
+        }
+    }
 }
 
 /// The hardening profile (`[agent] hardening`, §8.1). The opt-out is
@@ -122,12 +157,29 @@ impl Hardening {
 /// `fsfreeze_operation_timeout_secs` is omitted, capped by the hard cap.
 pub const DEFAULT_FSFREEZE_OPERATION_TIMEOUT_SECS: u64 = 60;
 
+/// Default virtio-serial port name expected in sysfs `name` when
+/// `channel_port_name` is omitted and `channel_path` has no UTF-8 basename.
+pub const DEFAULT_VIRTIO_PORT_NAME: &str = "org.qemu.guest_agent.0";
+
 impl AgentConfig {
     /// The effective freeze operation deadline in seconds: the explicit
     /// value, or `min(60, fsfreeze_max_timeout_secs)` when omitted.
     pub fn fsfreeze_operation_timeout_secs(&self) -> u64 {
         self.fsfreeze_operation_timeout_secs
             .unwrap_or(DEFAULT_FSFREEZE_OPERATION_TIMEOUT_SECS.min(self.fsfreeze_max_timeout_secs))
+    }
+
+    /// Expected virtio-serial port name in `/sys/dev/char/<maj>:<min>/name`
+    /// (without trailing newline).
+    pub fn expected_virtio_port_name(&self) -> &str {
+        if let Some(name) = self.channel_port_name.as_deref() {
+            return name;
+        }
+        self.channel_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or(DEFAULT_VIRTIO_PORT_NAME)
     }
 }
 
@@ -144,6 +196,8 @@ impl Default for AgentConfig {
             fsfreeze_operation_timeout_secs: None,
             freeze_allowed_mountpoints: None,
             freeze_ownership_dir: None,
+            channel_transport: ChannelTransport::VirtioSerial,
+            channel_port_name: None,
         }
     }
 }
@@ -419,6 +473,25 @@ impl Config {
         if agent.channel_path.as_os_str().is_empty() {
             return Err(invalid("agent.channel_path", "must not be empty"));
         }
+        if let Some(port_name) = &agent.channel_port_name {
+            if agent.channel_transport == ChannelTransport::PtyTestOnly {
+                return Err(invalid(
+                    "agent.channel_port_name",
+                    "only applies when agent.channel_transport = \"virtio-serial\"",
+                ));
+            }
+            if port_name.is_empty()
+                || port_name.len() > 255
+                || port_name
+                    .bytes()
+                    .any(|b| b == 0 || b == b'/' || b == b'\n' || b == b'\r')
+            {
+                return Err(invalid(
+                    "agent.channel_port_name",
+                    "must be 1..=255 bytes with no '/', NUL, or newline characters",
+                ));
+            }
+        }
         if !agent.state_path.is_absolute() {
             return Err(invalid(
                 "agent.state_path",
@@ -568,6 +641,12 @@ impl Config {
         if !self.agent.hardening.is_enforced() {
             out.push(
                 "agent.hardening = \"unenforced-development-only\": the sandbox is not required; never for a production host"
+                    .to_owned(),
+            );
+        }
+        if self.agent.channel_transport == ChannelTransport::PtyTestOnly {
+            out.push(
+                "agent.channel_transport = \"pty-test-only\": accepts devpts PTY slaves instead of verifying a virtio-serial port via sysfs; for test/development harnesses only"
                     .to_owned(),
             );
         }
@@ -1165,6 +1244,57 @@ mod tests {
             assert!(
                 err.to_string().contains("agent.freeze_ownership_dir"),
                 "bad={bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn channel_transport_and_port_name_validation() {
+        let def = Config::default();
+        assert_eq!(def.agent.channel_transport, ChannelTransport::VirtioSerial);
+        assert_eq!(def.agent.channel_transport.as_str(), "virtio-serial");
+        assert_eq!(
+            def.agent.expected_virtio_port_name(),
+            "org.qemu.guest_agent.0"
+        );
+        assert!(!def.warnings().iter().any(|w| w.contains("pty-test-only")));
+
+        let custom = Config::parse(
+            "[agent]\nchannel_path = \"/dev/vport0p1\"\nchannel_port_name = \"org.example.agent.1\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            custom.agent.expected_virtio_port_name(),
+            "org.example.agent.1"
+        );
+
+        let pty = Config::parse("[agent]\nchannel_transport = \"pty-test-only\"\n").unwrap();
+        assert_eq!(pty.agent.channel_transport, ChannelTransport::PtyTestOnly);
+        assert_eq!(pty.agent.channel_transport.as_str(), "pty-test-only");
+        assert!(pty.warnings().iter().any(|w| w.contains("pty-test-only")));
+
+        // channel_port_name cannot be combined with pty-test-only.
+        let err = Config::parse(
+            "[agent]\nchannel_transport = \"pty-test-only\"\nchannel_port_name = \"foo\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("agent.channel_port_name"), "{err}");
+
+        // Reject empty, too-long, slash, NUL, and newline port names.
+        let long_toml = format!("\"{}\"", "x".repeat(256));
+        for bad_toml in [
+            "\"\"",
+            "\"a/b\"",
+            "\"a\\nb\"",
+            "\"a\\rb\"",
+            "\"a\\u0000b\"",
+            long_toml.as_str(),
+        ] {
+            let toml = format!("[agent]\nchannel_port_name = {bad_toml}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("agent.channel_port_name"),
+                "bad={bad_toml}: {err}"
             );
         }
     }

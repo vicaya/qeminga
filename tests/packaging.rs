@@ -761,32 +761,66 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
 
     // 7. #78, #79, #88: docs/design.md, packaging/README.md, and README.md must
     //    describe the merged two-process split (`qeminga` 600 executor and
-    //    `qeminga-parser` 601 parser, `SCM_RIGHTS`), record completed #79
-    //    dual-arch (`x86_64` and `aarch64`) verification rather than pending
-    //    tracking, and keep `channel_port_name` documented in the normative
-    //    design and packaging guide.
+    //    `qeminga-parser` 601 parser), distinguish healthy-startup fd 4
+    //    inheritance from deferred-open/reconnect `SCM_RIGHTS` over fd 3, avoid
+    //    overstating the parser seccomp filter as "zero socket syscalls", and
+    //    preserve completed #79 verification evidence for both `x86_64` and
+    //    `aarch64` with the native-suite vs. disposable-guest layer distinction.
     for (name, text) in [
         ("docs/design.md", &design),
         ("packaging/README.md", &packaging),
         ("README.md", &readme),
     ] {
-        for needle in ["qeminga-parser", "601", "SCM_RIGHTS", "#79"] {
+        let norm = normalize_ws(text);
+        for needle in [
+            "qeminga-parser",
+            "601",
+            "fd 4",
+            "SCM_RIGHTS",
+            "#79",
+            "x86_64",
+            "aarch64",
+            "docs/isolation-design.md",
+            "2c48ac3",
+        ] {
             assert!(
-                text.contains(needle),
+                norm.contains(needle),
                 "{name} must document {needle:?} for the verified production parser/executor split"
             );
         }
-        let norm = normalize_ws(text);
         for stale in [
             "the process would still hold",
             "is tracked in **#79**",
             "until #79 passes",
+            "zero filesystem/ioctl/socket syscalls",
+            "zero socket syscalls",
         ] {
             assert!(
-                !norm.contains(stale),
-                "{name} must not retain stale pre-OQ-10 / pre-#79 wording {stale:?}"
+                !norm.to_ascii_lowercase().contains(stale),
+                "{name} must not retain stale or overstated wording {stale:?}"
             );
         }
+        // Guard the #79 verification paragraph itself (not just incidental
+        // occurrences elsewhere in the file) for both architectures, the
+        // canonical evidence reference, and the native-suite vs. disposable-
+        // guest verification layers.
+        let verify_para = text
+            .split("\n\n")
+            .map(normalize_ws)
+            .find(|p| p.contains("#79") && p.contains("2c48ac3"))
+            .unwrap_or_else(|| {
+                panic!("{name} must have a #79 verification paragraph citing 2c48ac3")
+            });
+        for needle in ["x86_64", "aarch64", "docs/isolation-design.md", "2c48ac3"] {
+            assert!(
+                verify_para.contains(needle),
+                "{name} #79 verification paragraph must name {needle:?}: {verify_para}"
+            );
+        }
+        assert!(
+            verify_para.contains("disposable-guest") && verify_para.contains("installed unit"),
+            "{name} #79 verification paragraph must distinguish disposable-guest installed-unit inspection from native suite checks: {verify_para}"
+        );
     }
     for (name, text) in [
         ("docs/design.md", &design),

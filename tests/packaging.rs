@@ -759,26 +759,43 @@ fn documented_cvm_capabilities_files_and_sockets_match_executable_profile() {
         "docs/design.md, packaging/README.md, and README.md must align on debug_assertions, enforcing-filter scope, and #67 narrowed socket/IPC rules"
     );
 
-    // 7. #78: docs/design.md and packaging/README.md must describe both service
-    //    accounts (`qeminga` 600 and `qeminga-parser` 601), the executor/parser
-    //    split, explicit `channel_port_name` configuration, and link installed-
-    //    service boundary verification to #79.
+    // 7. #78, #79, #88: docs/design.md, packaging/README.md, and README.md must
+    //    describe the merged two-process split (`qeminga` 600 executor and
+    //    `qeminga-parser` 601 parser, `SCM_RIGHTS`), record completed #79
+    //    dual-arch (`x86_64` and `aarch64`) verification rather than pending
+    //    tracking, and keep `channel_port_name` documented in the normative
+    //    design and packaging guide.
+    for (name, text) in [
+        ("docs/design.md", &design),
+        ("packaging/README.md", &packaging),
+        ("README.md", &readme),
+    ] {
+        for needle in ["qeminga-parser", "601", "SCM_RIGHTS", "#79"] {
+            assert!(
+                text.contains(needle),
+                "{name} must document {needle:?} for the verified production parser/executor split"
+            );
+        }
+        let norm = normalize_ws(text);
+        for stale in [
+            "the process would still hold",
+            "is tracked in **#79**",
+            "until #79 passes",
+        ] {
+            assert!(
+                !norm.contains(stale),
+                "{name} must not retain stale pre-OQ-10 / pre-#79 wording {stale:?}"
+            );
+        }
+    }
     for (name, text) in [
         ("docs/design.md", &design),
         ("packaging/README.md", &packaging),
     ] {
-        for needle in [
-            "qeminga-parser",
-            "601",
-            "channel_port_name",
-            "SCM_RIGHTS",
-            "#79",
-        ] {
-            assert!(
-                text.contains(needle),
-                "{name} must document {needle:?} for the production parser/executor split"
-            );
-        }
+        assert!(
+            text.contains("channel_port_name"),
+            "{name} must document \"channel_port_name\" for the production parser/executor split"
+        );
     }
 }
 

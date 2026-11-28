@@ -36,28 +36,38 @@ qeminga --config /etc/qeminga/config.toml   # the daemon (see packaging/README.m
 qeminga --version
 ```
 
-The daemon starts as root to open the virtio-serial port, drops to the
-`qeminga` account (UID/GID 600), derives its retained privileges from
-`config.toml`, installs a per-architecture seccomp-BPF filter (with the
-`seccomp` feature), and serves newline-delimited QGA JSON. The two packaged
-profiles differ in host command surface and retained authority (see
+The daemon starts as root, splits into an unprivileged host-facing parser
+(`qeminga-parser`, UID/GID 601, zero capabilities, `/dev/null` on fds
+`0`/`1`/`2`, zero filesystem/ioctl/socket syscalls) and a privileged policy
+and kernel executor (`qeminga`, UID/GID 600) connected over `IPC_FD = 3`
+(`AF_UNIX` `SOCK_SEQPACKET`), derives executor privileges from `config.toml`,
+installs per-architecture seccomp-BPF filters (with the `seccomp` feature),
+transfers the verified virtio-serial descriptor to the parser via
+`SCM_RIGHTS` (closing its own copy immediately), and serves
+newline-delimited QGA JSON. The two packaged profiles differ in host command
+surface and retained executor authority (see
 [`docs/design.md`](docs/design.md) §5.9):
 
 | Profile | Config file | Host commands accepted | Privileges retained after drop |
 |---|---|---|---|
-| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty (`CAP_SYS_BOOT` absent from all sets); seccomp omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, the inventory `sendto` rule, and `FITRIM`; keeps `socketpair(AF_UNIX, SOCK_STREAM \| SOCK_NONBLOCK \| SOCK_CLOEXEC, 0)`, peerless `recvfrom` (`src_addr == NULL`, `addrlen == NULL`), and peerless `sendto` (`dest_addr == NULL`, `addrlen == 0`) for runtime signal delivery |
-| **General-VM / lifecycle** (TOML schema default) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, `socket(AF_NETLINK, SOCK_RAW \| SOCK_CLOEXEC, NETLINK_ROUTE)`, an inventory `sendto` rule (`flags == 0`, `addrlen == 12`), netlink syscalls, and `FITRIM` |
+| **CVM / data-protection** (CVM installation default) | [`packaging/config-data-protection.toml`](packaging/config-data-protection.toml) | Snapshot coordination and controls only (`guest-fsfreeze-*`, `guest-ping`, `guest-sync*`, `guest-info`); `shutdown`, `information`, `fstrim`, and `suspend_ram` disabled | Executor (`qeminga`, 600): `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty (`CAP_SYS_BOOT` absent from all sets); seccomp restricts `sendmsg`/`recvmsg` to `IPC_FD` (`3`), keeps `readlinkat`/`wait4`, omits `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, netlink syscalls, `socket`, the inventory `sendto` rule, and `FITRIM`, and keeps `socketpair(AF_UNIX, SOCK_STREAM \| SOCK_NONBLOCK \| SOCK_CLOEXEC, 0)`, peerless `recvfrom` (`src_addr == NULL`, `addrlen == NULL`), and peerless `sendto` (`dest_addr == NULL`, `addrlen == 0`) for runtime signal delivery. Parser (`qeminga-parser`, 601): all five capability sets empty; zero filesystem/ioctl/socket syscalls |
+| **General-VM / lifecycle** (TOML schema default) | [`packaging/config.toml`](packaging/config.toml) | Adds `guest-shutdown`, `guest-fstrim`, `guest-get-osinfo`, `guest-network-get-interfaces`, and `guest-get-fsinfo` (`guest-suspend-ram` remains opt-in) | Executor (`qeminga`, 600): `CapEff`/`CapPrm`/`CapBnd` hold `CAP_SYS_ADMIN`, `CAP_SYS_BOOT`, and `CAP_DAC_READ_SEARCH`, `CapInh`/`CapAmb` empty; seccomp adds `reboot`/`sync`, `uname`/`statfs`/`fstatfs`, `socket(AF_NETLINK, SOCK_RAW \| SOCK_CLOEXEC, NETLINK_ROUTE)`, an inventory `sendto` rule (`flags == 0`, `addrlen == 12`), netlink syscalls, and `FITRIM`. Parser (`qeminga-parser`, 601): identical zero-capability, zero-filesystem sandbox |
 
 Installing `packaging/config-data-protection.toml` is what establishes the
 CVM default; an empty or partial `config.toml` defaults omitted
 `information`, `fstrim`, and `shutdown` keys to `true` even under
 `hardening = "enforced"`, so custom CVM configs must set them to `false`
-explicitly. If a defect compromised the parser process after startup, the
-process would still hold `CAP_SYS_ADMIN` and `CAP_DAC_READ_SEARCH` (plus
-`CAP_SYS_BOOT` in the general-VM profile), `openat`/`read`/`getdents64`,
-and the writable host virtio channel — so seccomp is **not** a
-confidentiality boundary for guest file contents after parser compromise
-(see `docs/design.md` §5.9 and `docs/tasks.md` OQ-10). Ordinary file opens,
+explicitly. Under the enforced CVM profile (verified across all seven
+[`docs/isolation-design.md`](docs/isolation-design.md) §6 boundary checks on
+both `x86_64` and `aarch64` in #79 at `2c48ac3`), `qeminga-parser` (UID/GID
+601) handles host framing and wire replies with zero capabilities and zero
+filesystem/ioctl/socket syscalls, while the `qeminga` executor (UID/GID 600)
+never parses host JSON, closes its channel copy after `SCM_RIGHTS` handoff,
+independently authorizes guest operations, and owns the guest-local
+`stderr`/journald audit record (see `docs/design.md` §5.9,
+`docs/isolation-design.md` §3.4, and `docs/tasks.md` OQ-10 for exact scope
+and residual limits — including parser-authored wire replies and untrusted
+parse-rejection observations). Inside the executor, ordinary file opens,
 writes, and unlinks (`openat`/`write`/`pwrite64`/`fsync`/`unlinkat`) remain
 in the filter and are bounded by guest Unix permissions (UID/GID 600, with
 `CAP_DAC_OVERRIDE` dropped) and the shipped systemd unit confinement

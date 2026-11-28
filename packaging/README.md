@@ -250,11 +250,18 @@ device numbers, or marker paths).
     + exact `name`, using `[agent] channel_port_name` when `channel_path`
     has a different basename such as `/dev/vport0p1`), transfers the verified
     fd to `qeminga-parser` via `SCM_RIGHTS`, and immediately closes its own
-    copy so it never parses host JSON or performs host-channel I/O. Full
-    installed-service boundary verification of this split on both `x86_64`
-    and `aarch64` (`docs/isolation-design.md` §6) is tracked in **#79**;
-    parser-compromise file-content confidentiality is not claimed in a
-    release until #79 passes on both architectures (design §5.9, OQ-10).
+    copy so it never parses host JSON or performs host-channel I/O. All seven
+    installed-service boundary checks on both `x86_64` and `aarch64`
+    (`docs/isolation-design.md` §6, `tests/privileged_isolation.rs`,
+    `tests/e2e_isolation.rs`, `scripts/ci/libvirt-tcg-guest.sh`) were
+    verified in **#79** (`2c48ac3`, both `seccomp-log` and `enforced` builds
+    plus dual-arch TCG and hosted `x86_64` KVM smoke) and remain a release
+    requirement on both architectures. In the enforced CVM profile, the
+    parser handles host framing and wire replies while the executor
+    authorizes guest operations and owns the guest-local audit record;
+    residual limits for parser-authored wire replies, raw frame drops before
+    IPC, and untrusted `ReportParseRejection` observations remain as
+    documented in `docs/isolation-design.md` §3.4 (design §5.9, OQ-10).
   - *Ordinary file writes:* The parser has no filesystem syscalls. Inside
     the executor, seccomp keeps `openat`, `write`, `writev`, `pwrite64`,
     `fsync`, and `unlinkat` (for stderr, the recovery marker, optional

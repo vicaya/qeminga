@@ -272,6 +272,22 @@ pub fn fs_info_with_monitor(
         .collect())
 }
 
+/// Host-safe error returned when [`MAX_FSINFO_WALKS`] walks are already active.
+pub fn fsinfo_busy_error() -> Error {
+    Error::Internal(format!(
+        "fsinfo: {MAX_FSINFO_WALKS} earlier walks are still running; retry later"
+    ))
+}
+
+/// Host-safe error returned when a filesystem inventory walk exceeds
+/// [`FSINFO_TIMEOUT`].
+pub fn fsinfo_timeout_error() -> Error {
+    Error::Internal(format!(
+        "fsinfo did not complete within {} s",
+        FSINFO_TIMEOUT.as_secs()
+    ))
+}
+
 /// `guest-get-fsinfo` handler. `statfs` may block, so the whole walk runs
 /// on the blocking pool under [`FSINFO_TIMEOUT`]; a walk that does not
 /// finish in time fails the command and the session moves on.
@@ -283,11 +299,7 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     // the blocking pool that freeze and thaw need (`MAX_FSINFO_WALKS`).
     let slot = Arc::clone(&ctx.fsinfo_walks)
         .try_acquire_owned()
-        .map_err(|_| {
-            Error::Internal(format!(
-                "fsinfo: {MAX_FSINFO_WALKS} earlier walks are still running; retry later"
-            ))
-        })?;
+        .map_err(|_| fsinfo_busy_error())?;
     let mounts: Arc<dyn MountSource> = Arc::clone(&ctx.mounts);
     let statfs: Arc<dyn StatfsSource> = Arc::clone(&ctx.statfs);
     let walk = tokio::task::spawn_blocking(move || {
@@ -299,12 +311,7 @@ pub async fn handle(ctx: &Context, req: &Request) -> Result<Value, Error> {
     });
     let info = tokio::time::timeout(FSINFO_TIMEOUT, walk)
         .await
-        .map_err(|_| {
-            Error::Internal(format!(
-                "fsinfo did not complete within {} s",
-                FSINFO_TIMEOUT.as_secs()
-            ))
-        })?
+        .map_err(|_| fsinfo_timeout_error())?
         .map_err(|err| Error::Internal(format!("fsinfo task failed: {err}")))??;
     Ok(info)
 }

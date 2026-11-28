@@ -497,6 +497,8 @@ Every input, queue, worker and reply the host can drive has an explicit limit; p
 | Mount table read (§4.2) | 32 MiB | the read fails; freeze, thaw and fsinfo report it |
 | `guest-get-fsinfo` reply | 1 MiB, the line as sent (value, `{"return":…,"id":…}` envelope and newline) | `GenericError` naming the bound; never truncated |
 | `guest-network-get-interfaces` reply | 256 KiB, the line as sent | `GenericError` naming the bound; never truncated |
+| `guest-fstrim` reply | 1 MiB, the line as sent (value, `{"return":…,"id":…}` envelope and newline) | `GenericError` reporting successful `FITRIM` discards (`trimmed_targets`) and failures (`failed_targets`, including targets that failed to open before `FITRIM`) separately; never truncated; session stays usable; guest-local `fstrim_failed` fields capped at 1024 bytes plus one fixed-size `fstrim_reply_too_large` summary |
+| `guest-get-osinfo` reply | 512 KiB, the line as sent | `GenericError` naming the bound; never truncated; session stays usable |
 | `os-release` read | 64 KiB | kernel fields only, the read failure logged |
 | Virtio-serial host-wait poll (§5.7) | 10 ms doubling to 500 ms | n/a: keeps the open virtio-serial port advertised while waiting for the host without busy-spinning; each session starts with a clean decoder |
 | Reopen backoff (§5.7) | 1 s doubling to 30 s | n/a: a reconnect storm is paced by the agent, and each session starts with a clean decoder and nothing retained |

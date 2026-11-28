@@ -20,6 +20,14 @@
 //! (C-17), while Cargo's standard `release` profile (`debug_assertions =
 //! false`) always enforces.
 //!
+//! For OQ-10 two-process privilege separation (`docs/isolation-design.md`
+//! §3.2, §5.4), [`parser_profile`] compiles an independent zero-filesystem,
+//! zero-socket-creation, zero-ioctl filter whose `sendmsg`/`recvmsg` rules
+//! are restricted to `arg0 == IPC_FD` (`3`), and [`executor_profile`] adds
+//! `wait4` (for child reaping without `CAP_KILL` or `kill(2)`) plus
+//! `IPC_FD`-restricted `sendmsg`/`recvmsg` in the CVM profile (`information =
+//! false`) while preserving the authority-derived rules above.
+//!
 //! The filter is installed by `main` after the capability drop and
 //! `PR_SET_NO_NEW_PRIVS` (§5.4 step 6), so `seccomp(2)`/`prctl(2)` need
 //! not stay available afterwards.
@@ -285,6 +293,70 @@ pub const X86_64_ONLY: &[&str] = &[
 /// rules remain in every profile for the runtime signal driver (§5.5, §5.9).
 pub const AF_NETLINK: u64 = 16;
 
+/// Reserved file descriptor number (`3`) pinned to the `AF_UNIX`
+/// `SOCK_SEQPACKET` IPC socket in both the parser and executor processes
+/// (OQ-10 §3.2, §5.4). `sendmsg`/`recvmsg` are restricted to `arg0 == IPC_FD`
+/// (`dword`) in the parser and in the CVM executor profile.
+pub const IPC_FD: u64 = crate::ipc::IPC_FD as u64;
+
+/// Syscalls allowed in the zero-privilege, zero-filesystem, single-threaded
+/// `ppoll` parser process on both targets (OQ-10 §3.2, §5.3, §5.4).
+///
+/// Both `clone` and `clone3` (as well as `fork`/`vfork`/`execve`/`execveat`)
+/// are omitted: the parser serves its pre-opened channel descriptor and
+/// `IPC_FD = 3` on a single `ppoll` loop after installing this filter, so a
+/// compromised parser cannot fork a detached child process that escapes
+/// `PR_SET_PDEATHSIG(SIGKILL)` supervision.
+pub const PARSER_COMMON: &[&str] = &[
+    // Pre-opened descriptor I/O only (verified virtio channel fd, /dev/null on
+    // fds 0/1/2, and IPC_FD = 3). Zero path-taking or filesystem-opening
+    // syscalls are permitted.
+    "read",
+    "write",
+    "readv",
+    "writev",
+    "close",
+    "fcntl",
+    // Runtime memory management.
+    "brk",
+    "mmap",
+    "munmap",
+    "mprotect",
+    "mremap",
+    "madvise",
+    "membarrier",
+    // Single-threaded process lifecycle (no clone/clone3/fork/vfork/execve).
+    "gettid",
+    "getpid",
+    "tgkill",
+    "futex",
+    "futex_waitv",
+    "sched_yield",
+    "sched_getaffinity",
+    "prlimit64",
+    "getrlimit",
+    "exit",
+    "exit_group",
+    // Event loop (no signal socketpair: executor owns SIGTERM/SIGINT).
+    "epoll_create1",
+    "epoll_ctl",
+    "epoll_pwait",
+    "epoll_pwait2",
+    "eventfd2",
+    "ppoll",
+    // Signal masks, altstack, and restart (no kill, no signal socketpair).
+    "rt_sigaction",
+    "rt_sigprocmask",
+    "rt_sigreturn",
+    "sigaltstack",
+    "restart_syscall",
+    // Clocks and randomness.
+    "clock_gettime",
+    "clock_nanosleep",
+    "nanosleep",
+    "getrandom",
+];
+
 /// The allow rules for `target` under `authority` (§5.5, §5.9): the common
 /// surface, the x86-64 aliases, `ioctl` restricted to `FIFREEZE` and
 /// `FITHAW` (and `FITRIM` with trim), `prctl(PR_SET_NAME)`, `socketpair`
@@ -373,6 +445,70 @@ pub fn rules(target: Target, authority: &Authority) -> Vec<Rule> {
     out
 }
 
+/// The allow rules for the zero-privilege host-facing parser process on
+/// `target` (OQ-10 §3.2, §5.4).
+///
+/// Independent of [`Authority`]: whether `[features] information` is enabled
+/// or not, the parser has zero filesystem-opening, filesystem-mutation,
+/// socket-creation, process-control, or kernel-ioctl syscalls, and
+/// `sendmsg`/`recvmsg` are restricted to `arg0 == IPC_FD` (`dword`).
+pub fn parser_rules(target: Target) -> Vec<Rule> {
+    let plain = |name: &&'static str| Rule {
+        syscall: name,
+        conditions: Vec::new(),
+    };
+    let mut out: Vec<Rule> = PARSER_COMMON.iter().map(plain).collect();
+    if target == Target::X86_64 {
+        out.extend(X86_64_ONLY.iter().map(plain));
+    }
+    out.push(Rule {
+        syscall: "prctl",
+        conditions: vec![ArgEq::dword(0, PR_SET_NAME)],
+    });
+    // Point-to-point SOCK_SEQPACKET IPC + SCM_RIGHTS channel reception pinned
+    // strictly to IPC_FD = 3.
+    out.push(Rule {
+        syscall: "sendmsg",
+        conditions: vec![ArgEq::dword(0, IPC_FD)],
+    });
+    out.push(Rule {
+        syscall: "recvmsg",
+        conditions: vec![ArgEq::dword(0, IPC_FD)],
+    });
+    out
+}
+
+/// The allow rules for the privileged typed executor process on `target`
+/// under `authority` (OQ-10 §3.2, §5.4).
+///
+/// Retains the authority-derived syscall surface of [`rules`] (including
+/// `readlinkat` for sysfs channel verification), adds `wait4` for reaping the
+/// parser child without `CAP_KILL` or `kill(2)`, and when
+/// `!authority.information` adds `sendmsg`/`recvmsg` restricted strictly to
+/// `arg0 == IPC_FD` (`dword`).
+pub fn executor_rules(target: Target, authority: &Authority) -> Vec<Rule> {
+    let mut out = rules(target, authority);
+    // Child reaping without CAP_KILL or kill(2) (OQ-10 §3.2, §5.3).
+    out.push(Rule {
+        syscall: "wait4",
+        conditions: Vec::new(),
+    });
+    // When `information = true`, `INFORMATION` already allows `sendmsg` and
+    // `recvmsg` for glibc's netlink exchange as well as `IPC_FD`. In the CVM
+    // profile (`information = false`), restrict both strictly to `IPC_FD = 3`.
+    if !authority.information {
+        out.push(Rule {
+            syscall: "sendmsg",
+            conditions: vec![ArgEq::dword(0, IPC_FD)],
+        });
+        out.push(Rule {
+            syscall: "recvmsg",
+            conditions: vec![ArgEq::dword(0, IPC_FD)],
+        });
+    }
+    out
+}
+
 /// `true` when an unlisted syscall is logged instead of killing the
 /// process: the `seccomp-log` compatibility feature (C-17) **only when
 /// `debug_assertions` are enabled**. Cargo's standard `release` profile
@@ -398,9 +534,8 @@ pub const fn default_action() -> &'static str {
 /// The name of the single filter in the JSON document.
 const FILTER_NAME: &str = "qeminga";
 
-/// The `seccompiler` JSON document for `target` under `authority`.
-pub fn profile_json(target: Target, authority: &Authority) -> String {
-    let filter: Vec<serde_json::Value> = rules(target, authority)
+fn rules_to_json(allow_rules: Vec<Rule>) -> String {
+    let filter: Vec<serde_json::Value> = allow_rules
         .into_iter()
         .map(|rule| {
             if rule.conditions.is_empty() {
@@ -432,6 +567,28 @@ pub fn profile_json(target: Target, authority: &Authority) -> String {
     .to_string()
 }
 
+fn compile_profile_json(target: Target, json: &str) -> Result<BpfProgram, SeccompError> {
+    let mut map = seccompiler::compile_from_json(json.as_bytes(), target.arch())
+        .map_err(|err| SeccompError::Compile(err.to_string()))?;
+    map.remove(FILTER_NAME).ok_or(SeccompError::Missing)
+}
+
+/// The `seccompiler` JSON document for `target` under `authority`.
+pub fn profile_json(target: Target, authority: &Authority) -> String {
+    rules_to_json(rules(target, authority))
+}
+
+/// The `seccompiler` JSON document for the unprivileged parser on `target`.
+pub fn parser_profile_json(target: Target) -> String {
+    rules_to_json(parser_rules(target))
+}
+
+/// The `seccompiler` JSON document for the privileged executor on `target`
+/// under `authority`.
+pub fn executor_profile_json(target: Target, authority: &Authority) -> String {
+    rules_to_json(executor_rules(target, authority))
+}
+
 /// A profile could not be built or installed.
 #[derive(Debug, thiserror::Error)]
 pub enum SeccompError {
@@ -449,10 +606,18 @@ pub enum SeccompError {
 
 /// Compiles the profile for `target` under `authority` into a BPF program.
 pub fn profile(target: Target, authority: &Authority) -> Result<BpfProgram, SeccompError> {
-    let json = profile_json(target, authority);
-    let mut map = seccompiler::compile_from_json(json.as_bytes(), target.arch())
-        .map_err(|err| SeccompError::Compile(err.to_string()))?;
-    map.remove(FILTER_NAME).ok_or(SeccompError::Missing)
+    compile_profile_json(target, &profile_json(target, authority))
+}
+
+/// Compiles the unprivileged parser profile for `target` into a BPF program.
+pub fn parser_profile(target: Target) -> Result<BpfProgram, SeccompError> {
+    compile_profile_json(target, &parser_profile_json(target))
+}
+
+/// Compiles the privileged executor profile for `target` under `authority`
+/// into a BPF program.
+pub fn executor_profile(target: Target, authority: &Authority) -> Result<BpfProgram, SeccompError> {
+    compile_profile_json(target, &executor_profile_json(target, authority))
 }
 
 /// Installs `program` on every thread of the process. Requires
@@ -1485,6 +1650,863 @@ mod tests {
                 "full-inet-socket",
                 "full-uevent-netlink-socket",
                 "full-unix-sendto",
+            ] {
+                let out = run_child(denied);
+                assert_eq!(
+                    out.status.signal(),
+                    Some(nix::libc::SIGSYS),
+                    "{denied} must be killed by SIGSYS on the tested syscall (exit {:?} means it returned without SIGSYS); stdout={}\nstderr={}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parser_profile_has_zero_filesystem_or_privileged_syscalls_and_pins_ipc_fd_on_both_targets() {
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+        const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+
+        let expected_deny = if log_mode() {
+            SECCOMP_RET_LOG
+        } else {
+            SECCOMP_RET_KILL_PROCESS
+        };
+
+        let forbidden = [
+            // Zero filesystem opening, inspection, or mutation.
+            "open",
+            "openat",
+            "openat2",
+            "creat",
+            "stat",
+            "lstat",
+            "fstat",
+            "newfstatat",
+            "statx",
+            "getdents",
+            "getdents64",
+            "readlink",
+            "readlinkat",
+            "faccessat",
+            "faccessat2",
+            "unlink",
+            "unlinkat",
+            "fsync",
+            "fdatasync",
+            "lseek",
+            "pread64",
+            "pwrite64",
+            "statfs",
+            "fstatfs",
+            "mkdir",
+            "mkdirat",
+            "rename",
+            "renameat",
+            "renameat2",
+            "chmod",
+            "fchmod",
+            "chown",
+            "fchown",
+            "symlinkat",
+            "linkat",
+            "mount",
+            "umount2",
+            "chdir",
+            "fchdir",
+            "chroot",
+            // Zero socket creation or general networking.
+            "socket",
+            "socketpair",
+            "connect",
+            "bind",
+            "listen",
+            "accept",
+            "accept4",
+            "sendto",
+            "recvfrom",
+            "getsockname",
+            "setsockopt",
+            "getsockopt",
+            "shutdown",
+            // Zero kernel/process/privilege authority (including process & thread
+            // creation so the parser cannot fork a child that escapes
+            // PR_SET_PDEATHSIG supervision).
+            "ioctl",
+            "execve",
+            "execveat",
+            "clone",
+            "clone3",
+            "fork",
+            "vfork",
+            "wait4",
+            "waitid",
+            "kill",
+            "reboot",
+            "sync",
+            "uname",
+            "seccomp",
+            "capset",
+            "ptrace",
+            "bpf",
+            "setns",
+            "unshare",
+            "setresuid",
+            "setresgid",
+            "setgroups",
+        ];
+
+        struct TargetSyscalls {
+            target: Target,
+            arch: u32,
+            wrong_arch: u32,
+            read: u32,
+            write: u32,
+            close: u32,
+            ppoll: u32,
+            epoll_pwait: u32,
+            prctl: u32,
+            sendmsg: u32,
+            recvmsg: u32,
+            openat: u32,
+            getdents64: u32,
+            readlinkat: u32,
+            unlinkat: u32,
+            ioctl: u32,
+            socket: u32,
+            socketpair: u32,
+            wait4: u32,
+            kill: u32,
+            execve: u32,
+            clone: u32,
+            clone3: u32,
+            fork: Option<u32>,
+            vfork: Option<u32>,
+        }
+
+        let targets = [
+            TargetSyscalls {
+                target: Target::X86_64,
+                arch: AUDIT_ARCH_X86_64,
+                wrong_arch: AUDIT_ARCH_AARCH64,
+                read: 0,
+                write: 1,
+                close: 3,
+                ppoll: 271,
+                epoll_pwait: 281,
+                prctl: 157,
+                sendmsg: 46,
+                recvmsg: 47,
+                openat: 257,
+                getdents64: 217,
+                readlinkat: 267,
+                unlinkat: 263,
+                ioctl: 16,
+                socket: 41,
+                socketpair: 53,
+                wait4: 61,
+                kill: 62,
+                execve: 59,
+                clone: 56,
+                clone3: 435,
+                fork: Some(57),
+                vfork: Some(58),
+            },
+            TargetSyscalls {
+                target: Target::Aarch64,
+                arch: AUDIT_ARCH_AARCH64,
+                wrong_arch: AUDIT_ARCH_X86_64,
+                read: 63,
+                write: 64,
+                close: 57,
+                ppoll: 73,
+                epoll_pwait: 22,
+                prctl: 167,
+                sendmsg: 211,
+                recvmsg: 212,
+                openat: 56,
+                getdents64: 61,
+                readlinkat: 78,
+                unlinkat: 35,
+                ioctl: 29,
+                socket: 198,
+                socketpair: 199,
+                wait4: 260,
+                kill: 129,
+                execve: 221,
+                clone: 220,
+                clone3: 435,
+                fork: None,
+                vfork: None,
+            },
+        ];
+
+        assert!(
+            !PARSER_COMMON.is_empty(),
+            "PARSER_COMMON must list parser runtime syscalls"
+        );
+
+        for ts in targets {
+            let p_rules = parser_rules(ts.target);
+            let names: Vec<&str> = p_rules.iter().map(|r| r.syscall).collect();
+            for bad in forbidden {
+                assert!(
+                    !names.contains(&bad),
+                    "{:?}: parser profile must omit {bad}",
+                    ts.target
+                );
+            }
+            for alias in X86_64_ONLY {
+                assert_eq!(
+                    names.contains(alias),
+                    ts.target == Target::X86_64,
+                    "{:?}: x86_64 alias {alias}",
+                    ts.target
+                );
+            }
+            // sendmsg and recvmsg appear once each, strictly pinned to IPC_FD.
+            for ipc_call in ["sendmsg", "recvmsg"] {
+                let matching: Vec<&Rule> =
+                    p_rules.iter().filter(|r| r.syscall == ipc_call).collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "{:?}: parser must have one {ipc_call} rule",
+                    ts.target
+                );
+                assert_eq!(
+                    matching[0].conditions,
+                    [ArgEq::dword(0, IPC_FD)],
+                    "{:?}: parser {ipc_call} must restrict arg0 == IPC_FD",
+                    ts.target
+                );
+            }
+            // No duplicate rules in parser profile.
+            let mut dedup = names.clone();
+            dedup.sort_unstable();
+            dedup.dedup();
+            assert_eq!(
+                dedup.len(),
+                names.len(),
+                "{:?}: duplicate parser rule",
+                ts.target
+            );
+
+            let bpf = parser_profile(ts.target).unwrap();
+            assert_eq!(
+                eval_bpf(&bpf, ts.wrong_arch, ts.read, [0; 6]),
+                SECCOMP_RET_KILL_PROCESS
+            );
+            for allowed_nr in [ts.read, ts.write, ts.close, ts.ppoll, ts.epoll_pwait] {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, allowed_nr, [0; 6]),
+                    SECCOMP_RET_ALLOW,
+                    "{:?}: syscall {allowed_nr} must be allowed in parser",
+                    ts.target
+                );
+            }
+            assert_eq!(
+                eval_bpf(&bpf, ts.arch, ts.prctl, [PR_SET_NAME, 0x1000, 0, 0, 0, 0]),
+                SECCOMP_RET_ALLOW
+            );
+            assert_eq!(
+                eval_bpf(&bpf, ts.arch, ts.prctl, [22, 0, 0, 0, 0, 0]), // PR_SET_SECCOMP
+                expected_deny
+            );
+            for ipc_nr in [ts.sendmsg, ts.recvmsg] {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ipc_nr, [IPC_FD, 0x1000, 0, 0, 0, 0]),
+                    SECCOMP_RET_ALLOW,
+                    "{:?}: parser IPC_FD must be allowed",
+                    ts.target
+                );
+                for wrong_fd in [0u64, 1, 2, 4, 5, 99, u64::from(u32::MAX)] {
+                    assert_eq!(
+                        eval_bpf(&bpf, ts.arch, ipc_nr, [wrong_fd, 0x1000, 0, 0, 0, 0]),
+                        expected_deny,
+                        "{:?}: parser fd={wrong_fd} must be denied",
+                        ts.target
+                    );
+                }
+            }
+            for denied_nr in [
+                ts.openat,
+                ts.getdents64,
+                ts.readlinkat,
+                ts.unlinkat,
+                ts.ioctl,
+                ts.socket,
+                ts.socketpair,
+                ts.wait4,
+                ts.kill,
+                ts.execve,
+            ] {
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        ts.arch,
+                        denied_nr,
+                        [0, u64::from(FIFREEZE), 0, 0, 0, 0]
+                    ),
+                    expected_deny,
+                    "{:?}: syscall {denied_nr} must be denied in parser",
+                    ts.target
+                );
+            }
+            // Separate-process creation (fork/vfork/clone(SIGCHLD)/clone3) and
+            // thread creation (clone(CLONE_THREAD)) are all denied in the
+            // single-threaded ppoll parser serving profile.
+            const SIGCHLD_FLAG: u64 = 17;
+            const CLONE_VM_VFORK_SIGCHLD: u64 = 0x0000_4100 | SIGCHLD_FLAG;
+            const CLONE_THREAD_FLAGS: u64 = 0x0001_0900;
+            for (case, flags) in [
+                ("fork-style clone(SIGCHLD)", SIGCHLD_FLAG),
+                ("vfork-style clone", CLONE_VM_VFORK_SIGCHLD),
+                ("thread-style clone", CLONE_THREAD_FLAGS),
+            ] {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.clone, [flags, 0, 0, 0, 0, 0]),
+                    expected_deny,
+                    "{:?}: parser must deny {case}",
+                    ts.target
+                );
+            }
+            assert_eq!(
+                eval_bpf(&bpf, ts.arch, ts.clone3, [0x1000, 88, 0, 0, 0, 0]),
+                expected_deny,
+                "{:?}: parser must deny clone3",
+                ts.target
+            );
+            if let Some(fork_nr) = ts.fork {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, fork_nr, [0; 6]),
+                    expected_deny,
+                    "{:?}: parser must deny fork",
+                    ts.target
+                );
+            }
+            if let Some(vfork_nr) = ts.vfork {
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, vfork_nr, [0; 6]),
+                    expected_deny,
+                    "{:?}: parser must deny vfork",
+                    ts.target
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn executor_profile_constrains_cvm_ipc_fd_adds_wait4_and_preserves_feature_gates_on_both_targets()
+     {
+        const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+        const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
+        const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
+        const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
+        const SECCOMP_RET_LOG: u32 = 0x7ffc_0000;
+
+        let expected_deny = if log_mode() {
+            SECCOMP_RET_LOG
+        } else {
+            SECCOMP_RET_KILL_PROCESS
+        };
+
+        struct TargetSyscalls {
+            target: Target,
+            arch: u32,
+            sendmsg: u32,
+            recvmsg: u32,
+            wait4: u32,
+            readlinkat: u32,
+            ioctl: u32,
+            socket: u32,
+            uname: u32,
+            reboot: u32,
+            kill: u32,
+            execve: u32,
+        }
+
+        let targets = [
+            TargetSyscalls {
+                target: Target::X86_64,
+                arch: AUDIT_ARCH_X86_64,
+                sendmsg: 46,
+                recvmsg: 47,
+                wait4: 61,
+                readlinkat: 267,
+                ioctl: 16,
+                socket: 41,
+                uname: 63,
+                reboot: 169,
+                kill: 62,
+                execve: 59,
+            },
+            TargetSyscalls {
+                target: Target::Aarch64,
+                arch: AUDIT_ARCH_AARCH64,
+                sendmsg: 211,
+                recvmsg: 212,
+                wait4: 260,
+                readlinkat: 78,
+                ioctl: 29,
+                socket: 198,
+                uname: 160,
+                reboot: 142,
+                kill: 129,
+                execve: 221,
+            },
+        ];
+
+        let dp = Authority::data_protection();
+        let info_only = Authority {
+            information: true,
+            ..dp
+        };
+        let trim_only = Authority { trim: true, ..dp };
+        let power_only = Authority { reboot: true, ..dp };
+
+        for ts in targets {
+            for (label, auth) in [
+                ("cvm", &dp),
+                ("info-only", &info_only),
+                ("trim-only", &trim_only),
+                ("power-only", &power_only),
+                ("full", &FULL),
+            ] {
+                let e_rules = executor_rules(ts.target, auth);
+                let names: Vec<&str> = e_rules.iter().map(|r| r.syscall).collect();
+
+                assert!(
+                    names.contains(&"wait4"),
+                    "{:?} {label}: executor must allow wait4",
+                    ts.target
+                );
+                assert!(
+                    names.contains(&"readlinkat"),
+                    "{:?} {label}: executor must retain readlinkat",
+                    ts.target
+                );
+                for forbidden in [
+                    "execve", "execveat", "fork", "vfork", "kill", "ptrace", "bpf",
+                ] {
+                    assert!(
+                        !names.contains(&forbidden),
+                        "{:?} {label}: executor must forbid {forbidden}",
+                        ts.target
+                    );
+                }
+
+                // sendmsg and recvmsg appear once each: pinned to IPC_FD when
+                // !information, unconditional when information == true (for netlink).
+                for ipc_call in ["sendmsg", "recvmsg"] {
+                    let matching: Vec<&Rule> =
+                        e_rules.iter().filter(|r| r.syscall == ipc_call).collect();
+                    assert_eq!(
+                        matching.len(),
+                        1,
+                        "{:?} {label}: executor must have exactly one {ipc_call} rule",
+                        ts.target
+                    );
+                    if auth.information {
+                        assert!(
+                            matching[0].conditions.is_empty(),
+                            "{:?} {label}: {ipc_call} must remain unconditional with information=true",
+                            ts.target
+                        );
+                    } else {
+                        assert_eq!(
+                            matching[0].conditions,
+                            [ArgEq::dword(0, IPC_FD)],
+                            "{:?} {label}: {ipc_call} must restrict arg0 == IPC_FD in CVM",
+                            ts.target
+                        );
+                    }
+                }
+
+                let bpf = executor_profile(ts.target, auth).unwrap();
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.wait4, [0; 6]),
+                    SECCOMP_RET_ALLOW,
+                    "{:?} {label}: wait4 allowed",
+                    ts.target
+                );
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.readlinkat, [0; 6]),
+                    SECCOMP_RET_ALLOW,
+                    "{:?} {label}: readlinkat allowed",
+                    ts.target
+                );
+                for ipc_nr in [ts.sendmsg, ts.recvmsg] {
+                    assert_eq!(
+                        eval_bpf(&bpf, ts.arch, ipc_nr, [IPC_FD, 0x1000, 0, 0, 0, 0]),
+                        SECCOMP_RET_ALLOW,
+                        "{:?} {label}: IPC_FD allowed",
+                        ts.target
+                    );
+                    for other_fd in [0u64, 1, 2, 4, 7, u64::from(u32::MAX)] {
+                        assert_eq!(
+                            eval_bpf(&bpf, ts.arch, ipc_nr, [other_fd, 0x1000, 0, 0, 0, 0]),
+                            if auth.information {
+                                SECCOMP_RET_ALLOW
+                            } else {
+                                expected_deny
+                            },
+                            "{:?} {label}: other fd={other_fd}",
+                            ts.target
+                        );
+                    }
+                }
+
+                // Feature gates preserved identically.
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        ts.arch,
+                        ts.ioctl,
+                        [5, u64::from(FIFREEZE), 0, 0, 0, 0]
+                    ),
+                    SECCOMP_RET_ALLOW
+                );
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.ioctl, [5, u64::from(FITRIM), 0, 0, 0, 0]),
+                    if auth.trim {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    }
+                );
+                assert_eq!(
+                    eval_bpf(
+                        &bpf,
+                        ts.arch,
+                        ts.socket,
+                        [AF_NETLINK, NETLINK_SOCKET_TYPE, NETLINK_ROUTE, 0, 0, 0]
+                    ),
+                    if auth.information {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    }
+                );
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.uname, [0x1000, 0, 0, 0, 0, 0]),
+                    if auth.information {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    }
+                );
+                assert_eq!(
+                    eval_bpf(&bpf, ts.arch, ts.reboot, [0; 6]),
+                    if auth.reboot {
+                        SECCOMP_RET_ALLOW
+                    } else {
+                        expected_deny
+                    }
+                );
+                assert_eq!(eval_bpf(&bpf, ts.arch, ts.kill, [0; 6]), expected_deny);
+                assert_eq!(eval_bpf(&bpf, ts.arch, ts.execve, [0; 6]), expected_deny);
+                assert_eq!(
+                    eval_bpf(&bpf, 0xdead_beef, ts.wait4, [0; 6]),
+                    SECCOMP_RET_KILL_PROCESS
+                );
+            }
+        }
+    }
+
+    /// Exercises both the zero-filesystem parser seccomp profile and the
+    /// CVM executor seccomp profile against the real Linux kernel in isolated
+    /// child processes:
+    /// - Under `parser_profile`: a real Tokio runtime parses QGA JSON, sends an
+    ///   `IpcRequest` over `IPC_FD = 3`, receives `OkChannelFd` + an
+    ///   `SCM_RIGHTS` descriptor over `IPC_FD = 3`, and reads/writes on it;
+    ///   `openat`, `getdents64`, `socket`, `ioctl`, `wait4`, and `sendmsg`/
+    ///   `recvmsg` on any descriptor `!= IPC_FD` are killed with `SIGSYS`.
+    /// - Under CVM `executor_profile`: `recvmsg`/`sendmsg` + `SCM_RIGHTS` on
+    ///   `IPC_FD = 3`, `readlinkat`, and `wait4` succeed; `sendmsg`/`recvmsg`
+    ///   on any descriptor `!= IPC_FD` and `kill` are killed with `SIGSYS`.
+    #[test]
+    #[ignore = "installs a seccomp filter on the test process (run in the privileged job)"]
+    fn privileged_parser_and_executor_seccomp_enforced_boundaries() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+        use std::os::unix::process::ExitStatusExt;
+
+        use nix::fcntl::{AT_FDCWD, OFlag, openat, readlinkat};
+        use nix::sys::signal::{Signal, kill};
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+        use nix::sys::stat::Mode;
+        use nix::sys::wait::{WaitPidFlag, waitpid};
+        use nix::unistd::{Pid, pipe};
+
+        const ENV_CASE: &str = "QEMINGA_SECCOMP_SPLIT_CASE";
+        const RETURNED_WITHOUT_SIGSYS: i32 = 99;
+
+        fn setup_ipc_pair_pinned() -> (OwnedFd, OwnedFd) {
+            let (local_raw, peer_raw) = crate::kernel::ipc::seqpacket_pair(false).unwrap();
+            let peer = if peer_raw.as_raw_fd() == crate::ipc::IPC_FD {
+                crate::kernel::ipc::dup_above_cloexec(peer_raw, crate::ipc::IPC_FD + 1).unwrap()
+            } else {
+                peer_raw
+            };
+            let local =
+                crate::kernel::ipc::pin_unused_fd_cloexec(local_raw, crate::ipc::IPC_FD).unwrap();
+            assert_eq!(local.as_raw_fd(), crate::ipc::IPC_FD);
+            assert_ne!(peer.as_raw_fd(), crate::ipc::IPC_FD);
+            (local, peer)
+        }
+
+        if let Ok(case) = std::env::var(ENV_CASE) {
+            let dp = Authority::data_protection();
+            match case.as_str() {
+                "parser-ipc-roundtrip" => {
+                    let (local, peer) = setup_ipc_pair_pinned();
+                    let (chan_r, mut chan_w_file) = {
+                        let (r, w) = pipe().unwrap();
+                        (r, std::fs::File::from(w))
+                    };
+                    chan_w_file.write_all(b"hi").unwrap();
+                    // Pre-enqueue a channel handoff reply on the peer end so
+                    // the parser receives it via recvmsg(IPC_FD) after seccomp.
+                    crate::ipc::send_response(
+                        peer.as_fd(),
+                        1,
+                        1,
+                        &crate::ipc::IpcResponse::OkChannelFd,
+                        Some(chan_r.as_fd()),
+                    )
+                    .unwrap();
+                    drop(chan_r);
+
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+
+                    // Parser uses ppoll + pre-opened descriptors (never Tokio's
+                    // signal driver socketpair, OQ-10 §3.2).
+                    let mut pfds = [nix::poll::PollFd::new(
+                        local.as_fd(),
+                        nix::poll::PollFlags::POLLIN,
+                    )];
+                    let ready = nix::poll::ppoll(&mut pfds, None, None).unwrap();
+                    assert_eq!(ready, 1);
+
+                    let mut dec = crate::framing::FrameDecoder::new();
+                    let events = dec.push(br#"{"execute":"guest-ping"}"#.as_slice());
+                    assert!(events.is_empty());
+                    let events = dec.push(b"\n");
+                    assert_eq!(events.len(), 1);
+                    let crate::framing::DecodeEvent::Frame { bytes, .. } = &events[0] else {
+                        panic!("expected frame");
+                    };
+                    let parsed = crate::proto::parse_request(bytes).unwrap();
+                    assert_eq!(parsed.method, "guest-ping");
+
+                    crate::ipc::send_request(local.as_fd(), 1, 1, &crate::ipc::IpcRequest::Ping)
+                        .unwrap();
+
+                    let mut asm = crate::ipc::StreamAssembler::new(crate::ipc::PeerRole::Parser);
+                    let got = crate::ipc::recv_response(local.as_fd(), &mut asm)
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(got.response, crate::ipc::IpcResponse::OkChannelFd);
+                    let mut chan = std::fs::File::from(got.channel_fd.unwrap());
+                    let mut buf = [0u8; 2];
+                    chan.read_exact(&mut buf).unwrap();
+                    assert_eq!(&buf, b"hi");
+                    drop(peer);
+                    println!("PARSER_IPC_OK");
+                }
+                "parser-openat-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = openat(AT_FDCWD, "/etc/hostname", OFlag::O_RDONLY, Mode::empty());
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-getdents-denied" => {
+                    let dir = nix::dir::Dir::open(
+                        "/",
+                        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let mut dir = dir;
+                    let _ = dir.iter().next();
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-socket-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = socket(
+                        AddressFamily::Unix,
+                        SockType::SeqPacket,
+                        SockFlag::SOCK_CLOEXEC,
+                        None,
+                    );
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-ioctl-denied" => {
+                    use std::os::unix::fs::MetadataExt;
+                    let kernel = crate::kernel::LinuxKernel;
+                    let dev = std::fs::metadata("/").unwrap().dev();
+                    let mount = crate::kernel::KernelOps::open_mount(
+                        &kernel,
+                        std::path::Path::new("/"),
+                        (
+                            nix::sys::stat::major(dev) as u32,
+                            nix::sys::stat::minor(dev) as u32,
+                        ),
+                    )
+                    .unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = crate::kernel::KernelOps::fifreeze(&kernel, &mount);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-sendmsg-wrong-fd-denied" => {
+                    let (_local, peer) = setup_ipc_pair_pinned();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = crate::kernel::ipc::send_packet(peer.as_fd(), b"nope", None);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-recvmsg-wrong-fd-denied" => {
+                    let (local, peer) = setup_ipc_pair_pinned();
+                    crate::kernel::ipc::send_packet(local.as_fd(), b"nope", None).unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = crate::kernel::ipc::recv_packet(peer.as_fd(), 16);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-wait4-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG));
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "parser-clone-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&parser_profile(Target::current()).unwrap()).unwrap();
+                    let _ = std::thread::Builder::new().spawn(|| {});
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "executor-cvm-ipc-and-wait4-allowed" => {
+                    let (local, peer) = setup_ipc_pair_pinned();
+                    let (chan_r, _chan_w) = pipe().unwrap();
+                    crate::ipc::send_request(
+                        peer.as_fd(),
+                        4,
+                        9,
+                        &crate::ipc::IpcRequest::RequestChannelReopen,
+                    )
+                    .unwrap();
+
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&executor_profile(Target::current(), &dp).unwrap()).unwrap();
+
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async {
+                        let mut asm =
+                            crate::ipc::StreamAssembler::new(crate::ipc::PeerRole::Executor);
+                        let got = crate::ipc::recv_request(local.as_fd(), &mut asm)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(got.request, crate::ipc::IpcRequest::RequestChannelReopen);
+                        crate::ipc::send_response(
+                            local.as_fd(),
+                            4,
+                            9,
+                            &crate::ipc::IpcResponse::OkChannelFd,
+                            Some(chan_r.as_fd()),
+                        )
+                        .unwrap();
+                        // Verify readlinkat (sysfs subsystem check) and wait4 (child reaping).
+                        let exe = readlinkat(AT_FDCWD, "/proc/self/exe").unwrap();
+                        assert!(!exe.is_empty());
+                        assert_eq!(
+                            waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)),
+                            Err(nix::errno::Errno::ECHILD)
+                        );
+                    });
+                    drop(peer);
+                    println!("EXECUTOR_CVM_OK");
+                }
+                "executor-cvm-sendmsg-wrong-fd-denied" => {
+                    let (_local, peer) = setup_ipc_pair_pinned();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&executor_profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = crate::kernel::ipc::send_packet(peer.as_fd(), b"nope", None);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "executor-cvm-recvmsg-wrong-fd-denied" => {
+                    let (local, peer) = setup_ipc_pair_pinned();
+                    crate::kernel::ipc::send_packet(local.as_fd(), b"nope", None).unwrap();
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&executor_profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = crate::kernel::ipc::recv_packet(peer.as_fd(), 16);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                "executor-cvm-kill-denied" => {
+                    nix::sys::prctl::set_no_new_privs().unwrap();
+                    install(&executor_profile(Target::current(), &dp).unwrap()).unwrap();
+                    let _ = kill(Pid::from_raw(0), Signal::SIGCONT);
+                    std::process::exit(RETURNED_WITHOUT_SIGSYS);
+                }
+                other => panic!("unknown split seccomp child case: {other}"),
+            }
+            return;
+        }
+
+        let run_child = |case: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "seccomp::tests::privileged_parser_and_executor_seccomp_enforced_boundaries",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(ENV_CASE, case)
+                .output()
+                .unwrap()
+        };
+
+        for (case, marker) in [
+            ("parser-ipc-roundtrip", "PARSER_IPC_OK"),
+            ("executor-cvm-ipc-and-wait4-allowed", "EXECUTOR_CVM_OK"),
+        ] {
+            let out = run_child(case);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                out.status.success() && stdout.contains(marker),
+                "{case} failed: {:?}\nstdout: {stdout}\nstderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        if !log_mode() {
+            for denied in [
+                "parser-openat-denied",
+                "parser-getdents-denied",
+                "parser-socket-denied",
+                "parser-ioctl-denied",
+                "parser-sendmsg-wrong-fd-denied",
+                "parser-recvmsg-wrong-fd-denied",
+                "parser-wait4-denied",
+                "parser-clone-denied",
+                "executor-cvm-sendmsg-wrong-fd-denied",
+                "executor-cvm-recvmsg-wrong-fd-denied",
+                "executor-cvm-kill-denied",
             ] {
                 let out = run_child(denied);
                 assert_eq!(

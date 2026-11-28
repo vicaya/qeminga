@@ -45,5 +45,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ipc_codec"
+path = "fuzz_targets/ipc_codec.rs"
+test = false
+doc = false
+bench = false
+
 [profile.release]
 debug = 1

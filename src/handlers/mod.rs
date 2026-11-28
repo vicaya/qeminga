@@ -255,6 +255,22 @@ pub fn spec(name: &str) -> Option<&'static CommandSpec> {
     SUPPORTED_COMMANDS.iter().find(|spec| spec.name == name)
 }
 
+/// Measures the worst-case QGA reply line length in bytes for `value`
+/// (including [`MAX_RESPONSE_ENVELOPE_BYTES`](crate::proto::MAX_RESPONSE_ENVELOPE_BYTES))
+/// without allocating a buffer of that size.
+pub(crate) fn serialized_reply_line_bytes<T: serde::Serialize>(
+    what: &str,
+    value: &T,
+) -> Result<(usize, usize), crate::proto::Error> {
+    let mut counter = Counting(0);
+    serde_json::to_writer(&mut counter, value)
+        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))?;
+    Ok((
+        counter.0,
+        counter.0 + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES,
+    ))
+}
+
 /// Serialises an information reply and refuses one whose line on the
 /// wire would exceed `bound` bytes with an explicit error instead of
 /// truncating it (§5.10, #43 §6): a controller validating coverage must
@@ -273,19 +289,14 @@ pub fn bounded_reply<T: serde::Serialize>(
     value: &T,
     bound: usize,
 ) -> Result<serde_json::Value, crate::proto::Error> {
-    let encode = |err: serde_json::Error| {
-        crate::proto::Error::Internal(format!("{what}: cannot encode: {err}"))
-    };
-    let mut counter = Counting(0);
-    serde_json::to_writer(&mut counter, value).map_err(encode)?;
-    let line = counter.0 + crate::proto::MAX_RESPONSE_ENVELOPE_BYTES;
+    let (value_bytes, line) = serialized_reply_line_bytes(what, value)?;
     if line > bound {
         return Err(crate::proto::Error::Internal(format!(
-            "{what}: the reply would be {line} bytes on the wire ({} of value), over the {bound} byte bound; not truncated",
-            counter.0
+            "{what}: the reply would be {line} bytes on the wire ({value_bytes} of value), over the {bound} byte bound; not truncated"
         )));
     }
-    serde_json::to_value(value).map_err(encode)
+    serde_json::to_value(value)
+        .map_err(|err| crate::proto::Error::Internal(format!("{what}: cannot encode: {err}")))
 }
 
 /// Counts the bytes written through it and keeps none of them: the

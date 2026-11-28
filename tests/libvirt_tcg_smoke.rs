@@ -1070,3 +1070,51 @@ fn the_lane_cleans_up_and_keeps_its_evidence_whatever_happened() {
     let step = &step[step.rfind("- name:").unwrap()..];
     assert!(step.contains("if: always()"), "{step}");
 }
+
+#[test]
+fn the_guest_script_verifies_live_parser_isolation_and_uid601_dac_confinement() {
+    // OQ-10 §6 (Issue #79): disposable-guest smoke lanes on both x86_64 and
+    // aarch64 (TCG and hosted KVM) verify the live qeminga-parser child of the
+    // installed production service as well as UID-601 DAC confinement.
+    let guest = std::fs::read_to_string(root().join("scripts/ci/libvirt-tcg-guest.sh")).unwrap();
+    for needle in [
+        "getent passwd qeminga-parser",
+        "601:601",
+        "check_parser_isolation \"$QEMINGA_PID\"",
+        "\"Name\": \"qeminga-parser\"",
+        "\"Uid\": \"601 601 601 601\"",
+        "\"Gid\": \"601 601 601 601\"",
+        "\"CapEff\": \"0000000000000000\"",
+        "\"CapBnd\": \"0000000000000000\"",
+        "\"NoNewPrivs\": \"1\"",
+        "\"Seccomp\": \"2\"",
+        "exec_stderr_id",
+        "exec_port_fds != 0",
+        "setpriv --reuid 601 --regid 601 --clear-groups",
+        "world-writable",
+        "world-writable O_WRONLY allowed outside unit",
+        "expect_err(\"root-secret rdonly\"",
+        "expect_err(\"uid600-file rdonly\"",
+        "expect_err(\"world-file wronly\", world_file, os.O_WRONLY, errno.EROFS)",
+        "os.unlink(world_file)",
+        "expect_err(\"virtio-port rdwr\"",
+        "expect_err(\"/run/qeminga dir\"",
+    ] {
+        assert!(
+            guest.contains(needle),
+            "scripts/ci/libvirt-tcg-guest.sh missing parser isolation check: {needle}"
+        );
+    }
+    // check_parser_isolation must run after check_write_confinement (which
+    // restarts qeminga.service and updates QEMINGA_PID).
+    let write_pos = guest
+        .find("check_write_confinement \"$pid\"")
+        .expect("check_write_confinement call");
+    let parser_pos = guest
+        .find("check_parser_isolation \"$QEMINGA_PID\"")
+        .expect("check_parser_isolation call");
+    assert!(
+        parser_pos > write_pos,
+        "check_parser_isolation must run after check_write_confinement restores qeminga.service"
+    );
+}

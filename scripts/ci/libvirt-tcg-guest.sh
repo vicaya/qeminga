@@ -101,6 +101,9 @@ check_production_state() {
     if [ "$(getent passwd qeminga | cut -d: -f3,4)" = "600:600" ]; then log "ok: account qeminga is 600:600"
     else log "FAILED: account qeminga: $(getent passwd qeminga || echo missing)"; ok=1; fi
 
+    if [ "$(getent passwd qeminga-parser | cut -d: -f3,4)" = "601:601" ]; then log "ok: account qeminga-parser is 601:601"
+    else log "FAILED: account qeminga-parser: $(getent passwd qeminga-parser || echo missing)"; ok=1; fi
+
     # The daemon drops and installs its filter after start (design §5.4);
     # give it a bounded moment under emulation.
     wait_for_qeminga_ready || true
@@ -127,6 +130,7 @@ check_production_state() {
 
     if [ -n "$pid" ] && [ "$pid" != 0 ] && [ -r "/proc/$pid/mountinfo" ]; then
         check_write_confinement "$pid" || ok=1
+        check_parser_isolation "$QEMINGA_PID" || ok=1
     else
         log "FAILED: cannot inspect /proc/${pid:-0}/mountinfo for write confinement"
         ok=1
@@ -533,6 +537,295 @@ PY
     fi
 
     check_sys_power_confinement "$pid" || ok=1
+    return "$ok"
+}
+
+# Inspect the live isolated parser child of the installed qeminga.service
+# (OQ-10 §6 Checks 1-3 in the disposable guest on both x86_64 and aarch64):
+# - single-threaded `qeminga-parser` child running as 601:601 with zero caps,
+#   NoNewPrivs=1, Seccomp=2 on every thread
+# - backing-object fd check: fds 0/1/2 are S_ISCHR(1,3) /dev/null distinct from
+#   executor stderr; fd 3 is a Unix socket in both processes; parser holds
+#   strictly /dev/null (0/1/2), IPC socket (3), one verified virtio-port char
+#   device, and optional epoll/eventfd; executor holds zero virtio-port fds
+# - UID 601 DAC confinement inside the service mount namespace against a
+#   synthetic 0600 root:root secret, a 0600 qeminga:qeminga file, the
+#   virtio-port device, and /run/qeminga.
+check_parser_isolation() {
+    local pid="$1" ok=0 out=""
+    if [ -z "$pid" ] || [ "$pid" = 0 ] || [ ! -r "/proc/$pid/status" ]; then
+        log "FAILED: cannot inspect parser isolation for missing executor pid ${pid:-0}"
+        return 1
+    fi
+
+    if out="$(python3 - "$pid" /dev/virtio-ports/org.qemu.guest_agent.0 <<'PY' 2>&1
+import os, stat, sys, time
+
+exec_pid = int(sys.argv[1])
+port_path = sys.argv[2]
+
+port_st = os.stat(port_path)
+if not stat.S_ISCHR(port_st.st_mode):
+    raise RuntimeError(f"{port_path} is not a char device")
+port_rdev = (os.major(port_st.st_rdev), os.minor(port_st.st_rdev))
+
+def read_status(path):
+    fields = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                fields[k.strip()] = " ".join(v.split())
+    return fields
+
+def find_children(parent_pid):
+    children = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            st = read_status(f"/proc/{entry}/status")
+        except OSError:
+            continue
+        if st.get("PPid") == str(parent_pid):
+            children.append((int(entry), st))
+    return children
+
+def count_port_fds(target_pid):
+    count = 0
+    for name in os.listdir(f"/proc/{target_pid}/fd"):
+        try:
+            st = os.stat(f"/proc/{target_pid}/fd/{name}")
+        except OSError:
+            continue
+        if stat.S_ISCHR(st.st_mode) and (os.major(st.st_rdev), os.minor(st.st_rdev)) == port_rdev:
+            count += 1
+    return count
+
+deadline = time.monotonic() + 15.0
+parser_pid = None
+last_diag = "no child found"
+while time.monotonic() < deadline:
+    kids = find_children(exec_pid)
+    if len(kids) == 1:
+        cpid, st = kids[0]
+        try:
+            p_fds = count_port_fds(cpid)
+        except OSError:
+            p_fds = 0
+        if (
+            st.get("Name") == "qeminga-parser"
+            and st.get("Uid") == "601 601 601 601"
+            and st.get("Seccomp") == "2"
+            and p_fds == 1
+        ):
+            parser_pid = cpid
+            break
+        last_diag = (
+            f"child pid={cpid} name={st.get('Name')} uid={st.get('Uid')} "
+            f"seccomp={st.get('Seccomp')} port_fds={p_fds}"
+        )
+    else:
+        last_diag = f"found {len(kids)} direct children: {[k[0] for k in kids]}"
+    time.sleep(0.2)
+
+if parser_pid is None:
+    raise RuntimeError(f"parser child did not settle within 15s ({last_diag})")
+
+# Verify every thread of the parser child.
+tasks = sorted(os.listdir(f"/proc/{parser_pid}/task"))
+if len(tasks) != 1:
+    raise RuntimeError(f"parser has {len(tasks)} threads, expected 1: {tasks}")
+for tid in tasks:
+    st = read_status(f"/proc/{parser_pid}/task/{tid}/status")
+    checks = {
+        "Name": "qeminga-parser",
+        "Threads": "1",
+        "Uid": "601 601 601 601",
+        "Gid": "601 601 601 601",
+        "CapEff": "0000000000000000",
+        "CapPrm": "0000000000000000",
+        "CapBnd": "0000000000000000",
+        "CapInh": "0000000000000000",
+        "CapAmb": "0000000000000000",
+        "NoNewPrivs": "1",
+        "Seccomp": "2",
+    }
+    for k, want in checks.items():
+        got = st.get(k)
+        if got != want:
+            raise RuntimeError(f"parser tid {tid} {k}={got!r}, expected {want!r}")
+
+# Verify backing kernel objects of parser and executor descriptors.
+exec_stderr = os.stat(f"/proc/{exec_pid}/fd/2")
+exec_stderr_id = (exec_stderr.st_dev, exec_stderr.st_ino)
+exec_ipc = os.stat(f"/proc/{exec_pid}/fd/3")
+if not stat.S_ISSOCK(exec_ipc.st_mode):
+    raise RuntimeError("executor fd 3 is not a Unix socket")
+
+seen_ipc = False
+channel_fds = 0
+for name in sorted(os.listdir(f"/proc/{parser_pid}/fd"), key=int):
+    fd_num = int(name)
+    fd_path = f"/proc/{parser_pid}/fd/{name}"
+    target = os.readlink(fd_path)
+    st = os.stat(fd_path)
+    if fd_num in (0, 1, 2):
+        if not stat.S_ISCHR(st.st_mode) or (os.major(st.st_rdev), os.minor(st.st_rdev)) != (1, 3):
+            raise RuntimeError(f"parser fd {fd_num} -> {target} is not /dev/null (1,3)")
+        if (st.st_dev, st.st_ino) == exec_stderr_id:
+            raise RuntimeError(f"parser fd {fd_num} aliases executor stderr")
+    elif fd_num == 3:
+        if not stat.S_ISSOCK(st.st_mode) or not target.startswith("socket:["):
+            raise RuntimeError(f"parser fd 3 -> {target} is not a Unix socket")
+        seen_ipc = True
+    elif stat.S_ISCHR(st.st_mode) and (os.major(st.st_rdev), os.minor(st.st_rdev)) == port_rdev:
+        channel_fds += 1
+    elif target.startswith("anon_inode:[eventpoll]") or target.startswith("anon_inode:[eventfd]"):
+        pass
+    else:
+        raise RuntimeError(f"parser holds unexpected fd {fd_num} -> {target}")
+
+if not seen_ipc:
+    raise RuntimeError("parser is missing IPC socket on fd 3")
+if channel_fds != 1:
+    raise RuntimeError(f"parser holds {channel_fds} virtio-port fds, expected 1")
+
+# Verify executor closed its virtio-port descriptor immediately after handoff.
+exec_port_fds = count_port_fds(exec_pid)
+if exec_port_fds != 0:
+    raise RuntimeError(f"executor still holds {exec_port_fds} virtio-port fd(s)")
+
+print(f"parser pid={parser_pid} uid=601 caps=0 nnp=1 seccomp=2 fds=strict")
+PY
+    )"; then
+        log "ok: parser isolation verified ($out)"
+    else
+        log "FAILED: parser isolation check failed: $out"
+        ok=1
+    fi
+
+    # Verify UID 601 DAC and unit-layer read-only mount boundaries inside the
+    # service's mount namespace (OQ-10 §6 Checks 2-3):
+    # - 0600 root:root secret and 0600 qeminga:qeminga file fail EACCES (DAC)
+    # - 0666 world-writable file on /tmp (present at service startup) is
+    #   openable O_WRONLY to UID 601 outside the unit, and MUST fail EROFS on
+    #   both O_WRONLY open and unlink inside the service's mount namespace.
+    local secret_dir uid600_dir secret_file uid600_file world_file
+    secret_dir="$(mktemp -d /var/lib/qeminga-parser-probe.XXXXXX)" || {
+        log "FAILED: cannot create temp dir under /var/lib"
+        return 1
+    }
+    uid600_dir="$(mktemp -d /tmp/qeminga-parser-probe.XXXXXX)" || {
+        rm -rf -- "$secret_dir"
+        log "FAILED: cannot create temp dir under /tmp"
+        return 1
+    }
+    secret_file="$secret_dir/root-secret"
+    uid600_file="$uid600_dir/uid600-secret"
+    world_file="$uid600_dir/world-writable"
+
+    if ! python3 - "$secret_dir" "$uid600_dir" <<'PY'
+import os, sys
+
+secret_dir, tmp_dir = sys.argv[1:3]
+
+def make_file(parent, name, uid, gid, mode, data):
+    dfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+            dir_fd=dfd,
+        )
+        try:
+            os.fchown(fd, uid, gid)
+            os.fchmod(fd, mode)
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+
+make_file(secret_dir, "root-secret", 0, 0, 0o600, b"synthetic-root-secret-oq10\n")
+make_file(tmp_dir, "uid600-secret", 600, 600, 0o600, b"untouched-uid600\n")
+make_file(tmp_dir, "world-writable", 0, 0, 0o666, b"untouched-world\n")
+for d in (secret_dir, tmp_dir):
+    dfd = os.open(d, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        os.fchmod(dfd, 0o755)
+    finally:
+        os.close(dfd)
+PY
+    then
+        log "FAILED: cannot initialize exclusive parser boundary probe files"
+        rm -rf -- "$secret_dir" "$uid600_dir"
+        return 1
+    fi
+
+    # Outside the service namespace, UID 601 MUST be able to open the 0666 file
+    # O_WRONLY (zero bytes written), establishing that DAC does not mask EROFS.
+    if out="$(setpriv --reuid 601 --regid 601 --clear-groups -- python3 - "$world_file" <<'PY' 2>&1
+import os, sys
+
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_CLOEXEC)
+os.close(fd)
+print("world-writable O_WRONLY allowed outside unit")
+PY
+    )"; then
+        log "ok: parser UID 601 outside-unit baseline verified ($out)"
+    else
+        log "FAILED: parser UID 601 could not open 0666 fixture outside unit: $out"
+        ok=1
+    fi
+
+    if out="$(nsenter --mount="/proc/$pid/ns/mnt" -- setpriv --reuid 601 --regid 601 --clear-groups -- python3 - "$secret_file" "$uid600_file" "$world_file" /dev/virtio-ports/org.qemu.guest_agent.0 /run/qeminga <<'PY' 2>&1
+import errno, os, sys
+
+secret_file, uid600_file, world_file, port_path, run_dir = sys.argv[1:6]
+
+def expect_err(label, path, flags, want):
+    try:
+        fd = os.open(path, flags | os.O_CLOEXEC)
+    except OSError as exc:
+        if exc.errno != want:
+            want_name = errno.errorcode.get(want, str(want))
+            got = errno.errorcode.get(exc.errno, str(exc.errno))
+            raise RuntimeError(f"{label}: got {got}, expected {want_name}")
+    else:
+        os.close(fd)
+        raise RuntimeError(f"{label}: unexpectedly succeeded as uid 601")
+
+expect_err("root-secret rdonly", secret_file, os.O_RDONLY, errno.EACCES)
+expect_err("uid600-file rdonly", uid600_file, os.O_RDONLY, errno.EACCES)
+expect_err("world-file wronly", world_file, os.O_WRONLY, errno.EROFS)
+try:
+    os.unlink(world_file)
+except OSError as exc:
+    if exc.errno != errno.EROFS:
+        got = errno.errorcode.get(exc.errno, str(exc.errno))
+        raise RuntimeError(f"world-file unlink: got {got}, expected EROFS")
+else:
+    raise RuntimeError("world-file unlink unexpectedly succeeded as uid 601")
+expect_err("virtio-port rdwr", port_path, os.O_RDWR, errno.EACCES)
+expect_err("/run/qeminga dir", run_dir, os.O_RDONLY | os.O_DIRECTORY, errno.EACCES)
+print("uid601 denied root-secret/uid600-file/virtio-port/run (EACCES) and world-file write/unlink (EROFS)")
+PY
+    )"; then
+        log "ok: parser UID 601 DAC and unit-layer EROFS boundary verified ($out)"
+    else
+        log "FAILED: parser UID 601 boundary probe failed: $out"
+        ok=1
+    fi
+
+    if [ "$(cat "$secret_file")" != "synthetic-root-secret-oq10" ] \
+        || [ "$(cat "$uid600_file")" != "untouched-uid600" ] \
+        || [ "$(cat "$world_file")" != "untouched-world" ]; then
+        log "FAILED: parser boundary probe fixtures were modified"
+        ok=1
+    fi
+    rm -rf -- "$secret_dir" "$uid600_dir"
     return "$ok"
 }
 
